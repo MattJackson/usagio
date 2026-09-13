@@ -16,7 +16,7 @@
 //! side.
 
 use super::{MenuItem, MenuTree, ValueColor, ValueSpan};
-use muri::{Color, Icon, Item, Menu, MenuId, Row, Segment, StyleRun};
+use muri::{Color, Icon, Item, Menu, MenuId, Row, Segment, StyleRun, Weight};
 
 /// Map the platform-agnostic [`ValueColor`] (severity band) to muri's `Color`
 /// for `Row::value_color`. Red = "about to hit the wall", Amber = "approaching
@@ -102,14 +102,15 @@ fn append(menu: Menu, item: &MenuItem) -> Menu {
 
 /// Build a submenu's parent row. usagio's account label is `"name\tvalue"`; the
 /// tab splits it into a grow label + a right-aligned value segment so the value
-/// aligns and can be tinted per severity. The active account renders **bold**
-/// (no checkmark → no leading gutter), and its `S% / W%` value carries the
-/// severity color.
+/// aligns and can be tinted per severity. The active account renders **bold +
+/// accent forecolor** (bold alone is too subtle at 13pt through the glass; color
+/// reads clearly) — no checkmark → no leading gutter — and its `S% / W%` value
+/// carries the severity color.
 fn submenu_label(label: &str, active: bool, value_spans: &[ValueSpan]) -> Row {
     // Non-interactive parent row (id = none): the submenu opens the flyout;
     // the actionable rows live inside it.
     let base = Row::new(MenuId::none());
-    let mut row = match label.split_once('\t') {
+    match label.split_once('\t') {
         Some((name, value)) => {
             // `value_spans` offsets are UTF-16, relative to `value` (the text
             // after the `\t`) — see `menubar::value_spans_of`. Color each span
@@ -122,12 +123,21 @@ fn submenu_label(label: &str, active: bool, value_spans: &[ValueSpan]) -> Row {
                     .collect();
                 vseg = vseg.runs(runs);
             }
-            base.segment(Segment::grow(name)).segment(vseg)
+            let mut nseg = Segment::grow(name);
+            if active {
+                // Whole-name accent-colored bold run marks the active account.
+                let len = name.encode_utf16().count();
+                nseg = nseg.runs(vec![StyleRun::new(0, len, Color::Accent).weight(Weight::Bold)]);
+            }
+            base.segment(nseg).segment(vseg)
         }
-        None => base.label(label),
-    };
-    if active {
-        row = row.bold();
+        None => {
+            let row = base.label(label);
+            if active {
+                row.bold()
+            } else {
+                row
+            }
+        }
     }
-    row
 }

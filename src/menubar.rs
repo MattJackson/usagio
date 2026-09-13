@@ -622,7 +622,23 @@ fn provider_group_header_row(sec: &ProviderSection) -> RowStyle {
 /// column (see `plain_text`), so a forgotten `\t` would collapse it to a flat
 /// "Quit usagio vX.Y.Z".
 fn quit_row_plain() -> String {
-    format!("Quit\tusagio v{}", env!("CARGO_PKG_VERSION"))
+    // `USAGIO_BUILD_TAG`, set at compile time, is appended so a QA screenshot
+    // self-identifies which build rendered it (distinguishing a dev build from
+    // an installed release when both are running). Unset in normal/release
+    // builds, so the label stays exactly "Quit\tusagio vX.Y.Z".
+    // `MURI_BG=r,g,b,a` (runtime bg-tuning hook): surface the alpha on the Quit
+    // row so phone-photo comparisons self-label which alpha is on screen.
+    let bg = std::env::var("MURI_BG")
+        .ok()
+        .and_then(|s| s.rsplit(',').next().map(|a| a.trim().to_string()))
+        .map(|a| format!(" a={a}"))
+        .unwrap_or_default();
+    match option_env!("USAGIO_BUILD_TAG") {
+        Some(tag) if !tag.is_empty() => {
+            format!("Quit\tusagio v{} [{}]{bg}", env!("CARGO_PKG_VERSION"), tag)
+        }
+        _ => format!("Quit\tusagio v{}{bg}", env!("CARGO_PKG_VERSION")),
+    }
 }
 
 /// Locate the active section + account (if any) in the snapshot.
@@ -1046,6 +1062,11 @@ fn poll_loop() {
     let mut current = base;
     let mut wd = crate::watchdog::Watchdog::default();
     let mut wd_effects = crate::watchdog::RealEffects;
+    // Force a full refresh of EVERY account on the first cycle after launch —
+    // including "locked" ones the per-cycle guard would normally skip — so the
+    // menu never opens on stale data carried over from before the app was last
+    // closed (e.g. an account that reset/boosted while usagio wasn't running).
+    let mut first_cycle = true;
     loop {
         // Self-healing health check (fd-count + keychain-write), throttled to
         // ~once a minute. The menubar poller runs under launchd, so a critical
@@ -1057,8 +1078,9 @@ fn poll_loop() {
         // hits the network, so ordinary use can never rate-limit.
         let (rate_limited, max_pct_opt, trigger, actionable) = {
             let mut g = guard.lock().unwrap_or_else(|e| e.into_inner());
-            run_cycle(&mut g)
+            run_cycle(&mut g, first_cycle)
         };
+        first_cycle = false;
         let prev = current;
         current = next_interval(
             current,
@@ -1337,13 +1359,13 @@ fn launchd_managed_from_env(xpc_service_name: Option<&str>) -> bool {
 /// caller's adaptive-cadence math has everything it needs. The menubar
 /// poller uses the trigger the user actually configured (via `Settings ▸
 /// Auto-swap`), matching what `watch_cycle` itself dispatched on.
-fn run_cycle(guard: &mut SwapGuard) -> (bool, Option<f64>, f64, bool) {
+fn run_cycle(guard: &mut SwapGuard, force: bool) -> (bool, Option<f64>, f64, bool) {
     let st = State::load().unwrap_or_default();
     let autoswap = !st.autoswap_disabled;
     let threshold = st.trigger_pct.unwrap_or(TRIGGER_PCT);
     // With auto-swap off, use an unreachable trigger so we only observe.
     let trigger = if autoswap { threshold } else { 101.0 };
-    match watch_cycle(trigger, TARGET_CEILING_PCT, guard) {
+    match watch_cycle(trigger, TARGET_CEILING_PCT, guard, force) {
         Ok(o) => (o.rate_limited, o.max_pct, trigger, o.actionable),
         Err(e) => {
             crate::logging::log(&format!("menubar poll failed: {e}"));
@@ -1791,7 +1813,18 @@ fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
             // Stable sort preserves that order among the non-locked windows.
             let mut ordered: Vec<&WindowView> = a.windows.iter().collect();
             ordered.sort_by_key(|w| u8::from(!w.pct.is_some_and(|p| p >= 100.0)));
+            // When the WEEKLY window is locked, the account is fully blocked
+            // regardless of the session window — so drop the "Session resets in X"
+            // line (its countdown is meaningless while the weekly limit blocks all
+            // use). The "Weekly limit reached · resets in X" row says everything.
+            let weekly_locked = a
+                .windows
+                .iter()
+                .any(|w| w.id == "weekly" && w.pct.is_some_and(|p| p >= 100.0));
             for w in ordered {
+                if weekly_locked && !w.pct.is_some_and(|p| p >= 100.0) {
+                    continue;
+                }
                 if let Some(row) = window_status_row(w) {
                     rows.push(row);
                 }
@@ -1820,13 +1853,23 @@ fn account_extra_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
     if sec.supports_usage && a.has_data && !a.windows.is_empty() {
         let account_key =
             crate::usage_log::AccountKey::new(sec.provider_id.to_string(), a.key.clone());
-        if let Some(est) = crate::burn_rate::estimate(
-            &account_key,
-            crate::providers::trait_def::Window::Weekly,
-            Utc::now(),
-        ) {
-            if est.confidence >= crate::burn_rate::CONFIDENCE_FLOOR {
-                rows.push(crate::burn_rate::format_menu_row(&est));
+        // The burn-rate row forecasts when the WEEKLY window empties ("Weekly ·
+        // N% · empty in ~X"). Once the weekly window is already locked (100%),
+        // that reads as a redundant "· 100% · empty in ~0m" — skip it; the
+        // "Weekly limit reached" status row already conveys the lock.
+        let weekly_locked = a
+            .windows
+            .iter()
+            .any(|w| w.id == "weekly" && w.pct.is_some_and(|p| p >= 100.0));
+        if !weekly_locked {
+            if let Some(est) = crate::burn_rate::estimate(
+                &account_key,
+                crate::providers::trait_def::Window::Weekly,
+                Utc::now(),
+            ) {
+                if est.confidence >= crate::burn_rate::CONFIDENCE_FLOOR {
+                    rows.push(crate::burn_rate::format_menu_row(&est));
+                }
             }
         }
         if let Some(cost) = crate::cost_tracking::estimate_cycle_cost(
@@ -2291,7 +2334,7 @@ fn handle_refresh_now() {
             let _reset = InFlightGuard;
             let (rate_limited, _max_pct, _trigger, _actionable) = {
                 let mut g = guard.lock().unwrap_or_else(|e| e.into_inner());
-                run_cycle(&mut g)
+                run_cycle(&mut g, true)
             };
             if rate_limited {
                 notify("Refresh: rate limited, backing off");
@@ -3473,6 +3516,40 @@ mod tests {
         for row in submenu_info_rows(&sec, &a) {
             assert!(!row.contains('%'), "submenu row leaked a percentage: {row}");
         }
+    }
+
+    #[test]
+    fn weekly_locked_drops_session_reset_row() {
+        // Image #13: when the WEEKLY window is locked (100%), the account is fully
+        // blocked, so the "5h resets in X" session row is meaningless noise — the
+        // flyout should show only the "7d limit reached · resets in X" weekly row.
+        let sec = ProviderSection {
+            provider_id: CLAUDE_SLUG,
+            display_name: "Claude",
+            supports_switching: true,
+            supports_usage: true,
+            supports_launch: true,
+            supports_remove: true,
+            severity_bands: bands(),
+            env_override_active: false,
+            accounts: vec![],
+        };
+        let locked = acct("a@x.com", Some(40.0), Some(100.0), true);
+        let rows = submenu_info_rows(&sec, &locked);
+        assert!(
+            rows.iter().any(|r| r.contains("Weekly") && r.contains("limit reached")),
+            "weekly-locked flyout must keep the weekly lock row: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("Session")),
+            "weekly-locked flyout must drop the session reset row: {rows:?}"
+        );
+        // Control: an unlocked account still shows the session row.
+        let healthy = acct("b@x.com", Some(40.0), Some(60.0), true);
+        assert!(
+            submenu_info_rows(&sec, &healthy).iter().any(|r| r.contains("Session")),
+            "unlocked flyout must keep the session reset row"
+        );
     }
 
     #[test]
