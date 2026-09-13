@@ -525,7 +525,7 @@ fn cmd_list(args: &[String]) -> Result<()> {
     let refresh = args.iter().any(|a| a == "--refresh" || a == "-r");
     // By default read the cache (no network); --refresh does exactly one fetch.
     if refresh {
-        refresh_usage_cache();
+        refresh_usage_cache(true);
     }
     providers::init();
     let state = State::load()?;
@@ -2150,7 +2150,13 @@ struct RefreshOutcome {
 /// reloads state, merges the fresh tokens + `cached_usage` by email, and saves —
 /// so a concurrent switch is never clobbered. On 429/transient error it KEEPS
 /// the existing cache.
-fn refresh_usage_cache() -> RefreshOutcome {
+/// Max age a *locked* account's cached usage may reach before we refresh it
+/// anyway, even though `is_locked_until_reset` says to skip. Bounds staleness so
+/// an account that reset or got a temporary limit boost EARLIER than its cached
+/// reset can't stay frozen at a stale "locked" reading until the (wrong) reset.
+const MAX_LOCKED_STALENESS_SECS: i64 = 12 * 3600;
+
+fn refresh_usage_cache(force: bool) -> RefreshOutcome {
     let mut state = match State::load() {
         Ok(s) => s,
         Err(e) => {
@@ -2213,7 +2219,22 @@ fn refresh_usage_cache() -> RefreshOutcome {
         let is_the_active_account = state.active.as_deref() == Some(email.as_str());
         if !is_the_active_account {
             if let Some(cu) = &acct.cached_usage {
-                if countdown::is_locked_until_reset(&cached_to_account_usage(cu), Utc::now()) {
+                // Skip the refresh for a locked account ONLY while its cache is
+                // still fresh. The skip is a rate-limit guard (a shelf of locked
+                // accounts polled every cycle 429-starves the tenant), but it
+                // trusted the stored reset time absolutely — so when an account
+                // reset or got a temporary limit boost EARLIER than the cached
+                // reset, usagio never re-checked and showed a stale "locked" read
+                // indefinitely (e.g. weekly reset early / a 50%-boost freed it,
+                // website 0% but menu 100%). Cap that: past MAX_LOCKED_STALENESS
+                // we refresh even a "locked" account, bounding staleness to 12h
+                // and catching early/unexpected resets, while still skipping the
+                // vast majority of per-cycle locked polls.
+                let stale = Utc::now().timestamp() - cu.fetched_at > MAX_LOCKED_STALENESS_SECS;
+                if !force
+                    && !stale
+                    && countdown::is_locked_until_reset(&cached_to_account_usage(cu), Utc::now())
+                {
                     logging::log(&format!(
                         "poll: {email} locked until reset; skipping refresh (event=refresh_skip_locked account={email})"
                     ));
@@ -2436,7 +2457,7 @@ fn refresh_usage_cache() -> RefreshOutcome {
     // Claude lives in `state.accounts` and is handled above; every other
     // captured provider (Codex, …) needs its own usage fetch or it stays
     // "no data yet" forever — captured and shown in the menu/list but inert.
-    refresh_provider_usage_caches();
+    refresh_provider_usage_caches(force);
     logging::log("poll: done");
     RefreshOutcome { rate_limited }
 }
@@ -2479,7 +2500,7 @@ fn cached_from_usage_snapshot(snap: &UsageSnapshot) -> CachedUsage {
 /// called. Best-effort throughout: a token-refresh or usage error keeps the
 /// existing cache and moves on (never panics the poll loop). Applies the same
 /// locked-until-reset skip so a maxed provider account doesn't burn requests.
-fn refresh_provider_usage_caches() {
+fn refresh_provider_usage_caches(force: bool) {
     let state = match State::load() {
         Ok(s) => s,
         Err(_) => return,
@@ -2501,9 +2522,15 @@ fn refresh_provider_usage_caches() {
                 continue;
             }
             // Locked accounts don't change until reset — skip (same guard as
-            // the Claude path; the reset-boundary wake brings us back).
+            // the Claude path; the reset-boundary wake brings us back). A manual
+            // refresh (`force`) never skips, and past MAX_LOCKED_STALENESS we
+            // refresh anyway so an early/unexpected reset can't freeze it.
             if let Some(cu) = &acct.cached_usage {
-                if countdown::is_locked_until_reset(&cached_to_account_usage(cu), Utc::now()) {
+                let stale = Utc::now().timestamp() - cu.fetched_at > MAX_LOCKED_STALENESS_SECS;
+                if !force
+                    && !stale
+                    && countdown::is_locked_until_reset(&cached_to_account_usage(cu), Utc::now())
+                {
                     continue;
                 }
             }
@@ -2662,7 +2689,7 @@ fn cmd_watch(args: &[String]) -> Result<()> {
         // account switching from silently breaking if fds ever leak or the
         // keychain starts failing again (see `src/watchdog.rs`).
         wd.maybe_run(&mut wd_effects);
-        match watch_cycle(trigger, ceiling, &mut guard) {
+        match watch_cycle(trigger, ceiling, &mut guard, false) {
             Ok(outcome) => {
                 if let Some((from, to)) = outcome.swapped {
                     eprintln!("[{}] swapped {from} -> {to}", Utc::now().to_rfc3339());
@@ -2993,7 +3020,7 @@ fn evaluate_swap(
 /// Poll usage for every account (the only network path), record history, and
 /// auto-swap away from the active account if it has reached `trigger` and a
 /// healthy target exists. Shared by `usagio watch` and the menu-bar poller.
-fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<CycleOutcome> {
+fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard, force: bool) -> Result<CycleOutcome> {
     // Pre-cycle: absorb any on-disk credential rotations the vendor CLI made
     // behind our back (fsnotify may not fire on remote/network volumes, and
     // we want the invariant to hold even on the polling path). Then refresh
@@ -3004,7 +3031,7 @@ fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard) -> Result<Cycl
     }
     credentials::refresh_inactive_if_stale(State::load().ok().and_then(|s| s.active).as_deref());
 
-    let refresh = refresh_usage_cache();
+    let refresh = refresh_usage_cache(force);
     // Gap-4 (codex-switch-e2e): drive the active-account CAS refresh for
     // every non-Claude provider that has one wired (currently just codex).
     // Best-effort and self-contained — logs and moves on rather than

@@ -7,7 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.6.2] - 2026-09-11
+## [0.7.0] - 2026-09-13
+
+### Changed
+- **macOS menu now renders as native-style glass.** The live tray popup hosts an
+  `NSVisualEffectView` backdrop blur (no Screen Recording permission) with muri
+  painting a low-alpha cool-charcoal tint on top, so the desktop behind the menu
+  is *blurred* (like a native `NSMenu`/Time Machine popup) instead of readable,
+  while the rows/text stay crisp. Fill and blur were tuned on-device against a
+  live Time Machine menu (screenshots don't capture the compositor blur — phone
+  photos were used). Dark fill `rgba(28,32,44,0.16)`, light unchanged.
+- **Active account is now marked in the accent color** (plus bold). At 13pt
+  through the glass, bold alone was too subtle to read as "active", so the active
+  account's name renders in the system accent color.
+- **Cursor shows the arrow** (not the I-beam) over the popup, including a
+  stationary open (muri activates while the menu is open so its cursor wins).
+
+### Fixed
+- **Usage no longer goes stale while an account is locked.** All accounts refresh
+  at startup and at least every 12h (not only when a window unlocks), and a manual
+  refresh (`usagio list --refresh` or the menu) always runs — fixing accounts that
+  showed locked/100% after the real limit had already reset.
+- **Locked-account flyout de-cluttered.** When the weekly window is maxed, the
+  redundant "Session resets in X" and burn-rate "empty in ~0m" lines are dropped.
+
+## [0.6.3] - 2026-09-11
+
+### Changed
+- **muri 0.12.0 — live macOS menu now matches a native Tahoe `NSMenu`.** A batch
+  of OEM-fidelity fixes, all measured against a real `NSMenu` on macOS 26
+  (Tahoe): the active row renders **bold** (variable system-font `wght`-axis
+  instancing), letters are no longer over-tightened (native SF tracking), the
+  popup corner radius is version-aware (**12pt** on Tahoe, ~6pt earlier), row
+  pitch is read from AppKit's own `NSMenu.size` (24pt), the backdrop follows the
+  OS material (**Liquid Glass** on Tahoe, vibrancy earlier), the popup **dismisses
+  on a Space switch**, and the pointer shows the **arrow** cursor instead of the
+  I-beam. usagio drove all of these upstream with same-machine measurements.
 
 ### Changed
 - **macOS tray menu migrated to muri's native API (muri 0.11).** usagio builds

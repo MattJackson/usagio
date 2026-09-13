@@ -1415,7 +1415,7 @@ fn refresh_usage_cache_still_refreshes_inactive_accounts() {
     seed.active = None;
     seed.save().unwrap();
 
-    refresh_usage_cache();
+    refresh_usage_cache(false);
     oauth::set_token_url_override(None);
     usage::set_usage_url_override(None);
 
