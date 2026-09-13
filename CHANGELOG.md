@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-13
+
+### Fixed
+- **macOS popup now dismisses immediately on a Space switch** (muri 0.14.6, #69).
+  The dismiss notification (Space change / native menu opening / resign-active)
+  arrives with no `NSEvent`, so the popup's modal event pump didn't drain it until
+  the next real input — leaving the menu on-screen after a three-finger swipe.
+  muri now posts a wake event so the dismiss applies at once.
+
 ## [0.7.0] - 2026-09-13
 
 ### Changed
