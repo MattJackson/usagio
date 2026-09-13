@@ -190,22 +190,24 @@ jobs:
           # at it for a real Login Items icon.
           perl -0777 -pi -e 's/def install\n(?:.*\n)*?  end\n/def install\n    bin.install "usagio"\n    prefix.install "usagio.app"\n  end\n/' "$f"
 
-          # v0.5.4 walk-back: `post_install_steps` (attempted in v0.5.3 to
-          # silence the deprecation warning) is NOT a real Homebrew method
-          # and silently no-ops — the tap-side fix at commit 6461d87
-          # reverted to `def post_install`. Keep the deprecated name; the
-          # warning is fine, a silently-broken hook is not. Strip either
-          # form first (idempotent — reruns must not stack duplicate defs
-          # OR leave a stale `post_install_steps` behind), then insert a
-          # fresh `post_install` right after `install`. "install means
-          # install": `brew install`/`brew upgrade` should register the
-          # LaunchAgent and start the menu bar without a second manual
-          # `usagio install` step, matching the NSIS installer's
-          # equivalent auto-run on Windows (see
-          # packaging/windows/installer.nsi).
+          # Homebrew 7.0.0 made `post_install_steps do ... end` a REAL DSL that
+          # replaces the now-deprecated `def post_install` (deprecated for
+          # third-party taps, hard-removed 2027-12-11). The v0.5.3 attempt failed
+          # because back then `post_install_steps` silently no-op'd; on brew 7+ it
+          # is a genuine steps block. A steps block only allows the fixed step DSL
+          # (no arbitrary `system`/formula DSL), but the `run` step takes a literal
+          # command + args — and at post-install the keg is already linked, so the
+          # bare `usagio` is on PATH. `run "usagio", "install"` is style-clean
+          # (verified with `brew style`) and keeps the auto-register-on-install
+          # behavior ("install means install", matching the NSIS installer's
+          # auto-run on Windows) while dropping the deprecation warning.
+          # Strip any prior form first (idempotent across reruns): the old `def
+          # post_install`, the old (wrong) `def post_install_steps`, and the new
+          # `post_install_steps do ... end` block.
+          perl -0777 -pi -e 's/\n  post_install_steps do\n(?:.*\n)*?  end\n//' "$f"
           perl -0777 -pi -e 's/\n  def post_install_steps\n(?:.*\n)*?  end\n//' "$f"
           perl -0777 -pi -e 's/\n  def post_install\n(?:.*\n)*?  end\n//' "$f"
-          perl -0777 -pi -e 's/(def install\n(?:.*\n)*?  end\n)/$1\n  def post_install\n    system bin\/"usagio", "install"\n  end\n/' "$f"
+          perl -0777 -pi -e 's/(def install\n(?:.*\n)*?  end\n)/$1\n  post_install_steps do\n    run "usagio", "install"\n  end\n/' "$f"
 
           # Caveats block: also strip-then-reinsert (always current, not
           # "add once") so the wording keeps up with what post_install now
