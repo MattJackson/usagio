@@ -190,31 +190,29 @@ jobs:
           # at it for a real Login Items icon.
           perl -0777 -pi -e 's/def install\n(?:.*\n)*?  end\n/def install\n    bin.install "usagio"\n    prefix.install "usagio.app"\n  end\n/' "$f"
 
-          # Homebrew deprecated `def post_install` for a sandboxed
-          # `post_install_steps do ... end` block (brew 7.0.0; hard-removed for
-          # third-party taps 2027-12-11). We deliberately KEEP `def post_install`:
-          # our hook runs `usagio install`, which registers a LaunchAgent + Login
-          # Item under the user's HOME (~/Library) — a home-dir mutation the steps
-          # sandbox is designed to forbid. The `run` step is `run "cmd", args: []`
-          # (one positional command + an `args:` keyword — NOT two positionals,
-          # which is a runtime arity error that breaks install), and granting home
-          # writes would need `writable_paths: [Dir.home]`, but a steps block only
-          # allows the fixed step DSL with LITERAL args, so `Dir.home` (any
-          # arbitrary Ruby) is rejected by `brew style`. There is no supported
-          # literal to whitelist the home dir, so the auto-register hook cannot be
-          # expressed as steps. The deprecation warning is cosmetic and install
-          # works; a silently-sandboxed-out hook would not. Strip either form first
-          # (idempotent), then insert a fresh `post_install` right after `install`.
+          # NO post_install hook (caveats-only, brew-7 sanctioned). Homebrew
+          # deprecated `def post_install` (hard-removed for third-party taps
+          # 2027-12-11) and its replacement `post_install_steps` runs in a HERMETIC
+          # sandbox with `$HOME` pointed at a throwaway temp dir (verified on-device
+          # via a throwaway formula: the step's `$HOME` was `/private/tmp/s-.../..-
+          # postinstall-...`, deleted after). Our old hook ran `usagio install`,
+          # which registers a LaunchAgent + Login Item under the REAL `~/Library` —
+          # a home mutation `brew install` is explicitly not allowed to do anymore.
+          # Through steps it would register into the sandbox home and vanish, so
+          # the menu bar would silently never auto-start. There is no way to keep
+          # both auto-install-on-`brew install` AND drop the deprecation warning.
+          # So we drop the auto-run entirely and tell the user (in `caveats`) to run
+          # `usagio install` once from their own shell (real `$HOME`). Strip any
+          # prior post_install form first (idempotent across reruns).
           perl -0777 -pi -e 's/\n  post_install_steps do\n(?:.*\n)*?  end\n//' "$f"
           perl -0777 -pi -e 's/\n  def post_install_steps\n(?:.*\n)*?  end\n//' "$f"
           perl -0777 -pi -e 's/\n  def post_install\n(?:.*\n)*?  end\n//' "$f"
-          perl -0777 -pi -e 's/(def install\n(?:.*\n)*?  end\n)/$1\n  def post_install\n    system bin\/"usagio", "install"\n  end\n/' "$f"
 
-          # Caveats block: also strip-then-reinsert (always current, not
-          # "add once") so the wording keeps up with what post_install now
-          # does automatically.
+          # Caveats block: strip-then-reinsert (always current). Tells the user the
+          # ONE post-install command to run — `usagio install` — since the formula
+          # no longer auto-runs it.
           perl -0777 -pi -e 's/\n  def caveats\n(?:.*\n)*?  end\n//' "$f"
-          perl -0777 -pi -e 's/(\nend\n?)\z/\n  def caveats\n    <<~EOS\n      usagio install ran automatically as part of this install\/upgrade --\n      it registers the menu bar app + auto-swap daemon to run now and at\n      every login, and (for the app icon in Login Items) points launchd at\n      usagio.app\/Contents\/MacOS\/usagio.\n\n      Run `usagio uninstall` to stop the menu bar and remove autostart.\n    EOS\n  end\n$1/' "$f"
+          perl -0777 -pi -e 's/(\nend\n?)\z/\n  def caveats\n    <<~EOS\n      To start the menu bar app + auto-swap daemon (now and at every login),\n      run once from your shell:\n\n        usagio install\n\n      It registers the menu bar + daemon under your account and (for the app\n      icon in Login Items) points launchd at\n      usagio.app\/Contents\/MacOS\/usagio. `brew install` no longer does this\n      automatically \x28Homebrew forbids formulae from writing to your home\x29.\n\n      Run `usagio uninstall` to stop the menu bar and remove autostart.\n    EOS\n  end\n$1/' "$f"
 
           # M14: the perl rewrites above are brittle regex surgery on the
           # formula's `install` block. Validate the result is still valid
@@ -231,17 +229,19 @@ jobs:
             cat "$f"
             exit 1
           fi
-          # v0.5.4: assert exactly ONE `def post_install` (not `_steps`),
-          # matching the real Homebrew hook name. `grep -c 'def
-          # post_install'` alone would count both variants; add an
-          # explicit reject for `post_install_steps` so a stray reintro
-          # (which silently no-ops on the user side) fails CI here.
-          if [ "$(grep -c 'def post_install' "$f")" != "1" ] || grep -q 'def post_install_steps' "$f" || ! grep -qF 'system bin/"usagio", "install"' "$f"; then
-            echo "::error::$f is missing (or has duplicate) the expected post_install block after the rewrite — aborting before push"
+          # Caveats-only (brew 7): assert there is NO post_install hook of any
+          # form (the deprecated `def post_install`, the old wrong
+          # `def post_install_steps`, or a `post_install_steps do` block) — the
+          # auto-run was dropped because steps sandbox `$HOME` (see above). A stray
+          # reintro would either warn (def) or silently register into the sandbox
+          # home and never start the menu bar, so fail CI here.
+          if grep -qE 'post_install' "$f"; then
+            echo "::error::$f still has a post_install hook — must be caveats-only (steps sandbox \$HOME); aborting before push"
             cat "$f"
             exit 1
           fi
-          if [ "$(grep -c 'def caveats' "$f")" != "1" ] || ! grep -q 'usagio uninstall' "$f"; then
+          # Exactly one caveats block that tells the user to run `usagio install`.
+          if [ "$(grep -c 'def caveats' "$f")" != "1" ] || ! grep -qF 'usagio install' "$f" || ! grep -q 'usagio uninstall' "$f"; then
             echo "::error::$f is missing (or has duplicate) the expected caveats block after the rewrite — aborting before push"
             cat "$f"
             exit 1
