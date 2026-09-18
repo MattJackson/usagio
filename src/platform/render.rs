@@ -127,7 +127,9 @@ fn submenu_label(label: &str, active: bool, value_spans: &[ValueSpan]) -> Row {
             if active {
                 // Whole-name accent-colored bold run marks the active account.
                 let len = name.encode_utf16().count();
-                nseg = nseg.runs(vec![StyleRun::new(0, len, Color::Accent).weight(Weight::Bold)]);
+                nseg = nseg.runs(vec![
+                    StyleRun::new(0, len, Color::Accent).weight(Weight::Bold)
+                ]);
             }
             base.segment(nseg).segment(vseg)
         }

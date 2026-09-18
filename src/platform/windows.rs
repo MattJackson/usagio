@@ -209,7 +209,13 @@ fn decode_icon(bytes: &[u8]) -> MuriIcon {
 /// a taskbar button and a blank window; `SW_HIDE` removes both. No-op when there
 /// is no console (null HWND) — e.g. if usagio is ever relaunched detached.
 fn hide_console_window() {
+    // Leading `::` is load-bearing: this module IS `platform::windows`, and the
+    // `use super::*` at the top pulls a `windows` name into scope, so a bare
+    // `windows::` path is E0659-ambiguous. rustfmt 1.9.0 strips the `::`, so
+    // pin these imports with `#[rustfmt::skip]`.
+    #[rustfmt::skip]
     use ::windows::Win32::System::Console::GetConsoleWindow;
+    #[rustfmt::skip]
     use ::windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
     // SAFETY: `GetConsoleWindow` returns this process's console HWND (or a null
     // handle if none is attached, in which case `ShowWindow` is a harmless
@@ -223,6 +229,7 @@ fn hide_console_window() {
 }
 
 fn pump_windows_messages() {
+    #[rustfmt::skip]
     use ::windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
     };
