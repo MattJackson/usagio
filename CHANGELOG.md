@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-09-17
+
+### Fixed
+- **Auto-pick no longer lands you on an account that's already past the swap
+  target.** `usagio switch` (no argument) and the menu's "Now" item shared a
+  picker that only skipped fully-maxed (100%) accounts, so an account sitting at
+  e.g. 99% weekly could still be chosen — the very state auto-swap moves *away*
+  from. Auto-pick now prefers accounts below the swap trigger, and only falls
+  back to the least-full still-usable account when every account is already past
+  target (and says so). Manual switch and background auto-swap now use the same
+  target semantics.
+
+### Added
+- **A stuck account now tells you why.** When the OAuth endpoint permanently
+  rejects an account's refresh token (`invalid_grant`), the menu row shows
+  `⚠ re-login` (red) instead of a misleading `-% / -%` placeholder, and the
+  account's submenu spells out the fix (`log in with claude, then usagio
+  capture`). A refresh error shows `⚠ error` with the detail in the submenu.
+- **You get notified when an account needs re-login** — once, on the transition
+  into the stuck state during a background poll, and again in the "Usage
+  refreshed" toast if any account still needs re-login after a manual refresh.
+  Previously an account could silently freeze with stale numbers for days.
+
 ## [0.7.1] - 2026-09-13
 
 ### Fixed
