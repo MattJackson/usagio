@@ -737,7 +737,8 @@ fn select_email(state: &State, selector: Option<&str>) -> Result<String> {
         Some(sel) => state.resolve(sel),
         None => {
             let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
-            auto_pick(&rows)
+            let trigger = state.trigger_pct.unwrap_or(TRIGGER_PCT);
+            auto_pick(&rows, TARGET_CEILING_PCT, trigger)
         }
     }
 }
@@ -1528,7 +1529,8 @@ pub(crate) fn optimize_now() -> Result<Option<String>> {
     let state = State::load()?;
     let active = state.active.clone();
     let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
-    let best = auto_pick(&rows)?;
+    let trigger = state.trigger_pct.unwrap_or(TRIGGER_PCT);
+    let best = auto_pick(&rows, TARGET_CEILING_PCT, trigger)?;
     if active.as_deref() == Some(best.as_str()) {
         return Ok(None);
     }
@@ -1536,19 +1538,43 @@ pub(crate) fn optimize_now() -> Result<Option<String>> {
     Ok(Some(best))
 }
 
-/// Pick the account with room to spare whose weekly window resets soonest.
-/// Operates entirely on cached rows — callers must not fetch first.
-fn auto_pick(rows: &[Row]) -> Result<String> {
+/// Pick the account whose weekly window resets soonest, preferring one that
+/// still sits BELOW the swap target (`eligible_target(ceiling, trigger)`) — an
+/// account already past the trigger is where auto-swap would move *away* from,
+/// so it's never "best" while any under-target account exists. Only when every
+/// account is already past target (it's all that's left) do we fall back to the
+/// least-consumed still-usable one. Operates entirely on cached rows — callers
+/// must not fetch first.
+fn auto_pick(rows: &[Row], ceiling: f64, trigger: f64) -> Result<String> {
     if !rows.iter().any(|r| r.has_data()) {
         bail!(
             "no usage data yet — let the menu-bar app or `usagio watch` \
              populate it, or pass an explicit account email"
         );
     }
-    let mut candidates: Vec<&Row> = rows
-        .iter()
-        .filter(|r| r.has_data() && r.available())
-        .collect();
+    fn sorted(mut c: Vec<&Row>) -> Vec<&Row> {
+        c.sort_by(|a, b| candidate_order(a, b));
+        c
+    }
+    // Tier 1: accounts still under the swap target — the genuinely good places
+    // to land. Tier 2 ("all that's left"): anything with a shred of room left
+    // (weekly < 100%), used only when Tier 1 is empty so a `switch` never dead-
+    // ends when every account is past target but one still has a sliver.
+    let under_target = sorted(
+        rows.iter()
+            .filter(|r| r.has_data() && r.eligible_target(ceiling, trigger))
+            .collect(),
+    );
+    let fallback = under_target.is_empty();
+    let candidates = if fallback {
+        sorted(
+            rows.iter()
+                .filter(|r| r.has_data() && r.available())
+                .collect(),
+        )
+    } else {
+        under_target
+    };
     if candidates.is_empty() {
         let soonest = rows
             .iter()
@@ -1564,10 +1590,16 @@ fn auto_pick(rows: &[Row]) -> Result<String> {
             None => bail!("no account currently has room"),
         }
     }
-    candidates.sort_by(|a, b| candidate_order(a, b));
     let pick = candidates[0];
+    // In the fallback tier every option is already past target, so flag that the
+    // pick is a nearly-full last resort rather than a healthy landing spot.
+    let note = if fallback {
+        " (all accounts past target — this is the least-full)"
+    } else {
+        ""
+    };
     println!(
-        "Auto-picked {} — weekly resets in {}, {:.0}% headroom.",
+        "Auto-picked {} — weekly resets in {}, {:.0}% headroom.{note}",
         pick.email,
         pick.weekly.resets_in(),
         pick.headroom()
@@ -3020,7 +3052,12 @@ fn evaluate_swap(
 /// Poll usage for every account (the only network path), record history, and
 /// auto-swap away from the active account if it has reached `trigger` and a
 /// healthy target exists. Shared by `usagio watch` and the menu-bar poller.
-fn watch_cycle(trigger: f64, ceiling: f64, guard: &mut SwapGuard, force: bool) -> Result<CycleOutcome> {
+fn watch_cycle(
+    trigger: f64,
+    ceiling: f64,
+    guard: &mut SwapGuard,
+    force: bool,
+) -> Result<CycleOutcome> {
     // Pre-cycle: absorb any on-disk credential rotations the vendor CLI made
     // behind our back (fsnotify may not fire on remote/network volumes, and
     // we want the invariant to hold even on the polling path). Then refresh

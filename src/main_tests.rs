@@ -237,7 +237,10 @@ fn auto_pick_tie_break_picks_higher_headroom() {
         row_full("low@e.com", 10.0, 10.0, reset),
     ];
     // Equal soonest reset → the account with MORE headroom (lower usage) wins.
-    assert_eq!(auto_pick(&rows).unwrap(), "low@e.com");
+    assert_eq!(
+        auto_pick(&rows, TARGET_CEILING_PCT, TRIGGER_PCT).unwrap(),
+        "low@e.com"
+    );
 }
 
 #[test]
@@ -249,7 +252,44 @@ fn auto_pick_prefers_soonest_reset() {
         row_full("later@e.com", 5.0, 5.0, later),
         row_full("soon@e.com", 40.0, 40.0, soon),
     ];
-    assert_eq!(auto_pick(&rows).unwrap(), "soon@e.com");
+    assert_eq!(
+        auto_pick(&rows, TARGET_CEILING_PCT, TRIGGER_PCT).unwrap(),
+        "soon@e.com"
+    );
+}
+
+#[test]
+fn auto_pick_skips_past_target_account_even_if_it_resets_soonest() {
+    // The regression: a 99%-weekly account resetting soonest must NOT beat an
+    // under-target account. "Best is not one past target."
+    let soon = Utc::now() + Duration::hours(2);
+    let later = Utc::now() + Duration::hours(48);
+    let rows = vec![
+        row_full("nearlyfull@e.com", 1.0, 99.0, soon),
+        row_full("empty@e.com", 0.0, 0.0, later),
+    ];
+    assert_eq!(
+        auto_pick(&rows, TARGET_CEILING_PCT, TRIGGER_PCT).unwrap(),
+        "empty@e.com",
+        "an account past the weekly trigger is never the best landing spot"
+    );
+}
+
+#[test]
+fn auto_pick_falls_back_to_least_full_when_all_past_target() {
+    // "Unless it's all that's left": every account is past target, so the
+    // least-consumed still-usable one wins rather than erroring out.
+    let soon = Utc::now() + Duration::hours(2);
+    let later = Utc::now() + Duration::hours(48);
+    let rows = vec![
+        row_full("full99@e.com", 1.0, 99.0, soon),
+        row_full("full97@e.com", 1.0, 97.0, later),
+    ];
+    // Both past the 95% trigger → fallback tier. Soonest reset still wins.
+    assert_eq!(
+        auto_pick(&rows, TARGET_CEILING_PCT, TRIGGER_PCT).unwrap(),
+        "full99@e.com"
+    );
 }
 
 // --- menu_order (dropdown priority) ---
