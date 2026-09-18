@@ -157,6 +157,16 @@ struct AcctView {
     /// post-reset reading from a stale pre-reset one still sitting in the
     /// cache (`DisplayState::StaleAfterReset` — see `trailing_for_account`).
     fetched_at: Option<DateTime<Utc>>,
+    /// The OAuth token endpoint has permanently rejected this account's refresh
+    /// token — it's filtered out of every usage refresh, so its cached numbers
+    /// go stale forever. Takes priority over any usage/lock state in the row
+    /// trailing and submenu so the user sees "fix your login", not a misleading
+    /// "-% / -%" placeholder that reads like a transient poll gap.
+    needs_relogin: bool,
+    /// Last non-fatal error recorded for this account's refresh, if any. Shown
+    /// as the reason line under a `⚠ error` trailing when `needs_relogin` is not
+    /// set. `None` in the common healthy case.
+    error: Option<String>,
 }
 
 /// One provider's block in the menu. Rendered only if `accounts` is non-empty
@@ -515,6 +525,21 @@ fn trailing_for_account(
     bands: SeverityBands,
     now: DateTime<Utc>,
 ) -> (String, Vec<(usize, usize, Severity)>) {
+    // Auth trouble outranks any usage/lock display: an account whose refresh
+    // token was rejected can never refresh, so its cached pct is frozen and a
+    // "-% / -%" or stale countdown would misrepresent a dead login as a
+    // transient poll gap. Surface the reason instead (full detail lands in the
+    // submenu status row).
+    if a.needs_relogin {
+        let t = "⚠ re-login".to_string();
+        let len = u16len(&t);
+        return (t, vec![(0, len, Severity::Red)]);
+    }
+    if a.error.is_some() {
+        let t = "⚠ error".to_string();
+        let len = u16len(&t);
+        return (t, vec![(0, len, Severity::Red)]);
+    }
     match countdown::compute_display(&account_usage_for(a), now) {
         DisplayState::Locked {
             until,
@@ -1526,6 +1551,8 @@ fn acctview_from_row(
         fetched_at: r
             .fetched_at
             .and_then(|t| chrono::DateTime::from_timestamp(t, 0)),
+        needs_relogin: r.needs_relogin,
+        error: r.error.clone(),
     }
 }
 
@@ -1805,6 +1832,21 @@ fn window_status_row(w: &WindowView) -> Option<String> {
 /// call from a unit test without a `ScopedConfigDir`.
 fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
     let mut rows = Vec::new();
+    // Auth trouble is the account's headline state — spell out the reason and
+    // the fix before any (now-frozen) usage numbers. Mirrors the `⚠` trailing
+    // that `trailing_for_account` puts on the row header.
+    if a.needs_relogin {
+        rows.push("⚠ Re-login required — token expired".to_string());
+        rows.push(format!(
+            "Fix: log in with `claude`, then `usagio capture` ({})",
+            a.key
+        ));
+        return rows;
+    }
+    if let Some(err) = &a.error {
+        rows.push(format!("⚠ Refresh error: {err}"));
+        return rows;
+    }
     if sec.supports_usage {
         if a.has_data && !a.windows.is_empty() {
             // A window at 100% is the binding lock — lead with it (that's the
@@ -2310,6 +2352,30 @@ static REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// De-duplicated via `REFRESH_IN_FLIGHT`: a second click while a refresh is
 /// still running notifies instead of spawning another thread. See
 /// `try_start_refresh` for the testable core.
+/// Emails of every account currently flagged `needs_relogin`, across the
+/// Claude slot and all provider slots, sorted for a stable notification body.
+/// Reads state directly (no network) so it reflects whatever the just-finished
+/// refresh cycle persisted.
+fn accounts_needing_relogin() -> Vec<String> {
+    let st = State::load().unwrap_or_default();
+    let mut out: Vec<String> = st
+        .accounts
+        .iter()
+        .filter(|a| a.needs_relogin)
+        .map(|a| a.key().to_string())
+        .chain(
+            st.providers
+                .values()
+                .flat_map(|p| p.accounts.iter())
+                .filter(|a| a.needs_relogin)
+                .map(|a| a.key.clone()),
+        )
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn handle_refresh_now() {
     // Shares `poll_loop`'s `SwapGuard`
     // instead of a throwaway `SwapGuard::default()` — see
@@ -2339,7 +2405,19 @@ fn handle_refresh_now() {
             if rate_limited {
                 notify("Refresh: rate limited, backing off");
             } else {
-                notify("Usage refreshed");
+                // Surface accounts that can't refresh at all — a dead login is
+                // the reason the numbers won't move, so a bare "Usage refreshed"
+                // would be a quiet lie for those rows.
+                let stuck = accounts_needing_relogin();
+                match stuck.as_slice() {
+                    [] => notify("Usage refreshed"),
+                    [one] => notify(&format!("Usage refreshed — {one} needs re-login")),
+                    many => notify(&format!(
+                        "Usage refreshed — {} accounts need re-login: {}",
+                        many.len(),
+                        many.join(", ")
+                    )),
+                }
             }
         });
     })
@@ -3154,6 +3232,10 @@ mod tests {
             // so the default fixture never accidentally lands in
             // `StaleAfterReset`. Tests exercising that state set it directly.
             fetched_at: None,
+            // Healthy fixture: no auth trouble. Tests exercising the re-login /
+            // error trailing set these directly.
+            needs_relogin: false,
+            error: None,
         }
     }
 
@@ -3518,6 +3600,76 @@ mod tests {
         }
     }
 
+    fn claude_section() -> ProviderSection {
+        ProviderSection {
+            provider_id: CLAUDE_SLUG,
+            display_name: "Claude",
+            supports_switching: true,
+            supports_usage: true,
+            supports_launch: true,
+            supports_remove: true,
+            severity_bands: bands(),
+            env_override_active: false,
+            accounts: vec![],
+        }
+    }
+
+    #[test]
+    fn needs_relogin_trailing_beats_usage_and_lock() {
+        // A dead login must never render a usage pct or a stale countdown — its
+        // numbers are frozen, so the row surfaces the re-login state in red
+        // regardless of what the cached percentages / reset instants say.
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let reset = now + chrono::Duration::minutes(90);
+        with_now(now, || {
+            let mut a = acct_with_resets(
+                "stale@x.com",
+                Some(100.0),
+                Some(100.0),
+                false,
+                Some(reset),
+                Some(reset),
+            );
+            a.needs_relogin = true;
+            let (trailing, colors) = trailing_for_account(&a, bands(), now);
+            assert_eq!(trailing, "⚠ re-login");
+            assert!(!trailing.contains('%'), "no percentage on a dead login");
+            assert_eq!(colors.len(), 1, "single red span over the whole run");
+            assert_eq!(colors[0].2, Severity::Red);
+        });
+    }
+
+    #[test]
+    fn refresh_error_trailing_when_not_needing_relogin() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let mut a = acct("err@x.com", Some(10.0), Some(20.0), false);
+        a.error = Some("HTTP 500".into());
+        let (trailing, colors) = trailing_for_account(&a, bands(), now);
+        assert_eq!(trailing, "⚠ error");
+        assert_eq!(colors.len(), 1);
+        assert_eq!(colors[0].2, Severity::Red);
+    }
+
+    #[test]
+    fn needs_relogin_submenu_leads_with_reason_and_fix() {
+        let mut a = acct("stale@x.com", Some(100.0), Some(100.0), false);
+        a.needs_relogin = true;
+        let rows = submenu_info_rows(&claude_section(), &a);
+        assert!(
+            rows[0].contains("Re-login required"),
+            "first row states the problem: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("usagio capture")),
+            "a row names the fix: {rows:?}"
+        );
+        // No usage/window rows once the login is dead.
+        assert!(
+            !rows.iter().any(|r| r.contains("resets in")),
+            "dead login shows no window rows: {rows:?}"
+        );
+    }
+
     #[test]
     fn weekly_locked_drops_session_reset_row() {
         // Image #13: when the WEEKLY window is locked (100%), the account is fully
@@ -3537,7 +3689,8 @@ mod tests {
         let locked = acct("a@x.com", Some(40.0), Some(100.0), true);
         let rows = submenu_info_rows(&sec, &locked);
         assert!(
-            rows.iter().any(|r| r.contains("Weekly") && r.contains("limit reached")),
+            rows.iter()
+                .any(|r| r.contains("Weekly") && r.contains("limit reached")),
             "weekly-locked flyout must keep the weekly lock row: {rows:?}"
         );
         assert!(
@@ -3547,7 +3700,9 @@ mod tests {
         // Control: an unlocked account still shows the session row.
         let healthy = acct("b@x.com", Some(40.0), Some(60.0), true);
         assert!(
-            submenu_info_rows(&sec, &healthy).iter().any(|r| r.contains("Session")),
+            submenu_info_rows(&sec, &healthy)
+                .iter()
+                .any(|r| r.contains("Session")),
             "unlocked flyout must keep the session reset row"
         );
     }
