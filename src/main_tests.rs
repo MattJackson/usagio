@@ -632,38 +632,113 @@ fn next_interval_doubles_on_rate_limit_capped() {
 }
 
 #[test]
-fn next_interval_tightens_to_warning_inside_the_band() {
-    // Inside [trigger - 15, trigger): 30s WARNING cadence, regardless of
-    // the current `current` — this is exactly the case that let the user's
-    // 94% + 150s wait miss the swap on v0.4.3.
+fn next_interval_tightens_progressively_across_ramp_tiers() {
+    // v0.7.3 replaced the binary WARNING band (30s inside 15pt of trigger)
+    // with a 4-tier ramp. At trigger=95: TIGHT = [90, 95), MIDDLE = [85, 90),
+    // RELAXED = [75, 85), BASE below. The v0.4.3 user miss (94% + 150s wait
+    // → lock before next poll) still tightens to 30s TIGHT here.
+
+    // TIGHT band [trigger-5, trigger): 30s regardless of `current`.
     assert_eq!(
-        next_interval(150, 150, false, Some(94.9), TRIGGER_FOR_TESTS, true),
-        30
+        next_interval(180, 180, false, Some(94.9), TRIGGER_FOR_TESTS, true),
+        WATCH_TIGHT_INTERVAL_SECS
     );
     assert_eq!(
-        next_interval(150, 150, false, Some(85.0), TRIGGER_FOR_TESTS, true),
-        30
+        next_interval(180, 180, false, Some(90.0), TRIGGER_FOR_TESTS, true),
+        WATCH_TIGHT_INTERVAL_SECS,
+        "trigger-5 lower edge is inside TIGHT"
+    );
+
+    // MIDDLE band [trigger-10, trigger-5): 60s. dev3 at 87% today — the
+    // account whose stale 429-preserved cache silenced auto-swap in v0.7.2 —
+    // lands here.
+    assert_eq!(
+        next_interval(180, 180, false, Some(89.9), TRIGGER_FOR_TESTS, true),
+        WATCH_MIDDLE_INTERVAL_SECS
     );
     assert_eq!(
-        next_interval(150, 150, false, Some(80.001), TRIGGER_FOR_TESTS, true),
-        30
+        next_interval(180, 180, false, Some(87.0), TRIGGER_FOR_TESTS, true),
+        WATCH_MIDDLE_INTERVAL_SECS,
+        "the exact case from the v0.7.2 429 loop"
     );
-    // Exactly at the band-lower edge (trigger - 15 = 80.0) still tightens.
     assert_eq!(
-        next_interval(150, 150, false, Some(80.0), TRIGGER_FOR_TESTS, true),
-        30
+        next_interval(180, 180, false, Some(85.0), TRIGGER_FOR_TESTS, true),
+        WATCH_MIDDLE_INTERVAL_SECS,
+        "trigger-10 lower edge is inside MIDDLE"
     );
-    // 1 tick below the band — back to base.
+
+    // RELAXED band [trigger-20, trigger-10): 120s.
     assert_eq!(
-        next_interval(150, 150, false, Some(79.9), TRIGGER_FOR_TESTS, true),
-        150
+        next_interval(180, 180, false, Some(84.9), TRIGGER_FOR_TESTS, true),
+        WATCH_RELAXED_INTERVAL_SECS
     );
-    // Warning band ignores `actionable` — we tighten to catch the crossing
+    assert_eq!(
+        next_interval(180, 180, false, Some(75.0), TRIGGER_FOR_TESTS, true),
+        WATCH_RELAXED_INTERVAL_SECS,
+        "trigger-20 lower edge is inside RELAXED"
+    );
+
+    // Below the ramp: BASE.
+    assert_eq!(
+        next_interval(180, 180, false, Some(74.9), TRIGGER_FOR_TESTS, true),
+        180
+    );
+    assert_eq!(
+        next_interval(180, 180, false, Some(20.0), TRIGGER_FOR_TESTS, true),
+        180
+    );
+
+    // The whole ramp ignores `actionable` — tighten to catch the crossing
     // even when no swap target exists yet.
     assert_eq!(
-        next_interval(150, 150, false, Some(90.0), TRIGGER_FOR_TESTS, false),
-        30
+        next_interval(180, 180, false, Some(90.0), TRIGGER_FOR_TESTS, false),
+        WATCH_TIGHT_INTERVAL_SECS
     );
+    assert_eq!(
+        next_interval(180, 180, false, Some(87.0), TRIGGER_FOR_TESTS, false),
+        WATCH_MIDDLE_INTERVAL_SECS
+    );
+}
+
+#[test]
+fn next_interval_ramp_slides_with_custom_trigger() {
+    // The whole ramp is defined as absolute percentage-point offsets from
+    // the user-configurable trigger, so trigger=70 and trigger=98 both work
+    // without a code change. This is why we care about the sliding property.
+
+    // trigger=70: TIGHT [65,70), MIDDLE [60,65), RELAXED [50,60).
+    assert_eq!(next_interval(180, 180, false, Some(66.0), 70.0, true), 30);
+    assert_eq!(next_interval(180, 180, false, Some(62.0), 70.0, true), 60);
+    assert_eq!(next_interval(180, 180, false, Some(55.0), 70.0, true), 120);
+    assert_eq!(next_interval(180, 180, false, Some(45.0), 70.0, true), 180);
+
+    // trigger=98: TIGHT [93,98), MIDDLE [88,93), RELAXED [78,88).
+    assert_eq!(next_interval(180, 180, false, Some(95.0), 98.0, true), 30);
+    assert_eq!(next_interval(180, 180, false, Some(90.0), 98.0, true), 60);
+    assert_eq!(next_interval(180, 180, false, Some(80.0), 98.0, true), 120);
+    assert_eq!(next_interval(180, 180, false, Some(60.0), 98.0, true), 180);
+}
+
+// --- per_account_fetch_floor_secs (v0.7.3 rate-limit guard) ---
+
+#[test]
+fn per_account_fetch_floor_matches_the_cadence_ramp() {
+    // The per-account fetch floor uses the same ramp as `next_interval`, so
+    // an account at 87% has a 60s floor even when the GLOBAL loop wakes every
+    // 30s because a *different* account is in the TIGHT band. This is the
+    // guard that stops a single at-trigger account from dragging every other
+    // account down to 120 req/hr/account against /oauth/usage.
+    let t = TRIGGER_FOR_TESTS;
+    assert_eq!(per_account_fetch_floor_secs(Some(92.0), t, 180), 30);
+    assert_eq!(per_account_fetch_floor_secs(Some(87.0), t, 180), 60);
+    assert_eq!(per_account_fetch_floor_secs(Some(80.0), t, 180), 120);
+    assert_eq!(per_account_fetch_floor_secs(Some(50.0), t, 180), 180);
+    // At-or-above trigger stays on TIGHT so a stale 429-preserved cache
+    // refreshes as soon as the endpoint recovers.
+    assert_eq!(per_account_fetch_floor_secs(Some(99.0), t, 180), 30);
+    // No cached usage yet → BASE (need at least one fetch to place the
+    // account on a tier).
+    assert_eq!(per_account_fetch_floor_secs(None, t, 180), 180);
 }
 
 #[test]

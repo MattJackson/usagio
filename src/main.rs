@@ -66,8 +66,13 @@ pub(crate) const LEGACY_APP_SLUG: &str = "claude-usage";
 const REFRESH_SKEW_SECS: i64 = credentials::REFRESH_SKEW_SECS;
 
 // --- watch (auto-swap daemon) defaults ---
-/// How often the watcher polls, in seconds.
-const WATCH_INTERVAL_SECS: u64 = 150;
+/// How often the watcher polls, in seconds — the BASE tier of the adaptive
+/// cadence when every account is comfortably far from `trigger`. Tightened
+/// to 180s from the historical 150s alongside the v0.7.3 four-tier ramp:
+/// with the new tiers picking up long before we're near the trigger (60s
+/// inside 10pt, 30s inside 5pt), the BASE tier is now the "nothing is even
+/// close" case and can breathe.
+const WATCH_INTERVAL_SECS: u64 = 180;
 /// Upper bound for the poll interval when backing off after a 429.
 const WATCH_MAX_INTERVAL_SECS: u64 = 1200;
 /// Swap away from the active account when it reaches this utilization.
@@ -2214,6 +2219,11 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
     sync_active_from_keychain(provider, &mut state);
     logging::log("poll: refreshing usage cache");
 
+    // Per-account fetch floor uses the same tier ramp as `next_interval`; read
+    // the user's configured trigger once so we don't reload state per account.
+    let trigger_for_floor = state.trigger_pct.unwrap_or(TRIGGER_PCT);
+    let now_ts = Utc::now().timestamp();
+
     let mut rate_limited = false;
     // (email, refreshed account after ensure_fresh, new cached usage or None,
     // updated notif state or None)
@@ -2367,6 +2377,41 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
                 Err(e) => {
                     logging::log(&format!(
                         "token refresh failed for {email}: {e} (keeping cache)"
+                    ));
+                    continue;
+                }
+            }
+        }
+        // Per-account fetch floor: the account's own cadence tier gates whether
+        // we actually hit `/api/oauth/usage` this cycle. The GLOBAL loop cadence
+        // is driven by the active account's `max_pct` — so a single account in
+        // the TIGHT band would otherwise drag every other account's fetch rate
+        // to 30s and re-open the 429 loop (v0.7.2 miss: one dev3 429 escalated
+        // the global backoff, but the per-account rate against `/oauth/usage`
+        // was still 120/hr per account because every wake fetched everyone).
+        // With this floor, an account whose OWN tier is MIDDLE/RELAXED/BASE
+        // skips the fetch until its tier-interval has elapsed since its last
+        // successful fetch, regardless of how tight the global loop got.
+        //
+        // The `force` bypass keeps `usagio poll --force` semantics (a manual
+        // refresh always fetches). The token refresh above already happened, so
+        // the token stays warm even on skip.
+        if !force {
+            if let Some(cu) = &acct.cached_usage {
+                let age = now_ts - cu.fetched_at;
+                let max_pct = match (cu.session_pct, cu.weekly_pct) {
+                    (Some(s), Some(w)) => Some(s.max(w)),
+                    (Some(s), None) => Some(s),
+                    (None, Some(w)) => Some(w),
+                    (None, None) => None,
+                };
+                let floor =
+                    per_account_fetch_floor_secs(max_pct, trigger_for_floor, WATCH_INTERVAL_SECS)
+                        as i64;
+                if age >= 0 && age < floor {
+                    logging::log(&format!(
+                        "poll: {email} usage cache still fresh; skipping fetch \
+                         (event=fetch_skip_fresh account={email} age={age}s floor={floor}s)"
                     ));
                     continue;
                 }
@@ -2793,25 +2838,45 @@ fn cadence_max_pct(rows: &[Row], active: Option<&str>) -> Option<f64> {
         .map(Row::max_pct)
 }
 
-/// Threshold band widths for `next_interval`'s adaptive cadence.
+/// Threshold band widths (in percentage points below `trigger`) and their
+/// paired cadence intervals for `next_interval`'s adaptive ramp.
 ///
-/// Rationale for these values, from a real user-reported prod miss on
-/// v0.4.3: fixed 150s cadence caught an account at 94%, waited the full
-/// 150s to the next poll, and the account was at 99-100% by then — lock,
-/// swap missed. Below the warning band we stay at the full base cadence
-/// (cheap, ordinary case); inside the warning band we tighten to WARNING
-/// so we can't miss more than ~30s of runway; above the trigger threshold
-/// (the auto-swap should already have fired, but if it hasn't for any
-/// reason — network flap, keychain unlocked mid-cycle — the backstop
-/// makes sure the next attempt is 30s away, not 150s).
+/// History: v0.4.3 was a fixed 150s cadence — caught an account at 94%, waited
+/// the full 150s, account was at 99–100% by then (lock, swap missed). v0.5.x
+/// added a binary WARNING band (30s inside 15pt of trigger, 150s below).
+/// That fixed the miss but overshot: every account 80–95% was polled every
+/// 30s. With ~6 accounts that's 720 req/hr against `/api/oauth/usage`, which
+/// Anthropic 429s. The 429 loop pinned cached usage to a stale sub-trigger
+/// value, auto-swap never fired, Claude Code hit session-expired (v0.7.2
+/// user report; ~150 usage-429 events across a single day's log).
 ///
-/// 30s is the floor for BOTH tiers, deliberately: the usage endpoint is
-/// polled once per account per cycle, so with several near-maxed accounts a
-/// tighter floor multiplies into a request rate that Anthropic rate-limits
-/// (429). 30s catches a reset/swap-window within half a minute while keeping
-/// the aggregate request rate well under the limit even with many accounts.
-const WATCH_WARNING_BAND: f64 = 15.0;
-const WATCH_WARNING_INTERVAL_SECS: u64 = 30;
+/// v0.7.3 replaces the binary band with a 4-tier ramp keyed to distance from
+/// `trigger`. Widths are absolute percentage points so the whole ramp slides
+/// with the user-configurable trigger (70 / 95 / 98 all work). Cadence
+/// intervals halve at each step so an account climbing toward the trigger
+/// gets pinged progressively more often without a cliff:
+///
+/// | Cached usage           | Cadence                               |
+/// |------------------------|---------------------------------------|
+/// | ≥ trigger              | 30s BACKSTOP (only if `actionable`)   |
+/// | trigger−5 .. trigger   | 30s TIGHT                             |
+/// | trigger−10 .. trigger−5| 60s MIDDLE                            |
+/// | trigger−20 .. trigger−10| 120s RELAXED                         |
+/// | < trigger−20           | 180s BASE (WATCH_INTERVAL_SECS)       |
+///
+/// The same tier table also drives the per-account fetch floor — see
+/// `per_account_fetch_floor_secs`. Even when the global loop wakes at 30s
+/// (because *some* account is in the TIGHT band), an account whose own
+/// tier is MIDDLE/RELAXED/BASE only calls `usage::fetch` if its own last
+/// fetch is at least that tier's interval old. That's the hard ceiling
+/// that prevents any single account from being pinged faster than its tier
+/// allows, regardless of how tight the loop cadence gets for other accounts.
+const WATCH_TIGHT_BAND: f64 = 5.0;
+const WATCH_MIDDLE_BAND: f64 = 10.0;
+const WATCH_RELAXED_BAND: f64 = 20.0;
+const WATCH_TIGHT_INTERVAL_SECS: u64 = 30;
+const WATCH_MIDDLE_INTERVAL_SECS: u64 = 60;
+const WATCH_RELAXED_INTERVAL_SECS: u64 = 120;
 const WATCH_BACKSTOP_INTERVAL_SECS: u64 = 30;
 
 /// Compute the next poll interval. Priority order:
@@ -2819,18 +2884,20 @@ const WATCH_BACKSTOP_INTERVAL_SECS: u64 = 30;
 ///      capped at WATCH_MAX_INTERVAL_SECS). Overrides everything below.
 ///   2. Active account at or above the trigger threshold AND a swap is
 ///      actionable (an eligible target exists, even if currently
-///      cooldown-blocked) → BACKSTOP (10s). The auto-swap should already
+///      cooldown-blocked) → BACKSTOP (30s). The auto-swap should already
 ///      have fired; this makes sure a transient failure or a soon-clearing
 ///      cooldown doesn't leave us blind for a full base cycle.
 ///   3. Active account at/above trigger but NOT actionable (no eligible
 ///      target at all — a single-account user, or every other account is
 ///      full / needs_relogin / env-overridden) → BASE. There is nothing to
-///      catch, so polling every 10s for up to a week only risks HTTP 429;
+///      catch, so polling every 30s for up to a week only risks HTTP 429;
 ///      the reset-boundary cap still wakes us near the reset.
-///   4. Active account inside the warning band (trigger - 15% ≤ pct <
-///      trigger) → WARNING (30s), regardless of `actionable` — we tighten to
-///      catch the *crossing*, at which point a target may become relevant.
-///   5. Comfortably below → BASE (default WATCH_INTERVAL_SECS = 150s).
+///   4. Active account inside the ramp (trigger − WATCH_RELAXED_BAND
+///      ≤ pct < trigger) → TIGHT / MIDDLE / RELAXED per the table on
+///      `WATCH_TIGHT_BAND` above, regardless of `actionable` — we tighten
+///      progressively to catch the *crossing*, at which point a target may
+///      become relevant.
+///   5. Comfortably below → BASE (default WATCH_INTERVAL_SECS = 180s).
 ///
 /// `max_pct` is the ACTIVE account's `Row::max_pct()` — i.e.
 /// `max(session%, weekly%)` for the account currently logged in (v0.5.13,
@@ -2858,11 +2925,43 @@ fn next_interval(
         } else {
             base
         }
-    } else if pct >= trigger - WATCH_WARNING_BAND {
-        WATCH_WARNING_INTERVAL_SECS
+    } else {
+        tier_interval_for_pct(pct, trigger, base)
+    }
+}
+
+/// Map a usage percentage to its cadence tier interval. Shared by
+/// `next_interval` (drives the global loop) and `per_account_fetch_floor_secs`
+/// (per-account fetch throttle) so the two views of the same ramp can't drift.
+///
+/// The `>= trigger` case never reaches here in `next_interval` (handled
+/// above with `actionable`), but the per-account floor uses this directly:
+/// an account already over the trigger stays on the TIGHT tier so a stale
+/// 429-preserved cache still refreshes as soon as the endpoint recovers.
+fn tier_interval_for_pct(pct: f64, trigger: f64, base: u64) -> u64 {
+    if pct >= trigger - WATCH_TIGHT_BAND {
+        WATCH_TIGHT_INTERVAL_SECS
+    } else if pct >= trigger - WATCH_MIDDLE_BAND {
+        WATCH_MIDDLE_INTERVAL_SECS
+    } else if pct >= trigger - WATCH_RELAXED_BAND {
+        WATCH_RELAXED_INTERVAL_SECS
     } else {
         base
     }
+}
+
+/// Per-account minimum interval between `usage::fetch` calls, in seconds.
+/// Prevents any single account from being pinged faster than its own tier
+/// allows, even when the global loop cadence is tighter (because a *different*
+/// account is deeper in the ramp). Without this, a single at-trigger account
+/// would drag every other account down to the 30s TIGHT cadence and re-open
+/// the 429 loop this ramp was built to close.
+///
+/// Returns `base` (BASE cadence) for an account with no cached usage yet — we
+/// need at least one successful fetch before we know its tier.
+fn per_account_fetch_floor_secs(max_pct: Option<f64>, trigger: f64, base: u64) -> u64 {
+    let Some(pct) = max_pct else { return base };
+    tier_interval_for_pct(pct, trigger, base)
 }
 
 /// Anti-thrash state carried across watch cycles.

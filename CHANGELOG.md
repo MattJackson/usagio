@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-09-22
+
+### Fixed
+- **Menu no longer freezes on a stale sub-trigger percentage after a usage-API
+  429.** The v0.5.x binary WARNING band polled every account 30s whenever any
+  was between 80–95% of the swap trigger — with ~6 accounts that's 720 req/hr
+  against `/api/oauth/usage`, and Anthropic 429s. The 429 loop pinned an
+  account's cached usage below the trigger, so auto-swap never fired and
+  Claude Code hit session-expired mid-session.
+- The cadence is now a 4-tier ramp keyed to distance from your configured
+  trigger (works the same at 70 / 95 / 98): **180s** comfortable, **120s**
+  within 20 pts, **60s** within 10 pts, **30s** within 5 pts, **30s**
+  backstop at/above trigger. And a per-account fetch floor uses the same
+  ramp as a hard ceiling: even when the global loop wakes tight (because
+  another account is near trigger), an account whose own tier is
+  MIDDLE/RELAXED/BASE only calls the usage endpoint on its own tier
+  cadence. One near-trigger account can no longer drag every other account
+  into the 429 zone.
+
 ## [0.7.2] - 2026-09-17
 
 ### Fixed
