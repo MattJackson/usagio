@@ -1144,6 +1144,15 @@ fn apply_account(
         "event=switch from={} to={to} identity_written=ok keychain_written=ok",
         from.unwrap_or("<none>"),
     ));
+    // v0.8.0: drop the just-left account's ephemeral 429 tracker so a stale
+    // counter can't re-fire the moment it becomes active again (e.g. after
+    // NO_RETURN expires). Opus adversarial review BAD 4 — without this, a
+    // real recovery on the returning account would be ignored: the first
+    // 429 lands on count=1 (which was reset to 0 by us here), and the
+    // second bumps to 2, immediately re-escalating on possibly-stale data.
+    if let Some(prev) = from {
+        reset_usage_fetch_tracker(prev);
+    }
     Ok(())
 }
 
@@ -2405,23 +2414,58 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
                     (None, Some(w)) => Some(w),
                     (None, None) => None,
                 };
-                let floor =
-                    per_account_fetch_floor_secs(max_pct, trigger_for_floor, WATCH_INTERVAL_SECS)
-                        as i64;
+                // v0.8.0 smart cadence: project each window forward by the
+                // actual horizon (`max(tier_floor, current_loop_interval)` —
+                // under 429 backoff the loop cadence can be 1200s vs a
+                // tier_floor of 30s, and using the tier alone would
+                // under-predict by 40× on the exact storm this feature is
+                // meant to catch, Opus adversarial BLOCKER 1). Per-window
+                // (session/weekly) so a session rollover 99→5 doesn't
+                // produce nonsense `max_pct` slopes (Opus adversarial BAD
+                // 6). If EITHER projection hits trigger, tighten one tier.
+                let tier_floor =
+                    per_account_fetch_floor_secs(max_pct, trigger_for_floor, WATCH_INTERVAL_SECS);
+                let horizon_secs = tier_floor.max(current_loop_interval_secs());
+                let projected_at_horizon = project_active_max_pct_at_horizon(
+                    email,
+                    CLAUDE_SLUG,
+                    cu.session_pct,
+                    cu.weekly_pct,
+                    horizon_secs,
+                    Utc::now(),
+                );
+                let floor = per_account_fetch_floor_secs_with_projection(
+                    max_pct,
+                    trigger_for_floor,
+                    WATCH_INTERVAL_SECS,
+                    projected_at_horizon,
+                ) as i64;
                 if age >= 0 && age < floor {
+                    let projection_note = projected_at_horizon
+                        .map(|p| format!(" projected_at_{horizon_secs}s={p:.1}%"))
+                        .unwrap_or_default();
                     logging::log(&format!(
                         "poll: {email} usage cache still fresh; skipping fetch \
-                         (event=fetch_skip_fresh account={email} age={age}s floor={floor}s)"
+                         (event=fetch_skip_fresh account={email} age={age}s floor={floor}s{projection_note})"
                     ));
                     continue;
                 }
             }
         }
         let cu = match usage::fetch(&acct.access_token) {
-            Ok(u) => Some(cached_from_usage(&u)),
+            Ok(u) => {
+                record_usage_fetch_success(email, now_ts);
+                Some(cached_from_usage(&u))
+            }
             Err(usage::FetchError::RateLimited) => {
                 rate_limited = true;
-                logging::log(&format!("usage 429 for {email}; keeping cache"));
+                record_usage_fetch_429(email);
+                let tracker = get_usage_fetch_tracker(email);
+                logging::log(&format!(
+                    "usage 429 for {email}; keeping cache \
+                     (event=usage_429 account={email} consecutive={})",
+                    tracker.consecutive_429s
+                ));
                 None
             }
             Err(usage::FetchError::Auth) if is_active => {
@@ -2435,6 +2479,11 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
                 continue;
             }
             Err(e) => {
+                // Any non-429, non-Auth error (network, DNS, JSON parse, …)
+                // resets the escalation counter — flaky network isn't the
+                // "server is asking us to back off" signal escalation exists
+                // for (Sonnet adversarial review BAD 4).
+                record_usage_fetch_non_429(email);
                 logging::log(&format!("usage error for {email}: {e}; keeping cache"));
                 None
             }
@@ -2761,6 +2810,12 @@ fn cmd_watch(args: &[String]) -> Result<()> {
     let mut wd = watchdog::Watchdog::default();
     let mut wd_effects = watchdog::RealEffects;
     loop {
+        // Publish the current loop interval so the per-account fetch floor's
+        // burn-rate projection uses the RIGHT horizon (`max(tier_floor, this)`).
+        // Under a 429 backoff `current` can be 1200s while tier_floor stays at
+        // 30–180s, and the projection would otherwise under-predict by 40× on
+        // the exact storm the projection is meant to catch (Opus BLOCKER 1).
+        set_current_loop_interval_secs(current);
         // Self-healing health check (fd-count + keychain-write). Throttled to
         // ~once a minute internally; a cheap directory read otherwise. Keeps
         // account switching from silently breaking if fds ever leak or the
@@ -2964,6 +3019,268 @@ fn per_account_fetch_floor_secs(max_pct: Option<f64>, trigger: f64, base: u64) -
     tier_interval_for_pct(pct, trigger, base)
 }
 
+/// Tighten a static-tier interval by exactly one step, capped at TIGHT (never
+/// faster than 30s). Used by `per_account_fetch_floor_secs_with_projection`
+/// so a burn-rate projection can only ever pull cadence UP, never push it out
+/// beyond what the static tier alone would pick. See v0.8.0 "smart cadence".
+fn tighten_tier_once(current_secs: u64, base: u64) -> u64 {
+    if current_secs >= base {
+        WATCH_RELAXED_INTERVAL_SECS
+    } else if current_secs == WATCH_RELAXED_INTERVAL_SECS {
+        WATCH_MIDDLE_INTERVAL_SECS
+    } else if current_secs == WATCH_MIDDLE_INTERVAL_SECS {
+        WATCH_TIGHT_INTERVAL_SECS
+    } else {
+        // TIGHT or BACKSTOP — already at the floor, nothing to tighten.
+        current_secs
+    }
+}
+
+/// Per-account fetch floor, tier-based, with an optional burn-rate projection.
+/// When `projected_max_pct_at_horizon` (usually `now + max(tier_floor,
+/// current_loop_interval)`) is at or above `trigger`, tighten one tier so we
+/// see the crossing before it happens. Projection can only tighten — the
+/// caller has no way to make the raw tier slower, and the whole point of
+/// projection is to catch fast burns the static ramp would miss.
+///
+/// Rationale (v0.8.0, Opus adversarial BLOCKER 1): projecting on the tier
+/// floor alone under-predicts by up to 40× when `next_interval` doubles the
+/// loop cadence during a 429 backoff (tier_floor=30s but loop=1200s). Callers
+/// therefore feed `dt = max(tier_floor, current_loop_interval)` — the actual
+/// horizon before the next fetch is even attempted, not just the wish.
+fn per_account_fetch_floor_secs_with_projection(
+    max_pct: Option<f64>,
+    trigger: f64,
+    base: u64,
+    projected_max_pct_at_horizon: Option<f64>,
+) -> u64 {
+    let static_tier = per_account_fetch_floor_secs(max_pct, trigger, base);
+    match projected_max_pct_at_horizon {
+        Some(p) if p >= trigger => tighten_tier_once(static_tier, base),
+        _ => static_tier,
+    }
+}
+
+/// Project each usage window (`session_pct`, `weekly_pct`) forward by
+/// `horizon_secs` using `burn_rate::estimate`'s weighted-regression slope,
+/// and return the max of the two projections. Windows are projected
+/// separately because a session rollover (99→5) can produce a positive
+/// `max_pct` slope that has nothing to do with real weekly burn (Opus
+/// adversarial BAD 6). Returns `None` when neither window has a confident,
+/// non-flat estimate — the caller then falls back to the static tier.
+fn project_active_max_pct_at_horizon(
+    email: &str,
+    provider_id: &str,
+    session_pct: Option<f64>,
+    weekly_pct: Option<f64>,
+    horizon_secs: u64,
+    now: DateTime<Utc>,
+) -> Option<f64> {
+    let account_key = usage_log::AccountKey::new(provider_id, email);
+    let hours = horizon_secs as f64 / 3600.0;
+    let project = |window: providers::trait_def::Window, curr: Option<f64>| -> Option<f64> {
+        let curr = curr?;
+        let est = burn_rate::estimate(&account_key, window, now)?;
+        if (est.confidence as f64) < burn_rate::CONFIDENCE_FLOOR as f64 {
+            return None;
+        }
+        if est.rate_pct_per_hour <= burn_rate::FLAT_SLOPE_THRESHOLD_PCT_PER_HOUR {
+            return None;
+        }
+        Some((curr + (est.rate_pct_per_hour as f64) * hours).min(100.0))
+    };
+    let s = project(providers::trait_def::Window::Session, session_pct);
+    let w = project(providers::trait_def::Window::Weekly, weekly_pct);
+    match (s, w) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.8.0 auto-swap escalation on repeated `/oauth/usage` 429s
+// ---------------------------------------------------------------------------
+
+/// Minimum consecutive 429s on an ACTIVE account's usage endpoint before we
+/// treat its cached max_pct as untrustworthy for auto-swap purposes. Two rules
+/// out a one-off spike; more would risk letting the account run out of quota
+/// while we wait for a third rejection.
+const ESCALATION_MIN_CONSECUTIVE_429S: u32 = 2;
+
+/// Cached max_pct must be within this many percentage points of `trigger`
+/// (i.e. in the TIGHT band) for a 429 storm to count as escalation signal.
+/// Wider bands (e.g. RELAXED at trigger−20 = 75%) would fire on tenant-wide
+/// 429 noise unrelated to THIS account's real usage — Opus adversarial
+/// review BAD 3. Kept identical to `WATCH_TIGHT_BAND` on purpose so the
+/// escalation gate never fires outside the tightest static tier.
+const ESCALATION_MIN_BAND: f64 = WATCH_TIGHT_BAND;
+
+/// Last successful `usage::fetch` for this account must be within this window
+/// for escalation to fire. Guards against re-escalating on stale in-memory
+/// count when an account is reactivated after a long absence — the counter
+/// might have been left at threshold and the cached number is old enough to
+/// be unrelated to the current 429 signal (Opus adversarial review BAD 4).
+const ESCALATION_MAX_SUCCESS_AGE_SECS: i64 = 300;
+
+/// Ephemeral per-account usage-endpoint tracker for the v0.8.0 escalation
+/// path. In-memory only, no `State` field — persisting a counter reintroduced
+/// the `needs_relogin` stale-latch bug class in prior sessions (Opus
+/// adversarial review BLOCKER 2). A daemon restart drops the state; the fresh
+/// process observes real 429s (or successes) and rebuilds within seconds.
+#[derive(Default, Clone, Copy)]
+struct UsageFetchTracker {
+    consecutive_429s: u32,
+    last_success_ts: Option<i64>,
+}
+
+static USAGE_FETCH_TRACKERS: std::sync::Mutex<
+    Option<std::collections::HashMap<String, UsageFetchTracker>>,
+> = std::sync::Mutex::new(None);
+
+/// Set by `poll_loop` (and the menubar poller) at the top of each cycle so
+/// `per_account_fetch_floor_secs_with_projection` can compute the correct
+/// projection horizon `dt = max(tier_floor, current_loop_interval)`. Under
+/// a 429 backoff `next_interval` can push the loop cadence to 1200s while
+/// tier_floor is only 30–180s — projecting on the wrong horizon
+/// under-predicts by up to 40× and the smart-cadence feature never trips
+/// (Opus adversarial review BLOCKER 1). Zero means "not yet set" and
+/// callers fall back to using the tier floor alone.
+static CURRENT_LOOP_INTERVAL_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn set_current_loop_interval_secs(secs: u64) {
+    CURRENT_LOOP_INTERVAL_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn current_loop_interval_secs() -> u64 {
+    CURRENT_LOOP_INTERVAL_SECS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn with_fetch_trackers<T>(
+    f: impl FnOnce(&mut std::collections::HashMap<String, UsageFetchTracker>) -> T,
+) -> T {
+    let mut guard = USAGE_FETCH_TRACKERS.lock().unwrap();
+    if guard.is_none() {
+        *guard = Some(std::collections::HashMap::new());
+    }
+    f(guard.as_mut().unwrap())
+}
+
+fn record_usage_fetch_success(email: &str, now_ts: i64) {
+    with_fetch_trackers(|t| {
+        let entry = t.entry(email.to_string()).or_default();
+        entry.consecutive_429s = 0;
+        entry.last_success_ts = Some(now_ts);
+    });
+}
+
+fn record_usage_fetch_429(email: &str) {
+    with_fetch_trackers(|t| {
+        let entry = t.entry(email.to_string()).or_default();
+        entry.consecutive_429s = entry.consecutive_429s.saturating_add(1);
+    });
+}
+
+/// Any non-RateLimited error (network timeout, DNS, auth, …) resets the
+/// consecutive counter. Flaky-network failures aren't the "the server is
+/// telling us to back off" signal escalation exists to react to (Sonnet
+/// adversarial review, BAD 4).
+fn record_usage_fetch_non_429(email: &str) {
+    with_fetch_trackers(|t| {
+        if let Some(entry) = t.get_mut(email) {
+            entry.consecutive_429s = 0;
+        }
+    });
+}
+
+/// Called from the switch path so a stale count on the account we're leaving
+/// can't re-fire the moment it becomes active again after NO_RETURN expires
+/// (Opus adversarial review BAD 4).
+fn reset_usage_fetch_tracker(email: &str) {
+    with_fetch_trackers(|t| {
+        t.remove(email);
+    });
+}
+
+fn get_usage_fetch_tracker(email: &str) -> UsageFetchTracker {
+    with_fetch_trackers(|t| t.get(email).copied().unwrap_or_default())
+}
+
+/// Compute the "effective" max_pct of the ACTIVE account for the AUTO-SWAP
+/// FIRE DECISION ONLY. Returns the raw cached max_pct in the common case;
+/// when the escalation gate is satisfied (2+ consecutive 429s, active
+/// account, cached pct already in the TIGHT band, recent success), returns a
+/// value guaranteed to be ≥ `trigger` so `evaluate_swap` will fire on the
+/// next cycle even though the endpoint won't tell us the real number.
+///
+/// SCOPE: never used for candidate ranking or target eligibility. Using an
+/// escalated source value while comparing against other accounts' raw cached
+/// values would make a marginal source look artificially worse than a
+/// genuinely-96% one, corrupting target order (Sonnet adversarial review
+/// BAD 3). `evaluate_swap` reads raw values everywhere except the boolean
+/// "should we swap away right now" check.
+///
+/// PROJECTION: when `burn_rate::estimate` has enough samples and confidence,
+/// projects each window forward by `time_since_success` and takes the max;
+/// clamped to `[cached, 100]` so the escalation can only ever say "worse
+/// than cache", never "better." If projection isn't confident, falls back to
+/// pinning at `trigger` so escalation still fires (Opus adversarial review
+/// BAD 5 + MINOR 7 — honest bounded number when projectable, pin only when
+/// forced to).
+fn effective_active_max_pct_for_swap_fire(
+    row: &Row,
+    provider_id: &str,
+    trigger: f64,
+    now: DateTime<Utc>,
+) -> f64 {
+    let raw = row.max_pct();
+    let tracker = get_usage_fetch_tracker(&row.email);
+    if tracker.consecutive_429s < ESCALATION_MIN_CONSECUTIVE_429S {
+        return raw;
+    }
+    if raw < trigger - ESCALATION_MIN_BAND {
+        return raw;
+    }
+    let Some(success_ts) = tracker.last_success_ts else {
+        return raw;
+    };
+    let age_secs = now.timestamp() - success_ts;
+    if age_secs > ESCALATION_MAX_SUCCESS_AGE_SECS {
+        return raw;
+    }
+
+    // Escalation gate satisfied. Project forward per-window (session/weekly
+    // separately — a session rollover 99→5 makes `max_pct` slopes meaningless,
+    // Opus adversarial BAD 6) and take the higher projection. If neither
+    // window projects confidently, pin at trigger so escalation still fires.
+    let account_key = usage_log::AccountKey::new(provider_id, &row.email);
+    let hours = age_secs as f64 / 3600.0;
+    let project = |window: providers::trait_def::Window, curr: Option<f64>| -> Option<f64> {
+        let curr = curr?;
+        let est = burn_rate::estimate(&account_key, window, now)?;
+        if (est.confidence as f64) < burn_rate::CONFIDENCE_FLOOR as f64 {
+            return None;
+        }
+        if est.rate_pct_per_hour <= burn_rate::FLAT_SLOPE_THRESHOLD_PCT_PER_HOUR {
+            return None;
+        }
+        Some((curr + (est.rate_pct_per_hour as f64) * hours).min(100.0))
+    };
+    let s = project(providers::trait_def::Window::Session, row.session.pct);
+    let w = project(providers::trait_def::Window::Weekly, row.weekly.pct);
+    let projected = match (s, w) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    // Guarantee escalation actually fires: return at least `trigger`.
+    let candidate = projected.unwrap_or(raw).max(raw);
+    candidate.max(trigger)
+}
+
 /// Anti-thrash state carried across watch cycles.
 #[derive(Default)]
 pub(crate) struct SwapGuard {
@@ -3126,7 +3443,19 @@ fn evaluate_swap(
     let best = candidates[0];
     // Active in trouble → move to the best candidate. Active still healthy →
     // only move if the best candidate is genuinely a better place to be.
-    if !(act.max_pct() >= trigger || worth_returning_to(best, act)) {
+    //
+    // v0.8.0 escalation: `effective_active_max_pct_for_swap_fire` returns
+    // the raw cached max_pct in the common case, but escalates to ≥ trigger
+    // when the ACTIVE account's `/oauth/usage` has 429'd repeatedly while
+    // the cache was already in the TIGHT band (below trigger by ≤ 5pt) and
+    // the last success was recent. This closes the gap where a cache
+    // pinned at 94% by 429s silences auto-swap while real usage climbs to
+    // 98% (v0.7.3 postmortem). Scoped to the boolean fire ONLY — candidate
+    // ranking above still reads raw `max_pct` so a marginal source can't
+    // pretend to be worse than a genuinely-96% one and corrupt target order.
+    let act_effective =
+        effective_active_max_pct_for_swap_fire(act, &act.provider_id, trigger, Utc::now());
+    if !(act_effective >= trigger || worth_returning_to(best, act)) {
         return none;
     }
     let cooldown_active = guard

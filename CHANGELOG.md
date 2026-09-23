@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-23
+
+### Fixed
+- **Auto-swap now fires even when the usage API 429s the active account.**
+  Post-v0.7.3 field report: with the tenant-wide 429 storm on the active
+  account, the cache stayed pinned at the last successful reading (e.g. 94%
+  session) while real usage climbed past the 95% trigger — auto-swap silently
+  never fired, forcing a manual switch. Root cause: `usage 429 → keeping
+  cache` treated a 429 as "no news" instead of the strong signal it is when
+  the account was already inside the ramp.
+
+### Added
+- **Escalation on repeated 429s.** A per-account (ephemeral, in-memory) counter
+  tracks consecutive `/oauth/usage` 429s. When the ACTIVE account hits ≥2 in a
+  row with its cached max_pct already inside the TIGHT band (within 5 pts of
+  trigger) and its last successful fetch was within 5 min, the auto-swap fire
+  decision treats the account as `max(cached_max_pct, trigger)` — so
+  `evaluate_swap` fires on the next cycle. Scoped to the boolean fire only;
+  candidate ranking still reads raw cached values (no accidental target
+  corruption). Counter resets on any successful fetch, on any non-429 error,
+  and on switch-away.
+- **Smart cadence via burn-rate projection.** After each successful active
+  fetch, `usage_log::pace`-style burn rate (via the existing
+  `burn_rate::estimate` weighted regression with `MIN_SAMPLES=6` and
+  `CONFIDENCE_FLOOR=0.5`) projects each window (session/weekly separately)
+  forward by `max(tier_floor, current_loop_interval)`. If EITHER projection
+  crosses trigger, tighten the account's fetch floor one tier. Projection can
+  only tighten, never relax. Guards against reset-boundary and low-confidence
+  noise — falls back to the static ramp when the estimate isn't trustworthy.
+
 ## [0.7.3] - 2026-09-22
 
 ### Fixed

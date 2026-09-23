@@ -42,9 +42,9 @@ use crate::store::State;
 use crate::{
     age_str, capture_current, capture_current_generic, env_override_active, menu_order,
     next_interval, notify, optimize_now, remove_account, remove_provider_account_generic,
-    row_from_account, row_from_provider_account, switch_to, switch_to_provider_account,
-    watch_cycle, with_state_lock, Row, SwapGuard, CLAUDE_SLUG, TARGET_CEILING_PCT, TRIGGER_PCT,
-    WATCH_INTERVAL_SECS,
+    row_from_account, row_from_provider_account, set_current_loop_interval_secs, switch_to,
+    switch_to_provider_account, watch_cycle, with_state_lock, Row, SwapGuard, CLAUDE_SLUG,
+    TARGET_CEILING_PCT, TRIGGER_PCT, WATCH_INTERVAL_SECS,
 };
 
 /// Exact title of the disabled section row inserted when a provider's env
@@ -1093,6 +1093,9 @@ fn poll_loop() {
     // closed (e.g. an account that reset/boosted while usagio wasn't running).
     let mut first_cycle = true;
     loop {
+        // v0.8.0: publish current loop cadence so the fetch-floor projection
+        // uses the correct horizon under 429 backoff (see main.rs).
+        set_current_loop_interval_secs(current);
         // Self-healing health check (fd-count + keychain-write), throttled to
         // ~once a minute. The menubar poller runs under launchd, so a critical
         // fd leak that a watcher respawn can't clear escalates to a launchd

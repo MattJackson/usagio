@@ -719,6 +719,219 @@ fn next_interval_ramp_slides_with_custom_trigger() {
     assert_eq!(next_interval(180, 180, false, Some(60.0), 98.0, true), 180);
 }
 
+// --- v0.8.0 smart-cadence tighten (projection can only speed up cadence) ---
+
+#[test]
+fn tighten_tier_once_walks_the_ramp_one_step_and_caps_at_tight() {
+    // Each call takes us exactly one tier tighter (BASE → RELAXED → MIDDLE →
+    // TIGHT), and further calls at TIGHT are idempotent — projection can
+    // never make us poll faster than the static ramp's tightest tier.
+    let base = 180u64;
+    assert_eq!(tighten_tier_once(base, base), WATCH_RELAXED_INTERVAL_SECS);
+    assert_eq!(
+        tighten_tier_once(WATCH_RELAXED_INTERVAL_SECS, base),
+        WATCH_MIDDLE_INTERVAL_SECS
+    );
+    assert_eq!(
+        tighten_tier_once(WATCH_MIDDLE_INTERVAL_SECS, base),
+        WATCH_TIGHT_INTERVAL_SECS
+    );
+    assert_eq!(
+        tighten_tier_once(WATCH_TIGHT_INTERVAL_SECS, base),
+        WATCH_TIGHT_INTERVAL_SECS,
+        "at TIGHT already — projection can't tighten further"
+    );
+}
+
+#[test]
+fn floor_with_projection_tightens_only_when_projected_crosses_trigger() {
+    // Base case: no projection → identical to the plain floor.
+    let t = TRIGGER_FOR_TESTS;
+    let base = 180u64;
+    assert_eq!(
+        per_account_fetch_floor_secs_with_projection(Some(50.0), t, base, None),
+        per_account_fetch_floor_secs(Some(50.0), t, base)
+    );
+
+    // Static tier says BASE (comfortable at 50%) but the projection says
+    // we'll cross trigger before the next fetch → tighten one step (RELAXED).
+    // This is exactly the fast-burn case a static ramp misses.
+    assert_eq!(
+        per_account_fetch_floor_secs_with_projection(Some(50.0), t, base, Some(95.0)),
+        WATCH_RELAXED_INTERVAL_SECS,
+        "50% with a projection crossing trigger tightens BASE→RELAXED"
+    );
+
+    // A projection below trigger doesn't tighten anything.
+    assert_eq!(
+        per_account_fetch_floor_secs_with_projection(Some(50.0), t, base, Some(94.9)),
+        base
+    );
+
+    // Already at TIGHT — projection can't make us any tighter, but also
+    // doesn't LOOSEN us. Projection is upper-bound-only.
+    assert_eq!(
+        per_account_fetch_floor_secs_with_projection(Some(93.0), t, base, Some(200.0)),
+        WATCH_TIGHT_INTERVAL_SECS
+    );
+}
+
+// --- v0.8.0 auto-swap escalation on repeated /oauth/usage 429s ---
+
+fn active_row(email: &str, session: f64, weekly: f64) -> Row {
+    let mut r = row_for(email, Some(session), Some(weekly));
+    // `has_data()` requires fetched_at Some AND error None — mimic a real cached
+    // row so the escalation function's guard clauses see valid input.
+    r.fetched_at = Some(Utc::now().timestamp());
+    r
+}
+
+/// Tests share the process-global `USAGE_FETCH_TRACKERS` map; use unique emails
+/// per test so state can't cross-contaminate. Reset the caller's entry at the
+/// end of each test to keep the map bounded even in long test-runner sessions.
+fn escalation_test_email(tag: &str) -> String {
+    format!(
+        "escalation-{tag}-{}-{}@test",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    )
+}
+
+#[test]
+fn escalation_no_429s_returns_raw_max_pct() {
+    let email = escalation_test_email("no429s");
+    let row = active_row(&email, 94.0, 30.0);
+    // No tracker state → not escalated → raw value returned.
+    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
+    assert_eq!(eff, 94.0);
+    reset_usage_fetch_tracker(&email);
+}
+
+#[test]
+fn escalation_fires_when_active_two_429s_in_tight_band_and_recent_success() {
+    // Scoped config dir so `burn_rate::estimate` (which reads history files)
+    // sees an empty log — the escalation falls back to pin-at-trigger when
+    // no confident burn rate is available, which is exactly the "no history
+    // yet" case we want to prove fires the swap.
+    let _g = crate::store::ScopedConfigDir::new();
+    let email = escalation_test_email("fires");
+    // Simulate: one success, then two 429s, all recent — the exact v0.7.3
+    // dev4 postmortem pattern.
+    let now_ts = Utc::now().timestamp();
+    record_usage_fetch_success(&email, now_ts);
+    record_usage_fetch_429(&email);
+    record_usage_fetch_429(&email);
+    let row = active_row(&email, 94.0, 30.0);
+    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
+    // Escalated: pinned at ≥ trigger so `evaluate_swap` fires on the next
+    // cycle even though the endpoint refuses to give us the real number.
+    assert!(
+        eff >= 95.0,
+        "escalation must guarantee effective ≥ trigger, got {eff}"
+    );
+    reset_usage_fetch_tracker(&email);
+}
+
+#[test]
+fn escalation_ignored_when_cached_pct_is_far_below_trigger() {
+    let email = escalation_test_email("far_below");
+    let now_ts = Utc::now().timestamp();
+    record_usage_fetch_success(&email, now_ts);
+    record_usage_fetch_429(&email);
+    record_usage_fetch_429(&email);
+    // 75% is inside the RELAXED band (trigger-20) but OUTSIDE the TIGHT
+    // band (trigger-5). Escalation gates on TIGHT to avoid firing on
+    // tenant-wide 429 noise when this account isn't actually near limit
+    // (Opus adversarial review BAD 3).
+    let row = active_row(&email, 75.0, 30.0);
+    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
+    assert_eq!(
+        eff, 75.0,
+        "escalation must NOT fire outside TIGHT band, got {eff}"
+    );
+    reset_usage_fetch_tracker(&email);
+}
+
+#[test]
+fn escalation_ignored_when_last_success_is_stale() {
+    let email = escalation_test_email("stale");
+    // Success 10 min ago — beyond ESCALATION_MAX_SUCCESS_AGE_SECS (5 min).
+    let stale_ts = Utc::now().timestamp() - 600;
+    record_usage_fetch_success(&email, stale_ts);
+    record_usage_fetch_429(&email);
+    record_usage_fetch_429(&email);
+    let row = active_row(&email, 94.0, 30.0);
+    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
+    // Cached number is old enough that current 429s can't reliably be
+    // attributed to it — refuse to escalate (Opus adversarial review BAD 4).
+    assert_eq!(eff, 94.0);
+    reset_usage_fetch_tracker(&email);
+}
+
+#[test]
+fn escalation_ignored_after_one_429() {
+    let email = escalation_test_email("one429");
+    let now_ts = Utc::now().timestamp();
+    record_usage_fetch_success(&email, now_ts);
+    record_usage_fetch_429(&email);
+    let row = active_row(&email, 94.0, 30.0);
+    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
+    // One 429 could be a one-off spike; require ≥2 for escalation.
+    assert_eq!(eff, 94.0);
+    reset_usage_fetch_tracker(&email);
+}
+
+#[test]
+fn escalation_counter_resets_on_success() {
+    let email = escalation_test_email("reset_on_success");
+    let now_ts = Utc::now().timestamp();
+    record_usage_fetch_success(&email, now_ts);
+    record_usage_fetch_429(&email);
+    record_usage_fetch_429(&email);
+    // At this point escalation WOULD fire.
+    record_usage_fetch_success(&email, now_ts + 1);
+    let row = active_row(&email, 94.0, 30.0);
+    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
+    assert_eq!(eff, 94.0, "a successful fetch must reset the counter");
+    reset_usage_fetch_tracker(&email);
+}
+
+#[test]
+fn escalation_counter_resets_on_non_429_error() {
+    let email = escalation_test_email("reset_on_non_429");
+    let now_ts = Utc::now().timestamp();
+    record_usage_fetch_success(&email, now_ts);
+    record_usage_fetch_429(&email);
+    // A network timeout (or any non-RateLimited error) mid-storm shouldn't
+    // accumulate escalation credit — those failures don't carry the "server
+    // is asking us to back off" signal (Sonnet adversarial review BAD 4).
+    record_usage_fetch_non_429(&email);
+    record_usage_fetch_429(&email);
+    let row = active_row(&email, 94.0, 30.0);
+    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
+    assert_eq!(eff, 94.0, "non-429 error must reset the consecutive count");
+    reset_usage_fetch_tracker(&email);
+}
+
+#[test]
+fn escalation_reset_tracker_clears_all_state() {
+    let email = escalation_test_email("clear_all");
+    let now_ts = Utc::now().timestamp();
+    record_usage_fetch_success(&email, now_ts);
+    record_usage_fetch_429(&email);
+    record_usage_fetch_429(&email);
+    reset_usage_fetch_tracker(&email);
+    // After a switch-away (which calls `reset_usage_fetch_tracker`), the
+    // account starts fresh — a returning-active account can't re-escalate
+    // instantly on a stale count (Opus adversarial review BAD 4).
+    let row = active_row(&email, 94.0, 30.0);
+    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
+    assert_eq!(eff, 94.0);
+}
+
 // --- per_account_fetch_floor_secs (v0.7.3 rate-limit guard) ---
 
 #[test]
