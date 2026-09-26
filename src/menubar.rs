@@ -375,8 +375,7 @@ fn summary_pcts(a: &AcctView) -> (Option<f64>, Option<f64>) {
 
 /// Fold an `AcctView` into the shape `countdown::compute_display` expects —
 /// pcts from the first two windows plus the raw reset instants we captured off
-/// the row. Used by both `main_row` and `switch_target_lock_countdown` so a
-/// row that switches to "locked · Xd Yh" agrees with the switch-refusal path.
+/// the row. Shared by account-row and provider recovery countdowns.
 fn account_usage_for(a: &AcctView) -> AccountUsage {
     let (sp, wp) = summary_pcts(a);
     AccountUsage {
@@ -2568,45 +2567,11 @@ fn handle_capture(slug: &str) {
     }
 }
 
-/// If `key`'s account is currently "locked" (session or weekly window at
-/// ≥99.5% with a still-future reset — the same rule `header_row`'s "locked ·
-/// Xh Ym" display uses), return the human countdown string. `None` if the
-/// account isn't found, the provider isn't registered, or it has headroom.
-/// Pure over its `State` argument so tests don't need to touch state.json.
-fn switch_target_lock_countdown(st: &State, slug: &str, key: &str) -> Option<String> {
-    let provider = providers::get(slug)?;
-    let acct = st
-        .accounts
-        .iter()
-        .find(|a| a.key().eq_ignore_ascii_case(key))?;
-    let row = row_from_account(acct);
-    let view = acctview_from_row(
-        &row,
-        &st.active,
-        provider.provider_id(),
-        provider.window_order(),
-    );
-    locked_countdown_for(&view, now_utc()).map(|(cd, _win)| cd)
-}
-
 fn handle_switch(slug: &str, key: &str) {
-    // Item 8 of the v0.5.0 redesign: refuse a switch into an account still
-    // under its own rate-limit wall — auto-swap will pick it back up the
-    // moment it resets, and switching now would just leave the user on a
-    // 0%-headroom account. Only meaningful for Claude today —
-    // `switch_target_lock_countdown` reads `st.accounts`, which state v2
-    // keeps Claude-only (see `store.rs`); non-Claude providers have no
-    // persisted usage signal to gate on yet, so the check is a no-op for
-    // them rather than a false negative.
-    if let Ok(st) = State::load() {
-        if let Some(cd) = switch_target_lock_countdown(&st, slug, key) {
-            notify(&format!(
-                "Can't switch to {key}: at 100% for the next {cd}. \
-                 Auto-swap will pick it back up when it resets."
-            ));
-            return;
-        }
-    }
+    // Explicit user choice may select an exhausted account. Serialize with the
+    // poller so it cannot immediately undo the choice with an older decision.
+    let shared = shared_swap_guard();
+    let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
     // State v2 (codex-switch-e2e): dispatch by provider slug instead of
     // hard-gating on Claude — `capabilities().supports_switching` already
     // keeps the "Switch to this account" row from being built for a
@@ -2619,7 +2584,11 @@ fn handle_switch(slug: &str, key: &str) {
         switch_to_provider_account(slug, key)
     };
     match result {
-        Ok(label) => notify(&format!("Switched to {label}")),
+        Ok(label) => {
+            guard.last_swap = Some(std::time::Instant::now());
+            guard.manual_locked_choice = Some((slug.to_string(), key.to_string()));
+            notify(&format!("Switched to {label}"));
+        }
         Err(e) => notify(&format!("Switch failed: {e}")),
     }
 }
@@ -4899,85 +4868,23 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // v0.5.0 redesign: locked-switch refusal, API-key-once-captured, and the
+    // Manual-switch availability, API-key-once-captured, and the
     // "white but not clickable" submenu style.
     // -----------------------------------------------------------------------
 
-    /// Build a minimal Claude `Account` with cached usage, for
-    /// `switch_target_lock_countdown` fixtures. No I/O — a plain in-memory
-    /// `store::Account`, not anything touching state.json.
-    fn account_with_usage(
-        email: &str,
-        session_pct: Option<f64>,
-        session_reset: Option<DateTime<Utc>>,
-    ) -> crate::store::Account {
-        crate::store::Account {
-            email: Some(email.to_string()),
-            access_token: "tok".into(),
-            refresh_token: "ref".into(),
-            expires_at: 0,
-            keychain_blob: "{}".into(),
-            oauth_account: None,
-            user_id: None,
-            cached_usage: Some(crate::store::CachedUsage {
-                session_pct,
-                weekly_pct: Some(10.0),
-                session_reset: session_reset.map(|t| t.to_rfc3339()),
-                weekly_reset: None,
-                opus_pct: None,
-                opus_reset: None,
-                fetched_at: 0,
-            }),
-            notif_state: crate::notifications::NotifState::default(),
-            needs_relogin: false,
-        }
-    }
-
     #[test]
-    fn switch_target_lock_countdown_refuses_a_maxed_out_account() {
-        // Item 8 of the redesign: a session at 100% with a still-future reset
-        // is "locked" — `handle_switch` must see this and refuse.
-        providers::init();
+    fn locked_accounts_keep_manual_switch_action() {
         let now = Utc.timestamp_opt(5_000_000, 0).unwrap();
-        with_now(now, || {
-            let reset = now + chrono::Duration::minutes(45);
-            let st = State {
-                accounts: vec![account_with_usage(
-                    "matt@example.com",
-                    Some(100.0),
-                    Some(reset),
-                )],
-                ..State::default()
-            };
-            let cd = switch_target_lock_countdown(&st, CLAUDE_SLUG, "matt@example.com");
-            assert_eq!(cd, Some("45m".to_string()));
-        });
-    }
-
-    #[test]
-    fn switch_target_lock_countdown_allows_an_account_with_headroom() {
-        providers::init();
-        let now = Utc.timestamp_opt(5_000_000, 0).unwrap();
-        with_now(now, || {
-            let st = State {
-                accounts: vec![account_with_usage("matt@example.com", Some(40.0), None)],
-                ..State::default()
-            };
-            assert_eq!(
-                switch_target_lock_countdown(&st, CLAUDE_SLUG, "matt@example.com"),
-                None,
-            );
-        });
-    }
-
-    #[test]
-    fn switch_target_lock_countdown_is_none_for_an_unknown_account() {
-        providers::init();
-        let st = State::default();
-        assert_eq!(
-            switch_target_lock_countdown(&st, CLAUDE_SLUG, "nobody@example.com"),
-            None,
+        let a = acct_with_resets(
+            "locked@example.com",
+            Some(100.0),
+            Some(100.0),
+            false,
+            Some(now + chrono::Duration::hours(1)),
+            Some(now + chrono::Duration::days(2)),
         );
+        let rows = account_submenu_rows(&claude_section(), &a);
+        assert_eq!(rows.switch_row, Some(false));
     }
 
     #[test]

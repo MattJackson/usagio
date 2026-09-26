@@ -2238,3 +2238,99 @@ fn reset_boundary_invalidates_recent_cache() {
     cu.weekly_reset = Some((now + Duration::seconds(5)).to_rfc3339());
     assert!(!cache_crossed_reset(&cu, now));
 }
+
+#[test]
+fn all_blocked_prepares_earliest_fully_recovered_account_without_churn() {
+    let now = Utc::now();
+    let mut rows = vec![
+        row_full("active@e.com", 0.0, 100.0, now + Duration::days(5)),
+        row_full("both@e.com", 100.0, 100.0, now + Duration::days(3)),
+        row_full("next@e.com", 0.0, 100.0, now + Duration::hours(2)),
+    ];
+    rows[1].session.resets_at = Some(now + Duration::hours(1));
+    let guard = SwapGuard::default();
+    let eval = evaluate_swap(&rows, "active@e.com", 95.0, 85.0, &guard);
+    assert!(eval.preparing);
+    assert_eq!(eval.target.as_deref(), Some("next@e.com"));
+    assert!(!rows[2].available(), "preselection must not imply capacity");
+    assert!(evaluate_swap(&rows, "next@e.com", 95.0, 85.0, &guard)
+        .target
+        .is_none());
+    rows[0].weekly.resets_at = rows[2].weekly.resets_at;
+    assert!(evaluate_swap(&rows, "active@e.com", 95.0, 85.0, &guard)
+        .target
+        .is_none());
+}
+
+#[test]
+fn blocked_preparation_preserves_manual_choice_but_allows_recovered_target() {
+    let now = Utc::now();
+    let mut rows = vec![
+        row_full("manual@e.com", 0.0, 100.0, now + Duration::days(5)),
+        row_full("next@e.com", 0.0, 100.0, now + Duration::hours(2)),
+    ];
+    let guard = SwapGuard {
+        manual_locked_choice: Some((CLAUDE_SLUG.to_string(), "manual@e.com".to_string())),
+        ..SwapGuard::default()
+    };
+    assert!(evaluate_swap(&rows, "manual@e.com", 95.0, 85.0, &guard)
+        .target
+        .is_none());
+    rows[1].weekly.pct = Some(0.0);
+    let eval = evaluate_swap(&rows, "manual@e.com", 95.0, 85.0, &guard);
+    assert!(!eval.preparing);
+    assert_eq!(eval.target.as_deref(), Some("next@e.com"));
+}
+
+#[test]
+fn blocked_preparation_requires_known_future_resets_and_valid_login() {
+    let now = Utc::now();
+    let mut rows = vec![
+        row_full("active@e.com", 0.0, 100.0, now + Duration::days(5)),
+        row_full("next@e.com", 0.0, 100.0, now + Duration::hours(2)),
+    ];
+    let guard = SwapGuard::default();
+    rows[1].weekly.resets_at = None;
+    assert!(evaluate_swap(&rows, "active@e.com", 95.0, 85.0, &guard)
+        .target
+        .is_none());
+    rows[1].weekly.resets_at = Some(now - Duration::seconds(1));
+    assert!(evaluate_swap(&rows, "active@e.com", 95.0, 85.0, &guard)
+        .target
+        .is_none());
+    rows[1].weekly.resets_at = Some(now + Duration::hours(2));
+    rows[1].needs_relogin = true;
+    assert!(evaluate_swap(&rows, "active@e.com", 95.0, 85.0, &guard)
+        .target
+        .is_none());
+    rows[1].needs_relogin = false;
+    rows[1].error = Some("usage unavailable".to_string());
+    assert!(evaluate_swap(&rows, "active@e.com", 95.0, 85.0, &guard)
+        .target
+        .is_none());
+}
+
+#[test]
+fn blocked_preparation_respects_disabled_autoswap_cooldown_and_no_return() {
+    let now = Utc::now();
+    let rows = vec![
+        row_full("active@e.com", 0.0, 100.0, now + Duration::days(5)),
+        row_full("next@e.com", 0.0, 100.0, now + Duration::hours(2)),
+    ];
+    let mut guard = SwapGuard::default();
+    assert!(evaluate_swap(&rows, "active@e.com", 101.0, 85.0, &guard)
+        .target
+        .is_none());
+    guard.last_swap = Some(std::time::Instant::now());
+    let eval = evaluate_swap(&rows, "active@e.com", 95.0, 85.0, &guard);
+    assert!(eval.blocked_by_cooldown);
+    assert!(eval.target.is_none());
+    assert_eq!(eval.target_ignoring_cooldown.as_deref(), Some("next@e.com"));
+    guard.last_swap = None;
+    guard
+        .left_at
+        .insert("next@e.com".to_string(), std::time::Instant::now());
+    assert!(evaluate_swap(&rows, "active@e.com", 95.0, 85.0, &guard)
+        .target
+        .is_none());
+}
