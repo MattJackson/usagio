@@ -111,14 +111,26 @@ fn parse_usage_windows(body: &serde_json::Value) -> Vec<UsageWindow> {
         return windows;
     };
     for (keys, id, label) in [
-        (["primary_window", "primary"], "primary", "5h"),
-        (["secondary_window", "secondary"], "secondary", "7d"),
+        (["primary_window", "primary"], "session", "5h"),
+        (["secondary_window", "secondary"], "weekly", "7d"),
     ] {
         let Some(w) = keys
             .iter()
             .find_map(|k| rl.get(*k).and_then(|v| v.as_object()))
         else {
             continue;
+        };
+        // Primary is not necessarily a five-hour window: weekly-only plans
+        // return their seven-day quota here. Only use position for older
+        // responses that omit duration; never guess for an explicit unknown
+        // duration (our cache has no slot for it).
+        let (id, label) = match w.get("limit_window_seconds") {
+            Some(duration) => match duration.as_i64() {
+                Some(18_000) => ("session", "5h"),
+                Some(604_800) => ("weekly", "7d"),
+                _ => continue,
+            },
+            None => (id, label),
         };
         let utilization = w
             .get("used_percent")
@@ -129,12 +141,17 @@ fn parse_usage_windows(body: &serde_json::Value) -> Vec<UsageWindow> {
         // producing an out-of-range year) doesn't panic the refresh loop.
         // Also clamp to ~400d, matching notifications::evaluate_pace.
         let resets_at = w
-            .get("reset_after_seconds")
-            .or_else(|| w.get("resets_in_seconds"))
+            .get("reset_at")
             .and_then(|x| x.as_i64())
-            .and_then(|s| {
-                let capped = s.clamp(0, 60 * 60 * 24 * 400);
-                Utc::now().checked_add_signed(chrono::Duration::seconds(capped))
+            .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
+            .or_else(|| {
+                w.get("reset_after_seconds")
+                    .or_else(|| w.get("resets_in_seconds"))
+                    .and_then(|x| x.as_i64())
+                    .and_then(|s| {
+                        let capped = s.clamp(0, 60 * 60 * 24 * 400);
+                        Utc::now().checked_add_signed(chrono::Duration::seconds(capped))
+                    })
             });
         windows.push(UsageWindow {
             id: id.to_string(),
@@ -173,7 +190,7 @@ impl Provider for CodexProvider {
     }
 
     fn window_order(&self) -> &'static [&'static str] {
-        &["primary", "secondary"]
+        &["session", "weekly"]
     }
 
     /// Codex's refresh grant is a plain, programmatic HTTPS POST (no vendor
@@ -741,13 +758,65 @@ mod tests {
         });
         let w = parse_usage_windows(&body);
         assert_eq!(w.len(), 2);
-        assert_eq!(w[0].id, "primary");
+        assert_eq!(w[0].id, "session");
         assert_eq!(w[0].label, "5h");
         assert_eq!(w[0].utilization, Some(42.0));
         assert!(w[0].resets_at.is_some());
-        assert_eq!(w[1].id, "secondary");
+        assert_eq!(w[1].id, "weekly");
         assert_eq!(w[1].label, "7d");
         assert_eq!(w[1].utilization, Some(79.0));
+    }
+
+    #[test]
+    fn parse_usage_duration_maps_through_cache_to_correct_columns() {
+        // Reproduce the live weekly-only account, then both windows in either
+        // position. A weekly window near reset must still remain weekly.
+        for (primary_seconds, secondary_seconds) in [
+            (604_800, None),
+            (18_000, Some(604_800)),
+            (604_800, Some(18_000)),
+        ] {
+            let window = |seconds| {
+                serde_json::json!({
+                    "used_percent": if seconds == 604_800 { 40.0 } else { 12.0 },
+                    "limit_window_seconds": seconds,
+                    "reset_at": 1791047392_i64,
+                    "reset_after_seconds": 60
+                })
+            };
+            let body = serde_json::json!({"rate_limit": {
+                "primary_window": window(primary_seconds),
+                "secondary_window": secondary_seconds.map(window)
+            }});
+            let snapshot = UsageSnapshot {
+                windows: parse_usage_windows(&body),
+                fetched_at: Utc::now(),
+            };
+            let cache = crate::cached_from_usage_snapshot(&snapshot);
+            assert_eq!(cache.weekly_pct, Some(40.0));
+            assert_eq!(cache.session_pct, secondary_seconds.map(|_| 12.0));
+            assert_eq!(
+                cache.weekly_reset.as_deref(),
+                Some("2026-10-03T17:09:52+00:00")
+            );
+            if secondary_seconds.is_none() {
+                assert!(cache.session_reset.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn parse_usage_unknown_duration_is_not_mislabeled() {
+        for duration in [
+            serde_json::json!(3600),
+            serde_json::json!(null),
+            serde_json::json!("604800"),
+        ] {
+            let body = serde_json::json!({"rate_limit": {"primary_window": {
+                "used_percent": 40, "limit_window_seconds": duration
+            }}});
+            assert!(parse_usage_windows(&body).is_empty());
+        }
     }
 
     #[test]
@@ -776,7 +845,7 @@ mod tests {
         });
         let w = parse_usage_windows(&body);
         assert_eq!(w.len(), 1);
-        assert_eq!(w[0].id, "primary");
+        assert_eq!(w[0].id, "session");
         assert_eq!(w[0].utilization, Some(0.0));
     }
 
@@ -813,7 +882,7 @@ mod tests {
         assert!(caps.supports_email_capture);
         assert_eq!(caps.secret_backend, SecretBackend::File);
         assert_eq!(caps.capture_mode, CaptureMode::CredsOnDisk);
-        assert_eq!(p.window_order(), &["primary", "secondary"]);
+        assert_eq!(p.window_order(), &["session", "weekly"]);
     }
 
     #[test]

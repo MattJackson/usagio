@@ -2196,3 +2196,45 @@ fn apply_account_rolls_back_claude_json_when_keychain_write_fails() {
         );
     });
 }
+
+#[test]
+fn reset_recovery_requires_refresh_then_selects_recovered_account() {
+    let now = Utc::now();
+    let reset = now - Duration::seconds(5);
+    let mut rows = vec![
+        row_full("active@e.com", 0.0, 100.0, now + Duration::days(5)),
+        row_full("recovering@e.com", 0.0, 100.0, reset),
+        row_full("later@e.com", 0.0, 100.0, now + Duration::days(2)),
+    ];
+    rows[1].fetched_at = Some((reset - Duration::seconds(10)).timestamp());
+    let guard = SwapGuard::default();
+    assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
+    // Even a low pre-reset sample is not confirmation of availability.
+    rows[1].weekly.pct = Some(0.0);
+    assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
+    rows[1].fetched_at = Some(now.timestamp());
+    rows[1].weekly.resets_at = Some(now + Duration::days(7));
+    assert_eq!(
+        choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).as_deref(),
+        Some("recovering@e.com")
+    );
+}
+
+#[test]
+fn reset_boundary_invalidates_recent_cache() {
+    let now = Utc::now();
+    let mut cu = CachedUsage {
+        session_pct: Some(0.0),
+        weekly_pct: Some(100.0),
+        session_reset: None,
+        weekly_reset: Some((now - Duration::seconds(5)).to_rfc3339()),
+        opus_pct: None,
+        opus_reset: None,
+        fetched_at: (now - Duration::seconds(10)).timestamp(),
+    };
+    assert!(cache_crossed_reset(&cu, now));
+    cu.fetched_at = now.timestamp();
+    assert!(!cache_crossed_reset(&cu, now));
+    cu.weekly_reset = Some((now + Duration::seconds(5)).to_rfc3339());
+    assert!(!cache_crossed_reset(&cu, now));
+}

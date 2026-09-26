@@ -7,6 +7,220 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-26
+
+### Fixed
+- Codex usage is classified by the reported window duration. Weekly-only
+  accounts now show their quota under Weekly and Session as not reported.
+  Exact server reset timestamps are preferred when available.
+- Exhausted accounts no longer show a misleading 0% session value in the
+  menu bar. The title counts down to the selected provider's earliest usable
+  account, with the account and reset time in the menu and tooltip.
+- When both session and weekly limits are exhausted, availability waits for
+  the later reset. Expired readings show a pending-refresh state until the
+  server confirms renewed capacity.
+- Reset boundaries bypass the usage-cache fetch floor so auto-swap can move
+  to a recovered account after a successful refresh. Stale pre-reset usage
+  cannot qualify an account as a switch target.
+
+## [0.8.0] - 2026-09-23
+
+### Fixed
+- **Auto-swap now fires even when the usage API 429s the active account.**
+  Post-v0.7.3 field report: with the tenant-wide 429 storm on the active
+  account, the cache stayed pinned at the last successful reading (e.g. 94%
+  session) while real usage climbed past the 95% trigger — auto-swap silently
+  never fired, forcing a manual switch. Root cause: `usage 429 → keeping
+  cache` treated a 429 as "no news" instead of the strong signal it is when
+  the account was already inside the ramp.
+
+### Added
+- **Escalation on repeated 429s.** A per-account (ephemeral, in-memory) counter
+  tracks consecutive `/oauth/usage` 429s. When the ACTIVE account hits ≥2 in a
+  row with its cached max_pct already inside the TIGHT band (within 5 pts of
+  trigger) and its last successful fetch was within 5 min, the auto-swap fire
+  decision treats the account as `max(cached_max_pct, trigger)` — so
+  `evaluate_swap` fires on the next cycle. Scoped to the boolean fire only;
+  candidate ranking still reads raw cached values (no accidental target
+  corruption). Counter resets on any successful fetch, on any non-429 error,
+  and on switch-away.
+- **Smart cadence via burn-rate projection.** After each successful active
+  fetch, `usage_log::pace`-style burn rate (via the existing
+  `burn_rate::estimate` weighted regression with `MIN_SAMPLES=6` and
+  `CONFIDENCE_FLOOR=0.5`) projects each window (session/weekly separately)
+  forward by `max(tier_floor, current_loop_interval)`. If EITHER projection
+  crosses trigger, tighten the account's fetch floor one tier. Projection can
+  only tighten, never relax. Guards against reset-boundary and low-confidence
+  noise — falls back to the static ramp when the estimate isn't trustworthy.
+
+## [0.7.3] - 2026-09-22
+
+### Fixed
+- **Menu no longer freezes on a stale sub-trigger percentage after a usage-API
+  429.** The v0.5.x binary WARNING band polled every account 30s whenever any
+  was between 80–95% of the swap trigger — with ~6 accounts that's 720 req/hr
+  against `/api/oauth/usage`, and Anthropic 429s. The 429 loop pinned an
+  account's cached usage below the trigger, so auto-swap never fired and
+  Claude Code hit session-expired mid-session.
+- The cadence is now a 4-tier ramp keyed to distance from your configured
+  trigger (works the same at 70 / 95 / 98): **180s** comfortable, **120s**
+  within 20 pts, **60s** within 10 pts, **30s** within 5 pts, **30s**
+  backstop at/above trigger. And a per-account fetch floor uses the same
+  ramp as a hard ceiling: even when the global loop wakes tight (because
+  another account is near trigger), an account whose own tier is
+  MIDDLE/RELAXED/BASE only calls the usage endpoint on its own tier
+  cadence. One near-trigger account can no longer drag every other account
+  into the 429 zone.
+
+## [0.7.2] - 2026-09-17
+
+### Fixed
+- **Auto-pick no longer lands you on an account that's already past the swap
+  target.** `usagio switch` (no argument) and the menu's "Now" item shared a
+  picker that only skipped fully-maxed (100%) accounts, so an account sitting at
+  e.g. 99% weekly could still be chosen — the very state auto-swap moves *away*
+  from. Auto-pick now prefers accounts below the swap trigger, and only falls
+  back to the least-full still-usable account when every account is already past
+  target (and says so). Manual switch and background auto-swap now use the same
+  target semantics.
+
+### Added
+- **A stuck account now tells you why.** When the OAuth endpoint permanently
+  rejects an account's refresh token (`invalid_grant`), the menu row shows
+  `⚠ re-login` (red) instead of a misleading `-% / -%` placeholder, and the
+  account's submenu spells out the fix (`log in with claude, then usagio
+  capture`). A refresh error shows `⚠ error` with the detail in the submenu.
+- **You get notified when an account needs re-login** — once, on the transition
+  into the stuck state during a background poll, and again in the "Usage
+  refreshed" toast if any account still needs re-login after a manual refresh.
+  Previously an account could silently freeze with stale numbers for days.
+
+## [0.7.1] - 2026-09-13
+
+### Fixed
+- **macOS popup now dismisses immediately on a Space switch** (muri 0.14.6, #69).
+  The dismiss notification (Space change / native menu opening / resign-active)
+  arrives with no `NSEvent`, so the popup's modal event pump didn't drain it until
+  the next real input — leaving the menu on-screen after a three-finger swipe.
+  muri now posts a wake event so the dismiss applies at once.
+
+## [0.7.0] - 2026-09-13
+
+### Changed
+- **macOS menu now renders as native-style glass.** The live tray popup hosts an
+  `NSVisualEffectView` backdrop blur (no Screen Recording permission) with muri
+  painting a low-alpha cool-charcoal tint on top, so the desktop behind the menu
+  is *blurred* (like a native `NSMenu`/Time Machine popup) instead of readable,
+  while the rows/text stay crisp. Fill and blur were tuned on-device against a
+  live Time Machine menu (screenshots don't capture the compositor blur — phone
+  photos were used). Dark fill `rgba(28,32,44,0.16)`, light unchanged.
+- **Active account is now marked in the accent color** (plus bold). At 13pt
+  through the glass, bold alone was too subtle to read as "active", so the active
+  account's name renders in the system accent color.
+- **Cursor shows the arrow** (not the I-beam) over the popup, including a
+  stationary open (muri activates while the menu is open so its cursor wins).
+
+### Fixed
+- **Usage no longer goes stale while an account is locked.** All accounts refresh
+  at startup and at least every 12h (not only when a window unlocks), and a manual
+  refresh (`usagio list --refresh` or the menu) always runs — fixing accounts that
+  showed locked/100% after the real limit had already reset.
+- **Locked-account flyout de-cluttered.** When the weekly window is maxed, the
+  redundant "Session resets in X" and burn-rate "empty in ~0m" lines are dropped.
+
+## [0.6.3] - 2026-09-11
+
+### Changed
+- **muri 0.12.0 — live macOS menu now matches a native Tahoe `NSMenu`.** A batch
+  of OEM-fidelity fixes, all measured against a real `NSMenu` on macOS 26
+  (Tahoe): the active row renders **bold** (variable system-font `wght`-axis
+  instancing), letters are no longer over-tightened (native SF tracking), the
+  popup corner radius is version-aware (**12pt** on Tahoe, ~6pt earlier), row
+  pitch is read from AppKit's own `NSMenu.size` (24pt), the backdrop follows the
+  OS material (**Liquid Glass** on Tahoe, vibrancy earlier), the popup **dismisses
+  on a Space switch**, and the pointer shows the **arrow** cursor instead of the
+  I-beam. usagio drove all of these upstream with same-machine measurements.
+
+### Changed
+- **macOS tray menu migrated to muri's native API (muri 0.11).** usagio builds
+  one generic, `Send` menu tree and renders it to a native `muri::Menu` on each
+  platform's UI thread — off the frozen `muda-compat` facade and onto the native
+  styling API (bold, per-severity value colors, leading icons, forced/host
+  themes). The same native menu feeds both the live `muri::Tray` and the
+  offscreen renderer, so a captured PNG matches what the menu bar draws.
+- **OEM fidelity pass (native look), verified against a real NSMenu reference.**
+  Bold now renders only on the active account row (muri #56/#63); the live menu
+  uses the real SF menu font with native tracking (#57) and native row pitch
+  (#63); and the live macOS popup now shows the `NSVisualEffectView`
+  `Material::Menu` vibrancy instead of a flat ~0.80-alpha fill masking it
+  (muri #64). The popup also pins a 300pt minimum width so the dense
+  account/`S% / W%` rows are no longer cramped.
+
+### Added
+- **Per-window value colors.** Each account row tints its session and weekly
+  percentages independently — amber at 80–89%, red at 90%+ — so a hot weekly
+  window stands out even while the session window is healthy.
+- **Agent-aware tray icon.** The status item can show an "at risk" indicator by
+  default, or a specific registered agent (Claude / Codex), selectable in
+  Settings.
+- **Headless screenshot rendering.** `usagio __render_shot <theme> <out.png>
+  <scale>` rasterizes the top-level menu for the current `state.json` via muri's
+  offscreen renderer (muri #59) — no display, tray, or accessibility needed. The
+  website screenshot pipeline now uses it for deterministic, real per-fixture
+  captures on all three OSes.
+
+## [0.6.1] - 2026-09-11
+
+### Fixed
+- **Codex works end-to-end** — capture, `list`, and usage parsing now handle the
+  live `rate_limit`/`primary_window` response shape, and the CLI mirrors the
+  menu's per-provider sections.
+- **Poll loop is robust under lockout and sleep.** usagio skips refreshing an
+  account that is locked until its reset (fixing a 429 storm that left the menu
+  showing stale usage), and its bounded sleep is suspend-aware so a laptop that
+  slept/among battery-out recovers its schedule instead of hanging.
+- **Crate version drift** — muri is caret-pinned so a stale lockfile can't hold
+  usagio on an old backend.
+
+### Changed
+- Tray menu backend on muri 0.10.7 (forced-OEM `--theme <os>` switcher for
+  auditing all three looks from one host).
+
+## [0.6.0] - 2026-09-10
+
+### Changed
+- **Windows/Linux tray menu now renders through [muri](https://crates.io/crates/muri)
+  0.9.1's `muda-compat` facade** instead of muda/tray-icon. This is an internal
+  backend swap only: the menu is feature- and pixel-identical to 0.5.23 — same
+  layout, grouping, icons, and behavior. macOS is unchanged (its NSMenu styler
+  still uses muda's `ns_menu()`). Surfaced and got two upstream muri fixes
+  (`MenuId::new`, `compat::tray_icon::menu` re-export) landed in muri 0.9.4.
+
+## [0.5.23] - 2026-09-10
+
+### Fixed
+- **Account switching never rotates the live CLI's refresh token.** usagio no
+  longer POSTs `/token` for the *active* account on a switch or `token` command;
+  it adopts the vendor CLI's current token instead. Single-use refresh tokens
+  rotate server-side, so minting one for the account the real CLI is using would
+  invalidate the CLI's own copy and force a re-login — breaking the "capture
+  once, never re-login" guarantee.
+- **A failed restore can no longer wipe your accounts.** "Restore…" moves the
+  live `state.json` aside before writing the restored one; if that write failed,
+  `state.json` was left missing and usagio read zero accounts on next load. The
+  pre-restore state is now rolled back automatically on write failure (and if the
+  rollback itself fails, the error names the backup file to recover from).
+- **Corrupt/unreadable `state.json` no longer silently bypasses the
+  overwrite-protection guard.** usagio now logs loudly when the guard (and rolling
+  backup) is skipped, so an account-drop can't slip through unnoticed.
+- **MCP context-ledger servers are fully cleaned up.** usagio now kills the
+  server's whole process group, so wrapper commands (`npx`/`node`, `uvx`/`python`)
+  don't leave orphaned child processes behind.
+
+### Security
+- **History files are created owner-only (0600).** Per-account usage history under
+  `~/.config/usagio` no longer inherits a world-readable umask.
+
 ## [0.5.22] - 2026-09-09
 
 ### Changed
