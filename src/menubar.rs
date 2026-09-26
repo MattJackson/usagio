@@ -42,9 +42,9 @@ use crate::store::State;
 use crate::{
     age_str, capture_current, capture_current_generic, env_override_active, menu_order,
     next_interval, notify, optimize_now, remove_account, remove_provider_account_generic,
-    row_from_account, row_from_provider_account, switch_to, switch_to_provider_account,
-    watch_cycle, with_state_lock, Row, SwapGuard, CLAUDE_SLUG, TARGET_CEILING_PCT, TRIGGER_PCT,
-    WATCH_INTERVAL_SECS,
+    row_from_account, row_from_provider_account, set_current_loop_interval_secs, switch_to,
+    switch_to_provider_account, watch_cycle, with_state_lock, Row, SwapGuard, CLAUDE_SLUG,
+    TARGET_CEILING_PCT, TRIGGER_PCT, WATCH_INTERVAL_SECS,
 };
 
 /// Exact title of the disabled section row inserted when a provider's env
@@ -157,6 +157,16 @@ struct AcctView {
     /// post-reset reading from a stale pre-reset one still sitting in the
     /// cache (`DisplayState::StaleAfterReset` — see `trailing_for_account`).
     fetched_at: Option<DateTime<Utc>>,
+    /// The OAuth token endpoint has permanently rejected this account's refresh
+    /// token — it's filtered out of every usage refresh, so its cached numbers
+    /// go stale forever. Takes priority over any usage/lock state in the row
+    /// trailing and submenu so the user sees "fix your login", not a misleading
+    /// "-% / -%" placeholder that reads like a transient poll gap.
+    needs_relogin: bool,
+    /// Last non-fatal error recorded for this account's refresh, if any. Shown
+    /// as the reason line under a `⚠ error` trailing when `needs_relogin` is not
+    /// set. `None` in the common healthy case.
+    error: Option<String>,
 }
 
 /// One provider's block in the menu. Rendered only if `accounts` is non-empty
@@ -501,10 +511,8 @@ fn main_row(provider_display: &str, a: &AcctView, bands: SeverityBands) -> RowSt
 ///     would be a healthy-looking number the user could still stall on for
 ///     up to a week.
 ///   * `Locked` on the SESSION window → `<countdown> / <weekly%>` — the
-///     weekly window still has headroom (a session lock can't win the
-///     `compute_display` tie-break over a simultaneously-locked weekly), so
-///     surfacing it tells the user there's still runway on this account via
-///     a different window.
+///     weekly percentage remains visible alongside the session countdown.
+///     If both are locked, the countdown waits for the later reset.
 ///   * `StaleAfterReset` → `-% / -%`, a deliberate "don't know yet"
 ///     placeholder rather than re-rendering the cached (typically ~100%)
 ///     reading, which would misreport an account that just reset as still
@@ -515,6 +523,21 @@ fn trailing_for_account(
     bands: SeverityBands,
     now: DateTime<Utc>,
 ) -> (String, Vec<(usize, usize, Severity)>) {
+    // Auth trouble outranks any usage/lock display: an account whose refresh
+    // token was rejected can never refresh, so its cached pct is frozen and a
+    // "-% / -%" or stale countdown would misrepresent a dead login as a
+    // transient poll gap. Surface the reason instead (full detail lands in the
+    // submenu status row).
+    if a.needs_relogin {
+        let t = "⚠ re-login".to_string();
+        let len = u16len(&t);
+        return (t, vec![(0, len, Severity::Red)]);
+    }
+    if a.error.is_some() {
+        let t = "⚠ error".to_string();
+        let len = u16len(&t);
+        return (t, vec![(0, len, Severity::Red)]);
+    }
     match countdown::compute_display(&account_usage_for(a), now) {
         DisplayState::Locked {
             until,
@@ -622,10 +645,27 @@ fn provider_group_header_row(sec: &ProviderSection) -> RowStyle {
 /// column (see `plain_text`), so a forgotten `\t` would collapse it to a flat
 /// "Quit usagio vX.Y.Z".
 fn quit_row_plain() -> String {
-    format!("Quit\tusagio v{}", env!("CARGO_PKG_VERSION"))
+    // `USAGIO_BUILD_TAG`, set at compile time, is appended so a QA screenshot
+    // self-identifies which build rendered it (distinguishing a dev build from
+    // an installed release when both are running). Unset in normal/release
+    // builds, so the label stays exactly "Quit\tusagio vX.Y.Z".
+    // `MURI_BG=r,g,b,a` (runtime bg-tuning hook): surface the alpha on the Quit
+    // row so phone-photo comparisons self-label which alpha is on screen.
+    let bg = std::env::var("MURI_BG")
+        .ok()
+        .and_then(|s| s.rsplit(',').next().map(|a| a.trim().to_string()))
+        .map(|a| format!(" a={a}"))
+        .unwrap_or_default();
+    match option_env!("USAGIO_BUILD_TAG") {
+        Some(tag) if !tag.is_empty() => {
+            format!("Quit\tusagio v{} [{}]{bg}", env!("CARGO_PKG_VERSION"), tag)
+        }
+        _ => format!("Quit\tusagio v{}{bg}", env!("CARGO_PKG_VERSION")),
+    }
 }
 
 /// Locate the active section + account (if any) in the snapshot.
+#[cfg(test)]
 fn active_account(snap: &Snapshot) -> Option<(&ProviderSection, &AcctView)> {
     for sec in &snap.sections {
         if let Some(a) = sec.accounts.iter().find(|a| a.active) {
@@ -1046,7 +1086,15 @@ fn poll_loop() {
     let mut current = base;
     let mut wd = crate::watchdog::Watchdog::default();
     let mut wd_effects = crate::watchdog::RealEffects;
+    // Force a full refresh of EVERY account on the first cycle after launch —
+    // including "locked" ones the per-cycle guard would normally skip — so the
+    // menu never opens on stale data carried over from before the app was last
+    // closed (e.g. an account that reset/boosted while usagio wasn't running).
+    let mut first_cycle = true;
     loop {
+        // v0.8.0: publish current loop cadence so the fetch-floor projection
+        // uses the correct horizon under 429 backoff (see main.rs).
+        set_current_loop_interval_secs(current);
         // Self-healing health check (fd-count + keychain-write), throttled to
         // ~once a minute. The menubar poller runs under launchd, so a critical
         // fd leak that a watcher respawn can't clear escalates to a launchd
@@ -1057,8 +1105,9 @@ fn poll_loop() {
         // hits the network, so ordinary use can never rate-limit.
         let (rate_limited, max_pct_opt, trigger, actionable) = {
             let mut g = guard.lock().unwrap_or_else(|e| e.into_inner());
-            run_cycle(&mut g)
+            run_cycle(&mut g, first_cycle)
         };
+        first_cycle = false;
         let prev = current;
         current = next_interval(
             current,
@@ -1337,13 +1386,13 @@ fn launchd_managed_from_env(xpc_service_name: Option<&str>) -> bool {
 /// caller's adaptive-cadence math has everything it needs. The menubar
 /// poller uses the trigger the user actually configured (via `Settings ▸
 /// Auto-swap`), matching what `watch_cycle` itself dispatched on.
-fn run_cycle(guard: &mut SwapGuard) -> (bool, Option<f64>, f64, bool) {
+fn run_cycle(guard: &mut SwapGuard, force: bool) -> (bool, Option<f64>, f64, bool) {
     let st = State::load().unwrap_or_default();
     let autoswap = !st.autoswap_disabled;
     let threshold = st.trigger_pct.unwrap_or(TRIGGER_PCT);
     // With auto-swap off, use an unreachable trigger so we only observe.
     let trigger = if autoswap { threshold } else { 101.0 };
-    match watch_cycle(trigger, TARGET_CEILING_PCT, guard) {
+    match watch_cycle(trigger, TARGET_CEILING_PCT, guard, force) {
         Ok(o) => (o.rate_limited, o.max_pct, trigger, o.actionable),
         Err(e) => {
             crate::logging::log(&format!("menubar poll failed: {e}"));
@@ -1504,6 +1553,8 @@ fn acctview_from_row(
         fetched_at: r
             .fetched_at
             .and_then(|t| chrono::DateTime::from_timestamp(t, 0)),
+        needs_relogin: r.needs_relogin,
+        error: r.error.clone(),
     }
 }
 
@@ -1745,10 +1796,15 @@ fn cached_state() -> State {
 /// Currently: the "env override active — swap disabled" row when the section's
 /// provider is env-overridden. Pure, so tests can assert on it without
 /// instantiating any native menu (muda requires the main thread on macOS).
-pub(crate) fn section_headline_rows(sec: &ProviderSection) -> Vec<&'static str> {
+pub(crate) fn section_headline_rows(sec: &ProviderSection) -> Vec<String> {
     let mut rows = Vec::new();
     if sec.env_override_active {
-        rows.push(ENV_OVERRIDE_ROW_TITLE);
+        rows.push(ENV_OVERRIDE_ROW_TITLE.to_string());
+    }
+    if let Some(active) = sec.accounts.iter().find(|a| a.active) {
+        if let Some((_, detail)) = recovery_status(sec, active, now_utc()) {
+            rows.push(detail);
+        }
     }
     rows
 }
@@ -1783,6 +1839,21 @@ fn window_status_row(w: &WindowView) -> Option<String> {
 /// call from a unit test without a `ScopedConfigDir`.
 fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
     let mut rows = Vec::new();
+    // Auth trouble is the account's headline state — spell out the reason and
+    // the fix before any (now-frozen) usage numbers. Mirrors the `⚠` trailing
+    // that `trailing_for_account` puts on the row header.
+    if a.needs_relogin {
+        rows.push("⚠ Re-login required — token expired".to_string());
+        rows.push(format!(
+            "Fix: log in with `claude`, then `usagio capture` ({})",
+            a.key
+        ));
+        return rows;
+    }
+    if let Some(err) = &a.error {
+        rows.push(format!("⚠ Refresh error: {err}"));
+        return rows;
+    }
     if sec.supports_usage {
         if a.has_data && !a.windows.is_empty() {
             // A window at 100% is the binding lock — lead with it (that's the
@@ -1791,9 +1862,22 @@ fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
             // Stable sort preserves that order among the non-locked windows.
             let mut ordered: Vec<&WindowView> = a.windows.iter().collect();
             ordered.sort_by_key(|w| u8::from(!w.pct.is_some_and(|p| p >= 100.0)));
+            // When the WEEKLY window is locked, the account is fully blocked
+            // regardless of the session window — so drop the "Session resets in X"
+            // line (its countdown is meaningless while the weekly limit blocks all
+            // use). The "Weekly limit reached · resets in X" row says everything.
+            let weekly_locked = a
+                .windows
+                .iter()
+                .any(|w| w.id == "weekly" && w.pct.is_some_and(|p| p >= 100.0));
             for w in ordered {
+                if weekly_locked && !w.pct.is_some_and(|p| p >= 100.0) {
+                    continue;
+                }
                 if let Some(row) = window_status_row(w) {
                     rows.push(row);
+                } else if sec.provider_id == "codex" && w.pct.is_none() {
+                    rows.push(format!("{} · Not reported", stat_display_label(w)));
                 }
             }
             if rows.is_empty() {
@@ -1820,13 +1904,23 @@ fn account_extra_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
     if sec.supports_usage && a.has_data && !a.windows.is_empty() {
         let account_key =
             crate::usage_log::AccountKey::new(sec.provider_id.to_string(), a.key.clone());
-        if let Some(est) = crate::burn_rate::estimate(
-            &account_key,
-            crate::providers::trait_def::Window::Weekly,
-            Utc::now(),
-        ) {
-            if est.confidence >= crate::burn_rate::CONFIDENCE_FLOOR {
-                rows.push(crate::burn_rate::format_menu_row(&est));
+        // The burn-rate row forecasts when the WEEKLY window empties ("Weekly ·
+        // N% · empty in ~X"). Once the weekly window is already locked (100%),
+        // that reads as a redundant "· 100% · empty in ~0m" — skip it; the
+        // "Weekly limit reached" status row already conveys the lock.
+        let weekly_locked = a
+            .windows
+            .iter()
+            .any(|w| w.id == "weekly" && w.pct.is_some_and(|p| p >= 100.0));
+        if !weekly_locked {
+            if let Some(est) = crate::burn_rate::estimate(
+                &account_key,
+                crate::providers::trait_def::Window::Weekly,
+                Utc::now(),
+            ) {
+                if est.confidence >= crate::burn_rate::CONFIDENCE_FLOOR {
+                    rows.push(crate::burn_rate::format_menu_row(&est));
+                }
             }
         }
         if let Some(cost) = crate::cost_tracking::estimate_cycle_cost(
@@ -1970,20 +2064,102 @@ fn menu_signature(snap: &Snapshot) -> String {
     s
 }
 
+/// Recovery information for the selected provider. A countdown is the first
+/// account that can clear *all* its blocking windows, not the first reset of
+/// any kind. Expired cached limits remain pending until a successful fetch.
+fn recovery_status(
+    sec: &ProviderSection,
+    active: &AcctView,
+    now: DateTime<Utc>,
+) -> Option<(String, String)> {
+    if active.needs_relogin {
+        return Some((
+            "Re-login".into(),
+            format!("{} · Re-login required", active.display),
+        ));
+    }
+    if active.error.is_some() {
+        return Some((
+            "⚠ error".into(),
+            format!("{} · Refresh error", active.display),
+        ));
+    }
+    let state = countdown::compute_display(&account_usage_for(active), now);
+    if matches!(state, DisplayState::Usage { .. })
+        && !acct_max_pct(active).is_some_and(|p| p >= 99.5)
+    {
+        return None;
+    }
+    let mut earliest: Option<(&AcctView, DateTime<Utc>)> = None;
+    let mut pending = None;
+    for account in &sec.accounts {
+        if account.needs_relogin || account.error.is_some() || !account.has_data {
+            continue;
+        }
+        if account.key != active.key && (!sec.supports_switching || sec.env_override_active) {
+            continue;
+        }
+        let usage = account_usage_for(account);
+        // A known reset for one limit cannot establish availability if the
+        // other exhausted limit has no reset time.
+        if [
+            (usage.session_pct, usage.session_reset),
+            (usage.weekly_pct, usage.weekly_reset),
+        ]
+        .iter()
+        .any(|(pct, reset)| pct.is_some_and(|p| p >= 99.5) && reset.is_none())
+        {
+            continue;
+        }
+        match countdown::compute_display(&usage, now) {
+            DisplayState::Locked { until, .. } => {
+                if earliest.is_none_or(|(_, previous)| until < previous) {
+                    earliest = Some((account, until));
+                }
+            }
+            DisplayState::StaleAfterReset { .. } => pending = Some(account),
+            DisplayState::Usage { .. } => {
+                if acct_max_pct(account).is_some_and(|p| p < 99.5) {
+                    return Some((
+                        "Switch".into(),
+                        format!("{} · Usage available", account.display),
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(account) = pending {
+        return Some((
+            "Refreshing…".into(),
+            format!("{} · Reset passed; awaiting fresh usage", account.display),
+        ));
+    }
+    if let Some((account, until)) = earliest {
+        return Some((
+            format!("🔒 {}", countdown::format_countdown(until - now)),
+            format!(
+                "Next available: {} · {} · awaiting confirmation at reset",
+                account.display,
+                until
+                    .with_timezone(&chrono::Local)
+                    .format("%b %d, %H:%M %Z")
+            ),
+        ));
+    }
+    Some((
+        "🔒".into(),
+        "Usage blocked · reset time not reported".into(),
+    ))
+}
+
 fn title_for(snap: &Snapshot) -> String {
     match tray_target(snap, snap.tray_icon_mode.as_deref()) {
-        // Session (5h) matters most day to day; fall back to weekly. Preserves
-        // the v1 tray-title semantics — a full weekly can't silently replace
-        // the low session number in the menu bar. Multi-window providers still
-        // yield a single honest number by leaning on the provider's window
-        // ordering (first = session-analog, second = weekly-analog).
-        Some((_sec, a)) => {
-            let s = a.windows.first().and_then(|w| w.pct);
-            let w = a.windows.get(1).and_then(|w| w.pct);
-            match s.or(w) {
-                Some(p) => format!("{p:.0}%"),
-                None => "—".to_string(),
+        Some((sec, a)) => {
+            if let Some((title, _)) = recovery_status(sec, a, now_utc()) {
+                return title;
             }
+            let (session, weekly) = summary_pcts(a);
+            pct(session.or(weekly))
         }
         None => "—".to_string(),
     }
@@ -2014,12 +2190,15 @@ pub fn render_menu_png_for_theme(theme_name: &str, scale: f32) -> Vec<u8> {
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn tooltip_for(snap: &Snapshot) -> String {
-    match active_account(snap) {
+    match tray_target(snap, snap.tray_icon_mode.as_deref()) {
         // Preserve the v1 tooltip format verbatim: `email — session X, weekly Y`.
         // Multi-window providers still project onto the first two windows
         // (session-analog / weekly-analog) so the tooltip stays a stable
         // one-liner regardless of how many windows the provider carries.
-        Some((_sec, a)) => {
+        Some((sec, a)) => {
+            if let Some((_, detail)) = recovery_status(sec, a, now_utc()) {
+                return detail;
+            }
             let s = a.windows.first().and_then(|w| w.pct);
             let w = a.windows.get(1).and_then(|w| w.pct);
             format!("{} — session {}, weekly {}", a.display, pct(s), pct(w))
@@ -2267,6 +2446,30 @@ static REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// De-duplicated via `REFRESH_IN_FLIGHT`: a second click while a refresh is
 /// still running notifies instead of spawning another thread. See
 /// `try_start_refresh` for the testable core.
+/// Emails of every account currently flagged `needs_relogin`, across the
+/// Claude slot and all provider slots, sorted for a stable notification body.
+/// Reads state directly (no network) so it reflects whatever the just-finished
+/// refresh cycle persisted.
+fn accounts_needing_relogin() -> Vec<String> {
+    let st = State::load().unwrap_or_default();
+    let mut out: Vec<String> = st
+        .accounts
+        .iter()
+        .filter(|a| a.needs_relogin)
+        .map(|a| a.key().to_string())
+        .chain(
+            st.providers
+                .values()
+                .flat_map(|p| p.accounts.iter())
+                .filter(|a| a.needs_relogin)
+                .map(|a| a.key.clone()),
+        )
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn handle_refresh_now() {
     // Shares `poll_loop`'s `SwapGuard`
     // instead of a throwaway `SwapGuard::default()` — see
@@ -2291,12 +2494,24 @@ fn handle_refresh_now() {
             let _reset = InFlightGuard;
             let (rate_limited, _max_pct, _trigger, _actionable) = {
                 let mut g = guard.lock().unwrap_or_else(|e| e.into_inner());
-                run_cycle(&mut g)
+                run_cycle(&mut g, true)
             };
             if rate_limited {
                 notify("Refresh: rate limited, backing off");
             } else {
-                notify("Usage refreshed");
+                // Surface accounts that can't refresh at all — a dead login is
+                // the reason the numbers won't move, so a bare "Usage refreshed"
+                // would be a quiet lie for those rows.
+                let stuck = accounts_needing_relogin();
+                match stuck.as_slice() {
+                    [] => notify("Usage refreshed"),
+                    [one] => notify(&format!("Usage refreshed — {one} needs re-login")),
+                    many => notify(&format!(
+                        "Usage refreshed — {} accounts need re-login: {}",
+                        many.len(),
+                        many.join(", ")
+                    )),
+                }
             }
         });
     })
@@ -3111,6 +3326,10 @@ mod tests {
             // so the default fixture never accidentally lands in
             // `StaleAfterReset`. Tests exercising that state set it directly.
             fetched_at: None,
+            // Healthy fixture: no auth trouble. Tests exercising the re-login /
+            // error trailing set these directly.
+            needs_relogin: false,
+            error: None,
         }
     }
 
@@ -3473,6 +3692,187 @@ mod tests {
         for row in submenu_info_rows(&sec, &a) {
             assert!(!row.contains('%'), "submenu row leaked a percentage: {row}");
         }
+    }
+
+    fn claude_section() -> ProviderSection {
+        ProviderSection {
+            provider_id: CLAUDE_SLUG,
+            display_name: "Claude",
+            supports_switching: true,
+            supports_usage: true,
+            supports_launch: true,
+            supports_remove: true,
+            severity_bands: bands(),
+            env_override_active: false,
+            accounts: vec![],
+        }
+    }
+
+    #[test]
+    fn needs_relogin_trailing_beats_usage_and_lock() {
+        // A dead login must never render a usage pct or a stale countdown — its
+        // numbers are frozen, so the row surfaces the re-login state in red
+        // regardless of what the cached percentages / reset instants say.
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let reset = now + chrono::Duration::minutes(90);
+        with_now(now, || {
+            let mut a = acct_with_resets(
+                "stale@x.com",
+                Some(100.0),
+                Some(100.0),
+                false,
+                Some(reset),
+                Some(reset),
+            );
+            a.needs_relogin = true;
+            let (trailing, colors) = trailing_for_account(&a, bands(), now);
+            assert_eq!(trailing, "⚠ re-login");
+            assert!(!trailing.contains('%'), "no percentage on a dead login");
+            assert_eq!(colors.len(), 1, "single red span over the whole run");
+            assert_eq!(colors[0].2, Severity::Red);
+        });
+    }
+
+    #[test]
+    fn refresh_error_trailing_when_not_needing_relogin() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let mut a = acct("err@x.com", Some(10.0), Some(20.0), false);
+        a.error = Some("HTTP 500".into());
+        let (trailing, colors) = trailing_for_account(&a, bands(), now);
+        assert_eq!(trailing, "⚠ error");
+        assert_eq!(colors.len(), 1);
+        assert_eq!(colors[0].2, Severity::Red);
+    }
+
+    #[test]
+    fn needs_relogin_submenu_leads_with_reason_and_fix() {
+        let mut a = acct("stale@x.com", Some(100.0), Some(100.0), false);
+        a.needs_relogin = true;
+        let rows = submenu_info_rows(&claude_section(), &a);
+        assert!(
+            rows[0].contains("Re-login required"),
+            "first row states the problem: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("usagio capture")),
+            "a row names the fix: {rows:?}"
+        );
+        // No usage/window rows once the login is dead.
+        assert!(
+            !rows.iter().any(|r| r.contains("resets in")),
+            "dead login shows no window rows: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn tray_countdown_uses_earliest_usable_account_then_waits_for_refresh() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let mut active = acct("active@x.com", Some(0.0), Some(100.0), true);
+        active.weekly_reset_at = Some(now + chrono::Duration::days(5));
+        active.fetched_at = Some(now);
+        let mut next = acct("next@x.com", Some(100.0), Some(100.0), false);
+        next.session_reset_at = Some(now + chrono::Duration::minutes(30));
+        next.weekly_reset_at = Some(now + chrono::Duration::hours(2));
+        next.fetched_at = Some(now);
+        let mut snap = one_section_snap(active);
+        snap.sections[0].accounts.push(next);
+        with_now(now, || {
+            assert_eq!(title_for(&snap), "🔒 2h 0m");
+            assert!(tooltip_for(&snap).contains("next@x.com"));
+            assert!(section_headline_rows(&snap.sections[0])[0].contains("next@x.com"));
+        });
+        with_now(now + chrono::Duration::hours(2), || {
+            assert_eq!(title_for(&snap), "Refreshing…");
+        });
+        // Once fresh usage arrives a usable alternative prompts a switch;
+        // the normal percentage returns after the switch is applied.
+        let next = &mut snap.sections[0].accounts[1];
+        next.windows[0].pct = Some(0.0);
+        next.windows[1].pct = Some(0.0);
+        next.fetched_at = Some(now + chrono::Duration::hours(2));
+        with_now(now + chrono::Duration::hours(2), || {
+            assert_eq!(title_for(&snap), "Switch")
+        });
+        snap.sections[0].accounts[0].active = false;
+        snap.sections[0].accounts[1].active = true;
+        with_now(now + chrono::Duration::hours(2), || {
+            assert_eq!(title_for(&snap), "0%")
+        });
+    }
+
+    #[test]
+    fn tray_countdown_requires_resets_for_every_exhausted_window() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let mut a = acct("blocked@x.com", Some(100.0), Some(100.0), true);
+        a.weekly_reset_at = Some(now + chrono::Duration::hours(2));
+        with_now(now, || assert_eq!(title_for(&one_section_snap(a)), "🔒"));
+    }
+
+    #[test]
+    fn tray_recovery_excludes_relogin_accounts_and_other_providers() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let mut snap = two_section_snap(
+            acct("active@x.com", Some(0.0), Some(100.0), true),
+            Some(0.0),
+            Some("claude".into()),
+        );
+        snap.tray_icon_mode = Some("claude".into());
+        snap.sections[0].accounts[0].weekly_reset_at = Some(now + chrono::Duration::hours(3));
+        let mut unusable = acct("relogin@x.com", Some(0.0), Some(100.0), false);
+        unusable.weekly_reset_at = Some(now + chrono::Duration::hours(1));
+        unusable.needs_relogin = true;
+        snap.sections[0].accounts.push(unusable);
+        with_now(now, || assert_eq!(title_for(&snap), "🔒 3h 0m"));
+    }
+
+    #[test]
+    fn codex_weekly_only_reports_missing_session_and_weekly_title() {
+        let mut a = acct("codex@example.com", None, Some(40.0), true);
+        a.provider_id = "codex";
+        a.windows[0].reset.clear();
+        let mut sec = claude_section();
+        sec.provider_id = "codex";
+        let rows = submenu_info_rows(&sec, &a);
+        assert_eq!(rows, ["Session · Not reported", "Weekly resets in 2d"]);
+        assert_eq!(summary_pcts(&a), (None, Some(40.0)));
+        assert_eq!(title_for(&one_section_snap(a)), "40%");
+    }
+
+    #[test]
+    fn weekly_locked_drops_session_reset_row() {
+        // Image #13: when the WEEKLY window is locked (100%), the account is fully
+        // blocked, so the "5h resets in X" session row is meaningless noise — the
+        // flyout should show only the "7d limit reached · resets in X" weekly row.
+        let sec = ProviderSection {
+            provider_id: CLAUDE_SLUG,
+            display_name: "Claude",
+            supports_switching: true,
+            supports_usage: true,
+            supports_launch: true,
+            supports_remove: true,
+            severity_bands: bands(),
+            env_override_active: false,
+            accounts: vec![],
+        };
+        let locked = acct("a@x.com", Some(40.0), Some(100.0), true);
+        let rows = submenu_info_rows(&sec, &locked);
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("Weekly") && r.contains("limit reached")),
+            "weekly-locked flyout must keep the weekly lock row: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("Session")),
+            "weekly-locked flyout must drop the session reset row: {rows:?}"
+        );
+        // Control: an unlocked account still shows the session row.
+        let healthy = acct("b@x.com", Some(40.0), Some(60.0), true);
+        assert!(
+            submenu_info_rows(&sec, &healthy)
+                .iter()
+                .any(|r| r.contains("Session")),
+            "unlocked flyout must keep the session reset row"
+        );
     }
 
     #[test]

@@ -237,7 +237,10 @@ fn auto_pick_tie_break_picks_higher_headroom() {
         row_full("low@e.com", 10.0, 10.0, reset),
     ];
     // Equal soonest reset → the account with MORE headroom (lower usage) wins.
-    assert_eq!(auto_pick(&rows).unwrap(), "low@e.com");
+    assert_eq!(
+        auto_pick(&rows, TARGET_CEILING_PCT, TRIGGER_PCT).unwrap(),
+        "low@e.com"
+    );
 }
 
 #[test]
@@ -249,7 +252,44 @@ fn auto_pick_prefers_soonest_reset() {
         row_full("later@e.com", 5.0, 5.0, later),
         row_full("soon@e.com", 40.0, 40.0, soon),
     ];
-    assert_eq!(auto_pick(&rows).unwrap(), "soon@e.com");
+    assert_eq!(
+        auto_pick(&rows, TARGET_CEILING_PCT, TRIGGER_PCT).unwrap(),
+        "soon@e.com"
+    );
+}
+
+#[test]
+fn auto_pick_skips_past_target_account_even_if_it_resets_soonest() {
+    // The regression: a 99%-weekly account resetting soonest must NOT beat an
+    // under-target account. "Best is not one past target."
+    let soon = Utc::now() + Duration::hours(2);
+    let later = Utc::now() + Duration::hours(48);
+    let rows = vec![
+        row_full("nearlyfull@e.com", 1.0, 99.0, soon),
+        row_full("empty@e.com", 0.0, 0.0, later),
+    ];
+    assert_eq!(
+        auto_pick(&rows, TARGET_CEILING_PCT, TRIGGER_PCT).unwrap(),
+        "empty@e.com",
+        "an account past the weekly trigger is never the best landing spot"
+    );
+}
+
+#[test]
+fn auto_pick_falls_back_to_least_full_when_all_past_target() {
+    // "Unless it's all that's left": every account is past target, so the
+    // least-consumed still-usable one wins rather than erroring out.
+    let soon = Utc::now() + Duration::hours(2);
+    let later = Utc::now() + Duration::hours(48);
+    let rows = vec![
+        row_full("full99@e.com", 1.0, 99.0, soon),
+        row_full("full97@e.com", 1.0, 97.0, later),
+    ];
+    // Both past the 95% trigger → fallback tier. Soonest reset still wins.
+    assert_eq!(
+        auto_pick(&rows, TARGET_CEILING_PCT, TRIGGER_PCT).unwrap(),
+        "full99@e.com"
+    );
 }
 
 // --- menu_order (dropdown priority) ---
@@ -592,38 +632,326 @@ fn next_interval_doubles_on_rate_limit_capped() {
 }
 
 #[test]
-fn next_interval_tightens_to_warning_inside_the_band() {
-    // Inside [trigger - 15, trigger): 30s WARNING cadence, regardless of
-    // the current `current` — this is exactly the case that let the user's
-    // 94% + 150s wait miss the swap on v0.4.3.
+fn next_interval_tightens_progressively_across_ramp_tiers() {
+    // v0.7.3 replaced the binary WARNING band (30s inside 15pt of trigger)
+    // with a 4-tier ramp. At trigger=95: TIGHT = [90, 95), MIDDLE = [85, 90),
+    // RELAXED = [75, 85), BASE below. The v0.4.3 user miss (94% + 150s wait
+    // → lock before next poll) still tightens to 30s TIGHT here.
+
+    // TIGHT band [trigger-5, trigger): 30s regardless of `current`.
     assert_eq!(
-        next_interval(150, 150, false, Some(94.9), TRIGGER_FOR_TESTS, true),
-        30
+        next_interval(180, 180, false, Some(94.9), TRIGGER_FOR_TESTS, true),
+        WATCH_TIGHT_INTERVAL_SECS
     );
     assert_eq!(
-        next_interval(150, 150, false, Some(85.0), TRIGGER_FOR_TESTS, true),
-        30
+        next_interval(180, 180, false, Some(90.0), TRIGGER_FOR_TESTS, true),
+        WATCH_TIGHT_INTERVAL_SECS,
+        "trigger-5 lower edge is inside TIGHT"
+    );
+
+    // MIDDLE band [trigger-10, trigger-5): 60s. dev3 at 87% today — the
+    // account whose stale 429-preserved cache silenced auto-swap in v0.7.2 —
+    // lands here.
+    assert_eq!(
+        next_interval(180, 180, false, Some(89.9), TRIGGER_FOR_TESTS, true),
+        WATCH_MIDDLE_INTERVAL_SECS
     );
     assert_eq!(
-        next_interval(150, 150, false, Some(80.001), TRIGGER_FOR_TESTS, true),
-        30
+        next_interval(180, 180, false, Some(87.0), TRIGGER_FOR_TESTS, true),
+        WATCH_MIDDLE_INTERVAL_SECS,
+        "the exact case from the v0.7.2 429 loop"
     );
-    // Exactly at the band-lower edge (trigger - 15 = 80.0) still tightens.
     assert_eq!(
-        next_interval(150, 150, false, Some(80.0), TRIGGER_FOR_TESTS, true),
-        30
+        next_interval(180, 180, false, Some(85.0), TRIGGER_FOR_TESTS, true),
+        WATCH_MIDDLE_INTERVAL_SECS,
+        "trigger-10 lower edge is inside MIDDLE"
     );
-    // 1 tick below the band — back to base.
+
+    // RELAXED band [trigger-20, trigger-10): 120s.
     assert_eq!(
-        next_interval(150, 150, false, Some(79.9), TRIGGER_FOR_TESTS, true),
-        150
+        next_interval(180, 180, false, Some(84.9), TRIGGER_FOR_TESTS, true),
+        WATCH_RELAXED_INTERVAL_SECS
     );
-    // Warning band ignores `actionable` — we tighten to catch the crossing
+    assert_eq!(
+        next_interval(180, 180, false, Some(75.0), TRIGGER_FOR_TESTS, true),
+        WATCH_RELAXED_INTERVAL_SECS,
+        "trigger-20 lower edge is inside RELAXED"
+    );
+
+    // Below the ramp: BASE.
+    assert_eq!(
+        next_interval(180, 180, false, Some(74.9), TRIGGER_FOR_TESTS, true),
+        180
+    );
+    assert_eq!(
+        next_interval(180, 180, false, Some(20.0), TRIGGER_FOR_TESTS, true),
+        180
+    );
+
+    // The whole ramp ignores `actionable` — tighten to catch the crossing
     // even when no swap target exists yet.
     assert_eq!(
-        next_interval(150, 150, false, Some(90.0), TRIGGER_FOR_TESTS, false),
-        30
+        next_interval(180, 180, false, Some(90.0), TRIGGER_FOR_TESTS, false),
+        WATCH_TIGHT_INTERVAL_SECS
     );
+    assert_eq!(
+        next_interval(180, 180, false, Some(87.0), TRIGGER_FOR_TESTS, false),
+        WATCH_MIDDLE_INTERVAL_SECS
+    );
+}
+
+#[test]
+fn next_interval_ramp_slides_with_custom_trigger() {
+    // The whole ramp is defined as absolute percentage-point offsets from
+    // the user-configurable trigger, so trigger=70 and trigger=98 both work
+    // without a code change. This is why we care about the sliding property.
+
+    // trigger=70: TIGHT [65,70), MIDDLE [60,65), RELAXED [50,60).
+    assert_eq!(next_interval(180, 180, false, Some(66.0), 70.0, true), 30);
+    assert_eq!(next_interval(180, 180, false, Some(62.0), 70.0, true), 60);
+    assert_eq!(next_interval(180, 180, false, Some(55.0), 70.0, true), 120);
+    assert_eq!(next_interval(180, 180, false, Some(45.0), 70.0, true), 180);
+
+    // trigger=98: TIGHT [93,98), MIDDLE [88,93), RELAXED [78,88).
+    assert_eq!(next_interval(180, 180, false, Some(95.0), 98.0, true), 30);
+    assert_eq!(next_interval(180, 180, false, Some(90.0), 98.0, true), 60);
+    assert_eq!(next_interval(180, 180, false, Some(80.0), 98.0, true), 120);
+    assert_eq!(next_interval(180, 180, false, Some(60.0), 98.0, true), 180);
+}
+
+// --- v0.8.0 smart-cadence tighten (projection can only speed up cadence) ---
+
+#[test]
+fn tighten_tier_once_walks_the_ramp_one_step_and_caps_at_tight() {
+    // Each call takes us exactly one tier tighter (BASE → RELAXED → MIDDLE →
+    // TIGHT), and further calls at TIGHT are idempotent — projection can
+    // never make us poll faster than the static ramp's tightest tier.
+    let base = 180u64;
+    assert_eq!(tighten_tier_once(base, base), WATCH_RELAXED_INTERVAL_SECS);
+    assert_eq!(
+        tighten_tier_once(WATCH_RELAXED_INTERVAL_SECS, base),
+        WATCH_MIDDLE_INTERVAL_SECS
+    );
+    assert_eq!(
+        tighten_tier_once(WATCH_MIDDLE_INTERVAL_SECS, base),
+        WATCH_TIGHT_INTERVAL_SECS
+    );
+    assert_eq!(
+        tighten_tier_once(WATCH_TIGHT_INTERVAL_SECS, base),
+        WATCH_TIGHT_INTERVAL_SECS,
+        "at TIGHT already — projection can't tighten further"
+    );
+}
+
+#[test]
+fn floor_with_projection_tightens_only_when_projected_crosses_trigger() {
+    // Base case: no projection → identical to the plain floor.
+    let t = TRIGGER_FOR_TESTS;
+    let base = 180u64;
+    assert_eq!(
+        per_account_fetch_floor_secs_with_projection(Some(50.0), t, base, None),
+        per_account_fetch_floor_secs(Some(50.0), t, base)
+    );
+
+    // Static tier says BASE (comfortable at 50%) but the projection says
+    // we'll cross trigger before the next fetch → tighten one step (RELAXED).
+    // This is exactly the fast-burn case a static ramp misses.
+    assert_eq!(
+        per_account_fetch_floor_secs_with_projection(Some(50.0), t, base, Some(95.0)),
+        WATCH_RELAXED_INTERVAL_SECS,
+        "50% with a projection crossing trigger tightens BASE→RELAXED"
+    );
+
+    // A projection below trigger doesn't tighten anything.
+    assert_eq!(
+        per_account_fetch_floor_secs_with_projection(Some(50.0), t, base, Some(94.9)),
+        base
+    );
+
+    // Already at TIGHT — projection can't make us any tighter, but also
+    // doesn't LOOSEN us. Projection is upper-bound-only.
+    assert_eq!(
+        per_account_fetch_floor_secs_with_projection(Some(93.0), t, base, Some(200.0)),
+        WATCH_TIGHT_INTERVAL_SECS
+    );
+}
+
+// --- v0.8.0 auto-swap escalation on repeated /oauth/usage 429s ---
+
+fn active_row(email: &str, session: f64, weekly: f64) -> Row {
+    let mut r = row_for(email, Some(session), Some(weekly));
+    // `has_data()` requires fetched_at Some AND error None — mimic a real cached
+    // row so the escalation function's guard clauses see valid input.
+    r.fetched_at = Some(Utc::now().timestamp());
+    r
+}
+
+/// Tests share the process-global `USAGE_FETCH_TRACKERS` map; use unique emails
+/// per test so state can't cross-contaminate. Reset the caller's entry at the
+/// end of each test to keep the map bounded even in long test-runner sessions.
+fn escalation_test_email(tag: &str) -> String {
+    format!(
+        "escalation-{tag}-{}-{}@test",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    )
+}
+
+#[test]
+fn escalation_no_429s_returns_raw_max_pct() {
+    let email = escalation_test_email("no429s");
+    let row = active_row(&email, 94.0, 30.0);
+    // No tracker state → not escalated → raw value returned.
+    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
+    assert_eq!(eff, 94.0);
+    reset_usage_fetch_tracker(&email);
+}
+
+#[test]
+fn escalation_fires_when_active_two_429s_in_tight_band_and_recent_success() {
+    // Scoped config dir so `burn_rate::estimate` (which reads history files)
+    // sees an empty log — the escalation falls back to pin-at-trigger when
+    // no confident burn rate is available, which is exactly the "no history
+    // yet" case we want to prove fires the swap.
+    let _g = crate::store::ScopedConfigDir::new();
+    let email = escalation_test_email("fires");
+    // Simulate: one success, then two 429s, all recent — the exact v0.7.3
+    // dev4 postmortem pattern.
+    let now_ts = Utc::now().timestamp();
+    record_usage_fetch_success(&email, now_ts);
+    record_usage_fetch_429(&email);
+    record_usage_fetch_429(&email);
+    let row = active_row(&email, 94.0, 30.0);
+    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
+    // Escalated: pinned at ≥ trigger so `evaluate_swap` fires on the next
+    // cycle even though the endpoint refuses to give us the real number.
+    assert!(
+        eff >= 95.0,
+        "escalation must guarantee effective ≥ trigger, got {eff}"
+    );
+    reset_usage_fetch_tracker(&email);
+}
+
+#[test]
+fn escalation_ignored_when_cached_pct_is_far_below_trigger() {
+    let email = escalation_test_email("far_below");
+    let now_ts = Utc::now().timestamp();
+    record_usage_fetch_success(&email, now_ts);
+    record_usage_fetch_429(&email);
+    record_usage_fetch_429(&email);
+    // 75% is inside the RELAXED band (trigger-20) but OUTSIDE the TIGHT
+    // band (trigger-5). Escalation gates on TIGHT to avoid firing on
+    // tenant-wide 429 noise when this account isn't actually near limit
+    // (Opus adversarial review BAD 3).
+    let row = active_row(&email, 75.0, 30.0);
+    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
+    assert_eq!(
+        eff, 75.0,
+        "escalation must NOT fire outside TIGHT band, got {eff}"
+    );
+    reset_usage_fetch_tracker(&email);
+}
+
+#[test]
+fn escalation_ignored_when_last_success_is_stale() {
+    let email = escalation_test_email("stale");
+    // Success 10 min ago — beyond ESCALATION_MAX_SUCCESS_AGE_SECS (5 min).
+    let stale_ts = Utc::now().timestamp() - 600;
+    record_usage_fetch_success(&email, stale_ts);
+    record_usage_fetch_429(&email);
+    record_usage_fetch_429(&email);
+    let row = active_row(&email, 94.0, 30.0);
+    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
+    // Cached number is old enough that current 429s can't reliably be
+    // attributed to it — refuse to escalate (Opus adversarial review BAD 4).
+    assert_eq!(eff, 94.0);
+    reset_usage_fetch_tracker(&email);
+}
+
+#[test]
+fn escalation_ignored_after_one_429() {
+    let email = escalation_test_email("one429");
+    let now_ts = Utc::now().timestamp();
+    record_usage_fetch_success(&email, now_ts);
+    record_usage_fetch_429(&email);
+    let row = active_row(&email, 94.0, 30.0);
+    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
+    // One 429 could be a one-off spike; require ≥2 for escalation.
+    assert_eq!(eff, 94.0);
+    reset_usage_fetch_tracker(&email);
+}
+
+#[test]
+fn escalation_counter_resets_on_success() {
+    let email = escalation_test_email("reset_on_success");
+    let now_ts = Utc::now().timestamp();
+    record_usage_fetch_success(&email, now_ts);
+    record_usage_fetch_429(&email);
+    record_usage_fetch_429(&email);
+    // At this point escalation WOULD fire.
+    record_usage_fetch_success(&email, now_ts + 1);
+    let row = active_row(&email, 94.0, 30.0);
+    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
+    assert_eq!(eff, 94.0, "a successful fetch must reset the counter");
+    reset_usage_fetch_tracker(&email);
+}
+
+#[test]
+fn escalation_counter_resets_on_non_429_error() {
+    let email = escalation_test_email("reset_on_non_429");
+    let now_ts = Utc::now().timestamp();
+    record_usage_fetch_success(&email, now_ts);
+    record_usage_fetch_429(&email);
+    // A network timeout (or any non-RateLimited error) mid-storm shouldn't
+    // accumulate escalation credit — those failures don't carry the "server
+    // is asking us to back off" signal (Sonnet adversarial review BAD 4).
+    record_usage_fetch_non_429(&email);
+    record_usage_fetch_429(&email);
+    let row = active_row(&email, 94.0, 30.0);
+    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
+    assert_eq!(eff, 94.0, "non-429 error must reset the consecutive count");
+    reset_usage_fetch_tracker(&email);
+}
+
+#[test]
+fn escalation_reset_tracker_clears_all_state() {
+    let email = escalation_test_email("clear_all");
+    let now_ts = Utc::now().timestamp();
+    record_usage_fetch_success(&email, now_ts);
+    record_usage_fetch_429(&email);
+    record_usage_fetch_429(&email);
+    reset_usage_fetch_tracker(&email);
+    // After a switch-away (which calls `reset_usage_fetch_tracker`), the
+    // account starts fresh — a returning-active account can't re-escalate
+    // instantly on a stale count (Opus adversarial review BAD 4).
+    let row = active_row(&email, 94.0, 30.0);
+    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
+    assert_eq!(eff, 94.0);
+}
+
+// --- per_account_fetch_floor_secs (v0.7.3 rate-limit guard) ---
+
+#[test]
+fn per_account_fetch_floor_matches_the_cadence_ramp() {
+    // The per-account fetch floor uses the same ramp as `next_interval`, so
+    // an account at 87% has a 60s floor even when the GLOBAL loop wakes every
+    // 30s because a *different* account is in the TIGHT band. This is the
+    // guard that stops a single at-trigger account from dragging every other
+    // account down to 120 req/hr/account against /oauth/usage.
+    let t = TRIGGER_FOR_TESTS;
+    assert_eq!(per_account_fetch_floor_secs(Some(92.0), t, 180), 30);
+    assert_eq!(per_account_fetch_floor_secs(Some(87.0), t, 180), 60);
+    assert_eq!(per_account_fetch_floor_secs(Some(80.0), t, 180), 120);
+    assert_eq!(per_account_fetch_floor_secs(Some(50.0), t, 180), 180);
+    // At-or-above trigger stays on TIGHT so a stale 429-preserved cache
+    // refreshes as soon as the endpoint recovers.
+    assert_eq!(per_account_fetch_floor_secs(Some(99.0), t, 180), 30);
+    // No cached usage yet → BASE (need at least one fetch to place the
+    // account on a tier).
+    assert_eq!(per_account_fetch_floor_secs(None, t, 180), 180);
 }
 
 #[test]
@@ -1415,7 +1743,7 @@ fn refresh_usage_cache_still_refreshes_inactive_accounts() {
     seed.active = None;
     seed.save().unwrap();
 
-    refresh_usage_cache();
+    refresh_usage_cache(false);
     oauth::set_token_url_override(None);
     usage::set_usage_url_override(None);
 
@@ -1867,4 +2195,46 @@ fn apply_account_rolls_back_claude_json_when_keychain_write_fails() {
              (no half-applied switch)"
         );
     });
+}
+
+#[test]
+fn reset_recovery_requires_refresh_then_selects_recovered_account() {
+    let now = Utc::now();
+    let reset = now - Duration::seconds(5);
+    let mut rows = vec![
+        row_full("active@e.com", 0.0, 100.0, now + Duration::days(5)),
+        row_full("recovering@e.com", 0.0, 100.0, reset),
+        row_full("later@e.com", 0.0, 100.0, now + Duration::days(2)),
+    ];
+    rows[1].fetched_at = Some((reset - Duration::seconds(10)).timestamp());
+    let guard = SwapGuard::default();
+    assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
+    // Even a low pre-reset sample is not confirmation of availability.
+    rows[1].weekly.pct = Some(0.0);
+    assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
+    rows[1].fetched_at = Some(now.timestamp());
+    rows[1].weekly.resets_at = Some(now + Duration::days(7));
+    assert_eq!(
+        choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).as_deref(),
+        Some("recovering@e.com")
+    );
+}
+
+#[test]
+fn reset_boundary_invalidates_recent_cache() {
+    let now = Utc::now();
+    let mut cu = CachedUsage {
+        session_pct: Some(0.0),
+        weekly_pct: Some(100.0),
+        session_reset: None,
+        weekly_reset: Some((now - Duration::seconds(5)).to_rfc3339()),
+        opus_pct: None,
+        opus_reset: None,
+        fetched_at: (now - Duration::seconds(10)).timestamp(),
+    };
+    assert!(cache_crossed_reset(&cu, now));
+    cu.fetched_at = now.timestamp();
+    assert!(!cache_crossed_reset(&cu, now));
+    cu.weekly_reset = Some((now + Duration::seconds(5)).to_rfc3339());
+    assert!(!cache_crossed_reset(&cu, now));
 }

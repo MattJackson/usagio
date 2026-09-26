@@ -263,6 +263,17 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
                     crate::logging::log(&format!(
                         "event=needs_relogin account={email} reason=invalid_grant"
                     ));
+                    // Alert on the TRANSITION into needs_relogin. The snapshot
+                    // at the top of this fn already filters out accounts that
+                    // were ALREADY flagged (`.filter(|a| !a.needs_relogin)`), so
+                    // any account reaching this branch is flipping clear→flagged
+                    // right now — a stuck account never re-notifies on later
+                    // polls. Without this the account silently freezes and its
+                    // cached numbers rot for days (the exact "no notification,
+                    // just stale" failure this path was patched for).
+                    crate::notify(&format!(
+                        "{email}: re-login required — run `usagio capture`"
+                    ));
                     // R2-EH-01 (round-2 codeaudit): mirror flag_needs_relogin's
                     // logging on save-Err so a state.json write failure here is
                     // visible instead of being silently discarded.
