@@ -42,9 +42,9 @@ use crate::store::State;
 use crate::{
     age_str, capture_current, capture_current_generic, env_override_active, menu_order,
     next_interval, notify, optimize_now, remove_account, remove_provider_account_generic,
-    row_from_account, row_from_provider_account, switch_to, switch_to_provider_account,
-    watch_cycle, with_state_lock, Row, SwapGuard, CLAUDE_SLUG, TARGET_CEILING_PCT, TRIGGER_PCT,
-    WATCH_INTERVAL_SECS,
+    row_from_account, row_from_provider_account, set_current_loop_interval_secs, switch_to,
+    switch_to_provider_account, watch_cycle, with_state_lock, Row, SwapGuard, CLAUDE_SLUG,
+    TARGET_CEILING_PCT, TRIGGER_PCT, WATCH_INTERVAL_SECS,
 };
 
 /// Exact title of the disabled section row inserted when a provider's env
@@ -511,10 +511,8 @@ fn main_row(provider_display: &str, a: &AcctView, bands: SeverityBands) -> RowSt
 ///     would be a healthy-looking number the user could still stall on for
 ///     up to a week.
 ///   * `Locked` on the SESSION window → `<countdown> / <weekly%>` — the
-///     weekly window still has headroom (a session lock can't win the
-///     `compute_display` tie-break over a simultaneously-locked weekly), so
-///     surfacing it tells the user there's still runway on this account via
-///     a different window.
+///     weekly percentage remains visible alongside the session countdown.
+///     If both are locked, the countdown waits for the later reset.
 ///   * `StaleAfterReset` → `-% / -%`, a deliberate "don't know yet"
 ///     placeholder rather than re-rendering the cached (typically ~100%)
 ///     reading, which would misreport an account that just reset as still
@@ -667,6 +665,7 @@ fn quit_row_plain() -> String {
 }
 
 /// Locate the active section + account (if any) in the snapshot.
+#[cfg(test)]
 fn active_account(snap: &Snapshot) -> Option<(&ProviderSection, &AcctView)> {
     for sec in &snap.sections {
         if let Some(a) = sec.accounts.iter().find(|a| a.active) {
@@ -1093,6 +1092,9 @@ fn poll_loop() {
     // closed (e.g. an account that reset/boosted while usagio wasn't running).
     let mut first_cycle = true;
     loop {
+        // v0.8.0: publish current loop cadence so the fetch-floor projection
+        // uses the correct horizon under 429 backoff (see main.rs).
+        set_current_loop_interval_secs(current);
         // Self-healing health check (fd-count + keychain-write), throttled to
         // ~once a minute. The menubar poller runs under launchd, so a critical
         // fd leak that a watcher respawn can't clear escalates to a launchd
@@ -1794,10 +1796,15 @@ fn cached_state() -> State {
 /// Currently: the "env override active — swap disabled" row when the section's
 /// provider is env-overridden. Pure, so tests can assert on it without
 /// instantiating any native menu (muda requires the main thread on macOS).
-pub(crate) fn section_headline_rows(sec: &ProviderSection) -> Vec<&'static str> {
+pub(crate) fn section_headline_rows(sec: &ProviderSection) -> Vec<String> {
     let mut rows = Vec::new();
     if sec.env_override_active {
-        rows.push(ENV_OVERRIDE_ROW_TITLE);
+        rows.push(ENV_OVERRIDE_ROW_TITLE.to_string());
+    }
+    if let Some(active) = sec.accounts.iter().find(|a| a.active) {
+        if let Some((_, detail)) = recovery_status(sec, active, now_utc()) {
+            rows.push(detail);
+        }
     }
     rows
 }
@@ -1869,6 +1876,8 @@ fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
                 }
                 if let Some(row) = window_status_row(w) {
                     rows.push(row);
+                } else if sec.provider_id == "codex" && w.pct.is_none() {
+                    rows.push(format!("{} · Not reported", stat_display_label(w)));
                 }
             }
             if rows.is_empty() {
@@ -2055,20 +2064,102 @@ fn menu_signature(snap: &Snapshot) -> String {
     s
 }
 
+/// Recovery information for the selected provider. A countdown is the first
+/// account that can clear *all* its blocking windows, not the first reset of
+/// any kind. Expired cached limits remain pending until a successful fetch.
+fn recovery_status(
+    sec: &ProviderSection,
+    active: &AcctView,
+    now: DateTime<Utc>,
+) -> Option<(String, String)> {
+    if active.needs_relogin {
+        return Some((
+            "Re-login".into(),
+            format!("{} · Re-login required", active.display),
+        ));
+    }
+    if active.error.is_some() {
+        return Some((
+            "⚠ error".into(),
+            format!("{} · Refresh error", active.display),
+        ));
+    }
+    let state = countdown::compute_display(&account_usage_for(active), now);
+    if matches!(state, DisplayState::Usage { .. })
+        && !acct_max_pct(active).is_some_and(|p| p >= 99.5)
+    {
+        return None;
+    }
+    let mut earliest: Option<(&AcctView, DateTime<Utc>)> = None;
+    let mut pending = None;
+    for account in &sec.accounts {
+        if account.needs_relogin || account.error.is_some() || !account.has_data {
+            continue;
+        }
+        if account.key != active.key && (!sec.supports_switching || sec.env_override_active) {
+            continue;
+        }
+        let usage = account_usage_for(account);
+        // A known reset for one limit cannot establish availability if the
+        // other exhausted limit has no reset time.
+        if [
+            (usage.session_pct, usage.session_reset),
+            (usage.weekly_pct, usage.weekly_reset),
+        ]
+        .iter()
+        .any(|(pct, reset)| pct.is_some_and(|p| p >= 99.5) && reset.is_none())
+        {
+            continue;
+        }
+        match countdown::compute_display(&usage, now) {
+            DisplayState::Locked { until, .. } => {
+                if earliest.is_none_or(|(_, previous)| until < previous) {
+                    earliest = Some((account, until));
+                }
+            }
+            DisplayState::StaleAfterReset { .. } => pending = Some(account),
+            DisplayState::Usage { .. } => {
+                if acct_max_pct(account).is_some_and(|p| p < 99.5) {
+                    return Some((
+                        "Switch".into(),
+                        format!("{} · Usage available", account.display),
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(account) = pending {
+        return Some((
+            "Refreshing…".into(),
+            format!("{} · Reset passed; awaiting fresh usage", account.display),
+        ));
+    }
+    if let Some((account, until)) = earliest {
+        return Some((
+            format!("🔒 {}", countdown::format_countdown(until - now)),
+            format!(
+                "Next available: {} · {} · awaiting confirmation at reset",
+                account.display,
+                until
+                    .with_timezone(&chrono::Local)
+                    .format("%b %d, %H:%M %Z")
+            ),
+        ));
+    }
+    Some((
+        "🔒".into(),
+        "Usage blocked · reset time not reported".into(),
+    ))
+}
+
 fn title_for(snap: &Snapshot) -> String {
     match tray_target(snap, snap.tray_icon_mode.as_deref()) {
-        // Session (5h) matters most day to day; fall back to weekly. Preserves
-        // the v1 tray-title semantics — a full weekly can't silently replace
-        // the low session number in the menu bar. Multi-window providers still
-        // yield a single honest number by leaning on the provider's window
-        // ordering (first = session-analog, second = weekly-analog).
-        Some((_sec, a)) => {
-            let s = a.windows.first().and_then(|w| w.pct);
-            let w = a.windows.get(1).and_then(|w| w.pct);
-            match s.or(w) {
-                Some(p) => format!("{p:.0}%"),
-                None => "—".to_string(),
+        Some((sec, a)) => {
+            if let Some((title, _)) = recovery_status(sec, a, now_utc()) {
+                return title;
             }
+            let (session, weekly) = summary_pcts(a);
+            pct(session.or(weekly))
         }
         None => "—".to_string(),
     }
@@ -2099,12 +2190,15 @@ pub fn render_menu_png_for_theme(theme_name: &str, scale: f32) -> Vec<u8> {
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn tooltip_for(snap: &Snapshot) -> String {
-    match active_account(snap) {
+    match tray_target(snap, snap.tray_icon_mode.as_deref()) {
         // Preserve the v1 tooltip format verbatim: `email — session X, weekly Y`.
         // Multi-window providers still project onto the first two windows
         // (session-analog / weekly-analog) so the tooltip stays a stable
         // one-liner regardless of how many windows the provider carries.
-        Some((_sec, a)) => {
+        Some((sec, a)) => {
+            if let Some((_, detail)) = recovery_status(sec, a, now_utc()) {
+                return detail;
+            }
             let s = a.windows.first().and_then(|w| w.pct);
             let w = a.windows.get(1).and_then(|w| w.pct);
             format!("{} — session {}, weekly {}", a.display, pct(s), pct(w))
@@ -3668,6 +3762,80 @@ mod tests {
             !rows.iter().any(|r| r.contains("resets in")),
             "dead login shows no window rows: {rows:?}"
         );
+    }
+
+    #[test]
+    fn tray_countdown_uses_earliest_usable_account_then_waits_for_refresh() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let mut active = acct("active@x.com", Some(0.0), Some(100.0), true);
+        active.weekly_reset_at = Some(now + chrono::Duration::days(5));
+        active.fetched_at = Some(now);
+        let mut next = acct("next@x.com", Some(100.0), Some(100.0), false);
+        next.session_reset_at = Some(now + chrono::Duration::minutes(30));
+        next.weekly_reset_at = Some(now + chrono::Duration::hours(2));
+        next.fetched_at = Some(now);
+        let mut snap = one_section_snap(active);
+        snap.sections[0].accounts.push(next);
+        with_now(now, || {
+            assert_eq!(title_for(&snap), "🔒 2h 0m");
+            assert!(tooltip_for(&snap).contains("next@x.com"));
+            assert!(section_headline_rows(&snap.sections[0])[0].contains("next@x.com"));
+        });
+        with_now(now + chrono::Duration::hours(2), || {
+            assert_eq!(title_for(&snap), "Refreshing…");
+        });
+        // Once fresh usage arrives a usable alternative prompts a switch;
+        // the normal percentage returns after the switch is applied.
+        let next = &mut snap.sections[0].accounts[1];
+        next.windows[0].pct = Some(0.0);
+        next.windows[1].pct = Some(0.0);
+        next.fetched_at = Some(now + chrono::Duration::hours(2));
+        with_now(now + chrono::Duration::hours(2), || {
+            assert_eq!(title_for(&snap), "Switch")
+        });
+        snap.sections[0].accounts[0].active = false;
+        snap.sections[0].accounts[1].active = true;
+        with_now(now + chrono::Duration::hours(2), || {
+            assert_eq!(title_for(&snap), "0%")
+        });
+    }
+
+    #[test]
+    fn tray_countdown_requires_resets_for_every_exhausted_window() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let mut a = acct("blocked@x.com", Some(100.0), Some(100.0), true);
+        a.weekly_reset_at = Some(now + chrono::Duration::hours(2));
+        with_now(now, || assert_eq!(title_for(&one_section_snap(a)), "🔒"));
+    }
+
+    #[test]
+    fn tray_recovery_excludes_relogin_accounts_and_other_providers() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let mut snap = two_section_snap(
+            acct("active@x.com", Some(0.0), Some(100.0), true),
+            Some(0.0),
+            Some("claude".into()),
+        );
+        snap.tray_icon_mode = Some("claude".into());
+        snap.sections[0].accounts[0].weekly_reset_at = Some(now + chrono::Duration::hours(3));
+        let mut unusable = acct("relogin@x.com", Some(0.0), Some(100.0), false);
+        unusable.weekly_reset_at = Some(now + chrono::Duration::hours(1));
+        unusable.needs_relogin = true;
+        snap.sections[0].accounts.push(unusable);
+        with_now(now, || assert_eq!(title_for(&snap), "🔒 3h 0m"));
+    }
+
+    #[test]
+    fn codex_weekly_only_reports_missing_session_and_weekly_title() {
+        let mut a = acct("codex@example.com", None, Some(40.0), true);
+        a.provider_id = "codex";
+        a.windows[0].reset.clear();
+        let mut sec = claude_section();
+        sec.provider_id = "codex";
+        let rows = submenu_info_rows(&sec, &a);
+        assert_eq!(rows, ["Session · Not reported", "Weekly resets in 2d"]);
+        assert_eq!(summary_pcts(&a), (None, Some(40.0)));
+        assert_eq!(title_for(&one_section_snap(a)), "40%");
     }
 
     #[test]

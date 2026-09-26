@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-26
+
+### Fixed
+- Codex usage is classified by the reported window duration. Weekly-only
+  accounts now show their quota under Weekly and Session as not reported.
+  Exact server reset timestamps are preferred when available.
+- Exhausted accounts no longer show a misleading 0% session value in the
+  menu bar. The title counts down to the selected provider's earliest usable
+  account, with the account and reset time in the menu and tooltip.
+- When both session and weekly limits are exhausted, availability waits for
+  the later reset. Expired readings show a pending-refresh state until the
+  server confirms renewed capacity.
+- Reset boundaries bypass the usage-cache fetch floor so auto-swap can move
+  to a recovered account after a successful refresh. Stale pre-reset usage
+  cannot qualify an account as a switch target.
+
+## [0.8.0] - 2026-09-23
+
+### Fixed
+- **Auto-swap now fires even when the usage API 429s the active account.**
+  Post-v0.7.3 field report: with the tenant-wide 429 storm on the active
+  account, the cache stayed pinned at the last successful reading (e.g. 94%
+  session) while real usage climbed past the 95% trigger — auto-swap silently
+  never fired, forcing a manual switch. Root cause: `usage 429 → keeping
+  cache` treated a 429 as "no news" instead of the strong signal it is when
+  the account was already inside the ramp.
+
+### Added
+- **Escalation on repeated 429s.** A per-account (ephemeral, in-memory) counter
+  tracks consecutive `/oauth/usage` 429s. When the ACTIVE account hits ≥2 in a
+  row with its cached max_pct already inside the TIGHT band (within 5 pts of
+  trigger) and its last successful fetch was within 5 min, the auto-swap fire
+  decision treats the account as `max(cached_max_pct, trigger)` — so
+  `evaluate_swap` fires on the next cycle. Scoped to the boolean fire only;
+  candidate ranking still reads raw cached values (no accidental target
+  corruption). Counter resets on any successful fetch, on any non-429 error,
+  and on switch-away.
+- **Smart cadence via burn-rate projection.** After each successful active
+  fetch, `usage_log::pace`-style burn rate (via the existing
+  `burn_rate::estimate` weighted regression with `MIN_SAMPLES=6` and
+  `CONFIDENCE_FLOOR=0.5`) projects each window (session/weekly separately)
+  forward by `max(tier_floor, current_loop_interval)`. If EITHER projection
+  crosses trigger, tighten the account's fetch floor one tier. Projection can
+  only tighten, never relax. Guards against reset-boundary and low-confidence
+  noise — falls back to the static ramp when the estimate isn't trustworthy.
+
+## [0.7.3] - 2026-09-22
+
+### Fixed
+- **Menu no longer freezes on a stale sub-trigger percentage after a usage-API
+  429.** The v0.5.x binary WARNING band polled every account 30s whenever any
+  was between 80–95% of the swap trigger — with ~6 accounts that's 720 req/hr
+  against `/api/oauth/usage`, and Anthropic 429s. The 429 loop pinned an
+  account's cached usage below the trigger, so auto-swap never fired and
+  Claude Code hit session-expired mid-session.
+- The cadence is now a 4-tier ramp keyed to distance from your configured
+  trigger (works the same at 70 / 95 / 98): **180s** comfortable, **120s**
+  within 20 pts, **60s** within 10 pts, **30s** within 5 pts, **30s**
+  backstop at/above trigger. And a per-account fetch floor uses the same
+  ramp as a hard ceiling: even when the global loop wakes tight (because
+  another account is near trigger), an account whose own tier is
+  MIDDLE/RELAXED/BASE only calls the usage endpoint on its own tier
+  cadence. One near-trigger account can no longer drag every other account
+  into the 429 zone.
+
 ## [0.7.2] - 2026-09-17
 
 ### Fixed

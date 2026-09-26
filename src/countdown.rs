@@ -62,8 +62,8 @@ pub fn compute_display(usage: &AccountUsage, now: DateTime<Utc>) -> DisplayState
 
     match (session_blocking, weekly_blocking) {
         (Some(s), Some(w)) => {
-            // Both blocking — pick the sooner reset. Sooner = smaller DateTime.
-            if s <= w {
+            // Both limits must clear before the account is usable.
+            if s >= w {
                 DisplayState::Locked {
                     until: s,
                     window: BlockingWindow::Session,
@@ -423,25 +423,25 @@ mod tests {
     }
 
     #[test]
-    fn both_locked_sooner_reset_wins_session() {
+    fn both_locked_later_reset_wins_weekly() {
         let u = usage(Some(100.0), Some(2000), Some(100.0), Some(5000));
         assert_eq!(
             compute_display(&u, t(1000)),
             DisplayState::Locked {
-                until: t(2000),
-                window: BlockingWindow::Session
+                until: t(5000),
+                window: BlockingWindow::Weekly
             }
         );
     }
 
     #[test]
-    fn both_locked_sooner_reset_wins_weekly() {
+    fn both_locked_later_reset_wins_session() {
         let u = usage(Some(100.0), Some(5000), Some(100.0), Some(2000));
         assert_eq!(
             compute_display(&u, t(1000)),
             DisplayState::Locked {
-                until: t(2000),
-                window: BlockingWindow::Weekly
+                until: t(5000),
+                window: BlockingWindow::Session
             }
         );
     }
