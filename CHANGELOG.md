@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-09-26
+
+### Fixed
+- Manual account switching now allows quota-blocked accounts.
+- When every usable login is quota-blocked, auto-switch prepares the account
+  whose exhausted limits clear first. The lock/countdown remains until a
+  successful usage refresh confirms capacity.
+- All-blocked preparation preserves manual selections and retains the
+  existing cooldown and no-return protections. The prepared account appears
+  first through the existing active-account ordering.
+
 ## [0.8.1] - 2026-09-26
 
 ### Fixed
@@ -1085,7 +1096,8 @@ fixes; every top finding was independently confirmed before fixing.
 - `token` — print a fresh access token for scripting.
 - Local, owner-only token store at `~/.config/claude-usage/state.json` (0600).
 
-[Unreleased]: https://github.com/MattJackson/usagio/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/MattJackson/usagio/compare/v0.8.2...HEAD
+[0.8.2]: https://github.com/MattJackson/usagio/compare/v0.8.1...v0.8.2
 [0.5.0]: https://github.com/MattJackson/usagio/compare/v0.4.3...v0.5.0
 [0.4.0]: https://github.com/MattJackson/claude-usage/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/MattJackson/claude-usage/compare/v0.3.0...v0.3.1
