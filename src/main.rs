@@ -3296,6 +3296,9 @@ pub(crate) struct SwapGuard {
     last_swap: Option<std::time::Instant>,
     left_at: std::collections::HashMap<String, std::time::Instant>,
     stuck_notified: bool,
+    // A manual choice wins over all-blocked preparation until useful capacity
+    // returns or the user chooses a different account.
+    manual_locked_choice: Option<(String, String)>,
 }
 
 /// Drop no-return entries past their window so `left_at` can't grow without
@@ -3383,6 +3386,7 @@ fn choose_swap_target(
 /// SAME target `choose_swap_target` would have picked once the cooldown
 /// clears.
 struct SwapEval {
+    preparing: bool,
     /// The account to switch to right now, if any (cooldown/no-return/
     /// eligibility have all already been consulted).
     target: Option<String>,
@@ -3397,6 +3401,64 @@ struct SwapEval {
     target_ignoring_cooldown: Option<String>,
 }
 
+/// Choose a login to prepare while every valid account is quota-blocked.
+/// Unknown usage/reset data is not proof of an all-blocked state. An account
+/// with two exhausted windows becomes usable only at the later reset.
+fn earliest_blocked_target<'a>(
+    rows: &'a [Row],
+    act: &Row,
+    guard: &SwapGuard,
+    now: DateTime<Utc>,
+) -> Option<&'a Row> {
+    if guard
+        .manual_locked_choice
+        .as_ref()
+        .is_some_and(|(provider, key)| {
+            provider == &act.provider_id && key.eq_ignore_ascii_case(&act.email)
+        })
+    {
+        return None;
+    }
+    let mut earliest: Option<(&Row, DateTime<Utc>)> = None;
+    for row in rows
+        .iter()
+        .filter(|r| r.provider_id == act.provider_id && !r.needs_relogin)
+    {
+        if !row.has_data() {
+            return None;
+        }
+        let mut until = None;
+        for cell in [&row.session, &row.weekly] {
+            if cell.pct.is_some_and(|p| p >= 99.5) {
+                let reset = cell.resets_at.filter(|r| *r > now)?;
+                until = Some(until.map_or(reset, |t: DateTime<Utc>| t.max(reset)));
+            }
+        }
+        let until = until?;
+        if earliest.is_none_or(|(_, previous)| until < previous) {
+            earliest = Some((row, until));
+        }
+    }
+    let (best, until) = earliest?;
+    // Stay on an equally early active account rather than churn on ties.
+    let active_until = [&act.session, &act.weekly]
+        .into_iter()
+        .filter(|c| c.pct.is_some_and(|p| p >= 99.5))
+        .filter_map(|c| c.resets_at)
+        .max()?;
+    if until >= active_until || !provider_supports_swap(&best.provider_id) {
+        return None;
+    }
+    if guard
+        .left_at
+        .get(&best.email)
+        .is_some_and(|t| t.elapsed().as_secs() < NO_RETURN_SECS)
+    {
+        return None;
+    }
+    Some(best)
+}
+
 fn evaluate_swap(
     rows: &[Row],
     active: &str,
@@ -3405,6 +3467,7 @@ fn evaluate_swap(
     guard: &SwapGuard,
 ) -> SwapEval {
     let none = SwapEval {
+        preparing: false,
         target: None,
         blocked_by_cooldown: false,
         target_ignoring_cooldown: None,
@@ -3412,7 +3475,7 @@ fn evaluate_swap(
     let Some(act) = rows.iter().find(|r| r.email == active) else {
         return none;
     };
-    if !act.has_data() {
+    if !act.has_data() || trigger > 100.0 {
         return none;
     }
     // If the active account's provider has its env-override active, the CLI
@@ -3428,7 +3491,7 @@ fn evaluate_swap(
         // ceiling) and a way to actually switch to it. This is the sole
         // capability gate for auto-swap: reporting-only or stub providers
         // never surface here, even if their rows carry a stale utilization.
-        .filter(|r| provider_supports_swap(&r.provider_id))
+        .filter(|r| r.provider_id == act.provider_id && provider_supports_swap(&r.provider_id))
         // Skip candidates the token endpoint has permanently rejected —
         // swapping to a needs-relogin account would just re-write the same
         // dead credentials into the keychain.
@@ -3457,8 +3520,12 @@ fn evaluate_swap(
                 .unwrap_or(true)
         })
         .collect();
-    if candidates.is_empty() {
-        return none;
+    let preparing = candidates.is_empty();
+    if preparing {
+        let Some(target) = earliest_blocked_target(rows, act, guard, Utc::now()) else {
+            return none;
+        };
+        candidates.push(target);
     }
     candidates.sort_by(|a, b| candidate_order(a, b));
     let best = candidates[0];
@@ -3485,12 +3552,14 @@ fn evaluate_swap(
         .unwrap_or(false);
     if cooldown_active {
         SwapEval {
+            preparing,
             target: None,
             blocked_by_cooldown: true,
             target_ignoring_cooldown: Some(best.email.clone()),
         }
     } else {
         SwapEval {
+            preparing,
             target: Some(best.email.clone()),
             blocked_by_cooldown: false,
             target_ignoring_cooldown: Some(best.email.clone()),
@@ -3623,11 +3692,12 @@ fn watch_cycle(
                     .insert(active_email.clone(), std::time::Instant::now());
                 guard.last_swap = Some(std::time::Instant::now());
                 guard.stuck_notified = false;
+                guard.manual_locked_choice = None;
                 prune_swap_guard(guard);
                 log_event(&serde_json::json!({
                     "ts": Utc::now().timestamp(),
                     "event": "swap",
-                    "reason": if proactive { "proactive" } else { "trigger" },
+                    "reason": if eval.preparing { "prepare_reset" } else if proactive { "proactive" } else { "trigger" },
                     "from": active_email,
                     "to": target,
                     "session": pick_s,
@@ -3638,7 +3708,13 @@ fn watch_cycle(
                 } else {
                     "Switched to"
                 };
-                notify(&format!("{verb} {label} — {pick_s:.0}% / {pick_w:.0}%"));
+                if eval.preparing {
+                    notify(&format!(
+                        "Prepared {label} for its next reset — usage is still blocked."
+                    ));
+                } else {
+                    notify(&format!("{verb} {label} — {pick_s:.0}% / {pick_w:.0}%"));
+                }
                 swapped = Some((active_email, target));
             }
             None => {
