@@ -2440,7 +2440,7 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
                     WATCH_INTERVAL_SECS,
                     projected_at_horizon,
                 ) as i64;
-                if age >= 0 && age < floor {
+                if age >= 0 && age < floor && !cache_crossed_reset(cu, Utc::now()) {
                     let projection_note = projected_at_horizon
                         .map(|p| format!(" projected_at_{horizon_secs}s={p:.1}%"))
                         .unwrap_or_default();
@@ -2589,9 +2589,8 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
 }
 
 /// Map a provider [`UsageSnapshot`] into the stored [`CachedUsage`] shape the
-/// menu/list render from: the first window (`primary`) is the session window,
-/// the second (`secondary`) is the weekly one — matching every provider's
-/// `window_order` and how `row_from_provider_account` reads the cache.
+/// menu/list render from. Providers normalize durations to `session`/`weekly`;
+/// `primary`/`secondary` remain aliases for providers using the older contract.
 fn cached_from_usage_snapshot(snap: &UsageSnapshot) -> CachedUsage {
     let mut cu = CachedUsage {
         session_pct: None,
@@ -2617,6 +2616,16 @@ fn cached_from_usage_snapshot(snap: &UsageSnapshot) -> CachedUsage {
         }
     }
     cu
+}
+
+/// A reset boundary invalidates even a recently fetched sample. Let that
+/// account bypass its fetch floor so the boundary wake can confirm recovery.
+fn cache_crossed_reset(cu: &CachedUsage, now: DateTime<Utc>) -> bool {
+    [cu.session_reset.as_deref(), cu.weekly_reset.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|s| DateTime::parse_from_rfc3339(s).ok())
+        .any(|reset| cu.fetched_at < reset.timestamp() && reset <= now)
 }
 
 /// Fetch usage for every captured non-Claude provider account and persist it
@@ -3428,6 +3437,18 @@ fn evaluate_swap(
         // switch to them would be silently ignored by the vendor CLI.
         .filter(|r| !env_override_active(&r.provider_id))
         .filter(|r| r.has_data() && r.email != active && r.eligible_target(ceiling, trigger))
+        // Never infer renewed capacity from a reset clock alone. A successful
+        // post-reset fetch must precede a switch to this account.
+        .filter(|r| {
+            ![r.session.resets_at, r.weekly.resets_at]
+                .into_iter()
+                .flatten()
+                .any(|reset| {
+                    reset <= Utc::now()
+                        && r.fetched_at
+                            .is_none_or(|fetched| fetched < reset.timestamp())
+                })
+        })
         .filter(|r| {
             guard
                 .left_at

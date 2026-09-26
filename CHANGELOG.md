@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-26
+
+### Fixed
+- Codex usage is classified by the reported window duration. Weekly-only
+  accounts now show their quota under Weekly and Session as not reported.
+  Exact server reset timestamps are preferred when available.
+- Exhausted accounts no longer show a misleading 0% session value in the
+  menu bar. The title counts down to the selected provider's earliest usable
+  account, with the account and reset time in the menu and tooltip.
+- When both session and weekly limits are exhausted, availability waits for
+  the later reset. Expired readings show a pending-refresh state until the
+  server confirms renewed capacity.
+- Reset boundaries bypass the usage-cache fetch floor so auto-swap can move
+  to a recovered account after a successful refresh. Stale pre-reset usage
+  cannot qualify an account as a switch target.
+
 ## [0.8.0] - 2026-09-23
 
 ### Fixed
