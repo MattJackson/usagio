@@ -132,7 +132,7 @@ jobs:
 
       - name: Resolve release-notes body path
         # Prefer a hand-drafted packaging/release-notes-<VERSION>.md (see
-        # packaging/release-notes-0.5.0.md) so the release description reads
+        # packaging/release-notes-0.8.3.md) so the release description reads
         # as curated notes rather than GitHub's raw commit-log
         # auto-generation. Falls back to generate_release_notes when no
         # drafted file exists for this version yet.
