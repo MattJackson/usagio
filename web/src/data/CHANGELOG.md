@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-09-26
+
+### Fixed
+- Menu text no longer renders random letters in bold. Regular rows (account
+  emails, countdowns, Settings, Capture current login) could draw individual
+  glyphs at the bold weight, because the menu renderer (muri) leaked the bold
+  font-variation state of a previously drawn glyph into the next one. Fixed
+  upstream in muri 0.14.7; usagio now requires it.
+
 ## [0.8.2] - 2026-09-26
 
 ### Fixed
@@ -1096,7 +1105,8 @@ fixes; every top finding was independently confirmed before fixing.
 - `token` — print a fresh access token for scripting.
 - Local, owner-only token store at `~/.config/claude-usage/state.json` (0600).
 
-[Unreleased]: https://github.com/MattJackson/usagio/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/MattJackson/usagio/compare/v0.8.3...HEAD
+[0.8.3]: https://github.com/MattJackson/usagio/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/MattJackson/usagio/compare/v0.8.1...v0.8.2
 [0.5.0]: https://github.com/MattJackson/usagio/compare/v0.4.3...v0.5.0
 [0.4.0]: https://github.com/MattJackson/claude-usage/compare/v0.3.1...v0.4.0
