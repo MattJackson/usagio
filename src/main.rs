@@ -541,13 +541,13 @@ fn cmd_list(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    // Claude accounts (state v1 `accounts` bucket). Order by the same auto-pick
-    // priority the menu uses (best switch target first, maxed/no-data accounts
-    // sinking) instead of raw insertion order, so `usagio list` and the menu
-    // bar agree on account order (user report: "account ordering seems off").
+    // Claude accounts (state v1 `accounts` bucket). Ordered by `menu_order`,
+    // the same rule the menu bar uses, so `usagio list` and the menu agree on
+    // account order (user report: "account ordering seems off").
     if !no_claude {
         let mut rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
-        rows.sort_by(menu_order);
+        let now = Utc::now();
+        rows.sort_by(|a, b| menu_order(a, b, state.active.as_deref(), now));
         render_table(&rows, state.active.as_deref());
     }
 
@@ -575,7 +575,8 @@ fn cmd_list(args: &[String]) -> Result<()> {
             .iter()
             .map(|a| row_from_provider_account(slug, a))
             .collect();
-        rows.sort_by(menu_order);
+        let now = Utc::now();
+        rows.sort_by(|a, b| menu_order(a, b, pa.active.as_deref(), now));
         println!("\n{}:", provider.display_name());
         render_table(&rows, pa.active.as_deref());
     }
@@ -1519,19 +1520,45 @@ fn candidate_order(a: &Row, b: &Row) -> std::cmp::Ordering {
     )
 }
 
-/// Order accounts for the menu the way auto-pick prioritizes them: the account
-/// you'd switch to first on top, then the rest by the same rule, with unusable
-/// ones (maxed out, or no data yet) sinking to the bottom. Used by BOTH the
-/// menu bar and `usagio list` so the two surfaces present accounts in the same
-/// order.
-pub(crate) fn menu_order(a: &Row, b: &Row) -> std::cmp::Ordering {
-    // Usable (has data + room) before unusable; then accounts with data before
-    // those without; then the normal auto-pick priority within each group.
-    let usable = |r: &Row| r.has_data() && r.available();
-    usable(b)
-        .cmp(&usable(a))
-        .then_with(|| b.has_data().cmp(&a.has_data()))
-        .then_with(|| candidate_order(a, b))
+/// Order accounts for `usagio list` exactly like the menu bar's
+/// `account_priority_cmp`, so the two surfaces always agree:
+///   1. Locked-and-not-active sinks to the bottom (an active locked account
+///      stays in normal rotation).
+///   2. Sunk accounts by unlock time (soonest usable first); everyone else by
+///      soonest weekly reset. No reset time sorts last within its rank.
+///   3. More headroom first.
+///   4. Email ascending.
+pub(crate) fn menu_order(
+    a: &Row,
+    b: &Row,
+    active: Option<&str>,
+    now: DateTime<Utc>,
+) -> std::cmp::Ordering {
+    let locked_until = |r: &Row| {
+        if active == Some(r.email.as_str()) {
+            return None;
+        }
+        match countdown::compute_display(&row_to_account_usage(r), now) {
+            countdown::DisplayState::Locked { until, .. } => Some(until),
+            _ => None,
+        }
+    };
+    let key = |r: &Row| {
+        let lu = locked_until(r);
+        (
+            lu.is_some(),
+            lu.or(r.weekly.resets_at)
+                .unwrap_or(DateTime::<Utc>::MAX_UTC),
+        )
+    };
+    key(a)
+        .cmp(&key(b))
+        .then(
+            b.headroom()
+                .partial_cmp(&a.headroom())
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+        .then_with(|| a.email.cmp(&b.email))
 }
 
 /// Switch to the account auto-pick considers best right now (the one with room

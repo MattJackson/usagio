@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `usagio list` now orders accounts exactly like the menu bar: locked accounts
+  sink below usable ones and are ordered by when they unlock, the active
+  account stays in normal rotation, and everything else orders by soonest
+  weekly reset.
+
 ## [0.8.4] - 2026-09-27
 
 ### Fixed

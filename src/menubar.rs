@@ -40,9 +40,9 @@ use crate::countdown::{self, AccountUsage, BlockingWindow, DisplayState};
 use crate::providers::{self, CaptureMode, Provider, SeverityBands};
 use crate::store::State;
 use crate::{
-    age_str, capture_current, capture_current_generic, env_override_active, menu_order,
-    next_interval, notify, optimize_now, remove_account, remove_provider_account_generic,
-    row_from_account, row_from_provider_account, set_current_loop_interval_secs, switch_to,
+    age_str, capture_current, capture_current_generic, env_override_active, next_interval, notify,
+    optimize_now, remove_account, remove_provider_account_generic, row_from_account,
+    row_from_provider_account, set_current_loop_interval_secs, switch_to,
     switch_to_provider_account, watch_cycle, with_state_lock, Row, SwapGuard, CLAUDE_SLUG,
     TARGET_CEILING_PCT, TRIGGER_PCT, WATCH_INTERVAL_SECS,
 };
@@ -1598,7 +1598,6 @@ fn build_snapshot() -> Snapshot {
                 .map(|a| row_from_provider_account(slug, a)),
         );
     }
-    rows.sort_by(menu_order);
 
     let mut sections: Vec<ProviderSection> = Vec::new();
     for provider in providers::all() {
@@ -4603,8 +4602,7 @@ mod tests {
     fn build_snapshot_sorts_active_first_within_a_section() {
         // `build_snapshot` orders accounts so the active row renders first
         // within each provider block — the "active-first ordering" rule from
-        // the redesign spec. We assert on the sort key `menu_order` cannot
-        // itself provide (it doesn't know about `active`).
+        // the redesign spec.
         let mut a1 = acct("second@x.com", Some(10.0), Some(20.0), false);
         a1.active = false;
         let mut a2 = acct("active@x.com", Some(50.0), Some(60.0), true);

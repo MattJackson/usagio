@@ -302,7 +302,7 @@ fn menu_order_lists_use_first_account_first() {
         row_full("later@e.com", 5.0, 5.0, later),
         row_full("soon@e.com", 40.0, 40.0, soon),
     ];
-    rows.sort_by(menu_order);
+    rows.sort_by(|a, b| menu_order(a, b, None, Utc::now()));
     // Soonest weekly reset (the account auto-pick would use first) leads.
     assert_eq!(rows[0].email, "soon@e.com");
     assert_eq!(rows[1].email, "later@e.com");
@@ -312,13 +312,42 @@ fn menu_order_lists_use_first_account_first() {
 fn menu_order_sinks_maxed_accounts_below_usable_ones() {
     let reset = Utc::now() + Duration::hours(6);
     // A maxed account resets soonest, but it's unusable — it must sort last.
+    let mut maxed = row_full("maxed@e.com", 100.0, 40.0, reset);
+    maxed.session.resets_at = Some(Utc::now() + Duration::hours(1));
     let mut rows = [
-        row_full("maxed@e.com", 100.0, 40.0, reset),
+        maxed,
         row_full("free@e.com", 30.0, 30.0, Utc::now() + Duration::hours(24)),
     ];
-    rows.sort_by(menu_order);
+    rows.sort_by(|a, b| menu_order(a, b, None, Utc::now()));
     assert_eq!(rows[0].email, "free@e.com");
     assert_eq!(rows[1].email, "maxed@e.com");
+}
+
+#[test]
+fn menu_order_sorts_locked_accounts_by_unlock_time() {
+    let now = Utc::now();
+    // Weekly-locked, unlocks in 38h (its weekly reset is the soonest).
+    let weekly_locked = row_full("weekly@e.com", 10.0, 100.0, now + Duration::hours(38));
+    // Session-locked, unlocks in 2h, weekly reset 5d out — usable first.
+    let mut session_locked = row_full("session@e.com", 100.0, 53.0, now + Duration::days(5));
+    session_locked.session.resets_at = Some(now + Duration::hours(2));
+    let mut rows = [weekly_locked, session_locked];
+    rows.sort_by(|a, b| menu_order(a, b, None, now));
+    assert_eq!(rows[0].email, "session@e.com");
+    assert_eq!(rows[1].email, "weekly@e.com");
+}
+
+#[test]
+fn menu_order_keeps_active_locked_account_in_rotation() {
+    let now = Utc::now();
+    // Active and locked: not sunk, so its sooner weekly reset puts it first.
+    let mut locked = row_full("active@e.com", 100.0, 40.0, now + Duration::hours(6));
+    locked.session.resets_at = Some(now + Duration::hours(1));
+    let free = row_full("free@e.com", 30.0, 30.0, now + Duration::hours(24));
+    let mut rows = [free, locked];
+    rows.sort_by(|a, b| menu_order(a, b, Some("active@e.com"), now));
+    assert_eq!(rows[0].email, "active@e.com");
+    assert_eq!(rows[1].email, "free@e.com");
 }
 
 // --- choose_swap_target (auto-swap guard) ---
