@@ -54,7 +54,7 @@ pub(crate) fn set_home_override(p: Option<PathBuf>) {
 /// The last usage snapshot fetched for an account. Written only by the
 /// scheduler's poll; read (never fetched) by `list`, `switch`, and the menu bar
 /// so ad-hoc commands never hit the usage API (and never trigger HTTP 429).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CachedUsage {
     #[serde(default)]
     pub session_pct: Option<f64>,
@@ -70,6 +70,14 @@ pub struct CachedUsage {
     pub opus_reset: Option<String>,
     /// Unix epoch seconds when this snapshot was fetched.
     pub fetched_at: i64,
+    /// Credits / breakdown / scoped limits the provider reported with this
+    /// snapshot. Absent in state written before these existed (defaults to
+    /// empty) and omitted from state.json when there's nothing to keep.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::providers::trait_def::ReportedUsage::is_empty"
+    )]
+    pub reported: crate::providers::trait_def::ReportedUsage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

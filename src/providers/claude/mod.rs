@@ -287,20 +287,21 @@ impl Provider for ClaudeProvider {
     fn fetch_usage(&self, access_token: &str) -> PResult<UsageSnapshot> {
         let u = usage::fetch(access_token).map_err(map_usage_error)?;
         let mut windows: Vec<UsageWindow> = Vec::new();
-        if let Some(w) = u.five_hour {
-            windows.push(claude_window("session", "5h", &w));
+        if let Some(w) = &u.five_hour {
+            windows.push(claude_window("session", "5h", w));
         }
-        if let Some(w) = u.seven_day {
-            windows.push(claude_window("weekly", "7d", &w));
+        if let Some(w) = &u.seven_day {
+            windows.push(claude_window("weekly", "7d", w));
         }
-        if let Some(w) = u.seven_day_opus {
-            windows.push(claude_window("opus", "Opus 7d", &w));
+        if let Some(w) = &u.seven_day_opus {
+            windows.push(claude_window("opus", "Opus 7d", w));
         }
         Ok(UsageSnapshot {
             windows,
             fetched_at: Utc::now(),
             // Claude's usage response carries no plan; see `check_plan`.
             plan: None,
+            reported: usage::reported_usage(&u),
         })
     }
 

@@ -1041,3 +1041,101 @@ fn from_value_keeps_distinct_accounts_untouched() {
     assert!(s.find("a@example.com").is_some());
     assert!(s.find("b@example.com").is_some());
 }
+
+// ---------------------------------------------------------------------------
+// Provider-reported extras on CachedUsage (credits / breakdown / scoped limits)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn claude_cached_usage_without_reported_field_still_loads() {
+    // A Claude cache written before `CachedUsage::reported` existed goes
+    // through the hand-written v1 loader; it must survive with the reported
+    // extras simply empty.
+    let old = serde_json::json!({
+        "accounts": [{
+            "email": "dev@getbusbar.com",
+            "access_token": "a1",
+            "refresh_token": "r1",
+            "expires_at": 1_700_000_000_000i64,
+            "keychain_blob": "{}",
+            "cached_usage": {
+                "session_pct": 42.0,
+                "weekly_pct": 61.0,
+                "fetched_at": 1_757_000_000i64
+            }
+        }]
+    });
+    let s = State::from_value(&old);
+    let cu = s
+        .find("dev@getbusbar.com")
+        .unwrap()
+        .cached_usage
+        .clone()
+        .unwrap();
+    assert_eq!(cu.weekly_pct, Some(61.0));
+    assert!(cu.reported.is_empty());
+}
+
+#[test]
+fn provider_cached_usage_without_reported_field_still_loads() {
+    // Empty extras are never written, so this serialized state is exactly the
+    // pre-feature shape of a generic provider account's cache.
+    let mut p = provider_account("c@example.com");
+    p.cached_usage = Some(CachedUsage {
+        weekly_pct: Some(12.0),
+        fetched_at: 1_757_000_000,
+        ..Default::default()
+    });
+    let mut s = State::default();
+    s.upsert_provider_account("codex", p);
+    let v = serde_json::to_value(&s).unwrap();
+    let cache = &v["providers"]["codex"]["accounts"][0]["cached_usage"];
+    assert!(cache.is_object(), "{v}");
+    assert!(cache.get("reported").is_none(), "{cache}");
+
+    let reloaded = State::from_value(&v);
+    let cu = reloaded
+        .find_provider_account("codex", "c@example.com")
+        .unwrap()
+        .cached_usage
+        .clone()
+        .unwrap();
+    assert_eq!(cu.weekly_pct, Some(12.0));
+    assert!(cu.reported.is_empty());
+}
+
+#[test]
+fn reported_usage_round_trips_through_state() {
+    use crate::providers::trait_def::{Credits, Money, ReportedUsage, UsageShare};
+    let reported = ReportedUsage {
+        credits: Some(Credits {
+            enabled: true,
+            used: Money::new(310, 2, "USD"),
+            ..Credits::default()
+        }),
+        breakdown: vec![UsageShare {
+            key: "chat".into(),
+            label: "Chats".into(),
+            percent: 18.0,
+        }],
+        scoped_limits: vec![],
+    };
+    let mut a = acct("dev@getbusbar.com");
+    a.cached_usage = Some(CachedUsage {
+        weekly_pct: Some(5.0),
+        fetched_at: 1,
+        reported: reported.clone(),
+        ..Default::default()
+    });
+    let mut s = State::default();
+    s.upsert(a);
+    let v = serde_json::to_value(&s).unwrap();
+    let reloaded = State::from_value(&v);
+    let cu = reloaded
+        .find("dev@getbusbar.com")
+        .unwrap()
+        .cached_usage
+        .clone()
+        .unwrap();
+    assert_eq!(cu.reported, reported);
+}

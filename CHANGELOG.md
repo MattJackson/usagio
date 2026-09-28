@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- The account submenu now shows usage figures the provider itself reports,
+  and only when there's something to show:
+  - Credits / extra-usage spend, e.g. "Credits · $12.34 used of $50.00",
+    "Credits · 120 left" (Codex credits), or "Credits · limit reached".
+  - Where this week's usage went, when it's split across more than one
+    product, e.g. "This week · Claude Code 82% · Chats 18%".
+  - Per-model weekly limits once they're in use, e.g. "Fable 7d · 42%".
+
 ### Fixed
 - Every provider's header in the menu is now the same plain label row with
   its icon. A provider used to turn into a dropdown (and lose its icon)

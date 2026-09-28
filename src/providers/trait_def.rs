@@ -122,6 +122,174 @@ pub struct UsageSnapshot {
     /// see [`Provider::check_plan`].
     #[serde(default)]
     pub plan: Option<PlanStatus>,
+    /// Extra figures the provider itself reported alongside the windows
+    /// (credits, where the week's usage went, per-model limits). Never an
+    /// estimate — empty when the provider reported nothing meaningful.
+    #[serde(default)]
+    pub reported: ReportedUsage,
+}
+
+/// Provider-reported extras beyond the fixed session/weekly windows. Every
+/// provider fills the parts its API exposes; the menu renders them once,
+/// generically. All fields default so a cache written before they existed
+/// (or a provider that reports none of them) round-trips cleanly.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReportedUsage {
+    /// Credits / extra-usage spend, when the provider reports any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<Credits>,
+    /// How this week's usage splits across the provider's products/surfaces
+    /// (Claude: Claude Code / Chats / Cowork / Other), in provider order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub breakdown: Vec<UsageShare>,
+    /// Extra limits scoped to one model or surface (e.g. a "Fable" weekly
+    /// bucket), beyond the fixed windows. `label` is display-ready.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scoped_limits: Vec<UsageWindow>,
+}
+
+impl ReportedUsage {
+    pub fn is_empty(&self) -> bool {
+        self.credits.is_none() && self.breakdown.is_empty() && self.scoped_limits.is_empty()
+    }
+}
+
+/// An exact amount of money or credits: `amount_minor / 10^exponent` in
+/// `unit`. Kept in integer minor units so formatting never drifts through a
+/// float. `unit` is an ISO currency code ("USD") or [`Money::CREDITS`] for a
+/// provider's own credit unit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Money {
+    pub amount_minor: i64,
+    #[serde(default)]
+    pub exponent: u32,
+    pub unit: String,
+}
+
+impl Money {
+    /// `unit` for amounts in a provider's own credits rather than a currency.
+    pub const CREDITS: &'static str = "credits";
+    /// Largest exponent we'll format; anything bigger is a garbled response.
+    const MAX_EXPONENT: u32 = 12;
+
+    pub fn new(amount_minor: i64, exponent: u32, unit: impl Into<String>) -> Option<Self> {
+        (exponent <= Self::MAX_EXPONENT).then(|| Money {
+            amount_minor,
+            exponent,
+            unit: unit.into(),
+        })
+    }
+
+    /// Parse a plain decimal string ("120", "12.50", "-3.1") exactly.
+    /// Anything else (exponents, junk, too many digits) is `None`.
+    pub fn from_decimal_str(s: &str, unit: impl Into<String>) -> Option<Self> {
+        let s = s.trim();
+        let (neg, digits) = match s.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, s),
+        };
+        let (int, frac) = digits.split_once('.').unwrap_or((digits, ""));
+        if int.is_empty() && frac.is_empty() {
+            return None;
+        }
+        if !int.chars().chain(frac.chars()).all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let exponent = u32::try_from(frac.len()).ok()?;
+        let joined = format!("{int}{frac}");
+        let mut amount: i64 = if joined.is_empty() {
+            0
+        } else {
+            joined.parse().ok()?
+        };
+        if neg {
+            amount = -amount;
+        }
+        Money::new(amount, exponent, unit)
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.amount_minor == 0
+    }
+
+    /// Display form: "$12.34", "€5.00", "12.34 CAD", or "120" for credits.
+    pub fn display(&self) -> String {
+        let scale = 10i128.pow(self.exponent);
+        let abs = i128::from(self.amount_minor).abs();
+        let whole = abs / scale;
+        let number = if self.exponent == 0 {
+            whole.to_string()
+        } else {
+            format!(
+                "{whole}.{:0width$}",
+                abs % scale,
+                width = self.exponent as usize
+            )
+        };
+        let sign = if self.amount_minor < 0 { "-" } else { "" };
+        let symbol = match self.unit.to_ascii_uppercase().as_str() {
+            "USD" => Some("$"),
+            "EUR" => Some("€"),
+            "GBP" => Some("£"),
+            _ => None,
+        };
+        match symbol {
+            Some(sym) => format!("{sign}{sym}{number}"),
+            None if self.unit.eq_ignore_ascii_case(Self::CREDITS) || self.unit.is_empty() => {
+                format!("{sign}{number}")
+            }
+            None => format!("{sign}{number} {}", self.unit),
+        }
+    }
+}
+
+/// Credits / extra-usage spend as the provider reports it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Credits {
+    /// Credits / extra usage is switched on for the account.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The provider reports unlimited credits.
+    #[serde(default)]
+    pub unlimited: bool,
+    /// The spend cap / overage limit has been hit.
+    #[serde(default)]
+    pub limit_reached: bool,
+    /// Spent so far in the current period.
+    #[serde(default)]
+    pub used: Option<Money>,
+    /// The spend cap for the period.
+    #[serde(default)]
+    pub limit: Option<Money>,
+    /// Remaining prepaid balance.
+    #[serde(default)]
+    pub balance: Option<Money>,
+}
+
+impl Credits {
+    /// Worth showing at all: switched on, capped, or carrying a non-zero
+    /// figure. An all-off, all-zero report is noise and maps to `None`.
+    pub fn is_meaningful(&self) -> bool {
+        self.enabled
+            || self.unlimited
+            || self.limit_reached
+            || [&self.used, &self.limit, &self.balance]
+                .into_iter()
+                .flatten()
+                .any(|m| !m.is_zero())
+    }
+}
+
+/// One product/surface's share of the week's usage, as the provider reports it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UsageShare {
+    /// Provider's stable key ("claude_code", "chat", …).
+    #[serde(default)]
+    pub key: String,
+    /// Display name ("Claude Code", "Chats", …).
+    pub label: String,
+    /// Share of the week's usage, `0.0..=100.0`.
+    pub percent: f64,
 }
 
 /// What plan an account is on, and whether it still pays for one. A lapsed
@@ -532,6 +700,77 @@ fn short_hash(v: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn money_displays_exactly_from_minor_units() {
+        let m = |a, e, u| Money::new(a, e, u).unwrap().display();
+        assert_eq!(m(1234, 2, "USD"), "$12.34");
+        assert_eq!(m(5, 2, "usd"), "$0.05");
+        assert_eq!(m(0, 2, "USD"), "$0.00");
+        assert_eq!(m(-310, 2, "USD"), "-$3.10");
+        assert_eq!(m(500, 2, "EUR"), "€5.00");
+        assert_eq!(m(1999, 2, "CAD"), "19.99 CAD");
+        assert_eq!(m(120, 0, Money::CREDITS), "120");
+        // Past f64's exact-integer range: no float drift.
+        assert_eq!(m(9_007_199_254_740_993, 2, "USD"), "$90071992547409.93");
+        assert!(Money::new(1, 13, "USD").is_none());
+    }
+
+    #[test]
+    fn money_parses_decimal_strings_exactly() {
+        let p = |s| Money::from_decimal_str(s, Money::CREDITS);
+        assert_eq!(p("120").unwrap(), Money::new(120, 0, "credits").unwrap());
+        assert_eq!(p("12.50").unwrap(), Money::new(1250, 2, "credits").unwrap());
+        assert_eq!(p(" -3.1 ").unwrap(), Money::new(-31, 1, "credits").unwrap());
+        assert_eq!(p(".5").unwrap(), Money::new(5, 1, "credits").unwrap());
+        for bad in [
+            "",
+            ".",
+            "1e3",
+            "abc",
+            "1.2.3",
+            "--1",
+            "99999999999999999999",
+        ] {
+            assert!(p(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn credits_meaningful_only_when_on_or_non_zero() {
+        assert!(!Credits::default().is_meaningful());
+        let zero = Credits {
+            used: Money::new(0, 2, "USD"),
+            balance: Money::new(0, 0, Money::CREDITS),
+            ..Credits::default()
+        };
+        assert!(!zero.is_meaningful());
+        assert!(Credits {
+            enabled: true,
+            ..Credits::default()
+        }
+        .is_meaningful());
+        assert!(Credits {
+            limit_reached: true,
+            ..Credits::default()
+        }
+        .is_meaningful());
+        assert!(Credits {
+            used: Money::new(1, 2, "USD"),
+            ..Credits::default()
+        }
+        .is_meaningful());
+    }
+
+    #[test]
+    fn usage_snapshot_without_reported_field_deserializes() {
+        let snap: UsageSnapshot = serde_json::from_value(json!({
+            "windows": [],
+            "fetched_at": "2026-09-27T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(snap.reported.is_empty());
+    }
 
     /// A minimal in-test provider used to check the default trait method
     /// implementations behave as documented.
