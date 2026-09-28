@@ -167,6 +167,12 @@ struct AcctView {
     /// as the reason line under a `⚠ error` trailing when `needs_relogin` is not
     /// set. `None` in the common healthy case.
     error: Option<String>,
+    /// The account's subscription lapsed: its cached usage (and reset
+    /// countdowns) are meaningless, so the row shows a red "-" and the
+    /// submenu explains instead.
+    no_subscription: bool,
+    /// Plan label ("Max 20x", "Pro", "Free", …) when known.
+    plan: Option<String>,
 }
 
 /// One provider's block in the menu. Rendered only if `accounts` is non-empty
@@ -536,6 +542,10 @@ fn trailing_for_account(
         let t = "⚠ error".to_string();
         let len = u16len(&t);
         return (t, vec![(0, len, Severity::Red)]);
+    }
+    // No plan, no usage: a countdown to a reset that frees nothing would lie.
+    if a.no_subscription {
+        return ("-".to_string(), vec![(0, 1, Severity::Red)]);
     }
     match countdown::compute_display(&account_usage_for(a), now) {
         DisplayState::Locked {
@@ -1482,6 +1492,15 @@ fn env_override_for(provider_id: &str) -> bool {
 /// NOT active-first: the active account ranks on its own priority, one stable
 /// rule for everyone (user decision — matches the auto-swap target priority).
 fn account_priority_cmp(a: &AcctView, b: &AcctView, now: DateTime<Utc>) -> std::cmp::Ordering {
+    // Lapsed subscriptions always sink to the bottom, alphabetically (even the
+    // active one) — their cached usage/resets are meaningless. Mirrors
+    // `crate::menu_order` so `usagio list` agrees.
+    match (a.no_subscription, b.no_subscription) {
+        (true, true) => return a.key.cmp(&b.key),
+        (true, false) => return std::cmp::Ordering::Greater,
+        (false, true) => return std::cmp::Ordering::Less,
+        (false, false) => {}
+    }
     let locked_until = |x: &AcctView| match countdown::compute_display(&account_usage_for(x), now) {
         DisplayState::Locked { until, .. } if !x.active => Some(until),
         _ => None,
@@ -1610,6 +1629,8 @@ fn acctview_from_row(
             .and_then(|t| chrono::DateTime::from_timestamp(t, 0)),
         needs_relogin: r.needs_relogin,
         error: r.error.clone(),
+        no_subscription: r.no_subscription,
+        plan: r.plan.clone(),
     }
 }
 
@@ -1908,6 +1929,21 @@ fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
         rows.push(format!("⚠ Refresh error: {err}"));
         return rows;
     }
+    if a.no_subscription {
+        rows.push(format!(
+            "No subscription · {} plan",
+            a.plan.as_deref().unwrap_or("Free")
+        ));
+        rows.push("Usage checks paused — renew to use this account".to_string());
+        rows.push(format!(
+            "Rechecked every {}m; resumes when a plan is back",
+            crate::SUBSCRIPTION_RECHECK_SECS / 60
+        ));
+        return rows;
+    }
+    if let Some(plan) = &a.plan {
+        rows.push(format!("Plan · {plan}"));
+    }
     if sec.supports_usage {
         if a.has_data && !a.windows.is_empty() {
             // A window at 100% is the binding lock — lead with it (that's the
@@ -1955,7 +1991,7 @@ fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
 /// `submenu_info_rows` block.
 fn account_extra_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
     let mut rows = Vec::new();
-    if sec.supports_usage && a.has_data && !a.windows.is_empty() {
+    if sec.supports_usage && a.has_data && !a.windows.is_empty() && !a.no_subscription {
         let account_key =
             crate::usage_log::AccountKey::new(sec.provider_id.to_string(), a.key.clone());
         // The burn-rate row forecasts when the WEEKLY window empties ("Weekly ·
@@ -2008,8 +2044,11 @@ struct AccountSubmenuRows {
 
 fn account_submenu_rows(sec: &ProviderSection, a: &AcctView) -> AccountSubmenuRows {
     AccountSubmenuRows {
-        switch_row: sec.supports_switching.then_some(a.active),
-        launch_row: sec.supports_launch,
+        // A lapsed plan can't serve requests: no Switch/Launch into it (the
+        // active one still shows "✓ Active" so it's clear where you are).
+        switch_row: (sec.supports_switching && (a.active || !a.no_subscription))
+            .then_some(a.active),
+        launch_row: sec.supports_launch && !a.no_subscription,
         remove_row: sec.supports_remove,
     }
 }
@@ -2078,8 +2117,18 @@ fn menu_signature(snap: &Snapshot) -> String {
                 }
             };
             s.push_str(&format!(
-                "{}@{}/{}|{}|{}|sr={}|wr={}|{}|",
-                a.provider_id, sec.provider_id, a.key, a.active, a.has_data, sr, wr, lock,
+                "{}@{}/{}|{}|{}|sr={}|wr={}|{}|rl={}|ns={}|plan={}|",
+                a.provider_id,
+                sec.provider_id,
+                a.key,
+                a.active,
+                a.has_data,
+                sr,
+                wr,
+                lock,
+                a.needs_relogin,
+                a.no_subscription,
+                a.plan.as_deref().unwrap_or(""),
             ));
             for w in &a.windows {
                 s.push_str(&format!(
@@ -2138,6 +2187,12 @@ fn recovery_status(
             format!("{} · Refresh error", active.display),
         ));
     }
+    if active.no_subscription {
+        return Some((
+            "No plan".into(),
+            format!("{} · No subscription", active.display),
+        ));
+    }
     let state = countdown::compute_display(&account_usage_for(active), now);
     if matches!(state, DisplayState::Usage { .. })
         && !acct_max_pct(active).is_some_and(|p| p >= 99.5)
@@ -2147,7 +2202,11 @@ fn recovery_status(
     let mut earliest: Option<(&AcctView, DateTime<Utc>)> = None;
     let mut pending = None;
     for account in &sec.accounts {
-        if account.needs_relogin || account.error.is_some() || !account.has_data {
+        if account.needs_relogin
+            || account.error.is_some()
+            || account.no_subscription
+            || !account.has_data
+        {
             continue;
         }
         if account.key != active.key && (!sec.supports_switching || sec.env_override_active) {
@@ -3362,6 +3421,8 @@ mod tests {
             // error trailing set these directly.
             needs_relogin: false,
             error: None,
+            no_subscription: false,
+            plan: None,
         }
     }
 
@@ -3774,6 +3835,80 @@ mod tests {
         assert_eq!(trailing, "⚠ error");
         assert_eq!(colors.len(), 1);
         assert_eq!(colors[0].2, Severity::Red);
+    }
+
+    #[test]
+    fn lapsed_subscription_trailing_is_red_dash_not_countdown() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let reset = now + chrono::Duration::days(4);
+        with_now(now, || {
+            let mut a = acct_with_resets(
+                "lapsed@x.com",
+                Some(0.0),
+                Some(100.0),
+                false,
+                None,
+                Some(reset),
+            );
+            a.no_subscription = true;
+            let (trailing, colors) = trailing_for_account(&a, bands(), now);
+            assert_eq!(trailing, "-");
+            assert_eq!(colors, vec![(0, 1, Severity::Red)]);
+        });
+    }
+
+    #[test]
+    fn lapsed_subscription_submenu_explains_instead_of_window_rows() {
+        let mut a = acct("lapsed@x.com", Some(0.0), Some(100.0), false);
+        a.no_subscription = true;
+        a.plan = Some("Free".into());
+        let rows = submenu_info_rows(&claude_section(), &a);
+        assert!(rows[0].contains("No subscription"), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("Free")), "{rows:?}");
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains("resets in") || r.contains("limit")),
+            "no stale window rows: {rows:?}"
+        );
+        assert!(account_extra_info_rows(&claude_section(), &a).is_empty());
+    }
+
+    #[test]
+    fn lapsed_subscription_hides_switch_and_launch() {
+        let mut sec = claude_section();
+        sec.supports_switching = true;
+        sec.supports_launch = true;
+        let mut a = acct("lapsed@x.com", Some(0.0), Some(0.0), false);
+        a.no_subscription = true;
+        let rows = account_submenu_rows(&sec, &a);
+        assert_eq!(rows.switch_row, None);
+        assert!(!rows.launch_row);
+        // Still active → keep the "✓ Active" marker.
+        a.active = true;
+        assert_eq!(account_submenu_rows(&sec, &a).switch_row, Some(true));
+    }
+
+    #[test]
+    fn submenu_leads_with_plan_when_known() {
+        let mut a = acct("max@x.com", Some(10.0), Some(20.0), false);
+        a.plan = Some("Max 20x".into());
+        let rows = submenu_info_rows(&claude_section(), &a);
+        assert_eq!(rows[0], "Plan · Max 20x");
+    }
+
+    #[test]
+    fn priority_order_sinks_lapsed_accounts_alphabetically() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let mut zed = acct("zed@x.com", Some(0.0), Some(0.0), true);
+        zed.no_subscription = true;
+        let mut abe = acct("abe@x.com", Some(0.0), Some(0.0), false);
+        abe.no_subscription = true;
+        let live = acct("live@x.com", Some(90.0), Some(90.0), false);
+        let mut v = [zed, live, abe];
+        v.sort_by(|a, b| account_priority_cmp(a, b, now));
+        let keys: Vec<&str> = v.iter().map(|a| a.key.as_str()).collect();
+        assert_eq!(keys, ["live@x.com", "abe@x.com", "zed@x.com"]);
     }
 
     #[test]

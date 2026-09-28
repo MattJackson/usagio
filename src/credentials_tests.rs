@@ -470,6 +470,8 @@ fn refresh_inactive_if_stale_skips_currently_active_account() {
                 cached_usage: None,
                 notif_state: crate::notifications::NotifState::default(),
                 needs_relogin: false,
+                no_subscription: false,
+                plan: None,
             };
             st.accounts.push(a);
             st.active = Some("only@e.com".into());
@@ -510,6 +512,8 @@ fn far_future_account(email: &str) -> crate::store::Account {
         cached_usage: None,
         notif_state: crate::notifications::NotifState::default(),
         needs_relogin: false,
+        no_subscription: false,
+        plan: None,
     }
 }
 
