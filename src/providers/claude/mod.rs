@@ -299,7 +299,13 @@ impl Provider for ClaudeProvider {
         Ok(UsageSnapshot {
             windows,
             fetched_at: Utc::now(),
+            // Claude's usage response carries no plan; see `check_plan`.
+            plan: None,
         })
+    }
+
+    fn check_plan(&self, access_token: &str) -> Option<crate::providers::trait_def::PlanStatus> {
+        usage::plan_status_from_profile(&usage::fetch_profile(access_token)?)
     }
 
     // --- Switching ----------------------------------------------------------
@@ -629,6 +635,7 @@ fn map_usage_error(e: usage::FetchError) -> ProviderError {
         },
         usage::FetchError::Auth => ProviderError::Auth,
         usage::FetchError::Transient(s) => ProviderError::Transient(s),
+        usage::FetchError::Forbidden => ProviderError::Other(e.to_string()),
         usage::FetchError::Other(s) => ProviderError::Other(s),
     }
 }

@@ -82,3 +82,64 @@ fn usage_window_defaults_when_fields_absent() {
     assert!(u.five_hour.as_ref().unwrap().utilization.is_none());
     assert!(u.five_hour.as_ref().unwrap().resets_at.is_none());
 }
+
+#[test]
+fn subscription_active_for_paid_org() {
+    assert_eq!(
+        subscription_active_from_profile(&sample_profile()),
+        Some(true)
+    );
+}
+
+#[test]
+fn subscription_lapsed_when_org_dropped_to_free() {
+    // The shape a Max account's profile took after its plan expired.
+    let p = serde_json::json!({
+        "account": { "email": "dev@example.com", "has_claude_max": false, "has_claude_pro": false },
+        "organization": {
+            "organization_type": "claude_free",
+            "billing_type": "none",
+            "subscription_status": "canceled"
+        }
+    });
+    assert_eq!(subscription_active_from_profile(&p), Some(false));
+}
+
+#[test]
+fn subscription_lapsed_on_terminal_status_alone() {
+    let mut p = sample_profile();
+    p["organization"]["subscription_status"] = "unpaid".into();
+    assert_eq!(subscription_active_from_profile(&p), Some(false));
+}
+
+#[test]
+fn subscription_active_while_status_active() {
+    let mut p = sample_profile();
+    p["organization"]["subscription_status"] = "active".into();
+    assert_eq!(subscription_active_from_profile(&p), Some(true));
+}
+
+#[test]
+fn subscription_unknown_without_organization() {
+    let p = serde_json::json!({ "account": { "email": "e@x.com" } });
+    assert_eq!(subscription_active_from_profile(&p), None);
+}
+
+#[test]
+fn plan_label_maps_org_type_and_tier() {
+    assert_eq!(
+        plan_label(Some("claude_max"), Some("default_claude_max_20x")).as_deref(),
+        Some("Max 20x")
+    );
+    assert_eq!(
+        plan_label(Some("claude_max"), Some("default_claude_max_5x")).as_deref(),
+        Some("Max 5x")
+    );
+    assert_eq!(plan_label(Some("claude_pro"), None).as_deref(), Some("Pro"));
+    assert_eq!(
+        plan_label(Some("claude_free"), None).as_deref(),
+        Some("Free")
+    );
+    assert_eq!(plan_label(Some("something_new"), None), None);
+    assert_eq!(plan_label(None, None), None);
+}

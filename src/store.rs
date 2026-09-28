@@ -111,6 +111,19 @@ pub struct Account {
     /// Cleared on any successful refresh or fresh capture.
     #[serde(default)]
     pub needs_relogin: bool,
+    /// True while the account's Claude subscription has lapsed (the usage
+    /// endpoint answers 403/429 and the profile shows a free/canceled org).
+    /// When set: the poller stops calling the usage endpoint for it (those
+    /// calls only burn the request budget and come back 429) and instead
+    /// re-checks the profile on a slow cadence, clearing the flag the moment
+    /// a plan is back; the menu and `usagio list` show "no subscription";
+    /// auto-swap skips it.
+    #[serde(default)]
+    pub no_subscription: bool,
+    /// Last plan label the provider reported ("Max 20x", "Pro", …); falls
+    /// back to the captured `oauth_account` when never checked.
+    #[serde(default)]
+    pub plan: Option<String>,
 }
 
 impl Account {
@@ -144,6 +157,8 @@ impl Account {
             cached_usage: None,
             notif_state: crate::notifications::NotifState::default(),
             needs_relogin: false,
+            no_subscription: false,
+            plan: None,
         })
     }
 
@@ -241,6 +256,12 @@ pub struct ProviderAccount {
     pub notif_state: crate::notifications::NotifState,
     #[serde(default)]
     pub needs_relogin: bool,
+    /// Same meaning as [`Account::no_subscription`], for any provider.
+    #[serde(default)]
+    pub no_subscription: bool,
+    /// Last plan label the provider reported ("Plus", "Pro", …).
+    #[serde(default)]
+    pub plan: Option<String>,
 }
 
 impl ProviderAccount {
@@ -493,6 +514,11 @@ impl State {
                         .get("needs_relogin")
                         .and_then(|x| x.as_bool())
                         .unwrap_or(false),
+                    no_subscription: obj
+                        .get("no_subscription")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(false),
+                    plan: obj.get("plan").and_then(|x| x.as_str()).map(String::from),
                 };
                 // robustness-05 (v0.5.1 audit): dedup by lowercased email as we
                 // build the list. Every account-keyed lookup elsewhere in
@@ -1117,6 +1143,7 @@ pub(crate) fn redact_state_for_dump(state: &State) -> serde_json::Value {
                 "user_id": a.user_id,
                 "oauth_account": a.oauth_account,
                 "needs_relogin": a.needs_relogin,
+                "no_subscription": a.no_subscription,
             })
         })
         .collect();
@@ -1136,6 +1163,7 @@ pub(crate) fn redact_state_for_dump(state: &State) -> serde_json::Value {
                         "refresh_token": "<redacted>",
                         "identity_email": a.identity_email,
                         "needs_relogin": a.needs_relogin,
+                        "no_subscription": a.no_subscription,
                     })
                 })
                 .collect();

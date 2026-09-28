@@ -101,6 +101,30 @@ const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 /// backend rollout or a plan-specific variant can't silently blank the reading
 /// — the mismatch that made a captured Codex account render no usage at all.
 /// An absent/`null` window (e.g. a free plan's `secondary_window`) is skipped.
+/// The ChatGPT plan from the usage response's `plan_type` ("plus", "pro",
+/// "prolite", "free", …). A "free" plan has no Codex allowance of its own —
+/// that's what a lapsed subscription drops to.
+pub(crate) fn parse_plan(
+    body: &serde_json::Value,
+) -> Option<crate::providers::trait_def::PlanStatus> {
+    let raw = body.get("plan_type")?.as_str()?;
+    let label = match raw {
+        "free" => "Free".to_string(),
+        "plus" => "Plus".to_string(),
+        "pro" => "Pro".to_string(),
+        "prolite" => "Pro Lite".to_string(),
+        "team" => "Team".to_string(),
+        "business" => "Business".to_string(),
+        "enterprise" => "Enterprise".to_string(),
+        "edu" => "Edu".to_string(),
+        other => other.to_string(),
+    };
+    Some(crate::providers::trait_def::PlanStatus {
+        label: Some(label),
+        active: raw != "free",
+    })
+}
+
 fn parse_usage_windows(body: &serde_json::Value) -> Vec<UsageWindow> {
     let mut windows: Vec<UsageWindow> = Vec::new();
     let Some(rl) = body
@@ -369,6 +393,7 @@ impl Provider for CodexProvider {
         Ok(UsageSnapshot {
             windows: parse_usage_windows(&body),
             fetched_at: Utc::now(),
+            plan: parse_plan(&body),
         })
     }
 
@@ -747,6 +772,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_plan_labels_paid_and_flags_free_as_lapsed() {
+        let plan = |t: &str| parse_plan(&serde_json::json!({ "plan_type": t })).unwrap();
+        assert_eq!(plan("prolite").label.as_deref(), Some("Pro Lite"));
+        assert!(plan("prolite").active);
+        assert_eq!(plan("plus").label.as_deref(), Some("Plus"));
+        assert!(!plan("free").active);
+        assert_eq!(plan("free").label.as_deref(), Some("Free"));
+        assert!(parse_plan(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
     fn parse_usage_current_shape_rate_limit_singular() {
         // The live 2026 shape: `rate_limit` → `primary_window`/`secondary_window`,
         // `used_percent` + `reset_after_seconds`.
@@ -791,6 +827,7 @@ mod tests {
             let snapshot = UsageSnapshot {
                 windows: parse_usage_windows(&body),
                 fetched_at: Utc::now(),
+                plan: parse_plan(&body),
             };
             let cache = crate::cached_from_usage_snapshot(&snapshot);
             assert_eq!(cache.weekly_pct, Some(40.0));
@@ -1313,6 +1350,8 @@ mod tests {
                     cached_usage: None,
                     notif_state: Default::default(),
                     needs_relogin: false,
+                    no_subscription: false,
+                    plan: None,
                 },
             );
             st.save()

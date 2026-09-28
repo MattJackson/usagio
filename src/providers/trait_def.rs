@@ -117,6 +117,21 @@ pub struct UsageWindow {
 pub struct UsageSnapshot {
     pub windows: Vec<UsageWindow>,
     pub fetched_at: DateTime<Utc>,
+    /// The account's plan, when the usage response reports it (Codex's
+    /// `plan_type`). `None` when the provider only exposes it elsewhere —
+    /// see [`Provider::check_plan`].
+    #[serde(default)]
+    pub plan: Option<PlanStatus>,
+}
+
+/// What plan an account is on, and whether it still pays for one. A lapsed
+/// plan (`active == false`) is rendered as "-" with an explanation, never
+/// polled for usage, and never a swap target — uniformly across providers.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlanStatus {
+    /// Short human label ("Max 20x", "Pro", "Free", …) when known.
+    pub label: Option<String>,
+    pub active: bool,
 }
 
 /// Identity fields we know about an account. All optional so a provider with
@@ -367,6 +382,16 @@ pub trait Provider: Send + Sync + 'static {
     fn fetch_usage(&self, access_token: &str) -> PResult<UsageSnapshot> {
         let _ = access_token;
         Err(ProviderError::Unsupported)
+    }
+
+    /// Ask the provider which plan the account is on, WITHOUT touching the
+    /// usage endpoint (so it's safe to call while that endpoint 403s/429s a
+    /// lapsed account). Used to confirm a suspected lapse and to notice a
+    /// renewal. `None` = unknown or unsupported; callers then fall back to
+    /// the plan reported in [`UsageSnapshot::plan`], if any.
+    fn check_plan(&self, access_token: &str) -> Option<PlanStatus> {
+        let _ = access_token;
+        None
     }
 
     // --- Switching ---
