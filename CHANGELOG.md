@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Every provider's header in the menu is now the same plain label row with
+  its icon. A provider used to turn into a dropdown (and lose its icon)
+  whenever its active account was blocked or an environment override was set;
+  the env-override notice now shows inline in the header instead.
+
 ### Removed
 - Dollar cost estimates: the "~$X this cycle (est)" menu row,
   `usagio report --verdict` and `usagio report --pricing`. No provider reports
