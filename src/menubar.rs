@@ -635,16 +635,21 @@ fn account_header_row(sec: &ProviderSection, a: &AcctView) -> RowStyle {
 /// Plain title is just the provider's display name (e.g. "Claude"), bold,
 /// disabled (`enabled: false` so it reads as a group heading, not a click
 /// target), and carries the per-provider 16px icon — the icon belongs to the
-/// GROUP, not to each account inside it. When the provider's env override is
-/// active, this row also hosts the "env override active — swap disabled" child
-/// (see `menu_tree_from_snapshot`) so a provider-wide fact renders once at the
-/// group level instead of on every affected account.
+/// GROUP, not to each account inside it. Every provider's header is the same
+/// plain, non-interactive label row — never a submenu, never highlighted. A
+/// provider-wide fact (the env override disabling swaps) rides inline in the
+/// label so it still renders once at the group level.
 fn provider_group_header_row(sec: &ProviderSection) -> RowStyle {
+    let label = if sec.env_override_active {
+        format!("{} · {ENV_OVERRIDE_ROW_TITLE}", sec.display_name)
+    } else {
+        sec.display_name.to_string()
+    };
     RowStyle {
         bold: true,
         section_header: true,
         icon_slug: Some(sec.provider_id),
-        ..RowStyle::plain_row(sec.display_name.to_string())
+        ..RowStyle::plain_row(label)
     }
 }
 
@@ -1867,23 +1872,6 @@ fn cached_state() -> State {
 // Menu building
 // ---------------------------------------------------------------------------
 
-/// Disabled/header-only rows a section prepends before its account submenus.
-/// Currently: the "env override active — swap disabled" row when the section's
-/// provider is env-overridden. Pure, so tests can assert on it without
-/// instantiating any native menu (muda requires the main thread on macOS).
-pub(crate) fn section_headline_rows(sec: &ProviderSection) -> Vec<String> {
-    let mut rows = Vec::new();
-    if sec.env_override_active {
-        rows.push(ENV_OVERRIDE_ROW_TITLE.to_string());
-    }
-    if let Some(active) = sec.accounts.iter().find(|a| a.active) {
-        if let Some((_, detail)) = recovery_status(sec, active, now_utc()) {
-            rows.push(detail);
-        }
-    }
-    rows
-}
-
 /// One window's line inside an account submenu. Percentages live in the header
 /// row, so these lines answer only what the header's bare countdown can't:
 /// WHICH window is the constraint and WHEN it frees. A maxed window reads
@@ -3052,27 +3040,13 @@ mod cross_platform {
     }
 
     /// The provider-group header row: the provider's display name plus its
-    /// 16px icon, disabled (a heading, not a click target). Becomes a submenu
-    /// carrying the "env override active — swap disabled" marker when that
-    /// provider's env override is on. Label comes from
+    /// 16px icon, as a static section header — identical for every provider
+    /// and every state (no submenu, no hover highlight). Label comes from
     /// `provider_group_header_row` so the header text has a single source.
-    fn build_provider_group_item(sec: &ProviderSection) -> PMenuItem {
-        let label = provider_group_header_row(sec).plain;
-        let icon_png = crate::icons::png16_for(sec.provider_id).map(|b| b.to_vec());
-        let headlines = section_headline_rows(sec);
-        if headlines.is_empty() {
-            return PMenuItem::Static { label, icon_png };
-        }
-        let children: Vec<PMenuItem> = headlines
-            .into_iter()
-            .map(|title| action(format!("envoverride:{}", sec.provider_id), title, false))
-            .collect();
-        PMenuItem::Submenu {
-            label,
-            icon_png,
-            items: children,
-            active: false,
-            value_spans: Vec::new(),
+    pub(super) fn build_provider_group_item(sec: &ProviderSection) -> PMenuItem {
+        PMenuItem::Static {
+            label: provider_group_header_row(sec).plain,
+            icon_png: crate::icons::png16_for(sec.provider_id).map(|b| b.to_vec()),
         }
     }
 
@@ -3939,7 +3913,6 @@ mod tests {
         with_now(now, || {
             assert_eq!(title_for(&snap), "🔒 2h 0m");
             assert!(tooltip_for(&snap).contains("next@x.com"));
-            assert!(section_headline_rows(&snap.sections[0])[0].contains("next@x.com"));
         });
         with_now(now + chrono::Duration::hours(2), || {
             assert_eq!(title_for(&snap), "Refreshing…");
@@ -4201,20 +4174,22 @@ mod tests {
     }
 
     #[test]
-    fn section_renders_env_override_row_when_flagged() {
-        // A section without the override contributes no extra header rows.
-        let base = one_section_snap(acct("a@x.com", Some(10.0), Some(20.0), true));
-        assert!(section_headline_rows(&base.sections[0]).is_empty());
-
-        // With the override on, the section prepends the disabled row that
-        // `menu_tree_from_snapshot` adds verbatim (`ENV_OVERRIDE_ROW_TITLE`).
-        // muri's compat Menu requires the main thread on macOS, so we assert on
-        // the pure helper `menu_tree_from_snapshot` shares with us instead of
-        // building the menu.
-        let mut flagged = one_section_snap(acct("a@x.com", Some(10.0), Some(20.0), true));
-        flagged.sections[0].env_override_active = true;
-        let rows = section_headline_rows(&flagged.sections[0]);
-        assert_eq!(rows, vec![ENV_OVERRIDE_ROW_TITLE]);
+    fn provider_header_is_always_a_static_label_row() {
+        // Every provider header is the same static row with its icon — no
+        // submenu whatever the state (env override, blocked active account).
+        let mut blocked = acct("a@x.com", Some(100.0), Some(100.0), true);
+        blocked.weekly_reset_at = Some(Utc::now() + chrono::Duration::days(2));
+        let mut snap = one_section_snap(blocked);
+        for env in [false, true] {
+            snap.sections[0].env_override_active = env;
+            match cross_platform::build_provider_group_item(&snap.sections[0]) {
+                crate::platform::MenuItem::Static { label, icon_png } => {
+                    assert!(icon_png.is_some(), "header keeps its icon");
+                    assert_eq!(label.contains(ENV_OVERRIDE_ROW_TITLE), env, "{label}");
+                }
+                _ => panic!("provider header must be a static label row"),
+            }
+        }
     }
 
     #[test]
