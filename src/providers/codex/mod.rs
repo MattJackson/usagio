@@ -52,8 +52,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::providers::trait_def::{
-    AccountKey, Capabilities, CaptureMode, CapturedAccount, CredentialFreshness, IdentitySnapshot,
-    PResult, Provider, ProviderError, SecretBackend, TokenGrant, UsageSnapshot, UsageWindow,
+    AccountKey, Capabilities, CaptureMode, CapturedAccount, CredentialFreshness, Credits,
+    IdentitySnapshot, Money, PResult, Provider, ProviderError, ReportedUsage, SecretBackend,
+    TokenGrant, UsageSnapshot, UsageWindow,
 };
 
 /// Read/write timeout applied to every outbound HTTP call this provider
@@ -123,6 +124,29 @@ pub(crate) fn parse_plan(
         label: Some(label),
         active: raw != "free",
     })
+}
+
+/// Credits from the usage response's `credits` object (`has_credits`,
+/// `unlimited`, `overage_limit_reached`, `balance` as a decimal string in
+/// Codex credits — not a currency). `None` unless something meaningful is
+/// reported: an account without credits and a "0" balance is noise.
+pub(crate) fn parse_credits(body: &serde_json::Value) -> Option<Credits> {
+    let c = body.get("credits")?.as_object()?;
+    let flag = |k: &str| c.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
+    let balance = c.get("balance").and_then(|b| match b {
+        Value::String(s) => Money::from_decimal_str(s, Money::CREDITS),
+        Value::Number(n) => Money::from_decimal_str(&n.to_string(), Money::CREDITS),
+        _ => None,
+    });
+    let credits = Credits {
+        enabled: flag("has_credits"),
+        unlimited: flag("unlimited"),
+        limit_reached: flag("overage_limit_reached"),
+        used: None,
+        limit: None,
+        balance,
+    };
+    credits.is_meaningful().then_some(credits)
 }
 
 fn parse_usage_windows(body: &serde_json::Value) -> Vec<UsageWindow> {
@@ -394,6 +418,10 @@ impl Provider for CodexProvider {
             windows: parse_usage_windows(&body),
             fetched_at: Utc::now(),
             plan: parse_plan(&body),
+            reported: ReportedUsage {
+                credits: parse_credits(&body),
+                ..ReportedUsage::default()
+            },
         })
     }
 
@@ -772,6 +800,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_credits_none_when_nothing_is_reported() {
+        // The live shape for an account without credits: nothing to show.
+        let body = serde_json::json!({ "credits": {
+            "has_credits": false, "unlimited": false, "overage_limit_reached": false,
+            "balance": "0", "approx_local_messages": [0, 0], "approx_cloud_messages": [0, 0]
+        }});
+        assert!(parse_credits(&body).is_none());
+        assert!(parse_credits(&serde_json::json!({})).is_none());
+        assert!(parse_credits(&serde_json::json!({ "credits": null })).is_none());
+        assert!(parse_credits(&serde_json::json!({ "credits": "lots" })).is_none());
+    }
+
+    #[test]
+    fn parse_credits_reports_a_balance_in_credits() {
+        let body = serde_json::json!({ "credits": {
+            "has_credits": true, "unlimited": false, "overage_limit_reached": false,
+            "balance": "120"
+        }});
+        let c = parse_credits(&body).unwrap();
+        assert!(c.enabled);
+        let b = c.balance.unwrap();
+        assert_eq!(b.unit, Money::CREDITS);
+        assert_eq!(b.display(), "120");
+        // A non-zero balance counts even if `has_credits` is off; decimals stay exact.
+        let body = serde_json::json!({ "credits": { "has_credits": false, "balance": "12.50" } });
+        assert_eq!(
+            parse_credits(&body).unwrap().balance.unwrap().display(),
+            "12.50"
+        );
+    }
+
+    #[test]
+    fn parse_credits_flags_overage_and_unlimited() {
+        let body = serde_json::json!({ "credits": {
+            "has_credits": true, "unlimited": true, "overage_limit_reached": true, "balance": "junk"
+        }});
+        let c = parse_credits(&body).unwrap();
+        assert!(c.unlimited);
+        assert!(c.limit_reached);
+        assert!(c.balance.is_none());
+    }
+
+    #[test]
     fn parse_plan_labels_paid_and_flags_free_as_lapsed() {
         let plan = |t: &str| parse_plan(&serde_json::json!({ "plan_type": t })).unwrap();
         assert_eq!(plan("prolite").label.as_deref(), Some("Pro Lite"));
@@ -828,6 +899,7 @@ mod tests {
                 windows: parse_usage_windows(&body),
                 fetched_at: Utc::now(),
                 plan: parse_plan(&body),
+                reported: ReportedUsage::default(),
             };
             let cache = crate::cached_from_usage_snapshot(&snapshot);
             assert_eq!(cache.weekly_pct, Some(40.0));
