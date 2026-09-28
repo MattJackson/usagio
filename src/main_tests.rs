@@ -95,6 +95,8 @@ fn row(session: Option<f64>, weekly: Option<f64>) -> Row {
     Row {
         provider_id: CLAUDE_SLUG.to_string(),
         needs_relogin: false,
+        no_subscription: false,
+        plan: None,
         email: "x@e.com".to_string(),
         session: cell(session),
         weekly: cell(weekly),
@@ -121,6 +123,8 @@ fn row_full_with_provider(
     Row {
         provider_id: provider_id.to_string(),
         needs_relogin: false,
+        no_subscription: false,
+        plan: None,
         email: email.to_string(),
         session: Cell {
             pct: Some(session),
@@ -350,6 +354,23 @@ fn menu_order_keeps_active_locked_account_in_rotation() {
     assert_eq!(rows[1].email, "free@e.com");
 }
 
+#[test]
+fn menu_order_sinks_lapsed_subscriptions_last_alphabetically() {
+    let now = Utc::now();
+    // Lapsed rows carry stale, "attractive" caches (0% / soonest reset) —
+    // they must still sink below every live account, even the active one,
+    // and order among themselves by email only.
+    let mut zed = row_full("zed@e.com", 0.0, 0.0, now + Duration::hours(1));
+    zed.no_subscription = true;
+    let mut abe = row_full("abe@e.com", 0.0, 100.0, now + Duration::days(6));
+    abe.no_subscription = true;
+    let live = row_full("live@e.com", 100.0, 100.0, now + Duration::days(5));
+    let mut rows = [zed, live, abe];
+    rows.sort_by(|a, b| menu_order(a, b, Some("zed@e.com"), now));
+    let order: Vec<&str> = rows.iter().map(|r| r.email.as_str()).collect();
+    assert_eq!(order, ["live@e.com", "abe@e.com", "zed@e.com"]);
+}
+
 // --- choose_swap_target (auto-swap guard) ---
 
 #[test]
@@ -359,6 +380,34 @@ fn choose_swap_target_moves_off_over_trigger_account() {
         row_full("active@e.com", 96.0, 96.0, reset),
         row_full("free@e.com", 20.0, 20.0, reset),
     ];
+    let guard = SwapGuard::default();
+    let target = choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard);
+    assert_eq!(target.as_deref(), Some("free@e.com"));
+}
+
+#[test]
+fn choose_swap_target_never_picks_lapsed_subscription() {
+    let reset = Utc::now() + Duration::hours(24);
+    let mut lapsed = row_full("lapsed@e.com", 0.0, 0.0, reset);
+    lapsed.no_subscription = true;
+    let rows = vec![
+        row_full("active@e.com", 96.0, 96.0, reset),
+        lapsed,
+        row_full("free@e.com", 50.0, 50.0, reset),
+    ];
+    let guard = SwapGuard::default();
+    let target = choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard);
+    assert_eq!(target.as_deref(), Some("free@e.com"));
+}
+
+#[test]
+fn choose_swap_target_moves_off_lapsed_active_account() {
+    // The active account's plan lapsed while its frozen cache looks healthy —
+    // it can't serve requests, so move off it.
+    let reset = Utc::now() + Duration::hours(24);
+    let mut active = row_full("active@e.com", 10.0, 10.0, reset);
+    active.no_subscription = true;
+    let rows = vec![active, row_full("free@e.com", 50.0, 50.0, reset)];
     let guard = SwapGuard::default();
     let target = choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard);
     assert_eq!(target.as_deref(), Some("free@e.com"));
@@ -2015,6 +2064,8 @@ fn resolve_provider_selector_matches_exact_and_unique_prefix() {
             cached_usage: None,
             notif_state: Default::default(),
             needs_relogin: false,
+            no_subscription: false,
+            plan: None,
         },
     );
 
@@ -2049,6 +2100,8 @@ fn refresh_provider_active_account_noop_when_provider_does_not_support_active_re
         cached_usage: None,
         notif_state: Default::default(),
         needs_relogin: false,
+        no_subscription: false,
+        plan: None,
     };
     with_state_lock(|| {
         let mut st = State::load()?;

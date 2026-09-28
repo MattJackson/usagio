@@ -812,6 +812,8 @@ fn provider_account(key: &str) -> ProviderAccount {
         cached_usage: None,
         notif_state: Default::default(),
         needs_relogin: false,
+        no_subscription: false,
+        plan: None,
     }
 }
 

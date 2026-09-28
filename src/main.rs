@@ -39,7 +39,7 @@ use providers::claude::{oauth, usage};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
 
-use providers::trait_def::{TokenGrant, UsageSnapshot};
+use providers::trait_def::{PlanStatus, ProviderError, TokenGrant, UsageSnapshot};
 use providers::Provider;
 use store::{Account, CachedUsage, ProviderAccount, State};
 
@@ -83,6 +83,11 @@ const WATCH_MAX_INTERVAL_SECS: u64 = 1200;
 const INACTIVE_FETCH_FLOOR_SECS: u64 = 600;
 /// Cap for an inactive account's own backoff after repeated failed fetches.
 const INACTIVE_FETCH_MAX_BACKOFF_SECS: u64 = 3600;
+/// How often to ask the profile endpoint about an account's subscription —
+/// both to confirm a suspected lapse (403/429 from the usage endpoint) and to
+/// notice a renewal of a lapsed one. The profile endpoint is separate from
+/// `/api/oauth/usage`, so these checks don't spend the usage request budget.
+pub(crate) const SUBSCRIPTION_RECHECK_SECS: u64 = 1800;
 /// Swap away from the active account when it reaches this utilization.
 const TRIGGER_PCT: f64 = 95.0;
 /// Only swap to an account at or below this utilization (hysteresis band).
@@ -484,6 +489,8 @@ pub(crate) fn capture_current_generic(slug: &str) -> Result<(String, bool)> {
                 .map(|a| a.notif_state.clone())
                 .unwrap_or_default(),
             needs_relogin: false,
+            no_subscription: false,
+            plan: None,
         };
         state.upsert_provider_account(slug, acct);
         // Capture always reflects whatever is currently logged in, so it
@@ -1417,6 +1424,12 @@ struct Row {
     /// account's refresh token. Filtered out of the auto-swap picker and
     /// surfaced by the menu as a re-login row.
     needs_relogin: bool,
+    /// The account's Claude subscription has lapsed (see
+    /// `Account::no_subscription`). Rendered as the plan instead of usage,
+    /// never a swap target, and a reason to swap AWAY when active.
+    no_subscription: bool,
+    /// Short plan label ("Max 20x", "Pro", "Free", …) when known.
+    plan: Option<String>,
     email: String,
     session: Cell,
     weekly: Cell,
@@ -1440,6 +1453,20 @@ impl Cell {
     }
 }
 
+/// Short plan label from the captured `oauthAccount` ("Max 20x", "Pro", …).
+/// A lapsed subscription is always "Free", whatever was captured.
+fn claude_plan_label(a: &Account) -> Option<String> {
+    if a.no_subscription {
+        return Some(a.plan.clone().unwrap_or_else(|| "Free".to_string()));
+    }
+    if a.plan.is_some() {
+        return a.plan.clone();
+    }
+    let o = a.oauth_account.as_ref()?;
+    let get = |k: &str| o.get(k).and_then(|v| v.as_str());
+    usage::plan_label(get("organizationType"), get("organizationRateLimitTier"))
+}
+
 /// Build a display row from an account's cached usage (never fetches).
 fn row_from_account(a: &Account) -> Row {
     let c = a.cached_usage.as_ref();
@@ -1449,6 +1476,8 @@ fn row_from_account(a: &Account) -> Row {
         // `store.rs`'s `State` doc), so every row built from it is Claude's.
         provider_id: CLAUDE_SLUG.to_string(),
         needs_relogin: a.needs_relogin,
+        no_subscription: a.no_subscription,
+        plan: claude_plan_label(a),
         email: a.key().to_string(),
         session: cell_from_parts(
             c.and_then(|c| c.session_pct),
@@ -1477,6 +1506,12 @@ pub(crate) fn row_from_provider_account(slug: &str, a: &ProviderAccount) -> Row 
     Row {
         provider_id: slug.to_string(),
         needs_relogin: a.needs_relogin,
+        no_subscription: a.no_subscription,
+        plan: match (&a.plan, a.no_subscription) {
+            (Some(p), _) => Some(p.clone()),
+            (None, true) => Some("Free".to_string()),
+            (None, false) => None,
+        },
         email: a.key.clone(),
         session: cell_from_parts(
             c.and_then(|c| c.session_pct),
@@ -1551,6 +1586,14 @@ pub(crate) fn menu_order(
             _ => None,
         }
     };
+    // Lapsed subscriptions always sink to the bottom, alphabetically — their
+    // cached usage/reset times are meaningless, so don't rank on them.
+    match (a.no_subscription, b.no_subscription) {
+        (true, true) => return a.email.cmp(&b.email),
+        (true, false) => return std::cmp::Ordering::Greater,
+        (false, true) => return std::cmp::Ordering::Less,
+        (false, false) => {}
+    }
     let key = |r: &Row| {
         let lu = locked_until(r);
         (
@@ -2303,6 +2346,14 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
         if acct.needs_relogin {
             continue;
         }
+        // A lapsed subscription never calls the usage endpoint (every call is
+        // a 403/429 that burns the tenant's request budget). It only gets a
+        // profile re-check every SUBSCRIPTION_RECHECK_SECS (or on a forced
+        // refresh), done below once the token is fresh.
+        let recheck_subscription = acct.no_subscription;
+        if recheck_subscription && !claim_subscription_check(email, now_ts, force) {
+            continue;
+        }
         // Locked accounts don't change until their reset — skip the network
         // refresh entirely, keeping the (accurate) locked cache. The
         // reset-boundary wake (`menubar::next_reset_wake_secs`) brings the
@@ -2329,6 +2380,7 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
                 // vast majority of per-cycle locked polls.
                 let stale = Utc::now().timestamp() - cu.fetched_at > MAX_LOCKED_STALENESS_SECS;
                 if !force
+                    && !recheck_subscription
                     && !stale
                     && countdown::is_locked_until_reset(&cached_to_account_usage(cu), Utc::now())
                 {
@@ -2342,7 +2394,7 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
         // The active account is fetched first; if it just got a 429, leave
         // the inactive accounts alone this cycle (no token or usage calls)
         // so the budget recovers for the account a failover depends on.
-        if !force && !is_the_active_account && rate_limited {
+        if !force && !is_the_active_account && !recheck_subscription && rate_limited {
             logging::log(&format!(
                 "poll: active account rate limited; skipping {email} this cycle \
                  (event=fetch_skip_active_429 account={email})"
@@ -2445,6 +2497,21 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
                     ));
                     continue;
                 }
+            }
+        }
+        if recheck_subscription {
+            match recheck_lapsed_plan(provider, email, &acct.access_token) {
+                Recheck::Restored(p) => {
+                    persist_plan(CLAUDE_SLUG, email, &p, None);
+                    acct.no_subscription = false;
+                    // Fall through: fetch real usage for it this cycle.
+                }
+                Recheck::StillLapsed(p) => {
+                    persist_plan(CLAUDE_SLUG, email, &p, None);
+                    continue;
+                }
+                // Unknown (profile unreachable) — stay lapsed, try later.
+                Recheck::Unknown => continue,
             }
         }
         // Per-account fetch floor: the account's own cadence tier gates whether
@@ -2575,6 +2642,21 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
                      (event=usage_429 account={email} consecutive={})",
                     tracker.consecutive_429s
                 ));
+                // A lapsed subscription 429s as often as it 403s — check.
+                if let Some(p) = detect_lapsed_plan(provider, email, &acct.access_token, now_ts) {
+                    persist_plan(CLAUDE_SLUG, email, &p, None);
+                }
+                None
+            }
+            Err(usage::FetchError::Forbidden) => {
+                record_usage_fetch_non_429(email);
+                if !is_the_active_account {
+                    record_inactive_fetch_failure(email, now_ts);
+                }
+                logging::log(&format!("usage 403 for {email}; keeping cache"));
+                if let Some(p) = detect_lapsed_plan(provider, email, &acct.access_token, now_ts) {
+                    persist_plan(CLAUDE_SLUG, email, &p, None);
+                }
                 None
             }
             Err(usage::FetchError::Auth) if is_active => {
@@ -2772,6 +2854,13 @@ fn refresh_provider_usage_caches(force: bool) {
             if acct.needs_relogin {
                 continue;
             }
+            // Same lapsed-plan gate as the Claude loop.
+            let now_ts = Utc::now().timestamp();
+            let tracker_key = format!("{slug}/{key}");
+            let recheck_subscription = acct.no_subscription;
+            if recheck_subscription && !claim_subscription_check(&tracker_key, now_ts, force) {
+                continue;
+            }
             // Locked accounts don't change until reset — skip (same guard as
             // the Claude path; the reset-boundary wake brings us back). A manual
             // refresh (`force`) never skips, and past MAX_LOCKED_STALENESS we
@@ -2779,6 +2868,7 @@ fn refresh_provider_usage_caches(force: bool) {
             if let Some(cu) = &acct.cached_usage {
                 let stale = Utc::now().timestamp() - cu.fetched_at > MAX_LOCKED_STALENESS_SECS;
                 if !force
+                    && !recheck_subscription
                     && !stale
                     && countdown::is_locked_until_reset(&cached_to_account_usage(cu), Utc::now())
                 {
@@ -2807,15 +2897,40 @@ fn refresh_provider_usage_caches(force: bool) {
                     }
                 }
             }
+            let mut plan: Option<PlanStatus> = None;
+            if recheck_subscription {
+                match recheck_lapsed_plan(provider.as_ref(), &tracker_key, &access) {
+                    Recheck::StillLapsed(p) => {
+                        persist_plan(slug, &key, &p, refreshed.as_ref());
+                        continue;
+                    }
+                    Recheck::Restored(p) => plan = Some(p),
+                    Recheck::Unknown => {}
+                }
+            }
             let cu = match provider.fetch_usage(&access) {
-                Ok(snap) => Some(cached_from_usage_snapshot(&snap)),
+                Ok(snap) => {
+                    if snap.plan.is_some() {
+                        plan = snap.plan.clone();
+                    }
+                    Some(cached_from_usage_snapshot(&snap))
+                }
                 Err(e) => {
                     logging::log(&format!(
                         "provider usage error for {slug}/{key}: {e}; keeping cache"
                     ));
+                    if matches!(
+                        e,
+                        ProviderError::RateLimited { .. } | ProviderError::Other(_)
+                    ) {
+                        plan = detect_lapsed_plan(provider.as_ref(), &tracker_key, &access, now_ts);
+                    }
                     None
                 }
             };
+            if let Some(p) = &plan {
+                persist_plan(slug, &key, p, None);
+            }
             // Persist tokens + usage under the lock with a fresh reload so a
             // concurrent capture/switch isn't clobbered.
             let _ = with_state_lock(|| {
@@ -3275,6 +3390,9 @@ struct UsageFetchTracker {
     /// kind, and the time before which we won't try again.
     consecutive_failures: u32,
     backoff_until_ts: Option<i64>,
+    /// Last profile (subscription) check — throttles them to
+    /// `SUBSCRIPTION_RECHECK_SECS` per account.
+    last_subscription_check_ts: Option<i64>,
 }
 
 static USAGE_FETCH_TRACKERS: std::sync::Mutex<
@@ -3336,6 +3454,133 @@ fn record_inactive_fetch_failure(email: &str, now_ts: i64) {
         entry.backoff_until_ts =
             Some(now_ts + inactive_fetch_backoff_secs(entry.consecutive_failures) as i64);
     });
+}
+
+/// Claim a subscription check for `email` if one is due (or `force`d);
+/// returns false when the last one was under `SUBSCRIPTION_RECHECK_SECS` ago.
+fn claim_subscription_check(email: &str, now_ts: i64, force: bool) -> bool {
+    with_fetch_trackers(|t| {
+        let entry = t.entry(email.to_string()).or_default();
+        let due = force
+            || entry
+                .last_subscription_check_ts
+                .is_none_or(|last| now_ts - last >= SUBSCRIPTION_RECHECK_SECS as i64);
+        if due {
+            entry.last_subscription_check_ts = Some(now_ts);
+        }
+        due
+    })
+}
+
+/// Forget an account's failure backoff so a just-renewed subscription is
+/// fetched this cycle instead of waiting out backoff earned while lapsed.
+fn clear_inactive_fetch_backoff(email: &str) {
+    with_fetch_trackers(|t| {
+        if let Some(entry) = t.get_mut(email) {
+            entry.consecutive_failures = 0;
+            entry.backoff_until_ts = None;
+        }
+    });
+}
+
+/// Outcome of re-checking a lapsed account's plan.
+enum Recheck {
+    /// Still lapsed — skip the usage endpoint.
+    StillLapsed(PlanStatus),
+    /// Plan is back — fetch usage this cycle.
+    Restored(PlanStatus),
+    /// The provider can't say without its usage endpoint (e.g. Codex reports
+    /// the plan only alongside usage) — fetch and read it from the snapshot.
+    Unknown,
+}
+
+/// Ask `provider` (never its usage endpoint) whether a lapsed account's plan
+/// is back. The caller has already claimed the throttled check.
+fn recheck_lapsed_plan(provider: &dyn Provider, tracker_key: &str, access: &str) -> Recheck {
+    match provider.check_plan(access) {
+        Some(p) if p.active => {
+            clear_inactive_fetch_backoff(tracker_key);
+            Recheck::Restored(p)
+        }
+        Some(p) => {
+            logging::log(&format!(
+                "poll: {tracker_key} still has no subscription; skipping usage \
+                 (event=fetch_skip_no_subscription account={tracker_key})"
+            ));
+            Recheck::StillLapsed(p)
+        }
+        None => Recheck::Unknown,
+    }
+}
+
+/// After a 403/429 from the usage endpoint, ask the provider (throttled per
+/// account) whether the plan lapsed. `Some` only for a confirmed lapse.
+fn detect_lapsed_plan(
+    provider: &dyn Provider,
+    tracker_key: &str,
+    access: &str,
+    now_ts: i64,
+) -> Option<PlanStatus> {
+    if !claim_subscription_check(tracker_key, now_ts, false) {
+        return None;
+    }
+    provider.check_plan(access).filter(|p| !p.active)
+}
+
+/// Persist an account's plan (label + lapsed flag) for any provider, and
+/// notify on a lapse/renewal transition. `refreshed` carries tokens rotated
+/// this cycle when the caller is about to skip its own save (non-Claude
+/// accounts only; Claude token writes go through the poll merge).
+fn persist_plan(
+    slug: &str,
+    key: &str,
+    plan: &PlanStatus,
+    refreshed: Option<&(String, String, i64)>,
+) {
+    let lapsed = !plan.active;
+    let res = with_state_lock(|| {
+        let mut st = State::load()?;
+        let mut changed = false;
+        let apply = |no_sub: &mut bool, label: &mut Option<String>| {
+            let was = *no_sub;
+            *no_sub = lapsed;
+            if plan.label.is_some() {
+                *label = plan.label.clone();
+            }
+            was != lapsed
+        };
+        if slug == CLAUDE_SLUG {
+            if let Some(a) = st.find_mut(key) {
+                changed = apply(&mut a.no_subscription, &mut a.plan);
+            }
+        } else if let Some(a) = st.find_provider_account_mut(slug, key) {
+            changed = apply(&mut a.no_subscription, &mut a.plan);
+            if let Some((at, rt, exp)) = refreshed {
+                a.access_token = at.clone();
+                a.refresh_token = rt.clone();
+                a.expires_at = *exp;
+            }
+        }
+        st.save()?;
+        Ok(changed)
+    });
+    match res {
+        Ok(true) => {
+            logging::log(&format!(
+                "event=subscription_{} provider={slug} account={key}",
+                if lapsed { "lapsed" } else { "restored" }
+            ));
+            notify(&if lapsed {
+                format!(
+                    "{key} ({slug}) has no subscription — usage checks paused until it's renewed"
+                )
+            } else {
+                format!("{key} ({slug}) subscription is back")
+            });
+        }
+        Ok(false) => {}
+        Err(e) => logging::log(&format!("persist_plan({slug}/{key}): save failed: {e:#}")),
+    }
 }
 
 /// The active account as of the last `refresh_usage_cache`. Lets the poller
@@ -3594,7 +3839,7 @@ fn earliest_blocked_target<'a>(
     let mut earliest: Option<(&Row, DateTime<Utc>)> = None;
     for row in rows
         .iter()
-        .filter(|r| r.provider_id == act.provider_id && !r.needs_relogin)
+        .filter(|r| r.provider_id == act.provider_id && !r.needs_relogin && !r.no_subscription)
     {
         if !row.has_data() {
             return None;
@@ -3647,7 +3892,10 @@ fn evaluate_swap(
     let Some(act) = rows.iter().find(|r| r.email == active) else {
         return none;
     };
-    if !act.has_data() || trigger > 100.0 {
+    // An active account whose subscription lapsed can't serve requests at
+    // all — move off it regardless of its (frozen) cached usage.
+    let act_lapsed = act.no_subscription;
+    if (!act.has_data() && !act_lapsed) || trigger > 100.0 {
         return none;
     }
     // If the active account's provider has its env-override active, the CLI
@@ -3668,6 +3916,9 @@ fn evaluate_swap(
         // swapping to a needs-relogin account would just re-write the same
         // dead credentials into the keychain.
         .filter(|r| !r.needs_relogin)
+        // A lapsed subscription has no capacity at all, whatever its stale
+        // cache says.
+        .filter(|r| !r.no_subscription)
         // Skip candidates whose provider has its env-override active — a
         // switch to them would be silently ignored by the vendor CLI.
         .filter(|r| !env_override_active(&r.provider_id))
@@ -3715,7 +3966,7 @@ fn evaluate_swap(
     // pretend to be worse than a genuinely-96% one and corrupt target order.
     let act_effective =
         effective_active_max_pct_for_swap_fire(act, &act.provider_id, trigger, Utc::now());
-    if !(act_effective >= trigger || worth_returning_to(best, act)) {
+    if !(act_lapsed || act_effective >= trigger || worth_returning_to(best, act)) {
         return none;
     }
     let cooldown_active = guard
@@ -4617,6 +4868,14 @@ fn render_table(rows: &[Row], active: Option<&str>) {
         } else {
             " "
         };
+        if r.no_subscription {
+            println!(
+                "{marker}  {:<28} no subscription (Free plan) — usage paused; re-checked every {}m",
+                truncate(&r.email, 28),
+                SUBSCRIPTION_RECHECK_SECS / 60,
+            );
+            continue;
+        }
         if !r.has_data() {
             println!(
                 "{marker}  {:<28} no data yet (run the menu-bar app or `usagio watch`)",
