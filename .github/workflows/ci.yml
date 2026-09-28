@@ -63,6 +63,13 @@ jobs:
 
       - name: cargo build --release
         if: env.FULL == 'true'
+        # macOS/Linux: this build only proves release mode compiles — the
+        # shipped binary is built by release.yml — so skip fat LTO, the
+        # slowest part of the link. Windows keeps the exact shipped profile:
+        # its load-time smoke test below checks the binary itself.
+        env:
+          CARGO_PROFILE_RELEASE_LTO: ${{ matrix.os == 'windows-latest' && 'true' || 'false' }}
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ matrix.os == 'windows-latest' && '16' || '256' }}
         run: cargo build --release --all-features --locked
 
       # A build that compiles is NOT proof the binary LOADS. usagio statically

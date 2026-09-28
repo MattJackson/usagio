@@ -1,0 +1,72 @@
+name: Release cache
+
+# Warms the build caches release.yml restores. A tag-triggered run can only
+# read caches saved on the default branch, and nothing else on main builds the
+# release targets, so every release used to compile all dependencies from
+# scratch (~3-4 min per job). Each job here mirrors its release.yml job's
+# runner, toolchain, system deps and build command exactly, and saves under the
+# same `shared-key`, so the next tag restores a warm cache.
+#
+# Runs off the critical path: a tag pushed right after a main merge restores
+# the previous warm cache (rust-cache falls back to the newest cache for the
+# same key prefix when Cargo.lock differs), which already has the deps built.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-cache
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: usagio
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: release-macos
+      - run: cargo build --release --locked --target aarch64-apple-darwin --target x86_64-apple-darwin
+
+  linux:
+    # Must match release.yml's pinned runner (glibc floor) or the cache won't fit.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libssl-dev pkg-config libsecret-1-dev librsvg2-bin
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: release-linux
+      - run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: release-windows
+      - run: cargo build --release --locked --target x86_64-pc-windows-msvc
