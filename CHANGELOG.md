@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- Dollar cost estimates: the "~$X this cycle (est)" menu row,
+  `usagio report --verdict` and `usagio report --pricing`. No provider reports
+  what a subscription's usage costs, so these multiplied the usage percentage
+  by a guessed token cap and API list prices — numbers that looked precise but
+  weren't.
+
 ## [0.8.6] - 2026-09-28
 
 ### Added
