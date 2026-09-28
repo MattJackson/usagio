@@ -3912,7 +3912,9 @@ mod tests {
         );
         // No usage/window rows once the login is dead.
         assert!(
-            !rows.iter().any(|r| r.contains("renews in") || r.contains("unlocks in")),
+            !rows
+                .iter()
+                .any(|r| r.contains("renews in") || r.contains("unlocks in")),
             "dead login shows no window rows: {rows:?}"
         );
     }
@@ -4197,9 +4199,18 @@ mod tests {
         // dev6's real shape: session maxed, weekly just reset to 0%.
         let a = acct("dev6@x.com", Some(100.0), Some(0.0), false);
         let items = submenu_info_items(&claude_section(), &a);
-        assert!(items.contains(&("Session locked · unlocks in 3h".to_string(), true)), "{items:?}");
-        assert!(items.contains(&("Weekly renews in 2d".to_string(), false)), "{items:?}");
-        assert!(!items.iter().any(|(r, _)| r.contains("resets in")), "{items:?}");
+        assert!(
+            items.contains(&("Session locked · unlocks in 3h".to_string(), true)),
+            "{items:?}"
+        );
+        assert!(
+            items.contains(&("Weekly renews in 2d".to_string(), false)),
+            "{items:?}"
+        );
+        assert!(
+            !items.iter().any(|(r, _)| r.contains("resets in")),
+            "{items:?}"
+        );
     }
 
     #[test]
