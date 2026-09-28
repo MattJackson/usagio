@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Account details no longer make a healthy limit look locked. A locked window
+  reads "Session locked · unlocks in 28m" in red (matching the red countdown
+  on the account row); a healthy one reads "Weekly renews in 6d 22h". Detail
+  lines are plain text and no longer highlight on hover.
 - Every provider's header in the menu is now the same plain label row with
   its icon. A provider used to turn into a dropdown (and lose its icon)
   whenever its active account was blocked or an environment override was set;

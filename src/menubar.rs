@@ -1872,20 +1872,21 @@ fn cached_state() -> State {
 // Menu building
 // ---------------------------------------------------------------------------
 
-/// One window's line inside an account submenu. Percentages live in the header
-/// row, so these lines answer only what the header's bare countdown can't:
-/// WHICH window is the constraint and WHEN it frees. A maxed window reads
-/// `<Label> limit reached · resets in <X>`; a healthy one `<Label> resets in
-/// <X>`. Returns `None` for a healthy window with no known reset (nothing useful
-/// to show — this replaces the old "no reset info yet" placeholder that read
-/// like an error).
-fn window_status_row(w: &WindowView) -> Option<String> {
+/// One window's line inside an account submenu, and whether it's a lock.
+/// Percentages live on the account row, so these lines answer only what the
+/// row's bare countdown can't: WHICH window binds and WHEN it frees. The two
+/// states use different verbs so the words alone say which is which: a maxed
+/// window is `<Label> locked · unlocks in <X>` (rendered red, like the row's
+/// countdown); a healthy one `<Label> renews in <X>` ("resets in" beside a
+/// lock read as if that window were locked too). `None` for a healthy window
+/// with no known reset — nothing useful to say.
+fn window_status_row(w: &WindowView) -> Option<(String, bool)> {
     let label = stat_display_label(w);
     let locked = w.pct.is_some_and(|p| p >= 100.0);
     match (locked, w.reset.is_empty()) {
-        (true, false) => Some(format!("{label} limit reached · resets in {}", w.reset)),
-        (true, true) => Some(format!("{label} limit reached")),
-        (false, false) => Some(format!("{label} resets in {}", w.reset)),
+        (true, false) => Some((format!("{label} locked · unlocks in {}", w.reset), true)),
+        (true, true) => Some((format!("{label} locked"), true)),
+        (false, false) => Some((format!("{label} renews in {}", w.reset), false)),
         (false, true) => None,
     }
 }
@@ -1900,37 +1901,58 @@ fn window_status_row(w: &WindowView) -> Option<String> {
 /// (`account_extra_info_rows` yields those separately): those touch the on-disk
 /// usage log, and this function must stay pure (no disk I/O) so it's safe to
 /// call from a unit test without a `ScopedConfigDir`.
+#[cfg(test)]
 fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
-    let mut rows = Vec::new();
+    submenu_info_items(sec, a)
+        .into_iter()
+        .map(|(r, _)| r)
+        .collect()
+}
+
+/// [`submenu_info_rows`] plus whether each line is a lock (rendered red).
+fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)> {
+    let mut rows: Vec<(String, bool)> = Vec::new();
     // Auth trouble is the account's headline state — spell out the reason and
     // the fix before any (now-frozen) usage numbers. Mirrors the `⚠` trailing
     // that `trailing_for_account` puts on the row header.
     if a.needs_relogin {
-        rows.push("⚠ Re-login required — token expired".to_string());
-        rows.push(format!(
-            "Fix: log in with `claude`, then `usagio capture` ({})",
-            a.key
+        rows.push(("⚠ Re-login required — token expired".to_string(), true));
+        rows.push((
+            format!(
+                "Fix: log in with `claude`, then `usagio capture` ({})",
+                a.key
+            ),
+            false,
         ));
         return rows;
     }
     if let Some(err) = &a.error {
-        rows.push(format!("⚠ Refresh error: {err}"));
+        rows.push((format!("⚠ Refresh error: {err}"), true));
         return rows;
     }
     if a.no_subscription {
-        rows.push(format!(
-            "No subscription · {} plan",
-            a.plan.as_deref().unwrap_or("Free")
+        rows.push((
+            format!(
+                "No subscription · {} plan",
+                a.plan.as_deref().unwrap_or("Free")
+            ),
+            true,
         ));
-        rows.push("Usage checks paused — renew to use this account".to_string());
-        rows.push(format!(
-            "Rechecked every {}m; resumes when a plan is back",
-            crate::SUBSCRIPTION_RECHECK_SECS / 60
+        rows.push((
+            "Usage checks paused — renew to use this account".to_string(),
+            false,
+        ));
+        rows.push((
+            format!(
+                "Rechecked every {}m; resumes when a plan is back",
+                crate::SUBSCRIPTION_RECHECK_SECS / 60
+            ),
+            false,
         ));
         return rows;
     }
     if let Some(plan) = &a.plan {
-        rows.push(format!("Plan · {plan}"));
+        rows.push((format!("Plan · {plan}"), false));
     }
     if sec.supports_usage {
         if a.has_data && !a.windows.is_empty() {
@@ -1941,9 +1963,9 @@ fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
             let mut ordered: Vec<&WindowView> = a.windows.iter().collect();
             ordered.sort_by_key(|w| u8::from(!w.pct.is_some_and(|p| p >= 100.0)));
             // When the WEEKLY window is locked, the account is fully blocked
-            // regardless of the session window — so drop the "Session resets in X"
+            // regardless of the session window — so drop the "Session renews in X"
             // line (its countdown is meaningless while the weekly limit blocks all
-            // use). The "Weekly limit reached · resets in X" row says everything.
+            // use). The "Weekly locked · unlocks in X" row says everything.
             let weekly_locked = a
                 .windows
                 .iter()
@@ -1953,19 +1975,19 @@ fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
                     continue;
                 }
                 if let Some(row) = window_status_row(w) {
-                    rows.push(row);
+                    rows.push(row); // (text, locked)
                 } else if sec.provider_id == "codex" && w.pct.is_none() {
-                    rows.push(format!("{} · Not reported", stat_display_label(w)));
+                    rows.push((format!("{} · Not reported", stat_display_label(w)), false));
                 }
             }
-            if rows.is_empty() {
-                rows.push("no data yet".to_string());
+            if !rows.iter().any(|(r, _)| !r.starts_with("Plan · ")) {
+                rows.push(("no data yet".to_string(), false));
             }
         } else {
-            rows.push("no data yet".to_string());
+            rows.push(("no data yet".to_string(), false));
         }
     } else {
-        rows.push("(no usage endpoint — headers only)".to_string());
+        rows.push(("(no usage endpoint — headers only)".to_string(), false));
     }
     rows
 }
@@ -2890,7 +2912,7 @@ mod cross_platform {
     use super::*;
     #[cfg(not(target_os = "macos"))]
     use crate::platform::MenuHandle;
-    use crate::platform::{MenuItem as PMenuItem, MenuTree};
+    use crate::platform::{MenuItem as PMenuItem, MenuTree, ValueColor};
 
     /// A `RowStyle`'s plain title. The `\t` is passed THROUGH so muri's
     /// muda-compat two-column layout right-aligns the trailing value column.
@@ -2951,14 +2973,11 @@ mod cross_platform {
     /// draws greyed/dimmed, which the maintainer flagged as unreadable, and
     /// muri has no rich-text to re-tint a disabled row back to full contrast —
     /// so full-contrast + a harmless no-op click wins over a dimmed row.
-    fn noop_info(label: impl Into<String>) -> PMenuItem {
-        PMenuItem::Action {
-            id: "noop".to_string(),
+    /// A non-clickable (never highlighted) detail line, optionally tinted.
+    fn info_row(label: impl Into<String>, color: Option<ValueColor>) -> PMenuItem {
+        PMenuItem::Info {
             label: label.into(),
-            icon_png: None,
-            enabled: true,
-            checked: false,
-            checkable: false,
+            color,
         }
     }
 
@@ -2994,11 +3013,11 @@ mod cross_platform {
     /// provider group holds one such submenu per account.
     fn build_account_submenu_item(sec: &ProviderSection, a: &AcctView) -> PMenuItem {
         let mut items = Vec::new();
-        for row in submenu_info_rows(sec, a) {
-            items.push(noop_info(row));
+        for (row, locked) in submenu_info_items(sec, a) {
+            items.push(info_row(row, locked.then_some(ValueColor::Red)));
         }
         for row in account_extra_info_rows(sec, a) {
-            items.push(noop_info(row));
+            items.push(info_row(row, None));
         }
         // Action rows: Switch/Active, Launch, Remove.
         let rows = account_submenu_rows(sec, a);
@@ -3835,7 +3854,7 @@ mod tests {
         assert!(
             !rows
                 .iter()
-                .any(|r| r.contains("resets in") || r.contains("limit")),
+                .any(|r| r.contains("renews in") || r.contains("unlocks in")),
             "no stale window rows: {rows:?}"
         );
         assert!(account_extra_info_rows(&claude_section(), &a).is_empty());
@@ -3893,7 +3912,7 @@ mod tests {
         );
         // No usage/window rows once the login is dead.
         assert!(
-            !rows.iter().any(|r| r.contains("resets in")),
+            !rows.iter().any(|r| r.contains("renews in") || r.contains("unlocks in")),
             "dead login shows no window rows: {rows:?}"
         );
     }
@@ -3966,7 +3985,7 @@ mod tests {
         let mut sec = claude_section();
         sec.provider_id = "codex";
         let rows = submenu_info_rows(&sec, &a);
-        assert_eq!(rows, ["Session · Not reported", "Weekly resets in 2d"]);
+        assert_eq!(rows, ["Session · Not reported", "Weekly renews in 2d"]);
         assert_eq!(summary_pcts(&a), (None, Some(40.0)));
         assert_eq!(title_for(&one_section_snap(a)), "40%");
     }
@@ -3991,7 +4010,7 @@ mod tests {
         let rows = submenu_info_rows(&sec, &locked);
         assert!(
             rows.iter()
-                .any(|r| r.contains("Weekly") && r.contains("limit reached")),
+                .any(|r| r.contains("Weekly") && r.contains("locked · unlocks in")),
             "weekly-locked flyout must keep the weekly lock row: {rows:?}"
         );
         assert!(
@@ -4012,7 +4031,7 @@ mod tests {
     fn submenu_reset_rows_are_plain_text_no_emoji() {
         // The details panel deliberately carries NO leading emoji glyphs (the
         // maintainer found them out of place). Reset rows are plain "<Label>
-        // resets in X" text — assert they read that way and never lead with a
+        // renews in X" text — assert they read that way and never lead with a
         // non-ASCII decoration.
         let a = acct("a@x.com", Some(20.0), Some(30.0), false);
         let sec = ProviderSection {
@@ -4034,7 +4053,7 @@ mod tests {
                 "reset row should be plain ASCII text, no emoji: {row}"
             );
             assert!(
-                row.contains("resets in") || row.contains("no reset info"),
+                row.contains("renews in") || row.contains("unlocks in"),
                 "unexpected reset row text: {row}"
             );
         }
@@ -4171,6 +4190,16 @@ mod tests {
         // The redraw signal includes the exact override state so a change
         // from active→inactive is not swallowed either.
         assert!(menu_signature(&snap).contains("env=true"));
+    }
+
+    #[test]
+    fn locked_window_rows_are_flagged_and_say_unlocks_healthy_say_renews() {
+        // dev6's real shape: session maxed, weekly just reset to 0%.
+        let a = acct("dev6@x.com", Some(100.0), Some(0.0), false);
+        let items = submenu_info_items(&claude_section(), &a);
+        assert!(items.contains(&("Session locked · unlocks in 3h".to_string(), true)), "{items:?}");
+        assert!(items.contains(&("Weekly renews in 2d".to_string(), false)), "{items:?}");
+        assert!(!items.iter().any(|(r, _)| r.contains("resets in")), "{items:?}");
     }
 
     #[test]
