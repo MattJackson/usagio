@@ -1421,7 +1421,8 @@ fn env_override_for(provider_id: &str) -> bool {
 ///      target regardless of how soon its reset is. An account that's BOTH
 ///      locked and currently active stays in normal rotation so its countdown
 ///      is still visible up top.
-///   2. Soonest WEEKLY reset ascending — the account whose 7-day window resets
+///   2. Sunk accounts order by unlock time (soonest-available first, whichever
+///      window is blocking). Everyone else: soonest WEEKLY reset ascending — the account whose 7-day window resets
 ///      first sits on top, so it gets used first and no weekly quota is left
 ///      behind before it resets (the "use credits top-down" rule). A `None`
 ///      weekly reset (no data yet) sorts last within its rank. NOTE: session
@@ -1436,8 +1437,18 @@ fn env_override_for(provider_id: &str) -> bool {
 /// NOT active-first: the active account ranks on its own priority, one stable
 /// rule for everyone (user decision — matches the auto-swap target priority).
 fn account_priority_cmp(a: &AcctView, b: &AcctView, now: DateTime<Utc>) -> std::cmp::Ordering {
-    let sink = |x: &AcctView| locked_countdown_for(x, now).is_some() && !x.active;
-    let weekly_reset = |x: &AcctView| x.weekly_reset_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
+    let locked_until = |x: &AcctView| match countdown::compute_display(&account_usage_for(x), now) {
+        DisplayState::Locked { until, .. } if !x.active => Some(until),
+        _ => None,
+    };
+    let sink = |x: &AcctView| locked_until(x).is_some();
+    // Usable accounts order by weekly reset; sunk (locked) accounts order by
+    // when they next become usable, so the soonest-available is on top.
+    let weekly_reset = |x: &AcctView| {
+        locked_until(x)
+            .or(x.weekly_reset_at)
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+    };
     let headroom = |x: &AcctView| {
         let (sp, wp) = summary_pcts(x);
         100.0 - sp.unwrap_or(0.0).max(wp.unwrap_or(0.0))
@@ -4494,6 +4505,41 @@ mod tests {
             .map(|&(si, ai)| sections[si].accounts[ai].key.as_str())
             .collect();
         assert_eq!(keys, vec!["healthy@x.com", "locked@x.com"]);
+    }
+
+    #[test]
+    fn flat_account_order_sorts_locked_accounts_by_unlock_time() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        // Weekly-locked, unlocks in ~1.5d (its weekly reset is the soonest).
+        let weekly_locked = acct_with_resets(
+            "weekly-locked@x.com",
+            Some(10.0),
+            Some(100.0),
+            false,
+            None,
+            Some(now + chrono::Duration::hours(38)),
+        );
+        // Session-locked, unlocks in 2h, but its weekly reset is 5d out. It is
+        // usable first, so it must sort above the weekly-locked account.
+        let session_locked = acct_with_resets(
+            "session-locked@x.com",
+            Some(100.0),
+            Some(53.0),
+            false,
+            Some(now + chrono::Duration::hours(2)),
+            Some(now + chrono::Duration::days(5)),
+        );
+        let sections = vec![section_with(
+            CLAUDE_SLUG,
+            "Claude",
+            vec![weekly_locked, session_locked],
+        )];
+        let order = flat_account_order(&sections, now);
+        let keys: Vec<&str> = order
+            .iter()
+            .map(|&(si, ai)| sections[si].accounts[ai].key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["session-locked@x.com", "weekly-locked@x.com"]);
     }
 
     #[test]

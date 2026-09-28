@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-09-27
+
+### Fixed
+- Locked accounts are now ordered by when they next become usable. They still
+  sink below usable accounts, but among themselves they were ordered by weekly
+  reset, so an account that was only session-locked (usable again in a couple
+  of hours) could sit below accounts locked for days. Usable accounts still
+  order by soonest weekly reset.
+
 ## [0.8.3] - 2026-09-26
 
 ### Fixed
@@ -1105,7 +1114,8 @@ fixes; every top finding was independently confirmed before fixing.
 - `token` — print a fresh access token for scripting.
 - Local, owner-only token store at `~/.config/claude-usage/state.json` (0600).
 
-[Unreleased]: https://github.com/MattJackson/usagio/compare/v0.8.3...HEAD
+[Unreleased]: https://github.com/MattJackson/usagio/compare/v0.8.4...HEAD
+[0.8.4]: https://github.com/MattJackson/usagio/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/MattJackson/usagio/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/MattJackson/usagio/compare/v0.8.1...v0.8.2
 [0.5.0]: https://github.com/MattJackson/usagio/compare/v0.4.3...v0.5.0
