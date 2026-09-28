@@ -75,6 +75,14 @@ const REFRESH_SKEW_SECS: i64 = credentials::REFRESH_SKEW_SECS;
 const WATCH_INTERVAL_SECS: u64 = 180;
 /// Upper bound for the poll interval when backing off after a 429.
 const WATCH_MAX_INTERVAL_SECS: u64 = 1200;
+/// Flat minimum interval between usage fetches for an INACTIVE account. Only
+/// the active account burns usage, so an inactive reading only moves at its
+/// reset (which bypasses this floor) or if it's used elsewhere — the tier ramp
+/// is reserved for the active account so the request budget goes where a
+/// failover depends on it.
+const INACTIVE_FETCH_FLOOR_SECS: u64 = 600;
+/// Cap for an inactive account's own backoff after repeated failed fetches.
+const INACTIVE_FETCH_MAX_BACKOFF_SECS: u64 = 3600;
 /// Swap away from the active account when it reaches this utilization.
 const TRIGGER_PCT: f64 = 95.0;
 /// Only swap to an account at or below this utilization (hysteresis band).
@@ -2269,7 +2277,18 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
         Option<CachedUsage>,
         Option<notifications::NotifState>,
     )> = Vec::new();
-    let emails: Vec<String> = state.accounts.iter().map(|a| a.key().to_string()).collect();
+    let mut emails: Vec<String> = state.accounts.iter().map(|a| a.key().to_string()).collect();
+    // Active account first: it gets first claim on the request budget, and a
+    // 429 on it stops the inactive fetches below for this cycle.
+    if let Some(active) = state.active.as_deref() {
+        if let Some(i) = emails.iter().position(|e| e == active) {
+            let e = emails.remove(i);
+            emails.insert(0, e);
+        }
+    }
+    // A switch since the last refresh: fetch the new active account now rather
+    // than trusting a cache taken while it was inactive.
+    let active_just_switched = note_polled_active(state.active.as_deref());
     // Settings ▸ Notifications ▸: per-trigger enable flags, persisted on
     // `State` and toggled from the menu bar (`menubar::toggle_notification_trigger`).
     let notif_cfg = state.notification_config.clone();
@@ -2319,6 +2338,16 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
                     continue;
                 }
             }
+        }
+        // The active account is fetched first; if it just got a 429, leave
+        // the inactive accounts alone this cycle (no token or usage calls)
+        // so the budget recovers for the account a failover depends on.
+        if !force && !is_the_active_account && rate_limited {
+            logging::log(&format!(
+                "poll: active account rate limited; skipping {email} this cycle \
+                 (event=fetch_skip_active_429 account={email})"
+            ));
+            continue;
         }
         // The ACTIVE account gets the compare-and-swap treatment (see the
         // `active_refresh_cas` doc above): usagio DOES rotate its token, but
@@ -2432,7 +2461,50 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
         // The `force` bypass keeps `usagio poll --force` semantics (a manual
         // refresh always fetches). The token refresh above already happened, so
         // the token stays warm even on skip.
-        if !force {
+        //
+        // v0.8.5: the tier ramp + burn-rate projection only make sense for the
+        // ACTIVE account — it's the only one burning usage, so it's the only one
+        // whose reading can race toward the trigger. An inactive account's
+        // reading only moves at its reset (which `cache_crossed_reset` already
+        // lets through) or if it's used elsewhere, so it gets a flat
+        // `INACTIVE_FETCH_FLOOR_SECS` — an inactive account at 99% used to land
+        // on the 30s TIGHT tier and spend the tenant's request budget the
+        // active account needs to fail over on time. A failed inactive fetch
+        // additionally backs that account off on its own (see
+        // `record_inactive_fetch_failure`) instead of slowing the global loop.
+        if !force && !is_the_active_account {
+            let tracker = get_usage_fetch_tracker(email);
+            // A reset crossing overrides the backoff: the account may have just
+            // become a swap target, and `evaluate_swap` won't pick it off a
+            // stale locked reading.
+            let crossed_reset = acct
+                .cached_usage
+                .as_ref()
+                .is_some_and(|cu| cache_crossed_reset(cu, Utc::now()));
+            if let (Some(until), false) = (tracker.backoff_until_ts, crossed_reset) {
+                if now_ts < until {
+                    logging::log(&format!(
+                        "poll: {email} backing off after failed fetch; skipping \
+                         (event=fetch_skip_backoff account={email} failures={} remaining={}s)",
+                        tracker.consecutive_failures,
+                        until - now_ts
+                    ));
+                    continue;
+                }
+            }
+            if let Some(cu) = &acct.cached_usage {
+                let age = now_ts - cu.fetched_at;
+                let floor = INACTIVE_FETCH_FLOOR_SECS as i64;
+                if age >= 0 && age < floor && !cache_crossed_reset(cu, Utc::now()) {
+                    logging::log(&format!(
+                        "poll: {email} usage cache still fresh; skipping fetch \
+                         (event=fetch_skip_fresh account={email} age={age}s floor={floor}s inactive)"
+                    ));
+                    continue;
+                }
+            }
+        }
+        if !force && is_the_active_account && !active_just_switched {
             if let Some(cu) = &acct.cached_usage {
                 let age = now_ts - cu.fetched_at;
                 let max_pct = match (cu.session_pct, cu.weekly_pct) {
@@ -2485,7 +2557,17 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
                 Some(cached_from_usage(&u))
             }
             Err(usage::FetchError::RateLimited) => {
-                rate_limited = true;
+                // Only the ACTIVE account's 429 slows the global loop. An
+                // inactive account's 429 backs off that account alone —
+                // otherwise one idle (or dead) account pushes the loop to
+                // 1200s and the active account hits its limit between polls
+                // with no swap (v0.8.5: dev@ 429s froze dev6 at 90% for 20min
+                // while it ran to 100%).
+                if is_the_active_account {
+                    rate_limited = true;
+                } else {
+                    record_inactive_fetch_failure(email, now_ts);
+                }
                 record_usage_fetch_429(email);
                 let tracker = get_usage_fetch_tracker(email);
                 logging::log(&format!(
@@ -2511,6 +2593,13 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
                 // "server is asking us to back off" signal escalation exists
                 // for (Sonnet adversarial review BAD 4).
                 record_usage_fetch_non_429(email);
+                if !is_the_active_account {
+                    // A persistently failing inactive account (e.g. a 403 on
+                    // a revoked org) would otherwise be re-fetched every
+                    // cycle forever — its cache never refreshes, so the
+                    // freshness floor never kicks in.
+                    record_inactive_fetch_failure(email, now_ts);
+                }
                 logging::log(&format!("usage error for {email}: {e}; keeping cache"));
                 None
             }
@@ -2845,12 +2934,20 @@ fn cmd_watch(args: &[String]) -> Result<()> {
     let mut guard = SwapGuard::default();
     let mut wd = watchdog::Watchdog::default();
     let mut wd_effects = watchdog::RealEffects;
+    let mut last_cycle_active = current_active_account();
     loop {
         // Publish the current loop interval so the per-account fetch floor's
         // burn-rate projection uses the RIGHT horizon (`max(tier_floor, this)`).
         // Under a 429 backoff `current` can be 1200s while tier_floor stays at
         // 30–180s, and the projection would otherwise under-predict by 40× on
         // the exact storm the projection is meant to catch (Opus BLOCKER 1).
+        // A switch since the last refresh: the backoff we carry belongs to the
+        // previous active account (see menubar::poll_loop).
+        let cycle_active = current_active_account();
+        if cycle_active != last_cycle_active {
+            current = base;
+        }
+        last_cycle_active = cycle_active.clone();
         set_current_loop_interval_secs(current);
         // Self-healing health check (fd-count + keychain-write). Throttled to
         // ~once a minute internally; a cheap directory read otherwise. Keeps
@@ -2897,7 +2994,12 @@ fn cmd_watch(args: &[String]) -> Result<()> {
         let wake_rows: Vec<Row> = State::load()
             .map(|s| s.accounts.iter().map(row_from_account).collect())
             .unwrap_or_default();
-        let sleep_secs = cap_sleep_to_reset_boundary(&wake_rows, Utc::now(), current);
+        let sleep_secs = if current_active_account() != cycle_active {
+            // Auto-swapped this cycle: refresh the new active account promptly.
+            5
+        } else {
+            cap_sleep_to_reset_boundary(&wake_rows, Utc::now(), current)
+        };
         std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
     }
 }
@@ -3169,6 +3271,10 @@ const ESCALATION_MAX_SUCCESS_AGE_SECS: i64 = 300;
 struct UsageFetchTracker {
     consecutive_429s: u32,
     last_success_ts: Option<i64>,
+    /// Inactive-account backoff (v0.8.5): consecutive failed fetches of any
+    /// kind, and the time before which we won't try again.
+    consecutive_failures: u32,
+    backoff_until_ts: Option<i64>,
 }
 
 static USAGE_FETCH_TRACKERS: std::sync::Mutex<
@@ -3209,7 +3315,46 @@ fn record_usage_fetch_success(email: &str, now_ts: i64) {
         let entry = t.entry(email.to_string()).or_default();
         entry.consecutive_429s = 0;
         entry.last_success_ts = Some(now_ts);
+        entry.consecutive_failures = 0;
+        entry.backoff_until_ts = None;
     });
+}
+
+/// Backoff after `failures` consecutive failed fetches of an inactive
+/// account: the inactive floor, doubling, capped.
+fn inactive_fetch_backoff_secs(failures: u32) -> u64 {
+    let shift = failures.saturating_sub(1).min(8);
+    (INACTIVE_FETCH_FLOOR_SECS << shift).min(INACTIVE_FETCH_MAX_BACKOFF_SECS)
+}
+
+/// Back an INACTIVE account off on its own after a failed fetch (429 or any
+/// other error), instead of slowing the global loop the active account runs on.
+fn record_inactive_fetch_failure(email: &str, now_ts: i64) {
+    with_fetch_trackers(|t| {
+        let entry = t.entry(email.to_string()).or_default();
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        entry.backoff_until_ts =
+            Some(now_ts + inactive_fetch_backoff_secs(entry.consecutive_failures) as i64);
+    });
+}
+
+/// The active account as of the last `refresh_usage_cache`. Lets the poller
+/// notice a switch (manual, auto-swap, or an external `claude /login`) and
+/// refresh the new active account right away at base cadence.
+static LAST_POLLED_ACTIVE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Record `active` as polled; returns true if it differs from the last one.
+fn note_polled_active(active: Option<&str>) -> bool {
+    let mut last = LAST_POLLED_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+    let changed = last.as_deref() != active;
+    *last = active.map(str::to_string);
+    changed
+}
+
+/// The active account in state.json, for the poll loops' switch detection.
+/// `None` on a load failure as well as when nothing is active.
+pub(crate) fn current_active_account() -> Option<String> {
+    State::load().ok().and_then(|st| st.active)
 }
 
 fn record_usage_fetch_429(email: &str) {

@@ -40,9 +40,9 @@ use crate::countdown::{self, AccountUsage, BlockingWindow, DisplayState};
 use crate::providers::{self, CaptureMode, Provider, SeverityBands};
 use crate::store::State;
 use crate::{
-    age_str, capture_current, capture_current_generic, env_override_active, next_interval, notify,
-    optimize_now, remove_account, remove_provider_account_generic, row_from_account,
-    row_from_provider_account, set_current_loop_interval_secs, switch_to,
+    age_str, capture_current, capture_current_generic, current_active_account, env_override_active,
+    next_interval, notify, optimize_now, remove_account, remove_provider_account_generic,
+    row_from_account, row_from_provider_account, set_current_loop_interval_secs, switch_to,
     switch_to_provider_account, watch_cycle, with_state_lock, Row, SwapGuard, CLAUDE_SLUG,
     TARGET_CEILING_PCT, TRIGGER_PCT, WATCH_INTERVAL_SECS,
 };
@@ -1065,7 +1065,9 @@ fn sleep_bounded_detecting_suspend(total: u64) -> bool {
     while remaining > 0 {
         let chunk = remaining.min(SLEEP_CHUNK_SECS);
         let before = std::time::SystemTime::now();
-        std::thread::sleep(Duration::from_secs(chunk));
+        if wait_for_poll_request(Duration::from_secs(chunk)) {
+            return true;
+        }
         let elapsed = before.elapsed().map(|d| d.as_secs()).unwrap_or(chunk);
         if is_suspend_gap(chunk, elapsed) {
             crate::logging::log(&format!(
@@ -1079,6 +1081,35 @@ fn sleep_bounded_detecting_suspend(total: u64) -> bool {
     false
 }
 
+/// Delay before refreshing a newly active account after an auto-swap — just
+/// long enough for Claude Code to pick up the new credentials.
+const POST_SWITCH_REFRESH_SECS: u64 = 5;
+
+/// Set by [`request_poll_now`]; the poller's sleep waits on the condvar so a
+/// request cuts the current sleep short.
+static POLL_REQUEST: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+/// Ask the poller to run its next cycle now. Called after a switch so the new
+/// active account is refreshed immediately — it may otherwise sit behind a
+/// 1200s backoff earned by the account we just left.
+pub(crate) fn request_poll_now() {
+    let (lock, cv) = &POLL_REQUEST;
+    *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    cv.notify_all();
+}
+
+/// Wait up to `timeout` for a [`request_poll_now`]; returns (and clears) the
+/// request flag. Behaves like `thread::sleep(timeout)` when nothing is asked.
+fn wait_for_poll_request(timeout: Duration) -> bool {
+    let (lock, cv) = &POLL_REQUEST;
+    let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut guard, _) = cv
+        .wait_timeout_while(guard, timeout, |requested| !*requested)
+        .unwrap_or_else(|e| e.into_inner());
+    std::mem::take(&mut *guard)
+}
+
 fn poll_loop() {
     let guard = shared_swap_guard();
     let base = WATCH_INTERVAL_SECS;
@@ -1090,6 +1121,9 @@ fn poll_loop() {
     // menu never opens on stale data carried over from before the app was last
     // closed (e.g. an account that reset/boosted while usagio wasn't running).
     let mut first_cycle = true;
+    // The active account at the start of the previous cycle — kept locally so
+    // another caller of the refresh path can't consume the switch signal.
+    let mut last_cycle_active = current_active_account();
     loop {
         // v0.8.0: publish current loop cadence so the fetch-floor projection
         // uses the correct horizon under 429 backoff (see main.rs).
@@ -1099,6 +1133,13 @@ fn poll_loop() {
         // fd leak that a watcher respawn can't clear escalates to a launchd
         // kickstart into a clean process (see `crate::watchdog`).
         wd.maybe_run(&mut wd_effects);
+        // A switch since the last refresh (manual, auto, or an external
+        // `claude /login`) means any backoff we're carrying was earned by the
+        // previous active account; start the new one at base cadence.
+        let cycle_active = current_active_account();
+        if cycle_active != last_cycle_active {
+            current = base;
+        }
         // Fetch usage + auto-swap; this writes cached usage to state.json, which
         // the main-thread timer reads back to render. This is the ONLY thing that
         // hits the network, so ordinary use can never rate-limit.
@@ -1131,6 +1172,9 @@ fn poll_loop() {
         // immediately, instead of showing stale "99%" until the next poll. A
         // single targeted boundary wake, so it may dip below the cadence floor.
         let sleep_secs = match next_reset_wake_secs() {
+            // An auto-swap this cycle: refresh the new active account right
+            // away instead of flying blind on its (possibly old) cache.
+            _ if current_active_account() != cycle_active => POST_SWITCH_REFRESH_SECS,
             Some(w) if w < current => w.max(RESET_SETTLE_SECS),
             _ => current,
         };
@@ -1140,6 +1184,7 @@ fn poll_loop() {
         // pre-sleep reading until the full interval elapses. The return value
         // is intentionally unused here — the loop head already re-refreshes;
         // early return just gets us there sooner.
+        last_cycle_active = cycle_active;
         let _resumed = sleep_bounded_detecting_suspend(sleep_secs);
     }
 }
@@ -2253,7 +2298,10 @@ fn handle_click(id: &str) {
         ("noop", _, _) => {}
         ("autoswap", Some("off"), None) => set_autoswap(false),
         ("autoswap", Some("now"), None) => match optimize_now() {
-            Ok(Some(email)) => notify(&format!("Switched to {email}")),
+            Ok(Some(email)) => {
+                notify(&format!("Switched to {email}"));
+                request_poll_now();
+            }
             Ok(None) => notify("Already on the best account"),
             Err(e) => notify(&format!("Optimize failed: {e}")),
         },
@@ -2550,10 +2598,14 @@ fn try_start_refresh(spawn: impl FnOnce()) {
 fn handle_capture(slug: &str) {
     if slug == CLAUDE_SLUG {
         match capture_current() {
-            Ok((email, existed)) => notify(&format!(
-                "{} {email}",
-                if existed { "Refreshed" } else { "Captured" }
-            )),
+            Ok((email, existed)) => {
+                notify(&format!(
+                    "{} {email}",
+                    if existed { "Refreshed" } else { "Captured" }
+                ));
+                // Capture makes this login the active account.
+                request_poll_now();
+            }
             Err(e) => notify(&format!("Capture failed: {e}")),
         }
         return;
@@ -2598,6 +2650,7 @@ fn handle_switch(slug: &str, key: &str) {
             guard.last_swap = Some(std::time::Instant::now());
             guard.manual_locked_choice = Some((slug.to_string(), key.to_string()));
             notify(&format!("Switched to {label}"));
+            request_poll_now();
         }
         Err(e) => notify(&format!("Switch failed: {e}")),
     }

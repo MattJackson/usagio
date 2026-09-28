@@ -2363,3 +2363,120 @@ fn blocked_preparation_respects_disabled_autoswap_cooldown_and_no_return() {
         .target
         .is_none());
 }
+
+// --- v0.8.5: active account gets the request budget; inactive backs off alone ---
+
+#[test]
+fn inactive_fetch_backoff_doubles_from_floor_and_caps() {
+    assert_eq!(inactive_fetch_backoff_secs(1), INACTIVE_FETCH_FLOOR_SECS);
+    assert_eq!(
+        inactive_fetch_backoff_secs(2),
+        INACTIVE_FETCH_FLOOR_SECS * 2
+    );
+    assert_eq!(
+        inactive_fetch_backoff_secs(3),
+        INACTIVE_FETCH_FLOOR_SECS * 4
+    );
+    assert_eq!(
+        inactive_fetch_backoff_secs(4),
+        INACTIVE_FETCH_MAX_BACKOFF_SECS
+    );
+    assert_eq!(
+        inactive_fetch_backoff_secs(u32::MAX),
+        INACTIVE_FETCH_MAX_BACKOFF_SECS
+    );
+}
+
+#[test]
+fn inactive_fetch_failure_sets_backoff_and_success_clears_it() {
+    let email = escalation_test_email("inactive-backoff");
+    let now_ts = 1_000_000;
+    record_inactive_fetch_failure(&email, now_ts);
+    record_inactive_fetch_failure(&email, now_ts);
+    let t = get_usage_fetch_tracker(&email);
+    assert_eq!(t.consecutive_failures, 2);
+    assert_eq!(
+        t.backoff_until_ts,
+        Some(now_ts + inactive_fetch_backoff_secs(2) as i64)
+    );
+    record_usage_fetch_success(&email, now_ts + 10);
+    let t = get_usage_fetch_tracker(&email);
+    assert_eq!(t.consecutive_failures, 0);
+    assert_eq!(t.backoff_until_ts, None);
+    reset_usage_fetch_tracker(&email);
+}
+
+/// Mock usage endpoint that answers every request with HTTP 429 and counts hits.
+fn spawn_mock_429_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{Shutdown, TcpListener};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock 429 server");
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_thread = Arc::clone(&hits);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(&stream);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" || line == "\n" {
+                    break;
+                }
+            }
+            hits_thread.fetch_add(1, Ordering::SeqCst);
+            let _ = stream.write_all(
+                b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            let _ = stream.flush();
+            let _ = stream.shutdown(Shutdown::Write);
+        }
+    });
+    (format!("http://{addr}"), hits)
+}
+
+/// The v0.8.5 incident: a 429 on an INACTIVE account set the global
+/// `rate_limited` flag, pushing the loop to 1200s so the active account ran
+/// out between polls. Now it must not slow the loop, and must back that
+/// account off on its own so the next cycle doesn't fetch it again.
+#[test]
+fn inactive_429_does_not_rate_limit_loop_and_backs_off_that_account() {
+    use crate::providers::claude::usage;
+    use crate::store::{Account, ScopedConfigDir};
+
+    let _g = ScopedConfigDir::new();
+    let (base_url, hits) = spawn_mock_429_server();
+    usage::set_usage_url_override(Some(&format!("{base_url}/api/oauth/usage")));
+
+    let email = escalation_test_email("inactive-429");
+    let fresh = Utc::now().timestamp_millis() + 3_600_000;
+    let mut inactive = Account::from_keychain_blob(&format!(
+        r#"{{"claudeAiOauth":{{"accessToken":"inactive-at","refreshToken":"inactive-rt","expiresAt":{fresh}}}}}"#
+    ))
+    .unwrap();
+    inactive.email = Some(email.clone());
+    let mut seed = State::default();
+    seed.accounts.push(inactive);
+    seed.active = None;
+    seed.save().unwrap();
+
+    let first = refresh_usage_cache(false);
+    let second = refresh_usage_cache(false);
+    usage::set_usage_url_override(None);
+
+    assert!(
+        !first.rate_limited,
+        "an inactive 429 must not slow the global loop"
+    );
+    assert!(!second.rate_limited);
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the backed-off inactive account must not be re-fetched next cycle"
+    );
+    assert!(get_usage_fetch_tracker(&email).backoff_until_ts.is_some());
+    reset_usage_fetch_tracker(&email);
+}
