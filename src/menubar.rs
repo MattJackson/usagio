@@ -1983,12 +1983,11 @@ fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
 }
 
 /// The disk-derived informational rows for an account's submenu, in render
-/// order: burn-rate estimate (`🔥`), cost estimate (`💰`), and the "updated Xm
-/// ago" footer. Split out from `submenu_info_rows` — which must stay
-/// disk-I/O-free so it's callable from a unit test without a `ScopedConfigDir`
-/// — because these read the on-disk usage log via `crate::burn_rate` /
-/// `crate::cost_tracking`. `build_account_submenu_item` appends them after the
-/// `submenu_info_rows` block.
+/// order: burn-rate estimate (`🔥`) and the "updated Xm ago" footer. Split out
+/// from `submenu_info_rows` — which must stay disk-I/O-free so it's callable
+/// from a unit test without a `ScopedConfigDir` — because the burn rate reads
+/// the on-disk usage log via `crate::burn_rate`. `build_account_submenu_item`
+/// appends them after the `submenu_info_rows` block.
 fn account_extra_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
     let mut rows = Vec::new();
     if sec.supports_usage && a.has_data && !a.windows.is_empty() && !a.no_subscription {
@@ -2012,12 +2011,6 @@ fn account_extra_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
                     rows.push(crate::burn_rate::format_menu_row(&est));
                 }
             }
-        }
-        if let Some(cost) = crate::cost_tracking::estimate_cycle_cost(
-            &account_key,
-            crate::cost_tracking::CLAUDE_MAX_100_WEEKLY_TOKENS,
-        ) {
-            rows.push(format!("~${:.2} this cycle (est)", cost.estimated_usd));
         }
         rows.push(format!("updated {}", a.updated));
     }
