@@ -302,7 +302,7 @@ fn menu_order_lists_use_first_account_first() {
         row_full("later@e.com", 5.0, 5.0, later),
         row_full("soon@e.com", 40.0, 40.0, soon),
     ];
-    rows.sort_by(menu_order);
+    rows.sort_by(|a, b| menu_order(a, b, None, Utc::now()));
     // Soonest weekly reset (the account auto-pick would use first) leads.
     assert_eq!(rows[0].email, "soon@e.com");
     assert_eq!(rows[1].email, "later@e.com");
@@ -312,13 +312,42 @@ fn menu_order_lists_use_first_account_first() {
 fn menu_order_sinks_maxed_accounts_below_usable_ones() {
     let reset = Utc::now() + Duration::hours(6);
     // A maxed account resets soonest, but it's unusable — it must sort last.
+    let mut maxed = row_full("maxed@e.com", 100.0, 40.0, reset);
+    maxed.session.resets_at = Some(Utc::now() + Duration::hours(1));
     let mut rows = [
-        row_full("maxed@e.com", 100.0, 40.0, reset),
+        maxed,
         row_full("free@e.com", 30.0, 30.0, Utc::now() + Duration::hours(24)),
     ];
-    rows.sort_by(menu_order);
+    rows.sort_by(|a, b| menu_order(a, b, None, Utc::now()));
     assert_eq!(rows[0].email, "free@e.com");
     assert_eq!(rows[1].email, "maxed@e.com");
+}
+
+#[test]
+fn menu_order_sorts_locked_accounts_by_unlock_time() {
+    let now = Utc::now();
+    // Weekly-locked, unlocks in 38h (its weekly reset is the soonest).
+    let weekly_locked = row_full("weekly@e.com", 10.0, 100.0, now + Duration::hours(38));
+    // Session-locked, unlocks in 2h, weekly reset 5d out — usable first.
+    let mut session_locked = row_full("session@e.com", 100.0, 53.0, now + Duration::days(5));
+    session_locked.session.resets_at = Some(now + Duration::hours(2));
+    let mut rows = [weekly_locked, session_locked];
+    rows.sort_by(|a, b| menu_order(a, b, None, now));
+    assert_eq!(rows[0].email, "session@e.com");
+    assert_eq!(rows[1].email, "weekly@e.com");
+}
+
+#[test]
+fn menu_order_keeps_active_locked_account_in_rotation() {
+    let now = Utc::now();
+    // Active and locked: not sunk, so its sooner weekly reset puts it first.
+    let mut locked = row_full("active@e.com", 100.0, 40.0, now + Duration::hours(6));
+    locked.session.resets_at = Some(now + Duration::hours(1));
+    let free = row_full("free@e.com", 30.0, 30.0, now + Duration::hours(24));
+    let mut rows = [free, locked];
+    rows.sort_by(|a, b| menu_order(a, b, Some("active@e.com"), now));
+    assert_eq!(rows[0].email, "active@e.com");
+    assert_eq!(rows[1].email, "free@e.com");
 }
 
 // --- choose_swap_target (auto-swap guard) ---
@@ -2333,4 +2362,121 @@ fn blocked_preparation_respects_disabled_autoswap_cooldown_and_no_return() {
     assert!(evaluate_swap(&rows, "active@e.com", 95.0, 85.0, &guard)
         .target
         .is_none());
+}
+
+// --- v0.8.5: active account gets the request budget; inactive backs off alone ---
+
+#[test]
+fn inactive_fetch_backoff_doubles_from_floor_and_caps() {
+    assert_eq!(inactive_fetch_backoff_secs(1), INACTIVE_FETCH_FLOOR_SECS);
+    assert_eq!(
+        inactive_fetch_backoff_secs(2),
+        INACTIVE_FETCH_FLOOR_SECS * 2
+    );
+    assert_eq!(
+        inactive_fetch_backoff_secs(3),
+        INACTIVE_FETCH_FLOOR_SECS * 4
+    );
+    assert_eq!(
+        inactive_fetch_backoff_secs(4),
+        INACTIVE_FETCH_MAX_BACKOFF_SECS
+    );
+    assert_eq!(
+        inactive_fetch_backoff_secs(u32::MAX),
+        INACTIVE_FETCH_MAX_BACKOFF_SECS
+    );
+}
+
+#[test]
+fn inactive_fetch_failure_sets_backoff_and_success_clears_it() {
+    let email = escalation_test_email("inactive-backoff");
+    let now_ts = 1_000_000;
+    record_inactive_fetch_failure(&email, now_ts);
+    record_inactive_fetch_failure(&email, now_ts);
+    let t = get_usage_fetch_tracker(&email);
+    assert_eq!(t.consecutive_failures, 2);
+    assert_eq!(
+        t.backoff_until_ts,
+        Some(now_ts + inactive_fetch_backoff_secs(2) as i64)
+    );
+    record_usage_fetch_success(&email, now_ts + 10);
+    let t = get_usage_fetch_tracker(&email);
+    assert_eq!(t.consecutive_failures, 0);
+    assert_eq!(t.backoff_until_ts, None);
+    reset_usage_fetch_tracker(&email);
+}
+
+/// Mock usage endpoint that answers every request with HTTP 429 and counts hits.
+fn spawn_mock_429_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{Shutdown, TcpListener};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock 429 server");
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_thread = Arc::clone(&hits);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(&stream);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" || line == "\n" {
+                    break;
+                }
+            }
+            hits_thread.fetch_add(1, Ordering::SeqCst);
+            let _ = stream.write_all(
+                b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            let _ = stream.flush();
+            let _ = stream.shutdown(Shutdown::Write);
+        }
+    });
+    (format!("http://{addr}"), hits)
+}
+
+/// The v0.8.5 incident: a 429 on an INACTIVE account set the global
+/// `rate_limited` flag, pushing the loop to 1200s so the active account ran
+/// out between polls. Now it must not slow the loop, and must back that
+/// account off on its own so the next cycle doesn't fetch it again.
+#[test]
+fn inactive_429_does_not_rate_limit_loop_and_backs_off_that_account() {
+    use crate::providers::claude::usage;
+    use crate::store::{Account, ScopedConfigDir};
+
+    let _g = ScopedConfigDir::new();
+    let (base_url, hits) = spawn_mock_429_server();
+    usage::set_usage_url_override(Some(&format!("{base_url}/api/oauth/usage")));
+
+    let email = escalation_test_email("inactive-429");
+    let fresh = Utc::now().timestamp_millis() + 3_600_000;
+    let mut inactive = Account::from_keychain_blob(&format!(
+        r#"{{"claudeAiOauth":{{"accessToken":"inactive-at","refreshToken":"inactive-rt","expiresAt":{fresh}}}}}"#
+    ))
+    .unwrap();
+    inactive.email = Some(email.clone());
+    let mut seed = State::default();
+    seed.accounts.push(inactive);
+    seed.active = None;
+    seed.save().unwrap();
+
+    let first = refresh_usage_cache(false);
+    let second = refresh_usage_cache(false);
+    usage::set_usage_url_override(None);
+
+    assert!(
+        !first.rate_limited,
+        "an inactive 429 must not slow the global loop"
+    );
+    assert!(!second.rate_limited);
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the backed-off inactive account must not be re-fetched next cycle"
+    );
+    assert!(get_usage_fetch_tracker(&email).backoff_until_ts.is_some());
+    reset_usage_fetch_tracker(&email);
 }
