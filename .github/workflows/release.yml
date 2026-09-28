@@ -30,7 +30,14 @@ jobs:
           # Both Apple architectures so we can lipo a universal binary.
           targets: aarch64-apple-darwin, x86_64-apple-darwin
 
+      # Restore-only: a tag run can only read caches saved on the default
+      # branch, so release-cache.yml warms these on every push to main
+      # (same shared-key). Saving here would upload ~600 MB that no later
+      # tag can ever read.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: release-macos
+          save-if: false
 
       - name: Verify tag matches Cargo.toml version
         run: |
@@ -42,9 +49,9 @@ jobs:
           fi
 
       - name: Build (aarch64 + x86_64)
-        run: |
-          cargo build --release --locked --target aarch64-apple-darwin
-          cargo build --release --locked --target x86_64-apple-darwin
+        # One invocation for both targets so cargo schedules them in parallel
+        # (two sequential builds left most cores idle during each link).
+        run: cargo build --release --locked --target aarch64-apple-darwin --target x86_64-apple-darwin
 
       - name: Package binaries
         run: |
@@ -309,7 +316,14 @@ jobs:
           toolchain: stable
           targets: x86_64-unknown-linux-gnu
 
+      # Restore-only: a tag run can only read caches saved on the default
+      # branch, so release-cache.yml warms these on every push to main
+      # (same shared-key). Saving here would upload ~600 MB that no later
+      # tag can ever read.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: release-linux
+          save-if: false
 
       - name: Verify tag matches Cargo.toml version
         run: |
@@ -389,7 +403,14 @@ jobs:
           # this just makes the target explicit rather than relying on it.
           targets: x86_64-pc-windows-msvc
 
+      # Restore-only: a tag run can only read caches saved on the default
+      # branch, so release-cache.yml warms these on every push to main
+      # (same shared-key). Saving here would upload ~600 MB that no later
+      # tag can ever read.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: release-windows
+          save-if: false
 
       - name: Verify tag matches Cargo.toml version
         shell: bash
