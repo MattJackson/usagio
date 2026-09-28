@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-09-28
+
+### Added
+- Accounts whose subscription has lapsed are now detected and shown, for every
+  provider. A lapsed account's row shows a red "-" instead of a stale reset
+  countdown, its submenu says "No subscription · Free plan" instead of old
+  usage and cost, "Switch to this account" and "Launch client" are hidden, it
+  always sorts to the bottom (alphabetically), and you get a notification when
+  a plan lapses or comes back. `usagio list` shows the same.
+- The account submenu shows the plan when known (Max 20x, Pro, Plus, …).
+
+### Fixed
+- A lapsed account no longer calls the usage endpoint every cycle. Those calls
+  only returned 403/429 and spent the request budget the other accounts need.
+  It now gets a plan check every 30 minutes (or on `usagio list --refresh`)
+  and resumes normal polling as soon as a plan is back.
+- Auto-swap never picks a lapsed account, and moves off the active account if
+  its plan lapses.
+
 ## [0.8.5] - 2026-09-27
 
 ### Fixed
@@ -1134,7 +1153,9 @@ fixes; every top finding was independently confirmed before fixing.
 - `token` — print a fresh access token for scripting.
 - Local, owner-only token store at `~/.config/claude-usage/state.json` (0600).
 
-[Unreleased]: https://github.com/MattJackson/usagio/compare/v0.8.4...HEAD
+[Unreleased]: https://github.com/MattJackson/usagio/compare/v0.8.6...HEAD
+[0.8.6]: https://github.com/MattJackson/usagio/compare/v0.8.5...v0.8.6
+[0.8.5]: https://github.com/MattJackson/usagio/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/MattJackson/usagio/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/MattJackson/usagio/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/MattJackson/usagio/compare/v0.8.1...v0.8.2

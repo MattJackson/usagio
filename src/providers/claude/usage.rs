@@ -12,6 +12,10 @@ pub enum FetchError {
     RateLimited,
     /// HTTP 401 — token expired or revoked.
     Auth,
+    /// HTTP 403 — the token is valid but the account may not use the endpoint.
+    /// Seen when the account's Claude subscription has lapsed; the caller
+    /// confirms via the profile (`Provider::check_plan`) before treating it as that.
+    Forbidden,
     /// Network / transport failure (no HTTP status).
     Transient(String),
     /// Any other non-success status or a parse failure.
@@ -23,6 +27,7 @@ impl std::fmt::Display for FetchError {
         match self {
             FetchError::RateLimited => write!(f, "rate limited (HTTP 429)"),
             FetchError::Auth => write!(f, "unauthorized (token expired or revoked)"),
+            FetchError::Forbidden => write!(f, "forbidden (HTTP 403)"),
             FetchError::Transient(e) => write!(f, "transient error: {e}"),
             FetchError::Other(e) => write!(f, "{e}"),
         }
@@ -92,6 +97,7 @@ pub fn fetch(access_token: &str) -> std::result::Result<Usage, FetchError> {
             .map_err(|e| FetchError::Other(format!("parsing usage response: {e}"))),
         Err(ureq::Error::Status(429, _)) => Err(FetchError::RateLimited),
         Err(ureq::Error::Status(401, _)) => Err(FetchError::Auth),
+        Err(ureq::Error::Status(403, _)) => Err(FetchError::Forbidden),
         Err(ureq::Error::Status(code, _r)) => {
             // Don't fold the raw response body into the error — it can echo
             // account/request detail and ends up in the debug log (same hygiene
@@ -138,6 +144,54 @@ pub fn fetch_profile(access_token: &str) -> Option<serde_json::Value> {
         .ok()?
         .into_json()
         .ok()
+}
+
+/// Whether a profile response shows a paid Claude plan. The profile endpoint
+/// is separate from `/api/oauth/usage` and keeps answering for a lapsed
+/// account, so it's the cheap way to both detect a lapse and notice a renewal
+/// without spending usage-endpoint requests (and 429s). A lapsed plan shows up as the org
+/// dropping to `claude_free` and/or a terminal `subscription_status`
+/// (observed: `organization_type: claude_free`, `subscription_status:
+/// canceled` after a Max plan expired).
+pub fn subscription_active_from_profile(profile: &serde_json::Value) -> Option<bool> {
+    let org = profile.get("organization")?.as_object()?;
+    let org_type = org.get("organization_type").and_then(|v| v.as_str());
+    let status = org.get("subscription_status").and_then(|v| v.as_str());
+    let lapsed = org_type == Some("claude_free")
+        || matches!(status, Some("canceled" | "unpaid" | "incomplete_expired"));
+    Some(!lapsed)
+}
+
+/// Map Anthropic's org type / rate-limit tier to what the user bought.
+pub fn plan_label(org_type: Option<&str>, tier: Option<&str>) -> Option<String> {
+    let label = match org_type? {
+        "claude_max" => match tier.unwrap_or("") {
+            t if t.ends_with("_20x") => "Max 20x",
+            t if t.ends_with("_5x") => "Max 5x",
+            _ => "Max",
+        },
+        "claude_pro" => "Pro",
+        "claude_team" => "Team",
+        "claude_enterprise" => "Enterprise",
+        "claude_free" => "Free",
+        _ => return None,
+    };
+    Some(label.to_string())
+}
+
+/// Plan label + lapsed/active from a profile response.
+pub fn plan_status_from_profile(
+    profile: &serde_json::Value,
+) -> Option<crate::providers::trait_def::PlanStatus> {
+    let active = subscription_active_from_profile(profile)?;
+    let org = profile.get("organization");
+    let get = |k: &str| org.and_then(|o| o.get(k)).and_then(|v| v.as_str());
+    let label = if active {
+        plan_label(get("organization_type"), get("rate_limit_tier"))
+    } else {
+        Some("Free".to_string())
+    };
+    Some(crate::providers::trait_def::PlanStatus { label, active })
 }
 
 /// Build an `oauthAccount` object (the shape Claude Code stores in
