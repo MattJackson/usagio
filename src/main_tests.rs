@@ -2046,7 +2046,7 @@ fn switch_to_provider_account_writes_auth_json_and_updates_active() {
         std::fs::write(dir.path().join("auth.json"), &blob_b).unwrap();
         capture_current_generic("codex").unwrap();
 
-        let label = switch_to_provider_account("codex", "a@example.com").unwrap();
+        let label = switch_to_provider_account("codex", "a@example.com", true).unwrap();
         assert_eq!(label, "a@example.com");
 
         let on_disk = std::fs::read_to_string(dir.path().join("auth.json")).unwrap();
@@ -2061,6 +2061,10 @@ fn switch_to_provider_account_writes_auth_json_and_updates_active() {
         assert!(state
             .find_provider_account("codex", "b@example.com")
             .is_some());
+        // A manual switch holds; an auto-swap clears the hold.
+        assert_eq!(state.manual_hold("codex"), Some("a@example.com"));
+        switch_to_provider_account("codex", "b@example.com", false).unwrap();
+        assert_eq!(State::load().unwrap().manual_hold("codex"), None);
     });
 }
 
@@ -2069,7 +2073,7 @@ fn switch_to_provider_account_errors_for_unknown_key() {
     let _cfg = crate::store::ScopedConfigDir::new();
     let dir = tempfile::tempdir().unwrap();
     crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
-        let err = switch_to_provider_account("codex", "nobody@example.com").unwrap_err();
+        let err = switch_to_provider_account("codex", "nobody@example.com", false).unwrap_err();
         assert!(format!("{err}").contains("no codex account matches"));
     });
 }
@@ -2390,6 +2394,130 @@ fn blocked_preparation_preserves_manual_choice_but_allows_recovered_target() {
     let eval = evaluate_swap(&rows, "manual@e.com", 95.0, 85.0, &guard);
     assert!(!eval.preparing);
     assert_eq!(eval.target.as_deref(), Some("next@e.com"));
+}
+
+#[test]
+fn manual_hold_stays_past_trigger_until_exhausted() {
+    let now = Utc::now();
+    let mut rows = vec![
+        row_full("manual@e.com", 0.0, 85.0, now + Duration::days(1)),
+        row_full("roomy@e.com", 0.0, 53.0, now + Duration::days(2)),
+    ];
+    let held = SwapGuard {
+        manual_locked_choice: Some((CLAUDE_SLUG.to_string(), "manual@e.com".to_string())),
+        ..SwapGuard::default()
+    };
+    // Unheld, 85% against an 85% trigger is an urgent swap.
+    assert_eq!(
+        evaluate_swap(&rows, "manual@e.com", 85.0, 85.0, &SwapGuard::default())
+            .target
+            .as_deref(),
+        Some("roomy@e.com")
+    );
+    assert!(evaluate_swap(&rows, "manual@e.com", 85.0, 85.0, &held)
+        .target
+        .is_none());
+    rows[0].weekly.pct = Some(99.0);
+    assert!(evaluate_swap(&rows, "manual@e.com", 85.0, 85.0, &held)
+        .target
+        .is_none());
+    // Exhausted: the hold no longer protects it.
+    rows[0].weekly.pct = Some(100.0);
+    assert_eq!(
+        evaluate_swap(&rows, "manual@e.com", 85.0, 85.0, &held)
+            .target
+            .as_deref(),
+        Some("roomy@e.com")
+    );
+    // Lapsed subscription: same.
+    rows[0].weekly.pct = Some(90.0);
+    rows[0].no_subscription = true;
+    assert_eq!(
+        evaluate_swap(&rows, "manual@e.com", 85.0, 85.0, &held)
+            .target
+            .as_deref(),
+        Some("roomy@e.com")
+    );
+}
+
+#[test]
+fn no_flip_back_into_the_429_escalation_band() {
+    // v0.8.7 thrash: dev@ at 84% (85% trigger) resets soonest, so every
+    // flip-back walked back to it — and the next 429 forced it out again.
+    let now = Utc::now();
+    let rows = vec![
+        row_full("dev4@e.com", 0.0, 53.0, now + Duration::days(2)),
+        row_full("dev@e.com", 0.0, 84.0, now + Duration::days(1)),
+    ];
+    let eval = evaluate_swap(&rows, "dev4@e.com", 85.0, 85.0, &SwapGuard::default());
+    assert!(eval.target.is_none() && eval.target_ignoring_cooldown.is_none());
+    // Just under the band it is a flip-back target again.
+    let mut rows = rows;
+    rows[1].weekly.pct = Some(79.0);
+    assert_eq!(
+        evaluate_swap(&rows, "dev4@e.com", 85.0, 85.0, &SwapGuard::default())
+            .target
+            .as_deref(),
+        Some("dev@e.com")
+    );
+}
+
+#[test]
+fn reactive_swap_prefers_targets_below_the_band() {
+    let now = Utc::now();
+    let rows = vec![
+        row_full("active@e.com", 0.0, 96.0, now + Duration::days(4)),
+        row_full("banded@e.com", 0.0, 90.0, now + Duration::days(1)),
+        row_full("roomy@e.com", 0.0, 40.0, now + Duration::days(3)),
+    ];
+    let eval = evaluate_swap(&rows, "active@e.com", 95.0, 95.0, &SwapGuard::default());
+    assert_eq!(eval.target.as_deref(), Some("roomy@e.com"));
+    assert!(!eval.fallback);
+    // Only banded accounts left: the fallback still moves to the most room.
+    let mut rows = rows;
+    rows.pop();
+    let eval = evaluate_swap(&rows, "active@e.com", 95.0, 95.0, &SwapGuard::default());
+    assert_eq!(eval.target.as_deref(), Some("banded@e.com"));
+    assert!(eval.fallback);
+}
+
+#[test]
+fn manual_hold_blocks_proactive_flip_back() {
+    let now = Utc::now();
+    let rows = vec![
+        row_full("manual@e.com", 0.0, 60.0, now + Duration::days(5)),
+        row_full("sooner@e.com", 0.0, 10.0, now + Duration::hours(3)),
+    ];
+    let unheld = evaluate_swap(&rows, "manual@e.com", 95.0, 95.0, &SwapGuard::default());
+    assert_eq!(
+        unheld.target_ignoring_cooldown.as_deref(),
+        Some("sooner@e.com"),
+        "precondition: an unheld account would flip to the sooner reset"
+    );
+    let held = SwapGuard {
+        manual_locked_choice: Some((CLAUDE_SLUG.to_string(), "manual@e.com".to_string())),
+        ..SwapGuard::default()
+    };
+    let eval = evaluate_swap(&rows, "manual@e.com", 95.0, 95.0, &held);
+    assert!(eval.target.is_none() && eval.target_ignoring_cooldown.is_none());
+}
+
+#[test]
+fn switch_reports_ambiguous_prefix_instead_of_no_match() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let mut state = State::default();
+    for email in ["dev@e.com", "dev2@e.com"] {
+        let mut a = acct_with_cache(None);
+        a.email = Some(email.to_string());
+        state.upsert(a);
+    }
+    state.save().unwrap();
+    let err = cmd_switch(Some("dev"), None).unwrap_err().to_string();
+    assert!(err.contains("ambiguous"), "{err}");
+    assert!(
+        err.contains("dev@e.com") && err.contains("dev2@e.com"),
+        "{err}"
+    );
 }
 
 #[test]

@@ -75,6 +75,18 @@ impl Platform for MacOsPlatform {
         // second call (or an unregistered id) returns Err, which we log and
         // ignore — the worst case is the pre-existing behavior, never a crash.
         const BUNDLE_ID: &str = "com.mattjackson.usagio";
+        // set_application only accepts an id LaunchServices already knows,
+        // and it can't be retried. Right after `brew upgrade` the new
+        // Cellar's usagio.app isn't registered yet, so register it first.
+        if !launch_services::knows_bundle_id(BUNDLE_ID) {
+            if let Some(app) = app_bundle_dir() {
+                let status = launch_services::register(&app);
+                crate::logging::log(&format!(
+                    "notifications: registered {} with LaunchServices (status={status})",
+                    app.display()
+                ));
+            }
+        }
         match notify_rust::set_application(BUNDLE_ID) {
             Ok(()) => {
                 crate::logging::log(&format!("notifications: registered bundle id {BUNDLE_ID}"));
@@ -94,6 +106,102 @@ impl Platform for MacOsPlatform {
             .show()
             .map(|_| ())
             .map_err(|e| anyhow::anyhow!("notify-rust show failed: {e}"))
+    }
+}
+
+/// Our `usagio.app` directory: the bundle we're running from, else the one
+/// the LaunchAgent would launch (Homebrew's sibling bundle).
+fn app_bundle_dir() -> Option<PathBuf> {
+    let exe = crate::launch_agent_exe_path();
+    exe.ancestors()
+        .find(|p| p.extension().is_some_and(|e| e == "app"))
+        .map(Path::to_path_buf)
+}
+
+/// Minimal LaunchServices FFI for `register_notification_app`.
+mod launch_services {
+    use std::ffi::c_void;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    type CFTypeRef = *const c_void;
+    const UTF8: u32 = 0x0800_0100; // kCFStringEncodingUTF8
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFStringCreateWithBytes(
+            alloc: CFTypeRef,
+            bytes: *const u8,
+            len: isize,
+            encoding: u32,
+            external: u8,
+        ) -> CFTypeRef;
+        fn CFURLCreateFromFileSystemRepresentation(
+            alloc: CFTypeRef,
+            buf: *const u8,
+            len: isize,
+            is_dir: u8,
+        ) -> CFTypeRef;
+        fn CFRelease(cf: CFTypeRef);
+    }
+
+    #[link(name = "CoreServices", kind = "framework")]
+    extern "C" {
+        fn LSCopyApplicationURLsForBundleIdentifier(
+            id: CFTypeRef,
+            err: *mut CFTypeRef,
+        ) -> CFTypeRef;
+        fn LSRegisterURL(url: CFTypeRef, update: u8) -> i32;
+    }
+
+    /// True if LaunchServices maps `id` to at least one application.
+    pub fn knows_bundle_id(id: &str) -> bool {
+        // SAFETY: every CF object created here is checked for null and
+        // released exactly once.
+        unsafe {
+            let s =
+                CFStringCreateWithBytes(std::ptr::null(), id.as_ptr(), id.len() as isize, UTF8, 0);
+            if s.is_null() {
+                return false;
+            }
+            let urls = LSCopyApplicationURLsForBundleIdentifier(s, std::ptr::null_mut());
+            CFRelease(s);
+            if urls.is_null() {
+                return false;
+            }
+            CFRelease(urls);
+            true
+        }
+    }
+
+    /// Register the bundle at `app` with LaunchServices; returns the OSStatus
+    /// (0 = success, -1 = couldn't build the URL).
+    pub fn register(app: &Path) -> i32 {
+        let bytes = app.as_os_str().as_bytes();
+        // SAFETY: as above; `bytes` outlives the call that reads it.
+        unsafe {
+            let url = CFURLCreateFromFileSystemRepresentation(
+                std::ptr::null(),
+                bytes.as_ptr(),
+                bytes.len() as isize,
+                1,
+            );
+            if url.is_null() {
+                return -1;
+            }
+            let status = LSRegisterURL(url, 1);
+            CFRelease(url);
+            status
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn knows_system_apps_but_not_made_up_ids() {
+            assert!(super::knows_bundle_id("com.apple.finder"));
+            assert!(!super::knows_bundle_id("com.example.usagio-does-not-exist"));
+        }
     }
 }
 
