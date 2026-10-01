@@ -242,7 +242,7 @@ fn auto_pick_tie_break_picks_higher_headroom() {
     ];
     // Equal soonest reset → the account with MORE headroom (lower usage) wins.
     assert_eq!(
-        auto_pick(&rows, TARGET_CEILING_PCT, TRIGGER_PCT).unwrap(),
+        auto_pick(&rows, TRIGGER_PCT, TRIGGER_PCT).unwrap(),
         "low@e.com"
     );
 }
@@ -257,7 +257,7 @@ fn auto_pick_prefers_soonest_reset() {
         row_full("soon@e.com", 40.0, 40.0, soon),
     ];
     assert_eq!(
-        auto_pick(&rows, TARGET_CEILING_PCT, TRIGGER_PCT).unwrap(),
+        auto_pick(&rows, TRIGGER_PCT, TRIGGER_PCT).unwrap(),
         "soon@e.com"
     );
 }
@@ -273,7 +273,7 @@ fn auto_pick_skips_past_target_account_even_if_it_resets_soonest() {
         row_full("empty@e.com", 0.0, 0.0, later),
     ];
     assert_eq!(
-        auto_pick(&rows, TARGET_CEILING_PCT, TRIGGER_PCT).unwrap(),
+        auto_pick(&rows, TRIGGER_PCT, TRIGGER_PCT).unwrap(),
         "empty@e.com",
         "an account past the weekly trigger is never the best landing spot"
     );
@@ -291,7 +291,7 @@ fn auto_pick_falls_back_to_least_full_when_all_past_target() {
     ];
     // Both past the 95% trigger → fallback tier. Soonest reset still wins.
     assert_eq!(
-        auto_pick(&rows, TARGET_CEILING_PCT, TRIGGER_PCT).unwrap(),
+        auto_pick(&rows, TRIGGER_PCT, TRIGGER_PCT).unwrap(),
         "full99@e.com"
     );
 }
