@@ -367,6 +367,12 @@ pub struct State {
     /// cycle without a restart.
     #[serde(default)]
     pub notification_config: crate::notifications::NotificationConfig,
+    /// Accounts the user switched to by hand, keyed by provider slug. While a
+    /// provider's active account is its held one, auto-swap leaves it alone
+    /// until it is exhausted or lapses. Shared by the CLI and the menu bar so
+    /// a manual choice made in either sticks the same way.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub manual_holds: std::collections::HashMap<String, String>,
     /// Emails this in-memory state has explicitly requested be dropped via
     /// `remove()`. NOT serialized — transient authorization consumed by
     /// `save_state_safe`, so `save()` can distinguish "the caller meant to
@@ -638,8 +644,41 @@ impl State {
                     }
                 })
                 .unwrap_or_default(),
+            manual_holds: v
+                .get("manual_holds")
+                .and_then(|x| serde_json::from_value(x.clone()).ok())
+                .unwrap_or_default(),
             pending_removals: HashSet::new(),
             pending_provider_removals: HashSet::new(),
+        }
+    }
+
+    /// The account `slug` is held on, if the hold still applies: the user's
+    /// manual choice is still that provider's active account. A hold left
+    /// behind by a later `claude /login` (or any other switch we didn't
+    /// record) is ignored.
+    pub fn manual_hold(&self, slug: &str) -> Option<&str> {
+        let held = self.manual_holds.get(slug)?;
+        let active = if slug == crate::CLAUDE_SLUG {
+            self.active.as_deref()
+        } else {
+            self.provider_accounts(slug)?.active.as_deref()
+        };
+        active
+            .is_some_and(|a| a.eq_ignore_ascii_case(held))
+            .then_some(held.as_str())
+    }
+
+    /// Hold `slug` on `key` (a manual switch), or clear its hold (`None`: an
+    /// auto-swap or auto-pick moved it).
+    pub fn set_manual_hold(&mut self, slug: &str, key: Option<&str>) {
+        match key {
+            Some(k) => {
+                self.manual_holds.insert(slug.to_string(), k.to_string());
+            }
+            None => {
+                self.manual_holds.remove(slug);
+            }
         }
     }
 
