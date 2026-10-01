@@ -986,7 +986,10 @@ fn escalation_fires_on_first_429_in_tight_band() {
     record_usage_fetch_429(&email);
     let row = active_row(&email, 93.0, 76.0);
     let eff = effective_active_max_pct_for_swap_fire(&row, 95.0);
-    assert!(eff >= 95.0, "one 429 in the tight band must escalate, got {eff}");
+    assert!(
+        eff >= 95.0,
+        "one 429 in the tight band must escalate, got {eff}"
+    );
     reset_usage_fetch_tracker(&email);
 }
 

@@ -4057,7 +4057,9 @@ fn evaluate_swap_verified(
                     row.max_pct()
                 ));
             }
-            None if eval.urgent && row.max_pct() <= trigger - UNVERIFIED_TARGET_MIN_HEADROOM_PTS => {
+            None if eval.urgent
+                && row.max_pct() <= trigger - UNVERIFIED_TARGET_MIN_HEADROOM_PTS =>
+            {
                 logging::log(&format!(
                     "event=swap_target_unverified account={target} cached_pct={:.0} action=use",
                     row.max_pct()
@@ -4079,7 +4081,8 @@ fn evaluate_swap_verified(
 /// `evaluate_swap` uses for an urgent swap.
 fn active_in_trouble(rows: &[Row], active: &str, trigger: f64) -> bool {
     rows.iter().find(|r| r.email == active).is_some_and(|a| {
-        a.no_subscription || (a.has_data() && effective_active_max_pct_for_swap_fire(a, trigger) >= trigger)
+        a.no_subscription
+            || (a.has_data() && effective_active_max_pct_for_swap_fire(a, trigger) >= trigger)
     })
 }
 
@@ -4137,7 +4140,9 @@ fn verify_swap_target(email: &str) -> Option<Account> {
                 st.save()
             });
             if let Err(e) = saved {
-                logging::log(&format!("swap target {email}: saving reading failed: {e:#}"));
+                logging::log(&format!(
+                    "swap target {email}: saving reading failed: {e:#}"
+                ));
             }
             acct.cached_usage = Some(cu);
             Some(acct)
