@@ -2709,16 +2709,17 @@ fn handle_switch(slug: &str, key: &str) {
     // non-switching provider, and `switch_to_provider_account` itself
     // re-checks that capability as belt-and-suspenders against a stray click id
     // shaped like `switch:<slug>:<key>` reaching this function directly.
+    // `hold`: the choice is recorded in state.json, so the poller (and a
+    // `usagio switch` from the CLI) honour it the same way.
     let result = if slug == CLAUDE_SLUG {
-        switch_to(key)
+        switch_to(key, true)
     } else {
-        switch_to_provider_account(slug, key)
+        switch_to_provider_account(slug, key, true)
     };
     match result {
         Ok(label) => {
             let g = guard.for_provider(slug);
             g.last_swap = Some(std::time::Instant::now());
-            g.manual_locked_choice = Some((slug.to_string(), key.to_string()));
             notify(&format!("Switched to {label}"));
             request_poll_now();
         }

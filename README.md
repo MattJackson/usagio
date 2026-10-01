@@ -207,8 +207,9 @@ your active session hit the wall. It does this two ways:
 
 Hysteresis keeps it from thrashing:
 
-- only swap **to** an account whose session and weekly are both under your
-  threshold, and whose reading is fresh — a target is re-checked right before the
+- only swap **to** an account whose session and weekly are both more than 5 points
+  under your threshold (inside that band a single 429 would force it straight back
+  out), and whose reading is fresh — a target is re-checked right before the
   swap if its last reading is more than two minutes old;
 - a **swap cooldown** on optional swaps (flip-backs) so it can't flip rapidly —
   moving off an account that has hit the threshold is never delayed;
@@ -225,6 +226,12 @@ swap — it notifies you of the soonest reset. It runs inside the menu-bar app (
 `usagio install` keeps it on), or headless via `usagio watch` on a machine with no
 menu bar; both run the same loop and use the threshold and auto-swap setting from
 the menu (`usagio watch --trigger` overrides the threshold).
+
+**Your own picks stick.** When you switch to an account yourself — from the menu or
+with `usagio switch <acct>` / `start <acct>` / `continue <acct>` — auto-swap leaves
+it alone even past your threshold, and won't flip back off it either, until it is
+exhausted (100%) or its subscription lapses. Picking another account (or letting
+`usagio switch` with no account auto-pick) ends the hold.
 
 ## How it works
 
