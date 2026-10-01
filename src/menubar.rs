@@ -44,7 +44,7 @@ use crate::{
     next_interval, notify, optimize_now, remove_account, remove_provider_account_generic,
     row_from_account, row_from_provider_account, set_current_loop_interval_secs, switch_to,
     switch_to_provider_account, watch_cycle, with_state_lock, Row, SwapGuard, CLAUDE_SLUG,
-    TARGET_CEILING_PCT, TRIGGER_PCT, WATCH_INTERVAL_SECS,
+    TRIGGER_PCT, WATCH_INTERVAL_SECS, WATCH_TIGHT_INTERVAL_SECS,
 };
 
 /// Exact title of the disabled section row inserted when a provider's env
@@ -1150,10 +1150,13 @@ fn poll_loop() {
         wd.maybe_run(&mut wd_effects);
         // A switch since the last refresh (manual, auto, or an external
         // `claude /login`) means any backoff we're carrying was earned by the
-        // previous active account; start the new one at base cadence.
+        // previous active account. Restart from the TIGHT interval, not base:
+        // `current` only seeds the 429 backoff (the non-429 cadence comes from
+        // the usage tier), and seeding it with base turned one 429 on a
+        // just-landed account into a 360s blind spot.
         let cycle_active = current_active_account();
         if cycle_active != last_cycle_active {
-            current = base;
+            current = WATCH_TIGHT_INTERVAL_SECS;
         }
         // Fetch usage + auto-swap; this writes cached usage to state.json, which
         // the main-thread timer reads back to render. This is the ONLY thing that
@@ -1451,7 +1454,8 @@ fn run_cycle(guard: &mut SwapGuard, force: bool) -> (bool, Option<f64>, f64, boo
     let threshold = st.trigger_pct.unwrap_or(TRIGGER_PCT);
     // With auto-swap off, use an unreachable trigger so we only observe.
     let trigger = if autoswap { threshold } else { 101.0 };
-    match watch_cycle(trigger, TARGET_CEILING_PCT, guard, force) {
+    // The target ceiling follows the trigger (see `Row::eligible_target`).
+    match watch_cycle(trigger, trigger, guard, force) {
         Ok(o) => (o.rate_limited, o.max_pct, trigger, o.actionable),
         Err(e) => {
             crate::logging::log(&format!("menubar poll failed: {e}"));
