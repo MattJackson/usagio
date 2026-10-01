@@ -1,10 +1,14 @@
 name: CI
 
+# Tiered, one run per stage (PRs only — branch pushes re-ran the same tree):
+#   PR -> dev : fast lane — fmt + clippy + debug build on all three OSes.
+#   PR -> qa  : full lane — release build, tests, runtime smoke tests.
+#   PR -> main: none — main only promotes what qa signed off on; the real
+#               release build runs on the version tag (release.yml).
 on:
-  push:
-    branches: [dev, qa, main]
   pull_request:
-    branches: [dev, qa, main]
+    branches: [dev, qa]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,13 +19,14 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Full lane on PRs into qa and on manual runs; fast lane otherwise.
+  FULL: ${{ github.base_ref == 'qa' || github.event_name == 'workflow_dispatch' }}
 
 jobs:
-  # Fast lane — runs on every push/PR (including dev), across all three
-  # platforms usagio ships on. Keeps dev quick per-OS while still catching
-  # platform-specific breakage before it reaches qa/main.
+  # All three platforms usagio ships on, in both lanes, so platform-specific
+  # breakage is caught at dev. Steps after the build run in the full lane only.
   check:
-    name: fmt + clippy + test (${{ matrix.os }})
+    name: ${{ (github.base_ref == 'qa' || github.event_name == 'workflow_dispatch') && 'full' || 'fast' }} (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -52,8 +57,20 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-features -- -D warnings
 
+      - name: cargo build (debug, fast lane)
+        if: env.FULL != 'true'
+        run: cargo build --all-features --locked
+
       - name: cargo build --release
-        run: cargo build --release --all-features
+        if: env.FULL == 'true'
+        # macOS/Linux: this build only proves release mode compiles — the
+        # shipped binary is built by release.yml — so skip fat LTO, the
+        # slowest part of the link. Windows keeps the exact shipped profile:
+        # its load-time smoke test below checks the binary itself.
+        env:
+          CARGO_PROFILE_RELEASE_LTO: ${{ matrix.os == 'windows-latest' && 'true' || 'false' }}
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ matrix.os == 'windows-latest' && '16' || '256' }}
+        run: cargo build --release --all-features --locked
 
       # A build that compiles is NOT proof the binary LOADS. usagio statically
       # imports tray-icon/muda + the VC++ CRT; if any of those fail to resolve
@@ -74,7 +91,7 @@ jobs:
       # a binary that dies before `main` on any clean Windows box. On failure it
       # dumps the exact imports + a Dependencies.exe chain naming the bad symbol.
       - name: Windows — binary must actually launch (load-time smoke test)
-        if: matrix.os == 'windows-latest'
+        if: env.FULL == 'true' && (matrix.os == 'windows-latest')
         shell: pwsh
         run: |
           $exe = "target/release/usagio.exe"
@@ -136,7 +153,7 @@ jobs:
         # behavior is still exercised via the `--ignored` step below scoped
         # to `platform::windows`. TODO(v0.5.1): investigate hermetic Windows
         # unit-test runtime for menubar-dependent code paths.
-        if: matrix.os != 'windows-latest'
+        if: env.FULL == 'true' && (matrix.os != 'windows-latest')
         run: cargo test --tests --all-features -- --test-threads=1
 
       # Windows-only: real side-effect tests — Credential Manager round-trip
@@ -165,11 +182,11 @@ jobs:
       # bus for ksni. `dbus-x11` provides dbus-run-session (installed with the
       # Secret Service deps below, but pulled up here since this step needs it).
       - name: Install xvfb + dbus
-        if: matrix.os == 'ubuntu-latest'
+        if: env.FULL == 'true' && (matrix.os == 'ubuntu-latest')
         run: sudo apt-get install -y xvfb dbus-x11
 
       - name: Linux tray init smoke test (xvfb + session bus)
-        if: matrix.os == 'ubuntu-latest'
+        if: env.FULL == 'true' && (matrix.os == 'ubuntu-latest')
         run: xvfb-run --auto-servernum dbus-run-session -- cargo test --test integration_tray --all-features -- --ignored --test-threads=1
 
       # Ubuntu-only: proves the Secret Service D-Bus path in LinuxSecrets
@@ -178,11 +195,11 @@ jobs:
       # throwaway session bus; gnome-keyring-daemon --unlock with an empty
       # stdin password creates an unlocked default keyring.
       - name: Install Secret Service daemon deps
-        if: matrix.os == 'ubuntu-latest'
+        if: env.FULL == 'true' && (matrix.os == 'ubuntu-latest')
         run: sudo apt-get install -y gnome-keyring dbus-x11
 
       - name: Linux Secret Service integration test (real D-Bus daemon)
-        if: matrix.os == 'ubuntu-latest'
+        if: env.FULL == 'true' && (matrix.os == 'ubuntu-latest')
         run: |
           dbus-run-session -- bash -c '
             set -euo pipefail
@@ -197,25 +214,9 @@ jobs:
       # (from librsvg) and dies loudly if missing. Verify locally on every
       # push so a missing dep doesn't only surface at release-tag time.
       - name: Install librsvg for icon generation
-        if: matrix.os == 'macos-latest'
+        if: env.FULL == 'true' && (matrix.os == 'macos-latest')
         run: brew install librsvg
 
       - name: Verify packaging/macos/generate-icns.sh runs end-to-end
-        if: matrix.os == 'macos-latest'
+        if: env.FULL == 'true' && (matrix.os == 'macos-latest')
         run: packaging/macos/generate-icns.sh
-
-
-  # Full lane — release build, only on the qa and main branches.
-  build:
-    name: release build
-    if: github.ref == 'refs/heads/qa' || github.ref == 'refs/heads/main'
-    needs: check
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: cargo build --release
-        run: cargo build --release --locked

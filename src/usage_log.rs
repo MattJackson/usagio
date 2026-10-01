@@ -151,8 +151,8 @@ pub fn rotate_if_needed(now: DateTime<Utc>) -> Result<()> {
 /// ascending by timestamp. Reads only the month files that could overlap the
 /// window, so a long history stays cheap to sample.
 ///
-/// H9 (round-1 codeaudit): each menu rebuild called this twice per account
-/// (burn_rate + cost_tracking), each doing a full ndjson parse. Now backed
+/// H9 (round-1 codeaudit): menu rebuilds called this per account on every
+/// tick, each doing a full ndjson parse. Now backed
 /// by a process-wide mtime-keyed cache: month files whose mtime is unchanged
 /// since the last read are served from memory. Cache is invalidated as soon
 /// as any tracked month file's mtime advances.
