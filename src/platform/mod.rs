@@ -123,6 +123,13 @@ pub enum MenuItem {
         label: String,
         icon_png: Option<Vec<u8>>,
     },
+    /// Non-clickable detail line inside a submenu (never highlights on
+    /// hover), optionally tinted — e.g. a red "Session locked · unlocks in
+    /// 28m" so a lock reads the same as the red countdown on the account row.
+    Info {
+        label: String,
+        color: Option<ValueColor>,
+    },
     Separator,
     Submenu {
         label: String,

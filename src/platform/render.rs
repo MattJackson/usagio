@@ -86,6 +86,14 @@ fn append(menu: Menu, item: &MenuItem) -> Menu {
             }
             menu.section_header(row)
         }
+        MenuItem::Info { label, color } => {
+            let mut seg = Segment::grow(label.as_str());
+            if let Some(c) = color {
+                let len = label.encode_utf16().count();
+                seg = seg.runs(vec![StyleRun::new(0, len, muri_color(*c))]);
+            }
+            menu.item(Item::Row(Row::new(MenuId::none()).segment(seg)))
+        }
         MenuItem::Separator => menu.separator(),
         MenuItem::Submenu {
             label,

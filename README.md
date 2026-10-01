@@ -195,7 +195,10 @@ your active session hit the wall. It does this two ways:
 
 - **Reactive.** When the active account's session **or** weekly usage crosses your
   threshold (default **95%**, set from the menu), it switches to another account with
-  room, so a long session keeps going instead of blocking.
+  room, so a long session keeps going instead of blocking. If the usage endpoint
+  rate-limits (HTTP 429) the active account while it's within 5 points of the
+  threshold, that counts as crossing it: usagio can't see the real number, so it
+  moves rather than letting you run out blind.
 - **Proactive flip-back.** The usual reason you leave an account is that its **5h
   session** filled — its weekly still has room. When that session resets, the daemon
   **returns to the account** to keep draining its weekly, as long as it's still the
@@ -204,11 +207,13 @@ your active session hit the wall. It does this two ways:
 
 Hysteresis keeps it from thrashing:
 
-- only swap **to** an account whose **session** has room to spare (so it won't
-  immediately re-trigger) — its weekly is allowed right up near the trigger, since
-  draining the weekly is the point;
-- a **swap cooldown** so it can't flip rapidly;
-- **no bounce-back** to an account it just left within a short window; and
+- only swap **to** an account whose session and weekly are both under your
+  threshold, and whose reading is fresh — a target is re-checked right before the
+  swap if its last reading is more than two minutes old;
+- a **swap cooldown** on optional swaps (flip-backs) so it can't flip rapidly —
+  moving off an account that has hit the threshold is never delayed;
+- **no bounce-back** to an account it just left within a short window, and not
+  until it has a fresh reading taken after it was left; and
 - on a proactive flip-back between two accounts that reset at the same time, a
   headroom margin so near-equal accounts don't ping-pong.
 

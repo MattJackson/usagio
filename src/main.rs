@@ -11,7 +11,6 @@
 
 mod burn_rate;
 mod context_ledger;
-mod cost_tracking;
 mod countdown;
 mod credentials;
 #[cfg(test)]
@@ -22,7 +21,6 @@ mod menubar;
 mod notifications;
 mod paths;
 mod platform;
-mod pricing;
 mod providers;
 mod store;
 // Custom tray-anchored popup UI (Phase 1). Whole module compiled only on macOS
@@ -90,10 +88,20 @@ const INACTIVE_FETCH_MAX_BACKOFF_SECS: u64 = 3600;
 pub(crate) const SUBSCRIPTION_RECHECK_SECS: u64 = 1800;
 /// Swap away from the active account when it reaches this utilization.
 const TRIGGER_PCT: f64 = 95.0;
-/// Only swap to an account at or below this utilization (hysteresis band).
-const TARGET_CEILING_PCT: f64 = 85.0;
-/// Never swap more often than this.
+/// Minimum gap between swaps. Applies only to OPTIONAL swaps (proactive
+/// flip-back, all-blocked preparation): moving off an account that has hit the
+/// trigger, 429'd near it, or lapsed is never delayed — a 5-minute hold there
+/// let a just-landed account run from 94% to ~98% before we could move again.
 const SWAP_COOLDOWN_SECS: u64 = 300;
+/// A swap target's reading must be at most this old when we swap to it;
+/// older, and we re-fetch it right before swapping (an inactive account's
+/// cache can be up to `INACTIVE_FETCH_FLOOR_SECS` old, and it may have been
+/// used elsewhere since).
+const TARGET_VERIFY_MAX_AGE_SECS: i64 = 120;
+/// When a target's pre-swap re-fetch fails, an urgent swap may still use it
+/// only if its last good reading left at least this many points under the
+/// trigger — a stale 24% can't plausibly be at the limit; a stale 93% can.
+const UNVERIFIED_TARGET_MIN_HEADROOM_PTS: f64 = 10.0;
 /// Don't return to an account we just left for this long.
 const NO_RETURN_SECS: u64 = 1200;
 /// Proactive flip-back: when the active account is healthy (below trigger), only
@@ -320,8 +328,6 @@ fn print_help() {
          usagio uninstall         Stop running the menu-bar app at login\n  \
          usagio report            Usage patterns by weekday / hour / account\n  \
          usagio report --pace     Per-account burn-rate forecast (empty-in ETA)\n  \
-         usagio report --pricing  Model → USD-per-1M-tokens lookup table\n  \
-         usagio report --verdict  Cancel/downgrade/keep/upgrade classifier\n  \
          usagio context [OPTS]    Audit CLI auto-injected context (per turn)\n  \
                                         --provider <slug>  claude|codex|opencode\n  \
                                         --project  <path>  scope in-tree instructions to this project\n  \
@@ -759,7 +765,7 @@ fn select_email(state: &State, selector: Option<&str>) -> Result<String> {
         None => {
             let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
             let trigger = state.trigger_pct.unwrap_or(TRIGGER_PCT);
-            auto_pick(&rows, TARGET_CEILING_PCT, trigger)
+            auto_pick(&rows, trigger, trigger)
         }
     }
 }
@@ -1622,7 +1628,7 @@ pub(crate) fn optimize_now() -> Result<Option<String>> {
     let active = state.active.clone();
     let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
     let trigger = state.trigger_pct.unwrap_or(TRIGGER_PCT);
-    let best = auto_pick(&rows, TARGET_CEILING_PCT, trigger)?;
+    let best = auto_pick(&rows, trigger, trigger)?;
     if active.as_deref() == Some(best.as_str()) {
         return Ok(None);
     }
@@ -1711,14 +1717,17 @@ impl Row {
         ok(&self.session) && ok(&self.weekly)
     }
 
-    /// Eligible as a swap / return target: the **session** has room to spare (so
-    /// landing here won't immediately re-trigger a swap) and the **weekly** is
-    /// still below the trigger. Weekly is deliberately allowed to run right up to
-    /// the trigger — returning to drain each account's weekly before it resets is
-    /// the whole point, so a high weekly must not disqualify a fresh-session one.
-    fn eligible_target(&self, session_ceiling: f64, weekly_trigger: f64) -> bool {
-        self.session.pct.unwrap_or(0.0) <= session_ceiling
-            && self.weekly.pct.unwrap_or(0.0) < weekly_trigger
+    /// Eligible as a swap / return target: both the **session** and the
+    /// **weekly** are still below the trigger, so every account's quota is
+    /// usable right up to the user's limit. The session ceiling defaults to the
+    /// trigger (`usagio watch --ceiling` can lower it) — the old fixed 85%
+    /// stranded each session's last ~10% and, with a trigger under 85%, let an
+    /// account already past the trigger be picked. Landing on a 94% account is
+    /// safe because a swap off an account at the trigger is never cooldown-
+    /// delayed (see `SWAP_COOLDOWN_SECS`).
+    fn eligible_target(&self, session_ceiling: f64, trigger: f64) -> bool {
+        let session = self.session.pct.unwrap_or(0.0);
+        session <= session_ceiling && session < trigger && self.weekly.pct.unwrap_or(0.0) < trigger
     }
 
     /// Remaining percent on the tightest of session/weekly.
@@ -2342,8 +2351,14 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
         let mut acct = acct;
         // Skip accounts already flagged needs_relogin — no useful token to
         // reason about, and hammering an invalid_grant refresh both wastes
-        // requests and can trip rate limits shared across the tenant.
-        if acct.needs_relogin {
+        // requests and can trip rate limits shared across the tenant. Except
+        // the ACTIVE account: its token is whatever Claude Code holds, and the
+        // active-refresh CAS below is the only path that adopts it and clears
+        // the flag — skipping it froze the active account's reading (no
+        // auto-swap, wrong cadence) after a manual switch to a flagged account.
+        let active_with_refresh =
+            state.active.as_deref() == Some(email.as_str()) && provider.supports_active_refresh();
+        if acct.needs_relogin && !active_with_refresh {
             continue;
         }
         // A lapsed subscription never calls the usage endpoint (every call is
@@ -2620,7 +2635,7 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
         }
         let cu = match usage::fetch(&acct.access_token) {
             Ok(u) => {
-                record_usage_fetch_success(email, now_ts);
+                record_usage_fetch_success(email);
                 Some(cached_from_usage(&u))
             }
             Err(usage::FetchError::RateLimited) => {
@@ -3031,16 +3046,18 @@ fn cap_sleep_to_reset_boundary(rows: &[Row], now: DateTime<Utc>, planned: u64) -
 fn cmd_watch(args: &[String]) -> Result<()> {
     let mut interval = WATCH_INTERVAL_SECS;
     let mut trigger = TRIGGER_PCT;
-    let mut ceiling = TARGET_CEILING_PCT;
+    let mut ceiling: Option<f64> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--interval" => interval = it.next().and_then(|s| s.parse().ok()).unwrap_or(interval),
             "--trigger" => trigger = it.next().and_then(|s| s.parse().ok()).unwrap_or(trigger),
-            "--ceiling" => ceiling = it.next().and_then(|s| s.parse().ok()).unwrap_or(ceiling),
+            "--ceiling" => ceiling = it.next().and_then(|s| s.parse().ok()).or(ceiling),
             other => bail!("unknown watch option: {other}"),
         }
     }
+    // The target ceiling follows the trigger unless explicitly lowered.
+    let ceiling = ceiling.unwrap_or(trigger).min(trigger);
 
     eprintln!("usagio watch: every {interval}s, swap at {trigger:.0}%, target <= {ceiling:.0}%");
 
@@ -3057,10 +3074,10 @@ fn cmd_watch(args: &[String]) -> Result<()> {
         // 30–180s, and the projection would otherwise under-predict by 40× on
         // the exact storm the projection is meant to catch (Opus BLOCKER 1).
         // A switch since the last refresh: the backoff we carry belongs to the
-        // previous active account (see menubar::poll_loop).
+        // previous active account (see menubar::poll_loop for why TIGHT).
         let cycle_active = current_active_account();
         if cycle_active != last_cycle_active {
-            current = base;
+            current = WATCH_TIGHT_INTERVAL_SECS;
         }
         last_cycle_active = cycle_active.clone();
         set_current_loop_interval_secs(current);
@@ -3182,14 +3199,17 @@ fn cadence_max_pct(rows: &[Row], active: Option<&str>) -> Option<f64> {
 const WATCH_TIGHT_BAND: f64 = 5.0;
 const WATCH_MIDDLE_BAND: f64 = 10.0;
 const WATCH_RELAXED_BAND: f64 = 20.0;
-const WATCH_TIGHT_INTERVAL_SECS: u64 = 30;
+pub(crate) const WATCH_TIGHT_INTERVAL_SECS: u64 = 30;
 const WATCH_MIDDLE_INTERVAL_SECS: u64 = 60;
 const WATCH_RELAXED_INTERVAL_SECS: u64 = 120;
 const WATCH_BACKSTOP_INTERVAL_SECS: u64 = 30;
 
 /// Compute the next poll interval. Priority order:
-///   1. Rate-limited from Anthropic → exponential backoff (doubling,
-///      capped at WATCH_MAX_INTERVAL_SECS). Overrides everything below.
+///   1. Rate-limited from Anthropic → exponential backoff, doubling the
+///      CURRENT interval (30s → 60s → 120s …, capped at
+///      WATCH_MAX_INTERVAL_SECS). Overrides everything below. Doubling from
+///      `max(current, base)` instead turned one 429 at the 30s tier into a
+///      360s blind spot right next to the trigger — long enough to run out.
 ///   2. Active account at or above the trigger threshold AND a swap is
 ///      actionable (an eligible target exists, even if currently
 ///      cooldown-blocked) → BACKSTOP (30s). The auto-swap should already
@@ -3222,7 +3242,7 @@ fn next_interval(
     actionable: bool,
 ) -> u64 {
     if rate_limited {
-        return (current.max(base) * 2).min(WATCH_MAX_INTERVAL_SECS);
+        return (current.max(WATCH_TIGHT_INTERVAL_SECS) * 2).min(WATCH_MAX_INTERVAL_SECS);
     }
     let Some(pct) = max_pct else {
         return base;
@@ -3356,26 +3376,21 @@ fn project_active_max_pct_at_horizon(
 // v0.8.0 auto-swap escalation on repeated `/oauth/usage` 429s
 // ---------------------------------------------------------------------------
 
-/// Minimum consecutive 429s on an ACTIVE account's usage endpoint before we
-/// treat its cached max_pct as untrustworthy for auto-swap purposes. Two rules
-/// out a one-off spike; more would risk letting the account run out of quota
-/// while we wait for a third rejection.
-const ESCALATION_MIN_CONSECUTIVE_429S: u32 = 2;
+/// Consecutive 429s on the ACTIVE account's usage endpoint before we treat its
+/// cached max_pct as "at the trigger" for auto-swap. v0.8.7: one. v0.8.0
+/// required two, but each 429 also backs the poll off, so the second strike
+/// arrived minutes later — dev@ ran from 93% to its limit waiting for it.
+/// Swapping on a false alarm costs only the last few points of that session:
+/// the account comes back once a fresh reading shows it under the trigger.
+const ESCALATION_MIN_CONSECUTIVE_429S: u32 = 1;
 
 /// Cached max_pct must be within this many percentage points of `trigger`
-/// (i.e. in the TIGHT band) for a 429 storm to count as escalation signal.
+/// (i.e. in the TIGHT band) for a 429 to count as escalation signal.
 /// Wider bands (e.g. RELAXED at trigger−20 = 75%) would fire on tenant-wide
 /// 429 noise unrelated to THIS account's real usage — Opus adversarial
 /// review BAD 3. Kept identical to `WATCH_TIGHT_BAND` on purpose so the
 /// escalation gate never fires outside the tightest static tier.
 const ESCALATION_MIN_BAND: f64 = WATCH_TIGHT_BAND;
-
-/// Last successful `usage::fetch` for this account must be within this window
-/// for escalation to fire. Guards against re-escalating on stale in-memory
-/// count when an account is reactivated after a long absence — the counter
-/// might have been left at threshold and the cached number is old enough to
-/// be unrelated to the current 429 signal (Opus adversarial review BAD 4).
-const ESCALATION_MAX_SUCCESS_AGE_SECS: i64 = 300;
 
 /// Ephemeral per-account usage-endpoint tracker for the v0.8.0 escalation
 /// path. In-memory only, no `State` field — persisting a counter reintroduced
@@ -3385,7 +3400,6 @@ const ESCALATION_MAX_SUCCESS_AGE_SECS: i64 = 300;
 #[derive(Default, Clone, Copy)]
 struct UsageFetchTracker {
     consecutive_429s: u32,
-    last_success_ts: Option<i64>,
     /// Inactive-account backoff (v0.8.5): consecutive failed fetches of any
     /// kind, and the time before which we won't try again.
     consecutive_failures: u32,
@@ -3428,11 +3442,10 @@ fn with_fetch_trackers<T>(
     f(guard.as_mut().unwrap())
 }
 
-fn record_usage_fetch_success(email: &str, now_ts: i64) {
+fn record_usage_fetch_success(email: &str) {
     with_fetch_trackers(|t| {
         let entry = t.entry(email.to_string()).or_default();
         entry.consecutive_429s = 0;
-        entry.last_success_ts = Some(now_ts);
         entry.consecutive_failures = 0;
         entry.backoff_until_ts = None;
     });
@@ -3636,10 +3649,14 @@ fn get_usage_fetch_tracker(email: &str) -> UsageFetchTracker {
 
 /// Compute the "effective" max_pct of the ACTIVE account for the AUTO-SWAP
 /// FIRE DECISION ONLY. Returns the raw cached max_pct in the common case;
-/// when the escalation gate is satisfied (2+ consecutive 429s, active
-/// account, cached pct already in the TIGHT band, recent success), returns a
-/// value guaranteed to be ≥ `trigger` so `evaluate_swap` will fire on the
-/// next cycle even though the endpoint won't tell us the real number.
+/// when the active account's last usage fetch was a 429 while its cached pct
+/// was already in the TIGHT band, returns at least `trigger` so
+/// `evaluate_swap` fires now even though the endpoint won't tell us the real
+/// number. Near the trigger, not knowing is treated as being there: the
+/// alternative is polling blind while the account runs out.
+///
+/// The tracker is reset on any successful fetch, on any non-429 error, and on
+/// switching away from the account, so a stale 429 never re-fires later.
 ///
 /// SCOPE: never used for candidate ranking or target eligibility. Using an
 /// escalated source value while comparing against other accounts' raw cached
@@ -3647,20 +3664,7 @@ fn get_usage_fetch_tracker(email: &str) -> UsageFetchTracker {
 /// genuinely-96% one, corrupting target order (Sonnet adversarial review
 /// BAD 3). `evaluate_swap` reads raw values everywhere except the boolean
 /// "should we swap away right now" check.
-///
-/// PROJECTION: when `burn_rate::estimate` has enough samples and confidence,
-/// projects each window forward by `time_since_success` and takes the max;
-/// clamped to `[cached, 100]` so the escalation can only ever say "worse
-/// than cache", never "better." If projection isn't confident, falls back to
-/// pinning at `trigger` so escalation still fires (Opus adversarial review
-/// BAD 5 + MINOR 7 — honest bounded number when projectable, pin only when
-/// forced to).
-fn effective_active_max_pct_for_swap_fire(
-    row: &Row,
-    provider_id: &str,
-    trigger: f64,
-    now: DateTime<Utc>,
-) -> f64 {
+fn effective_active_max_pct_for_swap_fire(row: &Row, trigger: f64) -> f64 {
     let raw = row.max_pct();
     let tracker = get_usage_fetch_tracker(&row.email);
     if tracker.consecutive_429s < ESCALATION_MIN_CONSECUTIVE_429S {
@@ -3669,42 +3673,7 @@ fn effective_active_max_pct_for_swap_fire(
     if raw < trigger - ESCALATION_MIN_BAND {
         return raw;
     }
-    let Some(success_ts) = tracker.last_success_ts else {
-        return raw;
-    };
-    let age_secs = now.timestamp() - success_ts;
-    if age_secs > ESCALATION_MAX_SUCCESS_AGE_SECS {
-        return raw;
-    }
-
-    // Escalation gate satisfied. Project forward per-window (session/weekly
-    // separately — a session rollover 99→5 makes `max_pct` slopes meaningless,
-    // Opus adversarial BAD 6) and take the higher projection. If neither
-    // window projects confidently, pin at trigger so escalation still fires.
-    let account_key = usage_log::AccountKey::new(provider_id, &row.email);
-    let hours = age_secs as f64 / 3600.0;
-    let project = |window: providers::trait_def::Window, curr: Option<f64>| -> Option<f64> {
-        let curr = curr?;
-        let est = burn_rate::estimate(&account_key, window, now)?;
-        if (est.confidence as f64) < burn_rate::CONFIDENCE_FLOOR as f64 {
-            return None;
-        }
-        if est.rate_pct_per_hour <= burn_rate::FLAT_SLOPE_THRESHOLD_PCT_PER_HOUR {
-            return None;
-        }
-        Some((curr + (est.rate_pct_per_hour as f64) * hours).min(100.0))
-    };
-    let s = project(providers::trait_def::Window::Session, row.session.pct);
-    let w = project(providers::trait_def::Window::Weekly, row.weekly.pct);
-    let projected = match (s, w) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
-    // Guarantee escalation actually fires: return at least `trigger`.
-    let candidate = projected.unwrap_or(raw).max(raw);
-    candidate.max(trigger)
+    raw.max(trigger)
 }
 
 /// Anti-thrash state carried across watch cycles.
@@ -3718,12 +3687,17 @@ pub(crate) struct SwapGuard {
     manual_locked_choice: Option<(String, String)>,
 }
 
-/// Drop no-return entries past their window so `left_at` can't grow without
-/// bound over a daemon running for weeks (e.g. accounts later `rm`'d).
+/// How long a `left_at` entry is kept. Longer than `NO_RETURN_SECS` because
+/// the entry also gates `fresh_since_left` (no return before a post-leave
+/// reading), which must outlive the no-return window.
+const LEFT_AT_RETENTION_SECS: u64 = 24 * 3600;
+
+/// Drop stale `left_at` entries so the map can't grow without bound over a
+/// daemon running for weeks (e.g. accounts later `rm`'d).
 fn prune_swap_guard(guard: &mut SwapGuard) {
     guard
         .left_at
-        .retain(|_, t| t.elapsed().as_secs() < NO_RETURN_SECS);
+        .retain(|_, t| t.elapsed().as_secs() < LEFT_AT_RETENTION_SECS);
 }
 
 /// Result of one poll: the swap it made (if any), the rate-limited flag, and
@@ -3804,6 +3778,12 @@ fn choose_swap_target(
 /// clears.
 struct SwapEval {
     preparing: bool,
+    /// The active account must be left now: it is at/over the trigger (or
+    /// 429'd near it — see `effective_active_max_pct_for_swap_fire`) or its
+    /// subscription lapsed. Urgent swaps skip the cooldown and may use a
+    /// target whose pre-swap re-check failed if its last reading had ample
+    /// room (`UNVERIFIED_TARGET_MIN_HEADROOM_PTS`).
+    urgent: bool,
     /// The account to switch to right now, if any (cooldown/no-return/
     /// eligibility have all already been consulted).
     target: Option<String>,
@@ -3816,6 +3796,17 @@ struct SwapEval {
     /// candidate at all (or the active account isn't in trouble and no
     /// candidate is `worth_returning_to` it).
     target_ignoring_cooldown: Option<String>,
+}
+
+/// True unless `r` is an account we auto-swapped away from and its cached
+/// reading predates leaving it. `left_at` is a monotonic `Instant`; map it
+/// onto the wall clock via its elapsed time.
+fn fresh_since_left(r: &Row, guard: &SwapGuard) -> bool {
+    let Some(left) = guard.left_at.get(&r.email) else {
+        return true;
+    };
+    let left_ts = Utc::now().timestamp() - left.elapsed().as_secs() as i64;
+    r.fetched_at.is_some_and(|f| f > left_ts)
 }
 
 /// Choose a login to prepare while every valid account is quota-blocked.
@@ -3885,6 +3876,7 @@ fn evaluate_swap(
 ) -> SwapEval {
     let none = SwapEval {
         preparing: false,
+        urgent: false,
         target: None,
         blocked_by_cooldown: false,
         target_ignoring_cooldown: None,
@@ -3942,6 +3934,10 @@ fn evaluate_swap(
                 .map(|t| t.elapsed().as_secs() >= NO_RETURN_SECS)
                 .unwrap_or(true)
         })
+        // An account we left is only a target again once a reading taken
+        // AFTER we left it says so — the cached number from just before
+        // leaving (e.g. 93% frozen by a 429) may be well past the trigger.
+        .filter(|r| fresh_since_left(r, guard))
         .collect();
     let preparing = candidates.is_empty();
     if preparing {
@@ -3964,18 +3960,26 @@ fn evaluate_swap(
     // 98% (v0.7.3 postmortem). Scoped to the boolean fire ONLY — candidate
     // ranking above still reads raw `max_pct` so a marginal source can't
     // pretend to be worse than a genuinely-96% one and corrupt target order.
-    let act_effective =
-        effective_active_max_pct_for_swap_fire(act, &act.provider_id, trigger, Utc::now());
-    if !(act_lapsed || act_effective >= trigger || worth_returning_to(best, act)) {
+    let act_effective = effective_active_max_pct_for_swap_fire(act, trigger);
+    let in_trouble = act_lapsed || act_effective >= trigger;
+    if !(in_trouble || worth_returning_to(best, act)) {
         return none;
     }
-    let cooldown_active = guard
-        .last_swap
-        .map(|t| t.elapsed().as_secs() < SWAP_COOLDOWN_SECS)
-        .unwrap_or(false);
+    // Leaving an account that is out of room is never delayed; the cooldown
+    // only rate-limits optional moves (proactive flip-back, all-blocked
+    // preparation). Thrash stays bounded without it: a target must be under
+    // the trigger, and the account we left can't be re-picked for
+    // NO_RETURN_SECS nor before a fresh reading.
+    let urgent = in_trouble && !preparing;
+    let cooldown_active = !urgent
+        && guard
+            .last_swap
+            .map(|t| t.elapsed().as_secs() < SWAP_COOLDOWN_SECS)
+            .unwrap_or(false);
     if cooldown_active {
         SwapEval {
             preparing,
+            urgent,
             target: None,
             blocked_by_cooldown: true,
             target_ignoring_cooldown: Some(best.email.clone()),
@@ -3983,9 +3987,175 @@ fn evaluate_swap(
     } else {
         SwapEval {
             preparing,
+            urgent,
             target: Some(best.email.clone()),
             blocked_by_cooldown: false,
             target_ignoring_cooldown: Some(best.email.clone()),
+        }
+    }
+}
+
+/// `evaluate_swap`, but only ever returning a target whose reading is
+/// current. A target last read more than `TARGET_VERIFY_MAX_AGE_SECS` ago is
+/// re-fetched first (one request, only when a swap is about to happen); the
+/// fresh reading replaces its row and the decision is re-run, so a target
+/// that turns out to be at the trigger is dropped for the next-best one. If
+/// the re-fetch fails, an urgent swap may still use the target when its last
+/// reading had `UNVERIFIED_TARGET_MIN_HEADROOM_PTS` of room — anything
+/// closer to the trigger is excluded rather than trusted. Each pass either
+/// stops or freshens/excludes one row, so the loop is bounded by `rows`.
+fn evaluate_swap_verified(
+    rows: &mut [Row],
+    active: &str,
+    trigger: f64,
+    ceiling: f64,
+    guard: &SwapGuard,
+) -> SwapEval {
+    // Stale-only rescues per cycle (see below) — bounds the extra requests.
+    const MAX_STALE_RESCUES: usize = 2;
+    let mut rescues = 0;
+    let mut tried: Vec<String> = Vec::new();
+    loop {
+        let eval = evaluate_swap(rows, active, trigger, ceiling, guard);
+        let Some(target) = eval.target.clone() else {
+            // The active account must be left but nothing qualifies. Candidates
+            // excluded only for staleness (a reset crossed since their last
+            // reading, no reading since we left them) never refresh during an
+            // active 429 — the poll skips inactive fetches that cycle — so
+            // re-check the best stale one directly instead of waiting blind.
+            if rescues >= MAX_STALE_RESCUES || !active_in_trouble(rows, active, trigger) {
+                return eval;
+            }
+            let Some(stale) = stale_swap_candidate(rows, active, guard, &tried) else {
+                return eval;
+            };
+            rescues += 1;
+            tried.push(stale.clone());
+            if let Some(acct) = verify_swap_target(&stale) {
+                if let Some(row) = rows.iter_mut().find(|r| r.email == stale) {
+                    *row = row_from_account(&acct);
+                }
+            }
+            continue;
+        };
+        // Preparing an all-blocked account isn't a bet on its capacity.
+        if eval.preparing {
+            return eval;
+        }
+        let Some(row) = rows.iter_mut().find(|r| r.email == target) else {
+            return eval;
+        };
+        let age = row.fetched_at.map(|f| Utc::now().timestamp() - f);
+        if age.is_some_and(|a| (0..=TARGET_VERIFY_MAX_AGE_SECS).contains(&a)) {
+            return eval;
+        }
+        match verify_swap_target(&target) {
+            Some(acct) => {
+                *row = row_from_account(&acct);
+                logging::log(&format!(
+                    "event=swap_target_verified account={target} pct={:.0}",
+                    row.max_pct()
+                ));
+            }
+            None if eval.urgent
+                && row.max_pct() <= trigger - UNVERIFIED_TARGET_MIN_HEADROOM_PTS =>
+            {
+                logging::log(&format!(
+                    "event=swap_target_unverified account={target} cached_pct={:.0} action=use",
+                    row.max_pct()
+                ));
+                return eval;
+            }
+            None => {
+                logging::log(&format!(
+                    "event=swap_target_unverified account={target} cached_pct={:.0} action=skip",
+                    row.max_pct()
+                ));
+                row.error = Some("swap target could not be re-checked".to_string());
+            }
+        }
+    }
+}
+
+/// Whether the active account must be left now — the same test
+/// `evaluate_swap` uses for an urgent swap.
+fn active_in_trouble(rows: &[Row], active: &str, trigger: f64) -> bool {
+    rows.iter().find(|r| r.email == active).is_some_and(|a| {
+        a.no_subscription
+            || (a.has_data() && effective_active_max_pct_for_swap_fire(a, trigger) >= trigger)
+    })
+}
+
+/// The best-ranked account that could be a swap target if its reading were
+/// current: usable, past the no-return window, and either read before we left
+/// it or with a reading older than `TARGET_VERIFY_MAX_AGE_SECS`.
+fn stale_swap_candidate(
+    rows: &[Row],
+    active: &str,
+    guard: &SwapGuard,
+    tried: &[String],
+) -> Option<String> {
+    let now_ts = Utc::now().timestamp();
+    let act_provider = &rows.iter().find(|r| r.email == active)?.provider_id;
+    let mut stale: Vec<&Row> = rows
+        .iter()
+        .filter(|r| r.email != active && &r.provider_id == act_provider)
+        .filter(|r| !r.needs_relogin && !r.no_subscription && r.has_data())
+        .filter(|r| !tried.contains(&r.email))
+        .filter(|r| {
+            guard
+                .left_at
+                .get(&r.email)
+                .is_none_or(|t| t.elapsed().as_secs() >= NO_RETURN_SECS)
+        })
+        .filter(|r| {
+            !fresh_since_left(r, guard)
+                || r.fetched_at
+                    .is_none_or(|f| now_ts - f > TARGET_VERIFY_MAX_AGE_SECS)
+        })
+        .collect();
+    stale.sort_by(|a, b| candidate_order(a, b));
+    stale.first().map(|r| r.email.clone())
+}
+
+/// Fetch a prospective swap target's usage right now and persist it. Returns
+/// the account with its refreshed cache, or `None` if it couldn't be read.
+/// Never rotates tokens — `refresh_usage_cache` owns that (including saving
+/// the rotated refresh token); an expired token just means "unverified".
+fn verify_swap_target(email: &str) -> Option<Account> {
+    let mut acct = State::load().ok()?.find(email).cloned()?;
+    if acct.needs_relogin || acct.expires_at <= Utc::now().timestamp_millis() {
+        return None;
+    }
+    let now_ts = Utc::now().timestamp();
+    match usage::fetch(&acct.access_token) {
+        Ok(u) => {
+            record_usage_fetch_success(email);
+            let cu = cached_from_usage(&u);
+            let saved = with_state_lock(|| {
+                let mut st = State::load()?;
+                if let Some(a) = st.find_mut(email) {
+                    a.cached_usage = Some(cu.clone());
+                }
+                st.save()
+            });
+            if let Err(e) = saved {
+                logging::log(&format!(
+                    "swap target {email}: saving reading failed: {e:#}"
+                ));
+            }
+            acct.cached_usage = Some(cu);
+            Some(acct)
+        }
+        Err(e) => {
+            if matches!(e, usage::FetchError::RateLimited) {
+                record_usage_fetch_429(email);
+            } else {
+                record_usage_fetch_non_429(email);
+            }
+            record_inactive_fetch_failure(email, now_ts);
+            logging::log(&format!("swap target {email}: usage re-check failed: {e}"));
+            None
         }
     }
 }
@@ -4029,7 +4199,7 @@ fn watch_cycle(
             actionable: false,
         });
     }
-    let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
+    let mut rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
     let max_pct = cadence_max_pct(&rows, state.active.as_deref());
     append_history(&rows, state.active.as_deref());
 
@@ -4042,7 +4212,7 @@ fn watch_cycle(
     let mut actionable = false;
 
     if let Some(active_email) = active.clone() {
-        let eval = evaluate_swap(&rows, &active_email, trigger, ceiling, guard);
+        let eval = evaluate_swap_verified(&mut rows, &active_email, trigger, ceiling, guard);
         // A target that's merely cooldown-blocked still counts as actionable:
         // we want the fast backstop so we swap the instant the cooldown clears.
         actionable = eval.target_ignoring_cooldown.is_some();
@@ -4068,8 +4238,9 @@ fn watch_cycle(
                 );
                 // Proactive flip-back if the account we're leaving wasn't itself
                 // over the trigger — a better account simply freed up.
-                let proactive = !act_over;
-                if act_over {
+                // A 429 near the trigger counts as over it (`eval.urgent`).
+                let proactive = !(act_over || eval.urgent);
+                if !proactive {
                     logging::log(&format!(
                         "event=swap_decision active={active_email} active_pct={active_pct:.0}% \
                          target={target} target_pct={:.0}% action=switching",
@@ -4320,18 +4491,10 @@ fn parse_context_args(args: &[String]) -> Result<(Option<String>, Option<std::pa
 fn cmd_report(args: &[String]) -> Result<()> {
     // Analytics subflavours share the same command surface so `report` stays
     // the one-stop CLI for usage insight. `--pace` prints per-account burn-
-    // rate forecasts; `--pricing` dumps the model→price lookup table;
-    // `--verdict` classifies each captured account as cancel/downgrade/keep/
-    // upgrade based on the last few weekly cycles. With no flag we fall
-    // through to the classic weekday/hour histogram.
+    // rate forecasts. With no flag we fall through to the classic
+    // weekday/hour histogram.
     if args.iter().any(|a| a == "--pace") {
         return cmd_report_pace();
-    }
-    if args.iter().any(|a| a == "--pricing") {
-        return cmd_report_pricing();
-    }
-    if args.iter().any(|a| a == "--verdict") {
-        return cmd_report_verdict();
     }
 
     use chrono::{Datelike, Local, TimeZone, Timelike};
@@ -4422,12 +4585,10 @@ fn cmd_report(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-// --- report --pace / --pricing / --verdict --------------------------------
+// --- report --pace ---------------------------------------------------------
 //
-// The three flag paths reuse the burn_rate / pricing / cost_tracking modules,
-// so the CLI stays a thin renderer over the same data the menu bar consumes.
-// Every flag prints the "estimate, not billing" disclaimer once so users read
-// the output with appropriate skepticism.
+// Reuses the burn_rate module, so the CLI stays a thin renderer over the same
+// data the menu bar consumes.
 
 fn cmd_report_pace() -> Result<()> {
     use crate::providers::trait_def::Window;
@@ -4438,7 +4599,7 @@ fn cmd_report_pace() -> Result<()> {
         return Ok(());
     }
     println!("\nBurn-rate forecast");
-    println!("  {}\n", crate::cost_tracking::DISCLAIMER);
+    println!("  Projection from recent usage history, not a guarantee.\n");
     let now = Utc::now();
     for acct in &state.accounts {
         let Some(email) = acct.email.clone() else {
@@ -4449,121 +4610,6 @@ fn cmd_report_pace() -> Result<()> {
         for window in [Window::Session, Window::Weekly] {
             if let Some(est) = crate::burn_rate::estimate(&key, window, now) {
                 println!("    {}", crate::burn_rate::format_menu_row(&est));
-            }
-        }
-    }
-    println!();
-    Ok(())
-}
-
-fn cmd_report_pricing() -> Result<()> {
-    // Static table dump — useful for verifying which model → dollar rate the
-    // cost estimator will use before it renders in the menu.
-    println!("\nModel pricing (USD per 1M tokens)");
-    println!("  Source: vendor pricing pages, compiled 2026-09-06.\n");
-    // We enumerate provider-slug guesses; unknown lookups are silently skipped.
-    let probes: &[(&str, &[&str])] = &[
-        (
-            "claude",
-            &[
-                "claude-fable-5-1",
-                "claude-opus-5",
-                "claude-opus-4-1",
-                "claude-sonnet-5",
-                "claude-sonnet-4-5",
-                "claude-haiku-4-5",
-            ],
-        ),
-        (
-            "codex",
-            &[
-                "gpt-6-astra",
-                "gpt-5-6-sol",
-                "gpt-5-6-luna",
-                "gpt-5",
-                "gpt-4-1",
-                "o3",
-            ],
-        ),
-        (
-            "gemini-cli",
-            &[
-                "gemini-2-5-pro",
-                "gemini-2-5-flash",
-                "gemini-2-5-flash-lite",
-            ],
-        ),
-        (
-            "deepseek",
-            &["deepseek-v4", "deepseek-chat", "deepseek-reasoner"],
-        ),
-        (
-            "qwen-code",
-            &["qwen-max", "qwen-plus", "qwen-turbo", "qwen-coder-3"],
-        ),
-        ("zai", &["glm-4-5", "glm-4-air", "glm-4-plus"]),
-        (
-            "fireworks",
-            &["llama-3-3-70b", "llama-4-scout", "llama-4-maverick"],
-        ),
-    ];
-    for (provider, models) in probes {
-        println!("  {provider}");
-        for m in *models {
-            if let Some(p) = crate::pricing::lookup(provider, m) {
-                println!(
-                    "    {m:<24} in ${:>5.2} / out ${:>6.2}",
-                    p.input_per_million, p.output_per_million
-                );
-            }
-        }
-        println!();
-    }
-    println!("  Passthrough providers (billed per-request against the vendor's API):");
-    for p in ["openrouter", "synthetic"] {
-        if crate::pricing::is_passthrough(p) {
-            println!("    {p} — cost pulled live from the underlying model");
-        } else {
-            // synthetic is not tagged as passthrough today; still enumerate so
-            // the user sees why it has no local rate.
-            println!("    {p} — no local rate table");
-        }
-    }
-    println!();
-    Ok(())
-}
-
-fn cmd_report_verdict() -> Result<()> {
-    use crate::cost_tracking::{subscription_verdict, Verdict};
-    use crate::usage_log::AccountKey;
-    let state = State::load()?;
-    if state.accounts.is_empty() {
-        println!("No accounts captured yet — run `usagio capture` first.");
-        return Ok(());
-    }
-    println!("\nSubscription verdict");
-    println!("  {}\n", crate::cost_tracking::DISCLAIMER);
-    // Four weekly cycles ≈ one month, the window we quote as "recoverable per
-    // month" downstream.
-    const CYCLES: usize = 4;
-    for acct in &state.accounts {
-        let Some(email) = acct.email.clone() else {
-            continue;
-        };
-        let key = AccountKey::new(CLAUDE_SLUG, &email);
-        match subscription_verdict(&key, CYCLES) {
-            None => println!("  {email}: not enough history yet"),
-            Some(sv) => {
-                let label = match sv.verdict {
-                    Verdict::Cancel => "cancel",
-                    Verdict::Downgrade => "downgrade",
-                    Verdict::Keep => "keep",
-                    Verdict::Upgrade => "upgrade",
-                };
-                println!(
-                    "  {email}: {label}  (avg {:.0}%, peak {:.0}%, ~${:.2} recoverable/mo)",
-                    sv.avg_utilization_pct, sv.peak_utilization_pct, sv.recoverable_dollars,
-                );
             }
         }
     }

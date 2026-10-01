@@ -44,7 +44,7 @@ use crate::{
     next_interval, notify, optimize_now, remove_account, remove_provider_account_generic,
     row_from_account, row_from_provider_account, set_current_loop_interval_secs, switch_to,
     switch_to_provider_account, watch_cycle, with_state_lock, Row, SwapGuard, CLAUDE_SLUG,
-    TARGET_CEILING_PCT, TRIGGER_PCT, WATCH_INTERVAL_SECS,
+    TRIGGER_PCT, WATCH_INTERVAL_SECS, WATCH_TIGHT_INTERVAL_SECS,
 };
 
 /// Exact title of the disabled section row inserted when a provider's env
@@ -635,16 +635,21 @@ fn account_header_row(sec: &ProviderSection, a: &AcctView) -> RowStyle {
 /// Plain title is just the provider's display name (e.g. "Claude"), bold,
 /// disabled (`enabled: false` so it reads as a group heading, not a click
 /// target), and carries the per-provider 16px icon — the icon belongs to the
-/// GROUP, not to each account inside it. When the provider's env override is
-/// active, this row also hosts the "env override active — swap disabled" child
-/// (see `menu_tree_from_snapshot`) so a provider-wide fact renders once at the
-/// group level instead of on every affected account.
+/// GROUP, not to each account inside it. Every provider's header is the same
+/// plain, non-interactive label row — never a submenu, never highlighted. A
+/// provider-wide fact (the env override disabling swaps) rides inline in the
+/// label so it still renders once at the group level.
 fn provider_group_header_row(sec: &ProviderSection) -> RowStyle {
+    let label = if sec.env_override_active {
+        format!("{} · {ENV_OVERRIDE_ROW_TITLE}", sec.display_name)
+    } else {
+        sec.display_name.to_string()
+    };
     RowStyle {
         bold: true,
         section_header: true,
         icon_slug: Some(sec.provider_id),
-        ..RowStyle::plain_row(sec.display_name.to_string())
+        ..RowStyle::plain_row(label)
     }
 }
 
@@ -1145,10 +1150,13 @@ fn poll_loop() {
         wd.maybe_run(&mut wd_effects);
         // A switch since the last refresh (manual, auto, or an external
         // `claude /login`) means any backoff we're carrying was earned by the
-        // previous active account; start the new one at base cadence.
+        // previous active account. Restart from the TIGHT interval, not base:
+        // `current` only seeds the 429 backoff (the non-429 cadence comes from
+        // the usage tier), and seeding it with base turned one 429 on a
+        // just-landed account into a 360s blind spot.
         let cycle_active = current_active_account();
         if cycle_active != last_cycle_active {
-            current = base;
+            current = WATCH_TIGHT_INTERVAL_SECS;
         }
         // Fetch usage + auto-swap; this writes cached usage to state.json, which
         // the main-thread timer reads back to render. This is the ONLY thing that
@@ -1446,7 +1454,8 @@ fn run_cycle(guard: &mut SwapGuard, force: bool) -> (bool, Option<f64>, f64, boo
     let threshold = st.trigger_pct.unwrap_or(TRIGGER_PCT);
     // With auto-swap off, use an unreachable trigger so we only observe.
     let trigger = if autoswap { threshold } else { 101.0 };
-    match watch_cycle(trigger, TARGET_CEILING_PCT, guard, force) {
+    // The target ceiling follows the trigger (see `Row::eligible_target`).
+    match watch_cycle(trigger, trigger, guard, force) {
         Ok(o) => (o.rate_limited, o.max_pct, trigger, o.actionable),
         Err(e) => {
             crate::logging::log(&format!("menubar poll failed: {e}"));
@@ -1867,37 +1876,21 @@ fn cached_state() -> State {
 // Menu building
 // ---------------------------------------------------------------------------
 
-/// Disabled/header-only rows a section prepends before its account submenus.
-/// Currently: the "env override active — swap disabled" row when the section's
-/// provider is env-overridden. Pure, so tests can assert on it without
-/// instantiating any native menu (muda requires the main thread on macOS).
-pub(crate) fn section_headline_rows(sec: &ProviderSection) -> Vec<String> {
-    let mut rows = Vec::new();
-    if sec.env_override_active {
-        rows.push(ENV_OVERRIDE_ROW_TITLE.to_string());
-    }
-    if let Some(active) = sec.accounts.iter().find(|a| a.active) {
-        if let Some((_, detail)) = recovery_status(sec, active, now_utc()) {
-            rows.push(detail);
-        }
-    }
-    rows
-}
-
-/// One window's line inside an account submenu. Percentages live in the header
-/// row, so these lines answer only what the header's bare countdown can't:
-/// WHICH window is the constraint and WHEN it frees. A maxed window reads
-/// `<Label> limit reached · resets in <X>`; a healthy one `<Label> resets in
-/// <X>`. Returns `None` for a healthy window with no known reset (nothing useful
-/// to show — this replaces the old "no reset info yet" placeholder that read
-/// like an error).
-fn window_status_row(w: &WindowView) -> Option<String> {
+/// One window's line inside an account submenu, and whether it's a lock.
+/// Percentages live on the account row, so these lines answer only what the
+/// row's bare countdown can't: WHICH window binds and WHEN it frees. The two
+/// states use different verbs so the words alone say which is which: a maxed
+/// window is `<Label> locked · unlocks in <X>` (rendered red, like the row's
+/// countdown); a healthy one `<Label> renews in <X>` ("resets in" beside a
+/// lock read as if that window were locked too). `None` for a healthy window
+/// with no known reset — nothing useful to say.
+fn window_status_row(w: &WindowView) -> Option<(String, bool)> {
     let label = stat_display_label(w);
     let locked = w.pct.is_some_and(|p| p >= 100.0);
     match (locked, w.reset.is_empty()) {
-        (true, false) => Some(format!("{label} limit reached · resets in {}", w.reset)),
-        (true, true) => Some(format!("{label} limit reached")),
-        (false, false) => Some(format!("{label} resets in {}", w.reset)),
+        (true, false) => Some((format!("{label} locked · unlocks in {}", w.reset), true)),
+        (true, true) => Some((format!("{label} locked"), true)),
+        (false, false) => Some((format!("{label} renews in {}", w.reset), false)),
         (false, true) => None,
     }
 }
@@ -1912,37 +1905,58 @@ fn window_status_row(w: &WindowView) -> Option<String> {
 /// (`account_extra_info_rows` yields those separately): those touch the on-disk
 /// usage log, and this function must stay pure (no disk I/O) so it's safe to
 /// call from a unit test without a `ScopedConfigDir`.
+#[cfg(test)]
 fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
-    let mut rows = Vec::new();
+    submenu_info_items(sec, a)
+        .into_iter()
+        .map(|(r, _)| r)
+        .collect()
+}
+
+/// [`submenu_info_rows`] plus whether each line is a lock (rendered red).
+fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)> {
+    let mut rows: Vec<(String, bool)> = Vec::new();
     // Auth trouble is the account's headline state — spell out the reason and
     // the fix before any (now-frozen) usage numbers. Mirrors the `⚠` trailing
     // that `trailing_for_account` puts on the row header.
     if a.needs_relogin {
-        rows.push("⚠ Re-login required — token expired".to_string());
-        rows.push(format!(
-            "Fix: log in with `claude`, then `usagio capture` ({})",
-            a.key
+        rows.push(("⚠ Re-login required — token expired".to_string(), true));
+        rows.push((
+            format!(
+                "Fix: log in with `claude`, then `usagio capture` ({})",
+                a.key
+            ),
+            false,
         ));
         return rows;
     }
     if let Some(err) = &a.error {
-        rows.push(format!("⚠ Refresh error: {err}"));
+        rows.push((format!("⚠ Refresh error: {err}"), true));
         return rows;
     }
     if a.no_subscription {
-        rows.push(format!(
-            "No subscription · {} plan",
-            a.plan.as_deref().unwrap_or("Free")
+        rows.push((
+            format!(
+                "No subscription · {} plan",
+                a.plan.as_deref().unwrap_or("Free")
+            ),
+            true,
         ));
-        rows.push("Usage checks paused — renew to use this account".to_string());
-        rows.push(format!(
-            "Rechecked every {}m; resumes when a plan is back",
-            crate::SUBSCRIPTION_RECHECK_SECS / 60
+        rows.push((
+            "Usage checks paused — renew to use this account".to_string(),
+            false,
+        ));
+        rows.push((
+            format!(
+                "Rechecked every {}m; resumes when a plan is back",
+                crate::SUBSCRIPTION_RECHECK_SECS / 60
+            ),
+            false,
         ));
         return rows;
     }
     if let Some(plan) = &a.plan {
-        rows.push(format!("Plan · {plan}"));
+        rows.push((format!("Plan · {plan}"), false));
     }
     if sec.supports_usage {
         if a.has_data && !a.windows.is_empty() {
@@ -1953,9 +1967,9 @@ fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
             let mut ordered: Vec<&WindowView> = a.windows.iter().collect();
             ordered.sort_by_key(|w| u8::from(!w.pct.is_some_and(|p| p >= 100.0)));
             // When the WEEKLY window is locked, the account is fully blocked
-            // regardless of the session window — so drop the "Session resets in X"
+            // regardless of the session window — so drop the "Session renews in X"
             // line (its countdown is meaningless while the weekly limit blocks all
-            // use). The "Weekly limit reached · resets in X" row says everything.
+            // use). The "Weekly locked · unlocks in X" row says everything.
             let weekly_locked = a
                 .windows
                 .iter()
@@ -1965,30 +1979,29 @@ fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
                     continue;
                 }
                 if let Some(row) = window_status_row(w) {
-                    rows.push(row);
+                    rows.push(row); // (text, locked)
                 } else if sec.provider_id == "codex" && w.pct.is_none() {
-                    rows.push(format!("{} · Not reported", stat_display_label(w)));
+                    rows.push((format!("{} · Not reported", stat_display_label(w)), false));
                 }
             }
-            if rows.is_empty() {
-                rows.push("no data yet".to_string());
+            if !rows.iter().any(|(r, _)| !r.starts_with("Plan · ")) {
+                rows.push(("no data yet".to_string(), false));
             }
         } else {
-            rows.push("no data yet".to_string());
+            rows.push(("no data yet".to_string(), false));
         }
     } else {
-        rows.push("(no usage endpoint — headers only)".to_string());
+        rows.push(("(no usage endpoint — headers only)".to_string(), false));
     }
     rows
 }
 
 /// The disk-derived informational rows for an account's submenu, in render
-/// order: burn-rate estimate (`🔥`), cost estimate (`💰`), and the "updated Xm
-/// ago" footer. Split out from `submenu_info_rows` — which must stay
-/// disk-I/O-free so it's callable from a unit test without a `ScopedConfigDir`
-/// — because these read the on-disk usage log via `crate::burn_rate` /
-/// `crate::cost_tracking`. `build_account_submenu_item` appends them after the
-/// `submenu_info_rows` block.
+/// order: burn-rate estimate (`🔥`) and the "updated Xm ago" footer. Split out
+/// from `submenu_info_rows` — which must stay disk-I/O-free so it's callable
+/// from a unit test without a `ScopedConfigDir` — because the burn rate reads
+/// the on-disk usage log via `crate::burn_rate`. `build_account_submenu_item`
+/// appends them after the `submenu_info_rows` block.
 fn account_extra_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
     let mut rows = Vec::new();
     if sec.supports_usage && a.has_data && !a.windows.is_empty() && !a.no_subscription {
@@ -2012,12 +2025,6 @@ fn account_extra_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
                     rows.push(crate::burn_rate::format_menu_row(&est));
                 }
             }
-        }
-        if let Some(cost) = crate::cost_tracking::estimate_cycle_cost(
-            &account_key,
-            crate::cost_tracking::CLAUDE_MAX_100_WEEKLY_TOKENS,
-        ) {
-            rows.push(format!("~${:.2} this cycle (est)", cost.estimated_usd));
         }
         rows.push(format!("updated {}", a.updated));
     }
@@ -2909,7 +2916,7 @@ mod cross_platform {
     use super::*;
     #[cfg(not(target_os = "macos"))]
     use crate::platform::MenuHandle;
-    use crate::platform::{MenuItem as PMenuItem, MenuTree};
+    use crate::platform::{MenuItem as PMenuItem, MenuTree, ValueColor};
 
     /// A `RowStyle`'s plain title. The `\t` is passed THROUGH so muri's
     /// muda-compat two-column layout right-aligns the trailing value column.
@@ -2970,14 +2977,11 @@ mod cross_platform {
     /// draws greyed/dimmed, which the maintainer flagged as unreadable, and
     /// muri has no rich-text to re-tint a disabled row back to full contrast —
     /// so full-contrast + a harmless no-op click wins over a dimmed row.
-    fn noop_info(label: impl Into<String>) -> PMenuItem {
-        PMenuItem::Action {
-            id: "noop".to_string(),
+    /// A non-clickable (never highlighted) detail line, optionally tinted.
+    fn info_row(label: impl Into<String>, color: Option<ValueColor>) -> PMenuItem {
+        PMenuItem::Info {
             label: label.into(),
-            icon_png: None,
-            enabled: true,
-            checked: false,
-            checkable: false,
+            color,
         }
     }
 
@@ -3013,11 +3017,11 @@ mod cross_platform {
     /// provider group holds one such submenu per account.
     fn build_account_submenu_item(sec: &ProviderSection, a: &AcctView) -> PMenuItem {
         let mut items = Vec::new();
-        for row in submenu_info_rows(sec, a) {
-            items.push(noop_info(row));
+        for (row, locked) in submenu_info_items(sec, a) {
+            items.push(info_row(row, locked.then_some(ValueColor::Red)));
         }
         for row in account_extra_info_rows(sec, a) {
-            items.push(noop_info(row));
+            items.push(info_row(row, None));
         }
         // Action rows: Switch/Active, Launch, Remove.
         let rows = account_submenu_rows(sec, a);
@@ -3059,27 +3063,13 @@ mod cross_platform {
     }
 
     /// The provider-group header row: the provider's display name plus its
-    /// 16px icon, disabled (a heading, not a click target). Becomes a submenu
-    /// carrying the "env override active — swap disabled" marker when that
-    /// provider's env override is on. Label comes from
+    /// 16px icon, as a static section header — identical for every provider
+    /// and every state (no submenu, no hover highlight). Label comes from
     /// `provider_group_header_row` so the header text has a single source.
-    fn build_provider_group_item(sec: &ProviderSection) -> PMenuItem {
-        let label = provider_group_header_row(sec).plain;
-        let icon_png = crate::icons::png16_for(sec.provider_id).map(|b| b.to_vec());
-        let headlines = section_headline_rows(sec);
-        if headlines.is_empty() {
-            return PMenuItem::Static { label, icon_png };
-        }
-        let children: Vec<PMenuItem> = headlines
-            .into_iter()
-            .map(|title| action(format!("envoverride:{}", sec.provider_id), title, false))
-            .collect();
-        PMenuItem::Submenu {
-            label,
-            icon_png,
-            items: children,
-            active: false,
-            value_spans: Vec::new(),
+    pub(super) fn build_provider_group_item(sec: &ProviderSection) -> PMenuItem {
+        PMenuItem::Static {
+            label: provider_group_header_row(sec).plain,
+            icon_png: crate::icons::png16_for(sec.provider_id).map(|b| b.to_vec()),
         }
     }
 
@@ -3868,7 +3858,7 @@ mod tests {
         assert!(
             !rows
                 .iter()
-                .any(|r| r.contains("resets in") || r.contains("limit")),
+                .any(|r| r.contains("renews in") || r.contains("unlocks in")),
             "no stale window rows: {rows:?}"
         );
         assert!(account_extra_info_rows(&claude_section(), &a).is_empty());
@@ -3926,7 +3916,9 @@ mod tests {
         );
         // No usage/window rows once the login is dead.
         assert!(
-            !rows.iter().any(|r| r.contains("resets in")),
+            !rows
+                .iter()
+                .any(|r| r.contains("renews in") || r.contains("unlocks in")),
             "dead login shows no window rows: {rows:?}"
         );
     }
@@ -3946,7 +3938,6 @@ mod tests {
         with_now(now, || {
             assert_eq!(title_for(&snap), "🔒 2h 0m");
             assert!(tooltip_for(&snap).contains("next@x.com"));
-            assert!(section_headline_rows(&snap.sections[0])[0].contains("next@x.com"));
         });
         with_now(now + chrono::Duration::hours(2), || {
             assert_eq!(title_for(&snap), "Refreshing…");
@@ -4000,7 +3991,7 @@ mod tests {
         let mut sec = claude_section();
         sec.provider_id = "codex";
         let rows = submenu_info_rows(&sec, &a);
-        assert_eq!(rows, ["Session · Not reported", "Weekly resets in 2d"]);
+        assert_eq!(rows, ["Session · Not reported", "Weekly renews in 2d"]);
         assert_eq!(summary_pcts(&a), (None, Some(40.0)));
         assert_eq!(title_for(&one_section_snap(a)), "40%");
     }
@@ -4025,7 +4016,7 @@ mod tests {
         let rows = submenu_info_rows(&sec, &locked);
         assert!(
             rows.iter()
-                .any(|r| r.contains("Weekly") && r.contains("limit reached")),
+                .any(|r| r.contains("Weekly") && r.contains("locked · unlocks in")),
             "weekly-locked flyout must keep the weekly lock row: {rows:?}"
         );
         assert!(
@@ -4046,7 +4037,7 @@ mod tests {
     fn submenu_reset_rows_are_plain_text_no_emoji() {
         // The details panel deliberately carries NO leading emoji glyphs (the
         // maintainer found them out of place). Reset rows are plain "<Label>
-        // resets in X" text — assert they read that way and never lead with a
+        // renews in X" text — assert they read that way and never lead with a
         // non-ASCII decoration.
         let a = acct("a@x.com", Some(20.0), Some(30.0), false);
         let sec = ProviderSection {
@@ -4068,7 +4059,7 @@ mod tests {
                 "reset row should be plain ASCII text, no emoji: {row}"
             );
             assert!(
-                row.contains("resets in") || row.contains("no reset info"),
+                row.contains("renews in") || row.contains("unlocks in"),
                 "unexpected reset row text: {row}"
             );
         }
@@ -4208,20 +4199,41 @@ mod tests {
     }
 
     #[test]
-    fn section_renders_env_override_row_when_flagged() {
-        // A section without the override contributes no extra header rows.
-        let base = one_section_snap(acct("a@x.com", Some(10.0), Some(20.0), true));
-        assert!(section_headline_rows(&base.sections[0]).is_empty());
+    fn locked_window_rows_are_flagged_and_say_unlocks_healthy_say_renews() {
+        // dev6's real shape: session maxed, weekly just reset to 0%.
+        let a = acct("dev6@x.com", Some(100.0), Some(0.0), false);
+        let items = submenu_info_items(&claude_section(), &a);
+        assert!(
+            items.contains(&("Session locked · unlocks in 3h".to_string(), true)),
+            "{items:?}"
+        );
+        assert!(
+            items.contains(&("Weekly renews in 2d".to_string(), false)),
+            "{items:?}"
+        );
+        assert!(
+            !items.iter().any(|(r, _)| r.contains("resets in")),
+            "{items:?}"
+        );
+    }
 
-        // With the override on, the section prepends the disabled row that
-        // `menu_tree_from_snapshot` adds verbatim (`ENV_OVERRIDE_ROW_TITLE`).
-        // muri's compat Menu requires the main thread on macOS, so we assert on
-        // the pure helper `menu_tree_from_snapshot` shares with us instead of
-        // building the menu.
-        let mut flagged = one_section_snap(acct("a@x.com", Some(10.0), Some(20.0), true));
-        flagged.sections[0].env_override_active = true;
-        let rows = section_headline_rows(&flagged.sections[0]);
-        assert_eq!(rows, vec![ENV_OVERRIDE_ROW_TITLE]);
+    #[test]
+    fn provider_header_is_always_a_static_label_row() {
+        // Every provider header is the same static row with its icon — no
+        // submenu whatever the state (env override, blocked active account).
+        let mut blocked = acct("a@x.com", Some(100.0), Some(100.0), true);
+        blocked.weekly_reset_at = Some(Utc::now() + chrono::Duration::days(2));
+        let mut snap = one_section_snap(blocked);
+        for env in [false, true] {
+            snap.sections[0].env_override_active = env;
+            match cross_platform::build_provider_group_item(&snap.sections[0]) {
+                crate::platform::MenuItem::Static { label, icon_png } => {
+                    assert!(icon_png.is_some(), "header keeps its icon");
+                    assert_eq!(label.contains(ENV_OVERRIDE_ROW_TITLE), env, "{label}");
+                }
+                _ => panic!("provider header must be a static label row"),
+            }
+        }
     }
 
     #[test]

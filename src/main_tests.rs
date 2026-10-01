@@ -242,7 +242,7 @@ fn auto_pick_tie_break_picks_higher_headroom() {
     ];
     // Equal soonest reset → the account with MORE headroom (lower usage) wins.
     assert_eq!(
-        auto_pick(&rows, TARGET_CEILING_PCT, TRIGGER_PCT).unwrap(),
+        auto_pick(&rows, TRIGGER_PCT, TRIGGER_PCT).unwrap(),
         "low@e.com"
     );
 }
@@ -257,7 +257,7 @@ fn auto_pick_prefers_soonest_reset() {
         row_full("soon@e.com", 40.0, 40.0, soon),
     ];
     assert_eq!(
-        auto_pick(&rows, TARGET_CEILING_PCT, TRIGGER_PCT).unwrap(),
+        auto_pick(&rows, TRIGGER_PCT, TRIGGER_PCT).unwrap(),
         "soon@e.com"
     );
 }
@@ -273,7 +273,7 @@ fn auto_pick_skips_past_target_account_even_if_it_resets_soonest() {
         row_full("empty@e.com", 0.0, 0.0, later),
     ];
     assert_eq!(
-        auto_pick(&rows, TARGET_CEILING_PCT, TRIGGER_PCT).unwrap(),
+        auto_pick(&rows, TRIGGER_PCT, TRIGGER_PCT).unwrap(),
         "empty@e.com",
         "an account past the weekly trigger is never the best landing spot"
     );
@@ -291,7 +291,7 @@ fn auto_pick_falls_back_to_least_full_when_all_past_target() {
     ];
     // Both past the 95% trigger → fallback tier. Soonest reset still wins.
     assert_eq!(
-        auto_pick(&rows, TARGET_CEILING_PCT, TRIGGER_PCT).unwrap(),
+        auto_pick(&rows, TRIGGER_PCT, TRIGGER_PCT).unwrap(),
         "full99@e.com"
     );
 }
@@ -488,18 +488,100 @@ fn choose_swap_target_proactive_respects_no_return_window() {
 }
 
 #[test]
-fn choose_swap_target_respects_cooldown() {
-    let reset = Utc::now() + Duration::hours(24);
+fn choose_swap_target_cooldown_blocks_only_optional_swaps() {
+    let soon = Utc::now() + Duration::hours(2);
+    let later = Utc::now() + Duration::hours(48);
+    let guard = SwapGuard {
+        last_swap: Some(std::time::Instant::now()),
+        ..SwapGuard::default()
+    };
+    // Proactive flip-back (active healthy, a sooner-resetting account freed
+    // up) → just swapped, so the cooldown holds it.
     let rows = vec![
-        row_full("active@e.com", 96.0, 96.0, reset),
-        row_full("free@e.com", 20.0, 20.0, reset),
+        row_full("active@e.com", 40.0, 40.0, later),
+        row_full("free@e.com", 10.0, 10.0, soon),
+    ];
+    assert!(choose_swap_target(&rows, "active@e.com", 95.0, 95.0, &guard).is_none());
+    // Active over the trigger → leaving is urgent; a recent swap must not
+    // hold it there (a just-landed 94% account would run out in the wait).
+    let rows = vec![
+        row_full("active@e.com", 96.0, 50.0, later),
+        row_full("free@e.com", 20.0, 20.0, soon),
+    ];
+    let eval = evaluate_swap(&rows, "active@e.com", 95.0, 95.0, &guard);
+    assert!(eval.urgent);
+    assert_eq!(eval.target.as_deref(), Some("free@e.com"));
+}
+
+#[test]
+fn first_429_near_trigger_swaps_immediately_even_after_a_recent_swap() {
+    // Replay of the dev@ incident: 93% session, trigger 95, one 429, and the
+    // previous swap only moments ago. Must move now, not after a backoff.
+    let email = escalation_test_email("replay");
+    record_usage_fetch_success(&email);
+    record_usage_fetch_429(&email);
+    let reset = Utc::now() + Duration::hours(24);
+    let mut active = row_full(&email, 93.0, 76.0, reset);
+    active.fetched_at = Some(Utc::now().timestamp());
+    let rows = vec![
+        active,
+        row_full("dev4@e.com", 24.0, 9.0, reset + Duration::hours(24)),
     ];
     let guard = SwapGuard {
         last_swap: Some(std::time::Instant::now()),
         ..SwapGuard::default()
     };
-    // Just swapped → cooldown blocks another swap.
-    assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
+    let eval = evaluate_swap(&rows, &email, 95.0, 95.0, &guard);
+    assert!(eval.urgent);
+    assert_eq!(eval.target.as_deref(), Some("dev4@e.com"));
+    reset_usage_fetch_tracker(&email);
+}
+
+#[test]
+fn swap_target_ceiling_follows_the_trigger() {
+    let reset = Utc::now() + Duration::hours(24);
+    // Trigger 95, ceiling = trigger: a 90% session is a usable target now
+    // (the old fixed 85% stranded it).
+    let rows = vec![
+        row_full("active@e.com", 96.0, 50.0, reset),
+        row_full("ninety@e.com", 90.0, 50.0, reset),
+    ];
+    let guard = SwapGuard::default();
+    assert_eq!(
+        choose_swap_target(&rows, "active@e.com", 95.0, 95.0, &guard).as_deref(),
+        Some("ninety@e.com")
+    );
+    // Trigger 80: an 84% session is already past it — never a target, even
+    // with a looser ceiling passed in.
+    let rows = vec![
+        row_full("active@e.com", 81.0, 50.0, reset),
+        row_full("over@e.com", 84.0, 10.0, reset),
+    ];
+    assert!(choose_swap_target(&rows, "active@e.com", 80.0, 85.0, &guard).is_none());
+}
+
+#[test]
+fn left_account_needs_a_reading_taken_after_leaving() {
+    // We left back@ moments ago with a 93% reading taken before leaving. Even
+    // once the no-return window has passed, that pre-leave number can't make
+    // it a target — only a reading taken after we left can.
+    let reset = Utc::now() + Duration::hours(24);
+    let mut back = row_full("back@e.com", 50.0, 50.0, reset);
+    let left = std::time::Instant::now();
+    let left_ts = Utc::now().timestamp();
+    let mut left_at = std::collections::HashMap::new();
+    left_at.insert("back@e.com".to_string(), left);
+    let guard = SwapGuard {
+        left_at,
+        ..SwapGuard::default()
+    };
+    back.fetched_at = Some(left_ts - 60);
+    assert!(!fresh_since_left(&back, &guard));
+    back.fetched_at = Some(left_ts + 60);
+    assert!(fresh_since_left(&back, &guard));
+    // An account we never left is unaffected.
+    let other = row_full("other@e.com", 50.0, 50.0, reset);
+    assert!(fresh_since_left(&other, &guard));
 }
 
 #[test]
@@ -690,10 +772,16 @@ fn next_interval_doubles_on_rate_limit_capped() {
         next_interval(60, 60, true, Some(50.0), TRIGGER_FOR_TESTS, true),
         120
     );
-    // Never below base even if `current` was stale-small.
+    // Doubles the CURRENT interval, not base: one 429 at the 30s tier must
+    // not jump to 2×base (the dev@ incident went 30s → 360s and ran out).
+    assert_eq!(
+        next_interval(30, 180, true, Some(93.0), TRIGGER_FOR_TESTS, true),
+        60
+    );
+    // Floored at the TIGHT interval if `current` was stale-small.
     assert_eq!(
         next_interval(1, 60, true, Some(50.0), TRIGGER_FOR_TESTS, true),
-        120
+        60
     );
     // Capped at the max.
     assert_eq!(
@@ -883,32 +971,24 @@ fn escalation_no_429s_returns_raw_max_pct() {
     let email = escalation_test_email("no429s");
     let row = active_row(&email, 94.0, 30.0);
     // No tracker state → not escalated → raw value returned.
-    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
+    let eff = effective_active_max_pct_for_swap_fire(&row, 95.0);
     assert_eq!(eff, 94.0);
     reset_usage_fetch_tracker(&email);
 }
 
 #[test]
-fn escalation_fires_when_active_two_429s_in_tight_band_and_recent_success() {
-    // Scoped config dir so `burn_rate::estimate` (which reads history files)
-    // sees an empty log — the escalation falls back to pin-at-trigger when
-    // no confident burn rate is available, which is exactly the "no history
-    // yet" case we want to prove fires the swap.
-    let _g = crate::store::ScopedConfigDir::new();
+fn escalation_fires_on_first_429_in_tight_band() {
+    // The dev@ incident: 93% with a 95% trigger, one 429. Waiting for a second
+    // strike meant waiting out a backoff while the account ran out, so a
+    // single 429 in the TIGHT band must already fire the swap.
     let email = escalation_test_email("fires");
-    // Simulate: one success, then two 429s, all recent — the exact v0.7.3
-    // dev4 postmortem pattern.
-    let now_ts = Utc::now().timestamp();
-    record_usage_fetch_success(&email, now_ts);
+    record_usage_fetch_success(&email);
     record_usage_fetch_429(&email);
-    record_usage_fetch_429(&email);
-    let row = active_row(&email, 94.0, 30.0);
-    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
-    // Escalated: pinned at ≥ trigger so `evaluate_swap` fires on the next
-    // cycle even though the endpoint refuses to give us the real number.
+    let row = active_row(&email, 93.0, 76.0);
+    let eff = effective_active_max_pct_for_swap_fire(&row, 95.0);
     assert!(
         eff >= 95.0,
-        "escalation must guarantee effective ≥ trigger, got {eff}"
+        "one 429 in the tight band must escalate, got {eff}"
     );
     reset_usage_fetch_tracker(&email);
 }
@@ -916,8 +996,7 @@ fn escalation_fires_when_active_two_429s_in_tight_band_and_recent_success() {
 #[test]
 fn escalation_ignored_when_cached_pct_is_far_below_trigger() {
     let email = escalation_test_email("far_below");
-    let now_ts = Utc::now().timestamp();
-    record_usage_fetch_success(&email, now_ts);
+    record_usage_fetch_success(&email);
     record_usage_fetch_429(&email);
     record_usage_fetch_429(&email);
     // 75% is inside the RELAXED band (trigger-20) but OUTSIDE the TIGHT
@@ -925,7 +1004,7 @@ fn escalation_ignored_when_cached_pct_is_far_below_trigger() {
     // tenant-wide 429 noise when this account isn't actually near limit
     // (Opus adversarial review BAD 3).
     let row = active_row(&email, 75.0, 30.0);
-    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
+    let eff = effective_active_max_pct_for_swap_fire(&row, 95.0);
     assert_eq!(
         eff, 75.0,
         "escalation must NOT fire outside TIGHT band, got {eff}"
@@ -934,45 +1013,15 @@ fn escalation_ignored_when_cached_pct_is_far_below_trigger() {
 }
 
 #[test]
-fn escalation_ignored_when_last_success_is_stale() {
-    let email = escalation_test_email("stale");
-    // Success 10 min ago — beyond ESCALATION_MAX_SUCCESS_AGE_SECS (5 min).
-    let stale_ts = Utc::now().timestamp() - 600;
-    record_usage_fetch_success(&email, stale_ts);
-    record_usage_fetch_429(&email);
-    record_usage_fetch_429(&email);
-    let row = active_row(&email, 94.0, 30.0);
-    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
-    // Cached number is old enough that current 429s can't reliably be
-    // attributed to it — refuse to escalate (Opus adversarial review BAD 4).
-    assert_eq!(eff, 94.0);
-    reset_usage_fetch_tracker(&email);
-}
-
-#[test]
-fn escalation_ignored_after_one_429() {
-    let email = escalation_test_email("one429");
-    let now_ts = Utc::now().timestamp();
-    record_usage_fetch_success(&email, now_ts);
-    record_usage_fetch_429(&email);
-    let row = active_row(&email, 94.0, 30.0);
-    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
-    // One 429 could be a one-off spike; require ≥2 for escalation.
-    assert_eq!(eff, 94.0);
-    reset_usage_fetch_tracker(&email);
-}
-
-#[test]
 fn escalation_counter_resets_on_success() {
     let email = escalation_test_email("reset_on_success");
-    let now_ts = Utc::now().timestamp();
-    record_usage_fetch_success(&email, now_ts);
+    record_usage_fetch_success(&email);
     record_usage_fetch_429(&email);
     record_usage_fetch_429(&email);
     // At this point escalation WOULD fire.
-    record_usage_fetch_success(&email, now_ts + 1);
+    record_usage_fetch_success(&email);
     let row = active_row(&email, 94.0, 30.0);
-    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
+    let eff = effective_active_max_pct_for_swap_fire(&row, 95.0);
     assert_eq!(eff, 94.0, "a successful fetch must reset the counter");
     reset_usage_fetch_tracker(&email);
 }
@@ -980,16 +1029,14 @@ fn escalation_counter_resets_on_success() {
 #[test]
 fn escalation_counter_resets_on_non_429_error() {
     let email = escalation_test_email("reset_on_non_429");
-    let now_ts = Utc::now().timestamp();
-    record_usage_fetch_success(&email, now_ts);
+    record_usage_fetch_success(&email);
     record_usage_fetch_429(&email);
-    // A network timeout (or any non-RateLimited error) mid-storm shouldn't
-    // accumulate escalation credit — those failures don't carry the "server
-    // is asking us to back off" signal (Sonnet adversarial review BAD 4).
+    // A network timeout (or any non-RateLimited error) after a 429 clears the
+    // signal — those failures don't mean "the server is asking us to back
+    // off" (Sonnet adversarial review BAD 4).
     record_usage_fetch_non_429(&email);
-    record_usage_fetch_429(&email);
     let row = active_row(&email, 94.0, 30.0);
-    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
+    let eff = effective_active_max_pct_for_swap_fire(&row, 95.0);
     assert_eq!(eff, 94.0, "non-429 error must reset the consecutive count");
     reset_usage_fetch_tracker(&email);
 }
@@ -997,8 +1044,7 @@ fn escalation_counter_resets_on_non_429_error() {
 #[test]
 fn escalation_reset_tracker_clears_all_state() {
     let email = escalation_test_email("clear_all");
-    let now_ts = Utc::now().timestamp();
-    record_usage_fetch_success(&email, now_ts);
+    record_usage_fetch_success(&email);
     record_usage_fetch_429(&email);
     record_usage_fetch_429(&email);
     reset_usage_fetch_tracker(&email);
@@ -1006,7 +1052,7 @@ fn escalation_reset_tracker_clears_all_state() {
     // account starts fresh — a returning-active account can't re-escalate
     // instantly on a stale count (Opus adversarial review BAD 4).
     let row = active_row(&email, 94.0, 30.0);
-    let eff = effective_active_max_pct_for_swap_fire(&row, CLAUDE_SLUG, 95.0, Utc::now());
+    let eff = effective_active_max_pct_for_swap_fire(&row, 95.0);
     assert_eq!(eff, 94.0);
 }
 
@@ -2452,7 +2498,7 @@ fn inactive_fetch_failure_sets_backoff_and_success_clears_it() {
         t.backoff_until_ts,
         Some(now_ts + inactive_fetch_backoff_secs(2) as i64)
     );
-    record_usage_fetch_success(&email, now_ts + 10);
+    record_usage_fetch_success(&email);
     let t = get_usage_fetch_tracker(&email);
     assert_eq!(t.consecutive_failures, 0);
     assert_eq!(t.backoff_until_ts, None);
