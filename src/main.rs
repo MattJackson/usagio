@@ -35,7 +35,7 @@ mod watchdog;
 use providers::claude::{oauth, usage};
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 
 use providers::trait_def::{PlanStatus, ProviderError, TokenGrant, UsageSnapshot};
 use providers::Provider;
@@ -102,6 +102,9 @@ const TARGET_VERIFY_MAX_AGE_SECS: i64 = 120;
 /// only if its last good reading left at least this many points under the
 /// trigger — a stale 24% can't plausibly be at the limit; a stale 93% can.
 const UNVERIFIED_TARGET_MIN_HEADROOM_PTS: f64 = 10.0;
+/// When every account is past the trigger, the active one is only swapped
+/// for one with at least this many more points of room.
+const FALLBACK_MIN_GAIN_PTS: f64 = 5.0;
 /// Don't return to an account we just left for this long.
 const NO_RETURN_SECS: u64 = 1200;
 /// Proactive flip-back: when the active account is healthy (below trigger), only
@@ -333,7 +336,8 @@ fn print_help() {
                                         --project  <path>  scope in-tree instructions to this project\n  \
          usagio rm <email>        Forget an account\n\n\
          With no [email], switch/start/continue auto-pick the account that has room\n  \
-         and whose weekly limit resets soonest (use it before the quota resets).\n\n\
+         and whose weekly limit resets soonest (use it before the quota resets).\n  \
+         With an [email], auto-swap stays on it until it's exhausted.\n\n\
          Onboarding: log into an account with `claude` as usual, then\n  \
          `usagio capture`. Repeat once per account.\n"
     );
@@ -620,14 +624,15 @@ fn cmd_switch(selector: Option<&str>, launch: Option<Launch>) -> Result<()> {
     // (state v2's `State::providers`) — this is the CLI half of routing a
     // switch by provider slug instead of assuming Claude, matching
     // `menubar.rs::handle_switch`.
+    // An explicit pick holds: auto-swap won't move off it until it's
+    // exhausted (see `State::manual_holds`).
     if let Some(sel) = selector {
-        if !state.accounts.is_empty() {
-            if let Ok(email) = state.resolve(sel) {
-                return finish_claude_switch(&email, launch);
-            }
+        let claude = (!state.accounts.is_empty()).then(|| state.resolve(sel));
+        if let Some(Ok(email)) = &claude {
+            return finish_claude_switch(email, launch, true);
         }
         if let Some((slug, key)) = resolve_provider_selector(&state, sel) {
-            let label = switch_to_provider_account(&slug, &key)?;
+            let label = switch_to_provider_account(&slug, &key, true)?;
             println!("Active login is now {label} ({slug}).");
             println!(
                 "New `{slug}` sessions will use it. Already-running sessions keep their \
@@ -641,6 +646,11 @@ fn cmd_switch(selector: Option<&str>, launch: Option<Launch>) -> Result<()> {
             }
             return Ok(());
         }
+        // Surface Claude's own error ("'dev' is ambiguous — matches: …")
+        // rather than a bare miss.
+        if let Some(Err(e)) = claude {
+            return Err(e);
+        }
         bail!("no account matches '{sel}'");
     }
 
@@ -649,13 +659,13 @@ fn cmd_switch(selector: Option<&str>, launch: Option<Launch>) -> Result<()> {
         bail!("no accounts yet; capture one with: usagio capture");
     }
     let email = select_email(&state, None)?;
-    finish_claude_switch(&email, launch)
+    finish_claude_switch(&email, launch, false)
 }
 
 /// Shared tail of `cmd_switch` for a resolved Claude email: perform the
 /// switch, print the confirmation, and optionally launch `claude`.
-fn finish_claude_switch(email: &str, launch: Option<Launch>) -> Result<()> {
-    let label = switch_to(email)?;
+fn finish_claude_switch(email: &str, launch: Option<Launch>, hold: bool) -> Result<()> {
+    let label = switch_to(email, hold)?;
 
     println!("Active login is now {label}.");
     println!("New `claude` sessions will use it. Already-running sessions keep their");
@@ -720,8 +730,9 @@ pub(crate) fn resolve_provider_selector(state: &State, selector: &str) -> Option
 /// `Provider::write_active_account`, then commits the new `active` selection
 /// to state.json under the state lock. Returns the account key as the
 /// display label (non-Claude providers have no separate display-name
-/// resolution step the way Claude's identity backfill does).
-pub(crate) fn switch_to_provider_account(slug: &str, key: &str) -> Result<String> {
+/// resolution step the way Claude's identity backfill does). `hold` marks a
+/// manual choice auto-swap must respect; `false` clears any earlier hold.
+pub(crate) fn switch_to_provider_account(slug: &str, key: &str, hold: bool) -> Result<String> {
     let provider = provider_by_slug(slug)?;
     if !provider.capabilities().supports_switching {
         bail!("switching is not supported for {slug}");
@@ -745,7 +756,11 @@ pub(crate) fn switch_to_provider_account(slug: &str, key: &str) -> Result<String
         provider
             .write_active_account(&acct.secret_blob, &identity)
             .map_err(|e| anyhow!("switching {slug} account: {e}"))?;
-        state.provider_accounts_mut(slug).active = Some(acct.key.clone());
+        let prev = state
+            .provider_accounts_mut(slug)
+            .active
+            .replace(acct.key.clone());
+        state.set_manual_hold(slug, hold.then_some(acct.key.as_str()));
         // The vendor credential file is already switched at this point; if
         // recording it in state.json fails, say so explicitly rather than
         // surfacing a bare io error that reads as "the whole switch failed"
@@ -754,6 +769,11 @@ pub(crate) fn switch_to_provider_account(slug: &str, key: &str) -> Result<String
             "the login was switched but recording it in state.json failed; \
              run `usagio switch` again to reconcile the bookkeeping",
         )?;
+        // Same as Claude's `switch_to_guarded`: the account we left must not
+        // re-escalate later on a stale 429 count.
+        if let Some(prev) = prev.filter(|p| !p.eq_ignore_ascii_case(&acct.key)) {
+            reset_usage_fetch_tracker(&fetch_tracker_key(slug, &prev));
+        }
         Ok(acct.key)
     })
 }
@@ -781,6 +801,65 @@ fn provider_by_slug(slug: &str) -> Result<&'static dyn Provider> {
 /// candidates) and a way to switch to it. An unknown slug returns `false`:
 /// the safest thing when a Row's `provider_id` doesn't correspond to any
 /// registered provider is to leave it out of the auto-swap decision.
+/// The swap-decision rows for one provider's captured accounts. Claude keeps
+/// its dedicated `State::accounts` slot; every other provider lives in
+/// `State::providers[slug]`.
+fn provider_rows(state: &State, slug: &str) -> Vec<Row> {
+    if slug == CLAUDE_SLUG {
+        state.accounts.iter().map(row_from_account).collect()
+    } else {
+        state
+            .provider_accounts(slug)
+            .map(|pa| {
+                pa.accounts
+                    .iter()
+                    .map(|a| row_from_provider_account(slug, a))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// The key of `slug`'s active account, if any.
+fn provider_active(state: &State, slug: &str) -> Option<String> {
+    if slug == CLAUDE_SLUG {
+        state.active.clone()
+    } else {
+        state.provider_accounts(slug).and_then(|p| p.active.clone())
+    }
+}
+
+/// Key into the in-memory usage-fetch trackers (429 escalation, inactive
+/// backoff, subscription re-checks). Claude keeps the bare email; other
+/// providers are namespaced so the same address on two providers can't share
+/// a tracker.
+fn fetch_tracker_key(slug: &str, key: &str) -> String {
+    if slug == CLAUDE_SLUG {
+        key.to_string()
+    } else {
+        format!("{slug}/{key}")
+    }
+}
+
+/// Auto-swap `slug` to `target`, but only if `expect_active` is still its
+/// active account (a manual switch since the decision was made wins).
+/// `Ok(None)` when the compare-and-set lost.
+fn switch_if_still_active(slug: &str, target: &str, expect_active: &str) -> Result<Option<String>> {
+    if slug == CLAUDE_SLUG {
+        return switch_to_if_still_active(provider_by_slug(slug)?, target, expect_active);
+    }
+    with_state_lock(|| {
+        let current = provider_active(&State::load()?, slug);
+        if !current
+            .as_deref()
+            .is_some_and(|c| c.eq_ignore_ascii_case(expect_active))
+        {
+            return Ok(None);
+        }
+        switch_to_provider_account(slug, target, false).map(Some)
+    })
+}
+
 fn provider_supports_swap(slug: &str) -> bool {
     match providers::get(slug) {
         Some(p) => {
@@ -862,13 +941,18 @@ where
 /// Make `email` the active login. Does all network work (token refresh, identity
 /// backfill) OUTSIDE the state lock, then commits keychain + ~/.claude.json +
 /// state under the lock with a fresh reload. Returns the display label.
-pub(crate) fn switch_to(email: &str) -> Result<String> {
+/// `hold` marks a manual choice auto-swap must respect; `false` clears any
+/// earlier hold.
+pub(crate) fn switch_to(email: &str, hold: bool) -> Result<String> {
     // v1 state is Claude-only; look up the "claude" provider now so later
     // phases can key the switch on the account's containing bucket instead.
     let provider = provider_by_slug(CLAUDE_SLUG)?;
     let (acct, identity, backfilled) = prepare_switch(provider, email)?;
     let label = acct.email.clone().unwrap_or_else(|| email.to_string());
-    Ok(switch_to_guarded(provider, email, &acct, &identity, backfilled, None)?.unwrap_or(label))
+    Ok(
+        switch_to_guarded(provider, email, &acct, &identity, backfilled, None, hold)?
+            .unwrap_or(label),
+    )
 }
 
 /// Like `switch_to`, but only if `expect_active` is still the active account
@@ -888,6 +972,7 @@ fn switch_to_if_still_active(
         &identity,
         backfilled,
         Some(expect_active),
+        false,
     )
 }
 
@@ -1014,6 +1099,7 @@ fn switch_to_guarded(
     identity: &serde_json::Value,
     backfilled: bool,
     expect_active: Option<&str>,
+    hold: bool,
 ) -> Result<Option<String>> {
     let label = acct.email.clone().unwrap_or_else(|| email.to_string());
     let switched = with_state_lock(|| {
@@ -1075,6 +1161,7 @@ fn switch_to_guarded(
             }
         }
         st.active = Some(email.to_string());
+        st.set_manual_hold(CLAUDE_SLUG, hold.then_some(email));
         // The login is already committed to the keychain + ~/.claude.json at this
         // point; if only the state.json bookkeeping write fails, say so clearly.
         if let Err(e) = st.save() {
@@ -1632,7 +1719,7 @@ pub(crate) fn optimize_now() -> Result<Option<String>> {
     if active.as_deref() == Some(best.as_str()) {
         return Ok(None);
     }
-    switch_to(&best)?;
+    switch_to(&best, false)?;
     Ok(Some(best))
 }
 
@@ -1718,16 +1805,18 @@ impl Row {
     }
 
     /// Eligible as a swap / return target: both the **session** and the
-    /// **weekly** are still below the trigger, so every account's quota is
-    /// usable right up to the user's limit. The session ceiling defaults to the
-    /// trigger (`usagio watch --ceiling` can lower it) — the old fixed 85%
-    /// stranded each session's last ~10% and, with a trigger under 85%, let an
-    /// account already past the trigger be picked. Landing on a 94% account is
-    /// safe because a swap off an account at the trigger is never cooldown-
-    /// delayed (see `SWAP_COOLDOWN_SECS`).
+    /// **weekly** are below the trigger by more than `ESCALATION_MIN_BAND`.
+    /// Inside that band a single 429 counts as reaching the trigger
+    /// (`effective_active_max_pct_for_swap_fire`), so landing there meant
+    /// leaving again on the next 429 — with the proactive flip-back walking
+    /// back to it 20 minutes later (the v0.8.7 dev@ thrash: ~30 swaps in 3h
+    /// around an 82–85% account). The active account still rides up to the
+    /// trigger; only moving *into* the band is refused. The session ceiling
+    /// defaults to the trigger (`usagio watch --ceiling` can lower it).
     fn eligible_target(&self, session_ceiling: f64, trigger: f64) -> bool {
+        let limit = trigger - ESCALATION_MIN_BAND;
         let session = self.session.pct.unwrap_or(0.0);
-        session <= session_ceiling && session < trigger && self.weekly.pct.unwrap_or(0.0) < trigger
+        session <= session_ceiling && session < limit && self.weekly.pct.unwrap_or(0.0) < limit
     }
 
     /// Remaining percent on the tightest of session/weekly.
@@ -2792,11 +2881,6 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
     if let Err(e) = merged {
         logging::log(&format!("poll: saving refreshed cache failed: {e:#}"));
     }
-    // Refresh non-Claude provider accounts (state v2 `providers[slug]`) too.
-    // Claude lives in `state.accounts` and is handled above; every other
-    // captured provider (Codex, …) needs its own usage fetch or it stays
-    // "no data yet" forever — captured and shown in the menu/list but inert.
-    refresh_provider_usage_caches(force);
     logging::log("poll: done");
     RefreshOutcome { rate_limited }
 }
@@ -2848,10 +2932,18 @@ fn cache_crossed_reset(cu: &CachedUsage, now: DateTime<Utc>) -> bool {
 /// called. Best-effort throughout: a token-refresh or usage error keeps the
 /// existing cache and moves on (never panics the poll loop). Applies the same
 /// locked-until-reset skip so a maxed provider account doesn't burn requests.
-fn refresh_provider_usage_caches(force: bool) {
+/// Refresh non-Claude provider accounts (state v2 `providers[slug]`) under
+/// the same fetch policy as Claude's `refresh_usage_cache`: the active account
+/// is fetched first on its cadence tier; a 429 on it skips that provider's
+/// inactive fetches this cycle; inactive accounts get the flat
+/// `INACTIVE_FETCH_FLOOR_SECS` floor and their own failure backoff (a reset
+/// crossing or `force` bypasses both). Returns the slugs whose ACTIVE account
+/// was rate-limited, for the poll cadence.
+fn refresh_provider_usage_caches(force: bool, trigger: f64) -> std::collections::HashSet<String> {
+    let mut rate_limited_slugs = std::collections::HashSet::new();
     let state = match State::load() {
         Ok(s) => s,
-        Err(_) => return,
+        Err(_) => return rate_limited_slugs,
     };
     for provider in providers::all() {
         let slug = provider.provider_id();
@@ -2861,17 +2953,31 @@ fn refresh_provider_usage_caches(force: bool) {
         let Some(pa) = state.providers.get(slug) else {
             continue;
         };
-        let keys: Vec<String> = pa.accounts.iter().map(|a| a.key.clone()).collect();
+        let active_key = pa.active.clone();
+        let mut keys: Vec<String> = pa.accounts.iter().map(|a| a.key.clone()).collect();
+        // Active first: it gets first claim on the request budget, and a 429
+        // on it stops this provider's inactive fetches for the cycle.
+        if let Some(i) = active_key
+            .as_deref()
+            .and_then(|a| keys.iter().position(|k| k.eq_ignore_ascii_case(a)))
+        {
+            let k = keys.remove(i);
+            keys.insert(0, k);
+        }
+        let mut active_rate_limited = false;
         for key in keys {
             let Some(acct) = state.find_provider_account(slug, &key).cloned() else {
                 continue;
             };
+            let is_active = active_key
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(&key));
             if acct.needs_relogin {
                 continue;
             }
             // Same lapsed-plan gate as the Claude loop.
             let now_ts = Utc::now().timestamp();
-            let tracker_key = format!("{slug}/{key}");
+            let tracker_key = fetch_tracker_key(slug, &key);
             let recheck_subscription = acct.no_subscription;
             if recheck_subscription && !claim_subscription_check(&tracker_key, now_ts, force) {
                 continue;
@@ -2888,6 +2994,45 @@ fn refresh_provider_usage_caches(force: bool) {
                     && countdown::is_locked_until_reset(&cached_to_account_usage(cu), Utc::now())
                 {
                     continue;
+                }
+            }
+            if !force && !is_active && !recheck_subscription {
+                if active_rate_limited {
+                    logging::log(&format!(
+                        "poll: active {slug} account rate limited; skipping {key} this cycle \
+                         (event=fetch_skip_active_429 provider={slug} account={key})"
+                    ));
+                    continue;
+                }
+                let crossed_reset = acct
+                    .cached_usage
+                    .as_ref()
+                    .is_some_and(|cu| cache_crossed_reset(cu, Utc::now()));
+                let tracker = get_usage_fetch_tracker(&tracker_key);
+                if let (Some(until), false) = (tracker.backoff_until_ts, crossed_reset) {
+                    if now_ts < until {
+                        continue;
+                    }
+                }
+                if let Some(cu) = &acct.cached_usage {
+                    let age = now_ts - cu.fetched_at;
+                    if age >= 0 && age < INACTIVE_FETCH_FLOOR_SECS as i64 && !crossed_reset {
+                        continue;
+                    }
+                }
+            }
+            if !force && is_active {
+                if let Some(cu) = &acct.cached_usage {
+                    let age = now_ts - cu.fetched_at;
+                    let max_pct = match (cu.session_pct, cu.weekly_pct) {
+                        (Some(s), Some(w)) => Some(s.max(w)),
+                        (s, w) => s.or(w),
+                    };
+                    let floor =
+                        per_account_fetch_floor_secs(max_pct, trigger, WATCH_INTERVAL_SECS) as i64;
+                    if age >= 0 && age < floor && !cache_crossed_reset(cu, Utc::now()) {
+                        continue;
+                    }
                 }
             }
             // Refresh the token if it's at/near expiry and we have a refresh
@@ -2925,12 +3070,25 @@ fn refresh_provider_usage_caches(force: bool) {
             }
             let cu = match provider.fetch_usage(&access) {
                 Ok(snap) => {
+                    record_usage_fetch_success(&tracker_key);
                     if snap.plan.is_some() {
                         plan = snap.plan.clone();
                     }
                     Some(cached_from_usage_snapshot(&snap))
                 }
                 Err(e) => {
+                    if matches!(e, ProviderError::RateLimited { .. }) {
+                        record_usage_fetch_429(&tracker_key);
+                        if is_active {
+                            active_rate_limited = true;
+                            rate_limited_slugs.insert(slug.to_string());
+                        }
+                    } else {
+                        record_usage_fetch_non_429(&tracker_key);
+                    }
+                    if !is_active {
+                        record_inactive_fetch_failure(&tracker_key, now_ts);
+                    }
                     logging::log(&format!(
                         "provider usage error for {slug}/{key}: {e}; keeping cache"
                     ));
@@ -2970,6 +3128,7 @@ fn refresh_provider_usage_caches(force: bool) {
             }
         }
     }
+    rate_limited_slugs
 }
 
 // ---------------------------------------------------------------------------
@@ -2977,8 +3136,7 @@ fn refresh_provider_usage_caches(force: bool) {
 // ---------------------------------------------------------------------------
 
 /// Fold a `Row`'s cached usage into `countdown::AccountUsage` so
-/// `countdown::any_reset_within` can reason about its reset instants — used
-/// by `cap_sleep_to_reset_boundary` (v0.5.2 item 4).
+/// `countdown` can reason about its reset instants.
 fn row_to_account_usage(r: &Row) -> countdown::AccountUsage {
     countdown::AccountUsage {
         session_pct: r.session.pct,
@@ -3009,131 +3167,36 @@ fn cached_to_account_usage(cu: &CachedUsage) -> countdown::AccountUsage {
     }
 }
 
-/// Horizon (seconds) within which an imminent reset is worth waking early
-/// for, and the buffer added past the reset instant so the wake lands just
-/// AFTER it (not exactly on it, where clock skew could still read stale).
-const RESET_WAKE_HORIZON_SECS: i64 = 30;
-const RESET_WAKE_BUFFER_SECS: i64 = 2;
-
-/// v0.5.2 item 4: if any Claude account has a session/weekly reset within
-/// `RESET_WAKE_HORIZON_SECS` of `now`, cap `planned` so the loop wakes right
-/// after it instead of riding out the whole adaptive-cadence interval — a
-/// stale locked/100% reading would otherwise survive up to a full cadence
-/// window past its own reset, and the very next loop iteration runs a FULL
-/// `watch_cycle` (refresh + swap re-evaluation), not just a display patch.
-/// Falls back to `planned` unchanged when nothing is imminent. Pure over
-/// already-loaded rows + `now` so it's unit-testable without a live clock.
-fn cap_sleep_to_reset_boundary(rows: &[Row], now: DateTime<Utc>, planned: u64) -> u64 {
-    let soonest = rows
-        .iter()
-        .filter_map(|r| {
-            countdown::any_reset_within(
-                &row_to_account_usage(r),
-                now,
-                Duration::seconds(RESET_WAKE_HORIZON_SECS),
-            )
-        })
-        .min();
-    match soonest {
-        Some(reset_at) => {
-            let secs = ((reset_at - now).num_seconds() + RESET_WAKE_BUFFER_SECS).max(1) as u64;
-            secs.min(planned)
-        }
-        None => planned,
-    }
-}
-
 fn cmd_watch(args: &[String]) -> Result<()> {
-    let mut interval = WATCH_INTERVAL_SECS;
-    let mut trigger = TRIGGER_PCT;
-    let mut ceiling: Option<f64> = None;
+    let mut opts = menubar::LoopOpts::default();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--interval" => interval = it.next().and_then(|s| s.parse().ok()).unwrap_or(interval),
-            "--trigger" => trigger = it.next().and_then(|s| s.parse().ok()).unwrap_or(trigger),
-            "--ceiling" => ceiling = it.next().and_then(|s| s.parse().ok()).or(ceiling),
+            "--interval" => opts.base = it.next().and_then(|s| s.parse().ok()).unwrap_or(opts.base),
+            "--trigger" => opts.trigger = it.next().and_then(|s| s.parse().ok()).or(opts.trigger),
+            "--ceiling" => opts.ceiling = it.next().and_then(|s| s.parse().ok()).or(opts.ceiling),
             other => bail!("unknown watch option: {other}"),
         }
     }
-    // The target ceiling follows the trigger unless explicitly lowered.
-    let ceiling = ceiling.unwrap_or(trigger).min(trigger);
-
-    eprintln!("usagio watch: every {interval}s, swap at {trigger:.0}%, target <= {ceiling:.0}%");
-
-    let base = interval;
-    let mut current = base;
-    let mut guard = SwapGuard::default();
-    let mut wd = watchdog::Watchdog::default();
-    let mut wd_effects = watchdog::RealEffects;
-    let mut last_cycle_active = current_active_account();
-    loop {
-        // Publish the current loop interval so the per-account fetch floor's
-        // burn-rate projection uses the RIGHT horizon (`max(tier_floor, this)`).
-        // Under a 429 backoff `current` can be 1200s while tier_floor stays at
-        // 30–180s, and the projection would otherwise under-predict by 40× on
-        // the exact storm the projection is meant to catch (Opus BLOCKER 1).
-        // A switch since the last refresh: the backoff we carry belongs to the
-        // previous active account (see menubar::poll_loop for why TIGHT).
-        let cycle_active = current_active_account();
-        if cycle_active != last_cycle_active {
-            current = WATCH_TIGHT_INTERVAL_SECS;
-        }
-        last_cycle_active = cycle_active.clone();
-        set_current_loop_interval_secs(current);
-        // Self-healing health check (fd-count + keychain-write). Throttled to
-        // ~once a minute internally; a cheap directory read otherwise. Keeps
-        // account switching from silently breaking if fds ever leak or the
-        // keychain starts failing again (see `src/watchdog.rs`).
-        wd.maybe_run(&mut wd_effects);
-        match watch_cycle(trigger, ceiling, &mut guard, false) {
-            Ok(outcome) => {
-                if let Some((from, to)) = outcome.swapped {
-                    eprintln!("[{}] swapped {from} -> {to}", Utc::now().to_rfc3339());
-                }
-                let prev = current;
-                current = next_interval(
-                    current,
-                    base,
-                    outcome.rate_limited,
-                    outcome.max_pct,
-                    trigger,
-                    outcome.actionable,
-                );
-                if outcome.rate_limited {
-                    logging::log(&format!("rate limited; backing off to {current}s"));
-                } else if current != prev && current < base {
-                    // Log cadence tightening so a user chasing a missed swap can
-                    // see the daemon was polling faster on approach.
-                    let max_pct = outcome.max_pct.unwrap_or(0.0);
-                    logging::log(&format!(
-                        "cadence: {prev}s → {current}s (max {max_pct:.1}%, \
-                         trigger {trigger:.0}%) event=cadence prev={prev}s new={current}s \
-                         max_pct={max_pct:.1} trigger={trigger:.0}"
-                    ));
-                }
-            }
-            Err(e) => eprintln!("watch cycle error: {e:#}"),
-        }
-        // v0.5.2 item 4: if a Claude account's session/weekly reset falls
-        // within the next `current` seconds, wake right after it (+2s
-        // buffer) instead of riding out the whole cadence window — the next
-        // loop iteration's `watch_cycle` does a full refresh + swap
-        // re-evaluation, not just a display patch, so a stale locked/100%
-        // reading can't survive past its own reset for up to a full cadence
-        // interval. Best-effort: falls back to `current` unchanged on any
-        // load failure or when nothing is imminent.
-        let wake_rows: Vec<Row> = State::load()
-            .map(|s| s.accounts.iter().map(row_from_account).collect())
-            .unwrap_or_default();
-        let sleep_secs = if current_active_account() != cycle_active {
-            // Auto-swapped this cycle: refresh the new active account promptly.
-            5
+    let state = State::load().unwrap_or_default();
+    let trigger = opts
+        .trigger
+        .unwrap_or_else(|| state.trigger_pct.unwrap_or(TRIGGER_PCT));
+    let ceiling = opts.ceiling.unwrap_or(trigger).min(trigger);
+    eprintln!(
+        "usagio watch: every {}s, swap at {trigger:.0}%, target < {ceiling:.0}%{}",
+        opts.base,
+        if state.autoswap_disabled {
+            " (auto-swap is off in settings: observing only)"
         } else {
-            cap_sleep_to_reset_boundary(&wake_rows, Utc::now(), current)
-        };
-        std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
-    }
+            ""
+        }
+    );
+    // The exact loop the menu-bar app runs: the configured trigger and
+    // auto-swap setting (unless overridden above), reset-boundary wakes,
+    // suspend/resume detection, per-provider cadence and swaps.
+    menubar::poll_loop_with(&opts);
+    Ok(())
 }
 
 /// The ACTIVE account's `Row::max_pct()` (session OR weekly, whichever is
@@ -3255,6 +3318,74 @@ fn next_interval(
         }
     } else {
         tier_interval_for_pct(pct, trigger, base)
+    }
+}
+
+/// Poll cadence across every switchable provider. Each provider keeps its own
+/// backoff state (`current`), so one provider's 429 never slows another's
+/// polling; the loop wakes at the soonest any provider needs.
+pub(crate) struct Cadence {
+    base: u64,
+    current: std::collections::HashMap<String, u64>,
+    last_active: std::collections::HashMap<String, Option<String>>,
+}
+
+impl Cadence {
+    pub(crate) fn new(base: u64) -> Self {
+        Cadence {
+            base,
+            current: std::collections::HashMap::new(),
+            last_active: std::collections::HashMap::new(),
+        }
+    }
+
+    /// The provider's current interval (its 429-backoff seed), `base` if unseen.
+    pub(crate) fn current_for(&self, slug: &str) -> u64 {
+        self.current.get(slug).copied().unwrap_or(self.base)
+    }
+
+    /// Fold a cycle's outcome into each provider's interval and return how
+    /// long to sleep before the next cycle.
+    ///
+    /// A different active account (auto-swap this cycle, or a manual switch
+    /// since the last one) restarts that provider from the TIGHT interval: the
+    /// backoff we carried was earned by the account we left. Seeding it with
+    /// `base` instead turned one 429 on a just-landed account into a 360s
+    /// blind spot. An auto-swap this cycle also ignores this cycle's 429 —
+    /// it belonged to the old account.
+    pub(crate) fn advance(&mut self, out: &CycleOutcome, trigger: f64) -> u64 {
+        let mut next: Option<u64> = None;
+        for p in &out.providers {
+            let base = self.base;
+            let cur = self.current.entry(p.slug.clone()).or_insert(base);
+            let last = self.last_active.insert(p.slug.clone(), p.active.clone());
+            let changed = last.is_some_and(|l| l != p.active);
+            if p.swapped.is_some() {
+                *cur = WATCH_TIGHT_INTERVAL_SECS;
+            } else {
+                if changed {
+                    *cur = WATCH_TIGHT_INTERVAL_SECS;
+                }
+                let prev = *cur;
+                *cur = next_interval(*cur, base, p.rate_limited, p.max_pct, trigger, p.actionable);
+                if p.rate_limited {
+                    logging::log(&format!(
+                        "rate limited; backing off to {}s (provider={})",
+                        *cur, p.slug
+                    ));
+                } else if *cur != prev && *cur < base {
+                    let max_pct = p.max_pct.unwrap_or(0.0);
+                    logging::log(&format!(
+                        "cadence: {prev}s → {}s (provider {}, max {max_pct:.1}%, trigger {trigger:.0}%) \
+                         event=cadence provider={} prev={prev}s new={}s max_pct={max_pct:.1} \
+                         trigger={trigger:.0}",
+                        *cur, p.slug, p.slug, *cur
+                    ));
+                }
+            }
+            next = Some(next.map_or(*cur, |n| n.min(*cur)));
+        }
+        next.unwrap_or(self.base)
     }
 }
 
@@ -3609,12 +3740,6 @@ fn note_polled_active(active: Option<&str>) -> bool {
     changed
 }
 
-/// The active account in state.json, for the poll loops' switch detection.
-/// `None` on a load failure as well as when nothing is active.
-pub(crate) fn current_active_account() -> Option<String> {
-    State::load().ok().and_then(|st| st.active)
-}
-
 fn record_usage_fetch_429(email: &str) {
     with_fetch_trackers(|t| {
         let entry = t.entry(email.to_string()).or_default();
@@ -3666,7 +3791,7 @@ fn get_usage_fetch_tracker(email: &str) -> UsageFetchTracker {
 /// "should we swap away right now" check.
 fn effective_active_max_pct_for_swap_fire(row: &Row, trigger: f64) -> f64 {
     let raw = row.max_pct();
-    let tracker = get_usage_fetch_tracker(&row.email);
+    let tracker = get_usage_fetch_tracker(&fetch_tracker_key(&row.provider_id, &row.email));
     if tracker.consecutive_429s < ESCALATION_MIN_CONSECUTIVE_429S {
         return raw;
     }
@@ -3682,9 +3807,24 @@ pub(crate) struct SwapGuard {
     last_swap: Option<std::time::Instant>,
     left_at: std::collections::HashMap<String, std::time::Instant>,
     stuck_notified: bool,
-    // A manual choice wins over all-blocked preparation until useful capacity
-    // returns or the user chooses a different account.
+    // The account the user switched to by hand, as `(slug, key)`. Mirrors
+    // `State::manual_hold`, refreshed every cycle. Auto-swap stays on it
+    // until it is exhausted or lapses, and never prepares a switch away from
+    // it while every account is blocked.
     manual_locked_choice: Option<(String, String)>,
+}
+
+/// Anti-thrash state for every provider: one independent `SwapGuard` each, so
+/// a Codex swap never starts Claude's cooldown or no-return window.
+#[derive(Default)]
+pub(crate) struct SwapGuards {
+    by_provider: std::collections::HashMap<String, SwapGuard>,
+}
+
+impl SwapGuards {
+    pub(crate) fn for_provider(&mut self, slug: &str) -> &mut SwapGuard {
+        self.by_provider.entry(slug.to_string()).or_default()
+    }
 }
 
 /// How long a `left_at` entry is kept. Longer than `NO_RETURN_SECS` because
@@ -3700,16 +3840,19 @@ fn prune_swap_guard(guard: &mut SwapGuard) {
         .retain(|_, t| t.elapsed().as_secs() < LEFT_AT_RETENTION_SECS);
 }
 
-/// Result of one poll: the swap it made (if any), the rate-limited flag, and
-/// the ACTIVE account's `Row::max_pct()` (session OR weekly, whichever is
-/// tighter) this cycle (used by `next_interval` to tighten the poll cadence
-/// on approach to the trigger threshold — see the user-reported miss where
-/// 94% + 150s wait produced a lock before the next poll). v0.5.13: scoped to
-/// the active account (see `cadence_max_pct`) so an inactive, already-maxed
-/// account can't pin the cadence at the 30s backstop indefinitely.
-pub(crate) struct CycleOutcome {
+/// One switchable provider's result for a poll cycle.
+pub(crate) struct ProviderCycle {
+    pub slug: String,
+    /// The provider's active account after this cycle (post-swap).
+    pub active: Option<String>,
+    /// The swap made this cycle, if any: (from, to).
     pub swapped: Option<(String, String)>,
+    /// The active account's usage fetch was rate-limited (HTTP 429).
     pub rate_limited: bool,
+    /// The ACTIVE account's `Row::max_pct()` (session OR weekly, whichever is
+    /// tighter), feeding `next_interval`'s cadence ramp. v0.5.13: scoped to the
+    /// active account (see `cadence_max_pct`) so an inactive, already-maxed
+    /// account can't pin the cadence at the 30s backstop indefinitely.
     pub max_pct: Option<f64>,
     /// Whether a swap is actionable this cycle: an eligible target exists for
     /// the active account, even if a cooldown currently blocks it. Feeds
@@ -3718,6 +3861,11 @@ pub(crate) struct CycleOutcome {
     /// (single-account user, or all others full/needs_relogin) falls back to
     /// BASE instead of hammering the usage endpoint into HTTP 429 (v0.5.17).
     pub actionable: bool,
+}
+
+/// Result of one poll: one entry per switchable provider with accounts.
+pub(crate) struct CycleOutcome {
+    pub providers: Vec<ProviderCycle>,
 }
 
 /// True if `cand` is a strictly better place to be than the healthy `act`:
@@ -3784,6 +3932,9 @@ struct SwapEval {
     /// target whose pre-swap re-check failed if its last reading had ample
     /// room (`UNVERIFIED_TARGET_MIN_HEADROOM_PTS`).
     urgent: bool,
+    /// No account is under the trigger, so the target is simply the one with
+    /// the most room (at least `FALLBACK_MIN_GAIN_PTS` more than the active).
+    fallback: bool,
     /// The account to switch to right now, if any (cooldown/no-return/
     /// eligibility have all already been consulted).
     target: Option<String>,
@@ -3809,6 +3960,22 @@ fn fresh_since_left(r: &Row, guard: &SwapGuard) -> bool {
     r.fetched_at.is_some_and(|f| f > left_ts)
 }
 
+/// True if `act` is the account the user manually switched to.
+fn held_on(guard: &SwapGuard, act: &Row) -> bool {
+    guard
+        .manual_locked_choice
+        .as_ref()
+        .is_some_and(|(provider, key)| {
+            provider == &act.provider_id && key.eq_ignore_ascii_case(&act.email)
+        })
+}
+
+/// A manual pick stays put past the trigger (and through any proactive
+/// flip-back) until it can't serve requests: exhausted or lapsed.
+fn hold_applies(guard: &SwapGuard, act: &Row) -> bool {
+    held_on(guard, act) && !act.no_subscription && act.max_pct() < 99.5
+}
+
 /// Choose a login to prepare while every valid account is quota-blocked.
 /// Unknown usage/reset data is not proof of an all-blocked state. An account
 /// with two exhausted windows becomes usable only at the later reset.
@@ -3818,13 +3985,7 @@ fn earliest_blocked_target<'a>(
     guard: &SwapGuard,
     now: DateTime<Utc>,
 ) -> Option<&'a Row> {
-    if guard
-        .manual_locked_choice
-        .as_ref()
-        .is_some_and(|(provider, key)| {
-            provider == &act.provider_id && key.eq_ignore_ascii_case(&act.email)
-        })
-    {
+    if held_on(guard, act) {
         return None;
     }
     let mut earliest: Option<(&Row, DateTime<Utc>)> = None;
@@ -3877,6 +4038,7 @@ fn evaluate_swap(
     let none = SwapEval {
         preparing: false,
         urgent: false,
+        fallback: false,
         target: None,
         blocked_by_cooldown: false,
         target_ignoring_cooldown: None,
@@ -3896,7 +4058,7 @@ fn evaluate_swap(
     if env_override_active(&act.provider_id) {
         return none;
     }
-    let mut candidates: Vec<&Row> = rows
+    let usable: Vec<&Row> = rows
         .iter()
         // A row is only a valid swap candidate if its owning provider has both
         // a usage signal (so we can compare its cached utilization to the
@@ -3914,7 +4076,7 @@ fn evaluate_swap(
         // Skip candidates whose provider has its env-override active — a
         // switch to them would be silently ignored by the vendor CLI.
         .filter(|r| !env_override_active(&r.provider_id))
-        .filter(|r| r.has_data() && r.email != active && r.eligible_target(ceiling, trigger))
+        .filter(|r| r.has_data() && r.email != active)
         // Never infer renewed capacity from a reset clock alone. A successful
         // post-reset fetch must precede a switch to this account.
         .filter(|r| {
@@ -3939,6 +4101,37 @@ fn evaluate_swap(
         // leaving (e.g. 93% frozen by a 429) may be well past the trigger.
         .filter(|r| fresh_since_left(r, guard))
         .collect();
+    let mut candidates: Vec<&Row> = usable
+        .iter()
+        .copied()
+        .filter(|r| r.eligible_target(ceiling, trigger))
+        .collect();
+    let act_effective = effective_active_max_pct_for_swap_fire(act, trigger);
+    let in_trouble = act_lapsed || act_effective >= trigger;
+    if hold_applies(guard, act) {
+        return none;
+    }
+    // Every other account is past the trigger too, but the active one must be
+    // left: move to whichever has the most room rather than staying put on a
+    // full account. Requires a real gain so two near-full accounts don't trade
+    // places for a point.
+    let mut fallback = false;
+    if candidates.is_empty() && in_trouble {
+        let act_headroom = if act_lapsed { 0.0 } else { act.headroom() };
+        if let Some(most_room) = usable
+            .iter()
+            .copied()
+            .filter(|r| r.available() && r.headroom() >= act_headroom + FALLBACK_MIN_GAIN_PTS)
+            .max_by(|a, b| {
+                a.headroom()
+                    .partial_cmp(&b.headroom())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        {
+            candidates.push(most_room);
+            fallback = true;
+        }
+    }
     let preparing = candidates.is_empty();
     if preparing {
         let Some(target) = earliest_blocked_target(rows, act, guard, Utc::now()) else {
@@ -3960,8 +4153,6 @@ fn evaluate_swap(
     // 98% (v0.7.3 postmortem). Scoped to the boolean fire ONLY — candidate
     // ranking above still reads raw `max_pct` so a marginal source can't
     // pretend to be worse than a genuinely-96% one and corrupt target order.
-    let act_effective = effective_active_max_pct_for_swap_fire(act, trigger);
-    let in_trouble = act_lapsed || act_effective >= trigger;
     if !(in_trouble || worth_returning_to(best, act)) {
         return none;
     }
@@ -3980,6 +4171,7 @@ fn evaluate_swap(
         SwapEval {
             preparing,
             urgent,
+            fallback,
             target: None,
             blocked_by_cooldown: true,
             target_ignoring_cooldown: Some(best.email.clone()),
@@ -3988,6 +4180,7 @@ fn evaluate_swap(
         SwapEval {
             preparing,
             urgent,
+            fallback,
             target: Some(best.email.clone()),
             blocked_by_cooldown: false,
             target_ignoring_cooldown: Some(best.email.clone()),
@@ -4015,6 +4208,13 @@ fn evaluate_swap_verified(
     const MAX_STALE_RESCUES: usize = 2;
     let mut rescues = 0;
     let mut tried: Vec<String> = Vec::new();
+    let Some(provider_id) = rows
+        .iter()
+        .find(|r| r.email == active)
+        .map(|r| r.provider_id.clone())
+    else {
+        return evaluate_swap(rows, active, trigger, ceiling, guard);
+    };
     loop {
         let eval = evaluate_swap(rows, active, trigger, ceiling, guard);
         let Some(target) = eval.target.clone() else {
@@ -4031,9 +4231,9 @@ fn evaluate_swap_verified(
             };
             rescues += 1;
             tried.push(stale.clone());
-            if let Some(acct) = verify_swap_target(&stale) {
+            if let Some(fresh) = verify_swap_target(&provider_id, &stale) {
                 if let Some(row) = rows.iter_mut().find(|r| r.email == stale) {
-                    *row = row_from_account(&acct);
+                    *row = fresh;
                 }
             }
             continue;
@@ -4049,9 +4249,9 @@ fn evaluate_swap_verified(
         if age.is_some_and(|a| (0..=TARGET_VERIFY_MAX_AGE_SECS).contains(&a)) {
             return eval;
         }
-        match verify_swap_target(&target) {
-            Some(acct) => {
-                *row = row_from_account(&acct);
+        match verify_swap_target(&provider_id, &target) {
+            Some(fresh) => {
+                *row = fresh;
                 logging::log(&format!(
                     "event=swap_target_verified account={target} pct={:.0}",
                     row.max_pct()
@@ -4119,54 +4319,94 @@ fn stale_swap_candidate(
 }
 
 /// Fetch a prospective swap target's usage right now and persist it. Returns
-/// the account with its refreshed cache, or `None` if it couldn't be read.
-/// Never rotates tokens — `refresh_usage_cache` owns that (including saving
-/// the rotated refresh token); an expired token just means "unverified".
-fn verify_swap_target(email: &str) -> Option<Account> {
-    let mut acct = State::load().ok()?.find(email).cloned()?;
-    if acct.needs_relogin || acct.expires_at <= Utc::now().timestamp_millis() {
-        return None;
-    }
+/// its refreshed row, or `None` if it couldn't be read. Never rotates tokens
+/// — the regular refresh owns that (including saving a rotated refresh
+/// token); an expired token just means "unverified".
+fn verify_swap_target(slug: &str, key: &str) -> Option<Row> {
+    let state = State::load().ok()?;
+    let tracker = fetch_tracker_key(slug, key);
     let now_ts = Utc::now().timestamp();
-    match usage::fetch(&acct.access_token) {
-        Ok(u) => {
-            record_usage_fetch_success(email);
-            let cu = cached_from_usage(&u);
-            let saved = with_state_lock(|| {
-                let mut st = State::load()?;
-                if let Some(a) = st.find_mut(email) {
-                    a.cached_usage = Some(cu.clone());
-                }
-                st.save()
-            });
-            if let Err(e) = saved {
-                logging::log(&format!(
-                    "swap target {email}: saving reading failed: {e:#}"
-                ));
-            }
-            acct.cached_usage = Some(cu);
-            Some(acct)
+    let fetched: std::result::Result<CachedUsage, String> = if slug == CLAUDE_SLUG {
+        let acct = state.find(key)?;
+        // Claude's `expires_at` is epoch millis.
+        if acct.needs_relogin || acct.expires_at <= Utc::now().timestamp_millis() {
+            return None;
         }
-        Err(e) => {
-            if matches!(e, usage::FetchError::RateLimited) {
-                record_usage_fetch_429(email);
-            } else {
-                record_usage_fetch_non_429(email);
+        match usage::fetch(&acct.access_token) {
+            Ok(u) => Ok(cached_from_usage(&u)),
+            Err(e) => {
+                if matches!(e, usage::FetchError::RateLimited) {
+                    record_usage_fetch_429(&tracker);
+                } else {
+                    record_usage_fetch_non_429(&tracker);
+                }
+                Err(e.to_string())
             }
-            record_inactive_fetch_failure(email, now_ts);
-            logging::log(&format!("swap target {email}: usage re-check failed: {e}"));
+        }
+    } else {
+        let acct = state.find_provider_account(slug, key)?;
+        // `ProviderAccount::expires_at` is epoch seconds (0 = unknown).
+        if acct.needs_relogin || (acct.expires_at != 0 && acct.expires_at <= now_ts) {
+            return None;
+        }
+        match provider_by_slug(slug).ok()?.fetch_usage(&acct.access_token) {
+            Ok(snap) => Ok(cached_from_usage_snapshot(&snap)),
+            Err(e) => {
+                if matches!(e, ProviderError::RateLimited { .. }) {
+                    record_usage_fetch_429(&tracker);
+                } else {
+                    record_usage_fetch_non_429(&tracker);
+                }
+                Err(e.to_string())
+            }
+        }
+    };
+    let cu = match fetched {
+        Ok(cu) => cu,
+        Err(e) => {
+            record_inactive_fetch_failure(&tracker, now_ts);
+            logging::log(&format!(
+                "swap target {slug}/{key}: usage re-check failed: {e}"
+            ));
+            return None;
+        }
+    };
+    record_usage_fetch_success(&tracker);
+    let saved = with_state_lock(|| {
+        let mut st = State::load()?;
+        if slug == CLAUDE_SLUG {
+            if let Some(a) = st.find_mut(key) {
+                a.cached_usage = Some(cu.clone());
+            }
+        } else if let Some(a) = st.find_provider_account_mut(slug, key) {
+            a.cached_usage = Some(cu.clone());
+        }
+        st.save()?;
+        Ok(provider_rows(&st, slug)
+            .into_iter()
+            .find(|r| r.email.eq_ignore_ascii_case(key)))
+    });
+    match saved {
+        Ok(row) => row,
+        Err(e) => {
+            logging::log(&format!(
+                "swap target {slug}/{key}: saving reading failed: {e:#}"
+            ));
             None
         }
     }
 }
 
 /// Poll usage for every account (the only network path), record history, and
-/// auto-swap away from the active account if it has reached `trigger` and a
-/// healthy target exists. Shared by `usagio watch` and the menu-bar poller.
+/// auto-swap each switchable provider's active account away if it has
+/// reached `trigger` and a healthy target exists. One core for every
+/// provider: Claude and Codex (and any future switchable provider) go through
+/// the same `provider_swap_cycle`. Shared by `usagio watch` and the menu-bar
+/// poller.
 fn watch_cycle(
     trigger: f64,
     ceiling: f64,
-    guard: &mut SwapGuard,
+    guards: &mut SwapGuards,
     force: bool,
 ) -> Result<CycleOutcome> {
     // Pre-cycle: absorb any on-disk credential rotations the vendor CLI made
@@ -4179,185 +4419,200 @@ fn watch_cycle(
     }
     credentials::refresh_inactive_if_stale(State::load().ok().and_then(|s| s.active).as_deref());
 
-    let refresh = refresh_usage_cache(force);
+    let claude_refresh = refresh_usage_cache(force);
     // Gap-4 (codex-switch-e2e): drive the active-account CAS refresh for
-    // every non-Claude provider that has one wired (currently just codex).
-    // Best-effort and self-contained — logs and moves on rather than
-    // affecting `refresh`'s rate-limit signal, which only tracks the usage
-    // endpoint above.
+    // every non-Claude provider that has one wired (currently just codex),
+    // then poll their usage under the same fetch policy as Claude.
     for p in providers::all() {
         if p.provider_id() != CLAUDE_SLUG {
             refresh_provider_active_account(p.provider_id());
         }
     }
+    let provider_rate_limited = refresh_provider_usage_caches(force, trigger);
+
     let state = State::load()?;
-    if state.accounts.is_empty() {
-        return Ok(CycleOutcome {
-            swapped: None,
-            rate_limited: refresh.rate_limited,
-            max_pct: None,
-            actionable: false,
+    let mut providers_out = Vec::new();
+    for p in providers::all() {
+        let slug = p.provider_id();
+        if !provider_supports_swap(slug) {
+            continue;
+        }
+        let mut rows = provider_rows(&state, slug);
+        if rows.is_empty() {
+            continue;
+        }
+        let active = provider_active(&state, slug);
+        if slug == CLAUDE_SLUG {
+            append_history(&rows, active.as_deref());
+        }
+        let rate_limited = if slug == CLAUDE_SLUG {
+            claude_refresh.rate_limited
+        } else {
+            provider_rate_limited.contains(slug)
+        };
+        let max_pct = cadence_max_pct(&rows, active.as_deref());
+        let guard = guards.for_provider(slug);
+        guard.manual_locked_choice = state
+            .manual_hold(slug)
+            .map(|k| (slug.to_string(), k.to_string()));
+        let (swapped, actionable) = match active.as_deref() {
+            Some(a) => provider_swap_cycle(slug, &mut rows, a, trigger, ceiling, guard)?,
+            None => (None, false),
+        };
+        providers_out.push(ProviderCycle {
+            slug: slug.to_string(),
+            active,
+            swapped,
+            rate_limited,
+            max_pct,
+            actionable,
         });
     }
-    let mut rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
-    let max_pct = cadence_max_pct(&rows, state.active.as_deref());
-    append_history(&rows, state.active.as_deref());
-
-    let active = state.active.clone();
-    let mut swapped = None;
-    // Whether a swap is actionable this cycle (an eligible target exists,
-    // ignoring cooldown). Captured out here because the final CycleOutcome is
-    // built after the `if let Some(active_email)` block closes and `eval` is
-    // out of scope. Drives the cadence backstop gate — see next_interval.
-    let mut actionable = false;
-
-    if let Some(active_email) = active.clone() {
-        let eval = evaluate_swap_verified(&mut rows, &active_email, trigger, ceiling, guard);
-        // A target that's merely cooldown-blocked still counts as actionable:
-        // we want the fast backstop so we swap the instant the cooldown clears.
-        actionable = eval.target_ignoring_cooldown.is_some();
-        // v0.5.2 item 6: structured decision logging (+ a "stayed" notification)
-        // fires every cycle the active account is at/above trigger, regardless
-        // of what happens next — a swap, a cooldown-blocked would-be swap, or
-        // genuinely nothing eligible.
-        let act_row = rows.iter().find(|r| r.email == active_email);
-        let act_over = act_row
-            .map(|r| r.has_data() && r.max_pct() >= trigger)
-            .unwrap_or(false);
-        let active_pct = act_row.map(|r| r.max_pct()).unwrap_or(0.0);
-
-        match eval.target {
-            Some(target) => {
-                let target_row = rows
-                    .iter()
-                    .find(|r| r.email == target)
-                    .expect("evaluate_swap returned an email absent from `rows`");
-                let (pick_s, pick_w) = (
-                    target_row.session.pct.unwrap_or(0.0),
-                    target_row.weekly.pct.unwrap_or(0.0),
-                );
-                // Proactive flip-back if the account we're leaving wasn't itself
-                // over the trigger — a better account simply freed up.
-                // A 429 near the trigger counts as over it (`eval.urgent`).
-                let proactive = !(act_over || eval.urgent);
-                if !proactive {
-                    logging::log(&format!(
-                        "event=swap_decision active={active_email} active_pct={active_pct:.0}% \
-                         target={target} target_pct={:.0}% action=switching",
-                        target_row.max_pct()
-                    ));
-                }
-                // Resolve the target row's provider. `evaluate_swap` already
-                // filtered on `provider_supports_swap`, so this must succeed
-                // for any row it returned; a mismatch is a bug.
-                let target_provider = match provider_by_slug(&target_row.provider_id) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        logging::log(&format!(
-                            "swap to {target} skipped: provider unavailable: {e:#}"
-                        ));
-                        return Ok(CycleOutcome {
-                            swapped: None,
-                            rate_limited: refresh.rate_limited,
-                            max_pct,
-                            // A target existed (we're in the eval.target Some
-                            // arm); the swap failed transiently — keep the fast
-                            // backstop so the retry is prompt.
-                            actionable: true,
-                        });
-                    }
-                };
-                // Compare-and-set on the active account: if a manual switch landed
-                // since evaluate_swap read the snapshot, skip this swap.
-                let Some(label) =
-                    switch_to_if_still_active(target_provider, &target, &active_email)?
-                else {
-                    return Ok(CycleOutcome {
-                        swapped: None,
-                        rate_limited: refresh.rate_limited,
-                        max_pct,
-                        // A target existed but a concurrent switch won the CAS;
-                        // still actionable — retry promptly.
-                        actionable: true,
-                    });
-                };
-                guard
-                    .left_at
-                    .insert(active_email.clone(), std::time::Instant::now());
-                guard.last_swap = Some(std::time::Instant::now());
-                guard.stuck_notified = false;
-                guard.manual_locked_choice = None;
-                prune_swap_guard(guard);
-                log_event(&serde_json::json!({
-                    "ts": Utc::now().timestamp(),
-                    "event": "swap",
-                    "reason": if eval.preparing { "prepare_reset" } else if proactive { "proactive" } else { "trigger" },
-                    "from": active_email,
-                    "to": target,
-                    "session": pick_s,
-                    "weekly": pick_w,
-                }));
-                let verb = if proactive {
-                    "Flipped back to"
-                } else {
-                    "Switched to"
-                };
-                if eval.preparing {
-                    notify(&format!(
-                        "Prepared {label} for its next reset — usage is still blocked."
-                    ));
-                } else {
-                    notify(&format!("{verb} {label} — {pick_s:.0}% / {pick_w:.0}%"));
-                }
-                swapped = Some((active_email, target));
-            }
-            None => {
-                if act_over {
-                    if eval.blocked_by_cooldown {
-                        if let Some(target) = &eval.target_ignoring_cooldown {
-                            logging::log(&format!(
-                                "event=swap_decision active={active_email} \
-                                 active_pct={active_pct:.0}% target={target} action=blocked \
-                                 reason=cooldown"
-                            ));
-                        }
-                    } else {
-                        logging::log(&format!(
-                            "event=swap_decision active={active_email} action=stayed \
-                             reason=no_eligible_target"
-                        ));
-                        if !guard.stuck_notified {
-                            // Pick the soonest reset by TIMESTAMP, then humanize —
-                            // taking min() of humanized strings sorts
-                            // lexicographically ("3d 12h" < "3d 9h"), which is not
-                            // chronological.
-                            let soonest = rows
-                                .iter()
-                                .filter(|r| r.has_data())
-                                .filter_map(|r| r.weekly.resets_at)
-                                .min()
-                                .map(humanize_until)
-                                .unwrap_or_else(|| "unknown".to_string());
-                            notify(&format!(
-                                "staying on {active_email} — no better target available \
-                                 (soonest reset in {soonest})"
-                            ));
-                            guard.stuck_notified = true;
-                        }
-                    }
-                } else {
-                    guard.stuck_notified = false;
-                }
-            }
-        }
-    }
-
     Ok(CycleOutcome {
-        swapped,
-        rate_limited: refresh.rate_limited,
-        max_pct,
-        actionable,
+        providers: providers_out,
     })
+}
+
+/// One provider's auto-swap decision and execution for this cycle. Returns
+/// the swap made (from, to), if any, and whether a swap is actionable (an
+/// eligible target exists, even if a cooldown currently blocks it) — the
+/// latter drives the cadence backstop (see `next_interval`).
+fn provider_swap_cycle(
+    slug: &str,
+    rows: &mut [Row],
+    active_email: &str,
+    trigger: f64,
+    ceiling: f64,
+    guard: &mut SwapGuard,
+) -> Result<(Option<(String, String)>, bool)> {
+    let active_email = active_email.to_string();
+    let eval = evaluate_swap_verified(rows, &active_email, trigger, ceiling, guard);
+    // A target that's merely cooldown-blocked still counts as actionable:
+    // we want the fast backstop so we swap the instant the cooldown clears.
+    let actionable = eval.target_ignoring_cooldown.is_some();
+    // v0.5.2 item 6: structured decision logging (+ a "stayed" notification)
+    // fires every cycle the active account is at/above trigger, regardless
+    // of what happens next — a swap, a cooldown-blocked would-be swap, or
+    // genuinely nothing eligible.
+    let act_row = rows.iter().find(|r| r.email == active_email);
+    let act_over = act_row
+        .map(|r| r.has_data() && r.max_pct() >= trigger)
+        .unwrap_or(false);
+    let active_pct = act_row.map(|r| r.max_pct()).unwrap_or(0.0);
+    let held = act_row.is_some_and(|r| hold_applies(guard, r));
+
+    let Some(target) = eval.target.clone() else {
+        if held && act_over {
+            logging::log(&format!(
+                "event=swap_decision provider={slug} active={active_email} \
+                 active_pct={active_pct:.0}% action=stayed reason=manual_hold"
+            ));
+        } else if act_over || eval.urgent {
+            if eval.blocked_by_cooldown {
+                if let Some(target) = &eval.target_ignoring_cooldown {
+                    logging::log(&format!(
+                        "event=swap_decision provider={slug} active={active_email} \
+                         active_pct={active_pct:.0}% target={target} action=blocked \
+                         reason=cooldown"
+                    ));
+                }
+            } else {
+                logging::log(&format!(
+                    "event=swap_decision provider={slug} active={active_email} action=stayed \
+                     reason=no_eligible_target"
+                ));
+                if !guard.stuck_notified {
+                    // Pick the soonest reset by TIMESTAMP, then humanize —
+                    // taking min() of humanized strings sorts
+                    // lexicographically ("3d 12h" < "3d 9h"), which is not
+                    // chronological.
+                    let soonest = rows
+                        .iter()
+                        .filter(|r| r.has_data())
+                        .filter_map(|r| r.weekly.resets_at)
+                        .min()
+                        .map(humanize_until)
+                        .unwrap_or_else(|| "unknown".to_string());
+                    notify(&format!(
+                        "staying on {active_email} — no better target available \
+                         (soonest reset in {soonest})"
+                    ));
+                    guard.stuck_notified = true;
+                }
+            }
+        } else {
+            guard.stuck_notified = false;
+        }
+        return Ok((None, actionable));
+    };
+
+    let target_row = rows
+        .iter()
+        .find(|r| r.email == target)
+        .expect("evaluate_swap returned an email absent from `rows`");
+    let (pick_s, pick_w) = (
+        target_row.session.pct.unwrap_or(0.0),
+        target_row.weekly.pct.unwrap_or(0.0),
+    );
+    // Proactive flip-back if the account we're leaving wasn't itself over the
+    // trigger — a better account simply freed up. A 429 near the trigger
+    // counts as over it (`eval.urgent`).
+    let proactive = !(act_over || eval.urgent);
+    if !proactive {
+        logging::log(&format!(
+            "event=swap_decision provider={slug} active={active_email} \
+             active_pct={active_pct:.0}% target={target} target_pct={:.0}% action=switching{}",
+            target_row.max_pct(),
+            if eval.fallback {
+                " reason=fallback_most_room"
+            } else {
+                ""
+            }
+        ));
+    }
+    // Compare-and-set on the active account: if a manual switch landed since
+    // evaluate_swap read the snapshot, skip this swap. A failure or a lost CAS
+    // keeps `actionable` so the retry is prompt.
+    let switched = match switch_if_still_active(slug, &target, &active_email) {
+        Ok(s) => s,
+        Err(e) => {
+            logging::log(&format!("swap to {slug}/{target} failed: {e:#}"));
+            return Ok((None, true));
+        }
+    };
+    let Some(label) = switched else {
+        return Ok((None, true));
+    };
+    guard
+        .left_at
+        .insert(active_email.clone(), std::time::Instant::now());
+    guard.last_swap = Some(std::time::Instant::now());
+    guard.stuck_notified = false;
+    guard.manual_locked_choice = None;
+    prune_swap_guard(guard);
+    log_event(&serde_json::json!({
+        "ts": Utc::now().timestamp(),
+        "event": "swap",
+        "provider": slug,
+        "reason": if eval.preparing { "prepare_reset" } else if proactive { "proactive" } else if eval.fallback { "fallback" } else { "trigger" },
+        "from": active_email,
+        "to": target,
+        "session": pick_s,
+        "weekly": pick_w,
+    }));
+    let verb = if proactive {
+        "Flipped back to"
+    } else {
+        "Switched to"
+    };
+    if eval.preparing {
+        notify(&format!(
+            "Prepared {label} for its next reset — usage is still blocked."
+        ));
+    } else {
+        notify(&format!("{verb} {label} — {pick_s:.0}% / {pick_w:.0}%"));
+    }
+    Ok((Some((active_email, target)), actionable))
 }
 
 /// Fire a native "usagio: {msg}" notification (best effort, cross-platform).

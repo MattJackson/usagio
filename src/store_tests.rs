@@ -144,6 +144,26 @@ fn needs_relogin_round_trips_through_save_load() {
 }
 
 #[test]
+fn manual_hold_round_trips_and_applies_only_while_active() {
+    let mut state = State {
+        accounts: vec![acct("dev@e.com"), acct("dev4@e.com")],
+        active: Some("dev@e.com".to_string()),
+        ..State::default()
+    };
+    state.set_manual_hold("claude", Some("dev@e.com"));
+    let s = State::from_value(&serde_json::to_value(&state).unwrap());
+    assert_eq!(s.manual_hold("claude"), Some("dev@e.com"));
+    // A switch we didn't record (e.g. `claude /login`) makes the hold stale.
+    state.active = Some("dev4@e.com".to_string());
+    assert_eq!(state.manual_hold("claude"), None);
+    state.set_manual_hold("claude", None);
+    assert!(serde_json::to_value(&state)
+        .unwrap()
+        .get("manual_holds")
+        .is_none());
+}
+
+#[test]
 fn identity_uuid_reads_oauth_account() {
     let mut a = acct("x@e.com");
     assert!(a.identity_uuid().is_none());

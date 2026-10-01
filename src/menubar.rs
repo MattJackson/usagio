@@ -40,11 +40,11 @@ use crate::countdown::{self, AccountUsage, BlockingWindow, DisplayState};
 use crate::providers::{self, CaptureMode, Provider, SeverityBands};
 use crate::store::State;
 use crate::{
-    age_str, capture_current, capture_current_generic, current_active_account, env_override_active,
-    next_interval, notify, optimize_now, remove_account, remove_provider_account_generic,
-    row_from_account, row_from_provider_account, set_current_loop_interval_secs, switch_to,
-    switch_to_provider_account, watch_cycle, with_state_lock, Row, SwapGuard, CLAUDE_SLUG,
-    TRIGGER_PCT, WATCH_INTERVAL_SECS, WATCH_TIGHT_INTERVAL_SECS,
+    age_str, capture_current, capture_current_generic, env_override_active, notify, optimize_now,
+    remove_account, remove_provider_account_generic, row_from_account, row_from_provider_account,
+    set_current_loop_interval_secs, switch_to, switch_to_provider_account, watch_cycle,
+    with_state_lock, Cadence, CycleOutcome, Row, SwapGuards, CLAUDE_SLUG, TRIGGER_PCT,
+    WATCH_INTERVAL_SECS,
 };
 
 /// Exact title of the disabled section row inserted when a provider's env
@@ -1018,11 +1018,11 @@ fn popover_model(snap: &Snapshot) -> crate::ui::PopoverModel {
 /// `stuck_notified`'s bookkeeping aren't lock-free-friendly, and the guard is
 /// only ever held for the duration of one `run_cycle` call, so a `Mutex`
 /// contends at most twice a poll interval.
-fn shared_swap_guard() -> std::sync::Arc<std::sync::Mutex<SwapGuard>> {
-    static GUARD: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<SwapGuard>>> =
+fn shared_swap_guard() -> std::sync::Arc<std::sync::Mutex<SwapGuards>> {
+    static GUARD: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<SwapGuards>>> =
         std::sync::OnceLock::new();
     GUARD
-        .get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(SwapGuard::default())))
+        .get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(SwapGuards::default())))
         .clone()
 }
 
@@ -1125,10 +1125,36 @@ fn wait_for_poll_request(timeout: Duration) -> bool {
     std::mem::take(&mut *guard)
 }
 
+/// Options for the shared poll loop. The menu-bar app uses the defaults (the
+/// trigger and auto-swap setting from Settings); `usagio watch` passes its
+/// command-line overrides. One loop for both, so they can't drift.
+pub(crate) struct LoopOpts {
+    /// Overrides the configured trigger (`usagio watch --trigger`).
+    pub trigger: Option<f64>,
+    /// Lowers the swap-target session ceiling (`usagio watch --ceiling`).
+    pub ceiling: Option<f64>,
+    /// Base cadence (`usagio watch --interval`).
+    pub base: u64,
+}
+
+impl Default for LoopOpts {
+    fn default() -> Self {
+        LoopOpts {
+            trigger: None,
+            ceiling: None,
+            base: WATCH_INTERVAL_SECS,
+        }
+    }
+}
+
 fn poll_loop() {
+    poll_loop_with(&LoopOpts::default());
+}
+
+/// The poll + auto-swap loop shared by the menu-bar app and `usagio watch`.
+pub(crate) fn poll_loop_with(opts: &LoopOpts) {
     let guard = shared_swap_guard();
-    let base = WATCH_INTERVAL_SECS;
-    let mut current = base;
+    let mut cadence = Cadence::new(opts.base);
     let mut wd = crate::watchdog::Watchdog::default();
     let mut wd_effects = crate::watchdog::RealEffects;
     // Force a full refresh of EVERY account on the first cycle after launch —
@@ -1136,54 +1162,25 @@ fn poll_loop() {
     // menu never opens on stale data carried over from before the app was last
     // closed (e.g. an account that reset/boosted while usagio wasn't running).
     let mut first_cycle = true;
-    // The active account at the start of the previous cycle — kept locally so
-    // another caller of the refresh path can't consume the switch signal.
-    let mut last_cycle_active = current_active_account();
     loop {
         // v0.8.0: publish current loop cadence so the fetch-floor projection
         // uses the correct horizon under 429 backoff (see main.rs).
-        set_current_loop_interval_secs(current);
+        set_current_loop_interval_secs(cadence.current_for(CLAUDE_SLUG));
         // Self-healing health check (fd-count + keychain-write), throttled to
         // ~once a minute. The menubar poller runs under launchd, so a critical
         // fd leak that a watcher respawn can't clear escalates to a launchd
         // kickstart into a clean process (see `crate::watchdog`).
         wd.maybe_run(&mut wd_effects);
-        // A switch since the last refresh (manual, auto, or an external
-        // `claude /login`) means any backoff we're carrying was earned by the
-        // previous active account. Restart from the TIGHT interval, not base:
-        // `current` only seeds the 429 backoff (the non-429 cadence comes from
-        // the usage tier), and seeding it with base turned one 429 on a
-        // just-landed account into a 360s blind spot.
-        let cycle_active = current_active_account();
-        if cycle_active != last_cycle_active {
-            current = WATCH_TIGHT_INTERVAL_SECS;
-        }
         // Fetch usage + auto-swap; this writes cached usage to state.json, which
         // the main-thread timer reads back to render. This is the ONLY thing that
         // hits the network, so ordinary use can never rate-limit.
-        let (rate_limited, max_pct_opt, trigger, actionable) = {
+        let (outcome, trigger) = {
             let mut g = guard.lock().unwrap_or_else(|e| e.into_inner());
-            run_cycle(&mut g, first_cycle)
+            run_cycle(&mut g, first_cycle, opts)
         };
         first_cycle = false;
-        let prev = current;
-        current = next_interval(
-            current,
-            base,
-            rate_limited,
-            max_pct_opt,
-            trigger,
-            actionable,
-        );
-        if rate_limited {
-            crate::logging::log(&format!("rate limited; backing off to {current}s"));
-        } else if current != prev && current < base {
-            let max_pct = max_pct_opt.unwrap_or(0.0);
-            crate::logging::log(&format!(
-                "cadence: {prev}s → {current}s (max {max_pct:.1}%, trigger {trigger:.0}%) \
-                 event=cadence prev={prev}s new={current}s max_pct={max_pct:.1} trigger={trigger:.0}"
-            ));
-        }
+        let current = cadence.advance(&outcome, trigger);
+        let swapped = outcome.providers.iter().any(|p| p.swapped.is_some());
         // Wake right after the soonest upcoming window reset (+ a settle
         // margin) if that's sooner than the normal cadence — so a session/
         // weekly reset refreshes usage and fires any now-unblocked swap
@@ -1192,7 +1189,7 @@ fn poll_loop() {
         let sleep_secs = match next_reset_wake_secs() {
             // An auto-swap this cycle: refresh the new active account right
             // away instead of flying blind on its (possibly old) cache.
-            _ if current_active_account() != cycle_active => POST_SWITCH_REFRESH_SECS,
+            _ if swapped => POST_SWITCH_REFRESH_SECS,
             Some(w) if w < current => w.max(RESET_SETTLE_SECS),
             _ => current,
         };
@@ -1202,7 +1199,6 @@ fn poll_loop() {
         // pre-sleep reading until the full interval elapses. The return value
         // is intentionally unused here — the loop head already re-refreshes;
         // early return just gets us there sooner.
-        last_cycle_active = cycle_active;
         let _resumed = sleep_bounded_detecting_suspend(sleep_secs);
     }
 }
@@ -1443,23 +1439,29 @@ fn launchd_managed_from_env(xpc_service_name: Option<&str>) -> bool {
     xpc_service_name == Some(crate::AUTOSTART_LABEL)
 }
 
-/// Run one poll+auto-swap cycle; returns whether it was rate limited.
-/// Runs one poll cycle and returns `(rate_limited, max_pct, trigger)` so the
-/// caller's adaptive-cadence math has everything it needs. The menubar
-/// poller uses the trigger the user actually configured (via `Settings ▸
-/// Auto-swap`), matching what `watch_cycle` itself dispatched on.
-fn run_cycle(guard: &mut SwapGuard, force: bool) -> (bool, Option<f64>, f64, bool) {
+/// Run one poll+auto-swap cycle with the configured trigger (Settings ▸
+/// Auto-swap, or `opts.trigger`), returning its outcome and the trigger used
+/// so the caller's cadence math matches what `watch_cycle` dispatched on.
+fn run_cycle(guards: &mut SwapGuards, force: bool, opts: &LoopOpts) -> (CycleOutcome, f64) {
     let st = State::load().unwrap_or_default();
     let autoswap = !st.autoswap_disabled;
-    let threshold = st.trigger_pct.unwrap_or(TRIGGER_PCT);
+    let threshold = opts
+        .trigger
+        .unwrap_or_else(|| st.trigger_pct.unwrap_or(TRIGGER_PCT));
     // With auto-swap off, use an unreachable trigger so we only observe.
     let trigger = if autoswap { threshold } else { 101.0 };
     // The target ceiling follows the trigger (see `Row::eligible_target`).
-    match watch_cycle(trigger, trigger, guard, force) {
-        Ok(o) => (o.rate_limited, o.max_pct, trigger, o.actionable),
+    let ceiling = opts.ceiling.unwrap_or(trigger).min(trigger);
+    match watch_cycle(trigger, ceiling, guards, force) {
+        Ok(o) => (o, trigger),
         Err(e) => {
-            crate::logging::log(&format!("menubar poll failed: {e}"));
-            (false, None, trigger, false)
+            crate::logging::log(&format!("poll failed: {e}"));
+            (
+                CycleOutcome {
+                    providers: Vec::new(),
+                },
+                trigger,
+            )
         }
     }
 }
@@ -2615,10 +2617,11 @@ fn handle_refresh_now() {
                 }
             }
             let _reset = InFlightGuard;
-            let (rate_limited, _max_pct, _trigger, _actionable) = {
+            let (outcome, _trigger) = {
                 let mut g = guard.lock().unwrap_or_else(|e| e.into_inner());
-                run_cycle(&mut g, true)
+                run_cycle(&mut g, true, &LoopOpts::default())
             };
+            let rate_limited = outcome.providers.iter().any(|p| p.rate_limited);
             if rate_limited {
                 notify("Refresh: rate limited, backing off");
             } else {
@@ -2706,15 +2709,17 @@ fn handle_switch(slug: &str, key: &str) {
     // non-switching provider, and `switch_to_provider_account` itself
     // re-checks that capability as belt-and-suspenders against a stray click id
     // shaped like `switch:<slug>:<key>` reaching this function directly.
+    // `hold`: the choice is recorded in state.json, so the poller (and a
+    // `usagio switch` from the CLI) honour it the same way.
     let result = if slug == CLAUDE_SLUG {
-        switch_to(key)
+        switch_to(key, true)
     } else {
-        switch_to_provider_account(slug, key)
+        switch_to_provider_account(slug, key, true)
     };
     match result {
         Ok(label) => {
-            guard.last_swap = Some(std::time::Instant::now());
-            guard.manual_locked_choice = Some((slug.to_string(), key.to_string()));
+            let g = guard.for_provider(slug);
+            g.last_swap = Some(std::time::Instant::now());
             notify(&format!("Switched to {label}"));
             request_poll_now();
         }
@@ -3583,10 +3588,10 @@ mod tests {
         // `run_cycle`'s callers already rely on for `&mut SwapGuard`).
         {
             let mut g = a.lock().unwrap();
-            g.stuck_notified = true;
+            g.for_provider(CLAUDE_SLUG).stuck_notified = true;
         }
         assert!(
-            b.lock().unwrap().stuck_notified,
+            b.lock().unwrap().for_provider(CLAUDE_SLUG).stuck_notified,
             "mutation through one handle must be visible through the other"
         );
     }
