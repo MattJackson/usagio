@@ -175,29 +175,6 @@ fn is_stale_after_reset(
     }
 }
 
-/// Returns the soonest of `{session_reset, weekly_reset}` that falls
-/// strictly within `horizon` of `now` (i.e. `now < reset <= now + horizon`),
-/// or `None` if neither reset is known or both fall outside the horizon.
-///
-/// Intended for `main.rs`'s `cmd_watch` loop: rather than waiting for the
-/// next adaptive-cadence poll tick to notice a window has rolled over
-/// (which can leave a stale `Locked`/cached-100% reading on screen for up
-/// to that tick's full interval), the watch loop can call this to find the
-/// next reset boundary and schedule an extra wake-up right at/after it, so
-/// the stale-cache window is minimized.
-pub fn any_reset_within(
-    u: &AccountUsage,
-    now: DateTime<Utc>,
-    horizon: Duration,
-) -> Option<DateTime<Utc>> {
-    let deadline = now + horizon;
-    [u.session_reset, u.weekly_reset]
-        .into_iter()
-        .flatten()
-        .filter(|&reset| reset > now && reset <= deadline)
-        .min()
-}
-
 /// Format a remaining duration into one of: "1d 23h" | "23h 52m" | "51m" | "<1m".
 /// Saturating: negative/huge durations are clamped to "<1m" and the largest
 /// representable-day-count respectively; never panics.
@@ -572,22 +549,5 @@ mod tests {
                 window: BlockingWindow::Session,
             }
         );
-    }
-
-    // ---- any_reset_within ----
-
-    #[test]
-    fn any_reset_within_finds_nearest() {
-        let now = t(10_000);
-        let session_reset = 10_300; // +5min
-        let weekly_reset = 10_600; // +10min
-        let u = usage(
-            Some(10.0),
-            Some(session_reset),
-            Some(20.0),
-            Some(weekly_reset),
-        );
-        let horizon = Duration::minutes(7);
-        assert_eq!(any_reset_within(&u, now, horizon), Some(t(session_reset)));
     }
 }

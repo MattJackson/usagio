@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Codex accounts auto-swap too.** Every switchable provider now runs
+  through the same swap logic as Claude: swap at the trigger, on a 429 near
+  it, fresh-reading checks on targets, cooldown only on optional swaps. Each
+  provider has its own cooldown, no-return window and poll backoff, so one
+  provider's 429 never slows another's polling.
+- **Codex polling follows the same request budget rules as Claude.** The
+  active account is fetched on its cadence tier, inactive accounts at most
+  every 10 minutes with their own failure backoff, and a 429 on the active
+  account pauses that provider's other fetches for the cycle. Previously
+  every Codex account was fetched on every wake.
+- **No more staying on a full account when everything else is nearly full.**
+  If every other account is past the trigger, auto-swap moves to the one with
+  the most room left (at least 5 points more than the active one) instead of
+  staying put.
+- **`usagio watch` behaves exactly like the menu-bar app.** It now runs the
+  same loop: it uses the trigger and auto-swap setting from the menu
+  (`--trigger` still overrides), wakes right after usage resets, and notices
+  the machine waking from sleep. It used to ignore the menu settings, miss
+  most resets, and stay blind for up to 20 minutes after a resume.
+
 ## [0.8.7] - 2026-10-01
 
 ### Fixed

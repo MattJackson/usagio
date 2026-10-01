@@ -638,12 +638,23 @@ fn row_from_account_tags_provider_id_claude() {
 #[test]
 fn choose_swap_target_skips_ceiling_and_maxed_targets() {
     let reset = Utc::now() + Duration::hours(24);
+    let guard = SwapGuard::default();
+    // A maxed account is never a target, not even as the all-full fallback.
     let rows = vec![
         row_full("active@e.com", 96.0, 96.0, reset),
-        row_full("alsohigh@e.com", 90.0, 90.0, reset), // over the 85% ceiling
+        row_full("maxed@e.com", 100.0, 50.0, reset),
     ];
-    let guard = SwapGuard::default();
     assert!(choose_swap_target(&rows, "active@e.com", 95.0, 85.0, &guard).is_none());
+    // Over an explicit 85% ceiling it isn't a normal target, but with the
+    // active account at the trigger and nothing else available, the all-full
+    // fallback still moves to it: 10 points of room beats 4.
+    let rows = vec![
+        row_full("active@e.com", 96.0, 96.0, reset),
+        row_full("alsohigh@e.com", 90.0, 90.0, reset),
+    ];
+    let eval = evaluate_swap(&rows, "active@e.com", 95.0, 85.0, &guard);
+    assert!(eval.fallback);
+    assert_eq!(eval.target.as_deref(), Some("alsohigh@e.com"));
 }
 
 #[test]
@@ -1174,35 +1185,6 @@ fn cadence_max_pct_none_without_active_or_data() {
     assert_eq!(cadence_max_pct(&[no_data], Some("a@e.com")), None);
     // Active email doesn't match any row.
     assert_eq!(cadence_max_pct(&rows, Some("ghost@e.com")), None);
-}
-
-// --- cap_sleep_to_reset_boundary (v0.5.2 item 4: wake right after a reset) ---
-
-#[test]
-fn cap_sleep_to_reset_boundary_wakes_early_for_an_imminent_reset() {
-    let now = Utc::now();
-    let mut r = row(Some(50.0), Some(60.0));
-    r.session.resets_at = Some(now + Duration::seconds(10));
-    // Planned cadence is 150s, but the session resets in 10s — should cap to
-    // 10s + the 2s buffer = 12s.
-    assert_eq!(cap_sleep_to_reset_boundary(&[r], now, 150), 12);
-}
-
-#[test]
-fn cap_sleep_to_reset_boundary_leaves_planned_alone_when_nothing_imminent() {
-    let now = Utc::now();
-    let mut r = row(Some(50.0), Some(60.0));
-    r.weekly.resets_at = Some(now + Duration::days(3));
-    assert_eq!(cap_sleep_to_reset_boundary(&[r], now, 150), 150);
-}
-
-#[test]
-fn cap_sleep_to_reset_boundary_never_exceeds_planned() {
-    // A reset 40s out is outside the 30s horizon — planned wins.
-    let now = Utc::now();
-    let mut r = row(Some(50.0), Some(60.0));
-    r.session.resets_at = Some(now + Duration::seconds(40));
-    assert_eq!(cap_sleep_to_reset_boundary(&[r], now, 150), 150);
 }
 
 // --- identity_matches (keychain adoption gate) ---
@@ -2578,4 +2560,113 @@ fn inactive_429_does_not_rate_limit_loop_and_backs_off_that_account() {
     );
     assert!(get_usage_fetch_tracker(&email).backoff_until_ts.is_some());
     reset_usage_fetch_tracker(&email);
+}
+
+// --- one core, multiple providers (v0.8.8) ---
+
+#[test]
+fn all_accounts_past_trigger_falls_back_to_most_room() {
+    // Trigger 80: the active account is locked at 100%; nothing else is under
+    // the trigger, but one account still has 15 points left. Staying on the
+    // full account is the worst option — move to the one with the most room.
+    let reset = Utc::now() + Duration::hours(24);
+    let rows = vec![
+        row_full("active@e.com", 100.0, 60.0, reset),
+        row_full("some@e.com", 85.0, 40.0, reset),
+        row_full("less@e.com", 97.0, 40.0, reset),
+    ];
+    let eval = evaluate_swap(&rows, "active@e.com", 80.0, 80.0, &SwapGuard::default());
+    assert!(eval.fallback && eval.urgent);
+    assert_eq!(eval.target.as_deref(), Some("some@e.com"));
+}
+
+#[test]
+fn fallback_needs_a_real_gain() {
+    // 96% → 97%-full alternatives isn't worth a swap.
+    let reset = Utc::now() + Duration::hours(24);
+    let rows = vec![
+        row_full("active@e.com", 96.0, 60.0, reset),
+        row_full("other@e.com", 94.0, 40.0, reset),
+    ];
+    let eval = evaluate_swap(&rows, "active@e.com", 90.0, 90.0, &SwapGuard::default());
+    assert!(!eval.fallback);
+    assert_ne!(eval.target.as_deref(), Some("other@e.com"));
+}
+
+fn cycle(slug: &str, active: &str, max_pct: f64, rate_limited: bool) -> ProviderCycle {
+    ProviderCycle {
+        slug: slug.to_string(),
+        active: Some(active.to_string()),
+        swapped: None,
+        rate_limited,
+        max_pct: Some(max_pct),
+        actionable: true,
+    }
+}
+
+#[test]
+fn cadence_keeps_one_providers_429_from_slowing_another() {
+    let _g = crate::store::ScopedConfigDir::new();
+    let mut c = Cadence::new(180);
+    let out = CycleOutcome {
+        providers: vec![
+            cycle(CLAUDE_SLUG, "a@e.com", 93.0, false),
+            cycle("codex", "x@e.com", 40.0, true),
+        ],
+    };
+    // Claude near the trigger polls at 30s even though Codex is backing off.
+    assert_eq!(c.advance(&out, 95.0), 30);
+    assert_eq!(c.current_for("codex"), 360);
+    assert_eq!(c.current_for(CLAUDE_SLUG), 30);
+}
+
+#[test]
+fn cadence_restarts_backoff_tight_after_a_switch() {
+    let _g = crate::store::ScopedConfigDir::new();
+    let mut c = Cadence::new(180);
+    // Backed off on account a.
+    let out = CycleOutcome {
+        providers: vec![cycle(CLAUDE_SLUG, "a@e.com", 93.0, true)],
+    };
+    c.advance(&out, 95.0);
+    c.advance(&out, 95.0);
+    assert!(c.current_for(CLAUDE_SLUG) > 60);
+    // Auto-swap to b this cycle: the 429 was a's; b starts from 30s.
+    let mut swapped = cycle(CLAUDE_SLUG, "b@e.com", 20.0, true);
+    swapped.swapped = Some(("a@e.com".into(), "b@e.com".into()));
+    c.advance(
+        &CycleOutcome {
+            providers: vec![swapped],
+        },
+        95.0,
+    );
+    assert_eq!(c.current_for(CLAUDE_SLUG), WATCH_TIGHT_INTERVAL_SECS);
+    // A first 429 on b only doubles that: 60s, not 360s.
+    c.advance(
+        &CycleOutcome {
+            providers: vec![cycle(CLAUDE_SLUG, "b@e.com", 93.0, true)],
+        },
+        95.0,
+    );
+    assert_eq!(c.current_for(CLAUDE_SLUG), 60);
+}
+
+#[test]
+fn fetch_tracker_keys_are_namespaced_per_provider() {
+    assert_eq!(fetch_tracker_key(CLAUDE_SLUG, "a@e.com"), "a@e.com");
+    assert_eq!(fetch_tracker_key("codex", "a@e.com"), "codex/a@e.com");
+}
+
+#[test]
+fn escalation_reads_the_providers_own_tracker() {
+    // A Codex 429 must escalate the Codex row, and never a Claude row with the
+    // same address.
+    let email = escalation_test_email("codex");
+    record_usage_fetch_429(&fetch_tracker_key("codex", &email));
+    let reset = Utc::now() + Duration::hours(24);
+    let codex = row_full_with_provider("codex", &email, 93.0, 50.0, reset);
+    let claude = row_full(&email, 93.0, 50.0, reset);
+    assert!(effective_active_max_pct_for_swap_fire(&codex, 95.0) >= 95.0);
+    assert_eq!(effective_active_max_pct_for_swap_fire(&claude, 95.0), 93.0);
+    reset_usage_fetch_tracker(&fetch_tracker_key("codex", &email));
 }

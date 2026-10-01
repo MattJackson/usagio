@@ -217,9 +217,14 @@ Hysteresis keeps it from thrashing:
 - on a proactive flip-back between two accounts that reset at the same time, a
   headroom margin so near-equal accounts don't ping-pong.
 
-If no account has room it doesn't swap — it notifies you of the soonest reset. It
-runs inside the menu-bar app (so `usagio install` keeps it on), or headless via
-`usagio watch` on a machine with no menu bar.
+Every account that can be switched — Claude and Codex alike — goes through the same
+rules, each provider with its own cooldown and backoff. If every other account is
+past your threshold too, it moves to the one with the most room left (when that's
+at least 5 points more than the active one). If no account has room it doesn't
+swap — it notifies you of the soonest reset. It runs inside the menu-bar app (so
+`usagio install` keeps it on), or headless via `usagio watch` on a machine with no
+menu bar; both run the same loop and use the threshold and auto-swap setting from
+the menu (`usagio watch --trigger` overrides the threshold).
 
 ## How it works
 
