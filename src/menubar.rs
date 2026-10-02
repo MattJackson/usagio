@@ -1944,17 +1944,6 @@ fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)
             ),
             true,
         ));
-        rows.push((
-            "Usage checks paused — renew to use this account".to_string(),
-            false,
-        ));
-        rows.push((
-            format!(
-                "Rechecked every {}m; resumes when a plan is back",
-                crate::SUBSCRIPTION_RECHECK_SECS / 60
-            ),
-            false,
-        ));
         return rows;
     }
     if let Some(plan) = &a.plan {
@@ -3877,8 +3866,7 @@ mod tests {
         a.no_subscription = true;
         a.plan = Some("Free".into());
         let rows = submenu_info_rows(&claude_section(), &a);
-        assert!(rows[0].contains("No subscription"), "{rows:?}");
-        assert!(rows.iter().any(|r| r.contains("Free")), "{rows:?}");
+        assert_eq!(rows, vec!["No subscription · Free plan"], "one row only");
         assert!(
             !rows
                 .iter()
