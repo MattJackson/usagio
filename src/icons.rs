@@ -108,3 +108,16 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod tray_icon_tests {
+    use super::*;
+
+    #[test]
+    fn usagio_tray_icon_is_the_bundled_png() {
+        const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        let bytes = usagio_tray_icon();
+        assert!(bytes.len() > 8);
+        assert_eq!(&bytes[..8], &PNG_SIG, "expected PNG magic");
+    }
+}

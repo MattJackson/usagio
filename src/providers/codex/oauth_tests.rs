@@ -448,3 +448,19 @@ fn refresh_token_grant_read_timeout_fails_fast_not_forever() {
         );
     });
 }
+
+#[test]
+fn refresh_error_display_texts() {
+    assert_eq!(
+        RefreshError::InvalidGrant.to_string(),
+        "refresh token rejected (invalid_grant)"
+    );
+    assert_eq!(
+        RefreshError::RateLimited.to_string(),
+        "token endpoint rate-limited (429)"
+    );
+    assert_eq!(
+        RefreshError::Transient("boom".into()).to_string(),
+        "transient: boom"
+    );
+}

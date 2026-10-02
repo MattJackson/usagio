@@ -1944,17 +1944,6 @@ fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)
             ),
             true,
         ));
-        rows.push((
-            "Usage checks paused — renew to use this account".to_string(),
-            false,
-        ));
-        rows.push((
-            format!(
-                "Rechecked every {}m; resumes when a plan is back",
-                crate::SUBSCRIPTION_RECHECK_SECS / 60
-            ),
-            false,
-        ));
         return rows;
     }
     if let Some(plan) = &a.plan {
@@ -3293,6 +3282,19 @@ mod cross_platform {
         // see `platform::linux::LinuxMenu` / `platform::windows::WindowsMenu`.
         backend.run_event_loop()
     }
+
+    // `initial_icon_bytes` is private to this module, so its test lives here.
+    #[cfg(all(test, not(target_os = "macos")))]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn initial_icon_falls_back_to_the_usagio_mark_without_a_target() {
+            let mark = crate::icons::usagio_tray_icon();
+            assert!(!mark.is_empty());
+            assert_eq!(initial_icon_bytes(&Snapshot::default()), mark);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3539,6 +3541,7 @@ mod tests {
         // try_start_refresh reaches logging::log → store::config_dir(), which
         // panics in tests without a HOME_OVERRIDE. Wrap in ScopedConfigDir so
         // the tripwire (added post-hermeticity merge) doesn't fire here.
+        let _l = REFRESH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _g = crate::store::ScopedConfigDir::new();
         // Reset in case a prior test in this binary left it set (best-effort
         // — tests run with --test-threads=1 so no other test races us here).
@@ -3587,11 +3590,16 @@ mod tests {
         // the crate-root module that declares the struct (same access
         // `run_cycle`'s callers already rely on for `&mut SwapGuard`).
         {
-            let mut g = a.lock().unwrap();
+            // Tolerate poison, like every production caller: the refresh-thread
+            // test deliberately panics a `run_cycle` while holding this guard.
+            let mut g = a.lock().unwrap_or_else(|e| e.into_inner());
             g.for_provider(CLAUDE_SLUG).stuck_notified = true;
         }
         assert!(
-            b.lock().unwrap().for_provider(CLAUDE_SLUG).stuck_notified,
+            b.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .for_provider(CLAUDE_SLUG)
+                .stuck_notified,
             "mutation through one handle must be visible through the other"
         );
     }
@@ -3858,8 +3866,7 @@ mod tests {
         a.no_subscription = true;
         a.plan = Some("Free".into());
         let rows = submenu_info_rows(&claude_section(), &a);
-        assert!(rows[0].contains("No subscription"), "{rows:?}");
-        assert!(rows.iter().any(|r| r.contains("Free")), "{rows:?}");
+        assert_eq!(rows, vec!["No subscription · Free plan"], "one row only");
         assert!(
             !rows
                 .iter()
@@ -5289,5 +5296,1070 @@ mod tests {
         // so a `!starts_with("/tmp")` guard would false-positive — the positive
         // form here catches the real regression (stash landing outside backups/).
         assert!(stash.starts_with(g.home().join(".config/usagio/backups")));
+    }
+
+    // -----------------------------------------------------------------------
+    // Behaviour pins for the tray theme override, labels, row spans, the
+    // cached-state snapshot pipeline, the poll-request wake-up, the recovery
+    // title/tooltip and the click-routing table.
+    // -----------------------------------------------------------------------
+
+    /// Serializes tests that go through `cached_state` (a process-wide mtime
+    /// cache): two tests with different config dirs would otherwise evict each
+    /// other's cached entry mid-assertion.
+    static SNAPSHOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serializes tests that touch the process-wide `REFRESH_IN_FLIGHT` flag.
+    static REFRESH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serializes tests that touch the process-wide `POLL_REQUEST` flag.
+    static POLL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Write `st` to the scoped `state.json` and pin its mtime to a value unique
+    /// per `tag`, so the `cached_state` mtime cache can neither miss a rewrite
+    /// (coarse filesystem timestamps) nor mistake another test's file for ours.
+    fn save_state_with_mtime(st: &State, tag: u64) {
+        st.save().unwrap();
+        let path = crate::store::config_dir().unwrap().join("state.json");
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000 + tag))
+            .unwrap();
+    }
+
+    /// A process-unique mtime tag for [`save_state_with_mtime`].
+    fn next_mtime_tag() -> u64 {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        N.fetch_add(10, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn cached(
+        session: f64,
+        weekly: f64,
+        session_reset: &str,
+        weekly_reset: &str,
+    ) -> crate::store::CachedUsage {
+        crate::store::CachedUsage {
+            session_pct: Some(session),
+            weekly_pct: Some(weekly),
+            session_reset: Some(session_reset.to_string()),
+            weekly_reset: Some(weekly_reset.to_string()),
+            opus_pct: None,
+            opus_reset: None,
+            fetched_at: 0,
+        }
+    }
+
+    fn codex_state_acct(key: &str) -> crate::store::ProviderAccount {
+        serde_json::from_value(serde_json::json!({
+            "key": key,
+            "secret_blob": "{}",
+            "access_token": "at",
+        }))
+        .unwrap()
+    }
+
+    /// A Codex `auth.json` for `email` whose id_token the codex provider can parse.
+    fn codex_auth_json(email: &str) -> String {
+        use base64::Engine;
+        let b64 = |s: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s);
+        let id_token = format!(
+            "{}.{}.sig",
+            b64(br#"{"alg":"none"}"#),
+            b64(
+                serde_json::json!({ "email": email, "exp": 4_000_000_000_i64 })
+                    .to_string()
+                    .as_bytes()
+            )
+        );
+        serde_json::json!({
+            "tokens": { "id_token": id_token, "access_token": "at", "refresh_token": "rt" }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn theme_override_args_set_the_forced_theme_and_tray_options_pin_min_width() {
+        use muri::ThemeSource;
+        // `FORCED_THEME` is a process-wide OnceLock, so this single test owns
+        // the whole before/after sequence.
+        assert!(forced_theme().is_none(), "no override before any args");
+        set_theme_override_from_args(&["--theme".into(), "beos".into()]);
+        assert!(forced_theme().is_none(), "an unknown name is ignored");
+        set_theme_override_from_args(&["menubar".into(), "--theme=windows".into()]);
+        assert!(matches!(forced_theme(), Some(ThemeSource::Windows(_))));
+        // First valid override wins; later ones can't change a running tray.
+        set_theme_override_from_args(&["--theme".into(), "gnome".into()]);
+        assert!(matches!(forced_theme(), Some(ThemeSource::Windows(_))));
+
+        assert_eq!(tray_options().min_width, Some(300.0));
+    }
+
+    #[test]
+    fn stat_display_label_names_claude_windows_and_falls_back_to_the_short_label() {
+        let w = |id: &str| WindowView {
+            id: id.into(),
+            label: "short".into(),
+            pct: None,
+            reset: String::new(),
+        };
+        assert_eq!(stat_display_label(&w("session")), "Session");
+        assert_eq!(stat_display_label(&w("weekly")), "Weekly");
+        assert_eq!(stat_display_label(&w("opus")), "Opus");
+        assert_eq!(stat_display_label(&w("something-new")), "short");
+    }
+
+    #[test]
+    fn main_row_checkmarks_only_the_active_account() {
+        let active = main_row(
+            "Claude",
+            &acct("a@x.com", Some(10.0), Some(20.0), true),
+            bands(),
+        );
+        assert!(active.checkmark, "active unlocked row gets the checkmark");
+        let idle = main_row(
+            "Claude",
+            &acct("a@x.com", Some(10.0), Some(20.0), false),
+            bands(),
+        );
+        assert!(!idle.checkmark);
+    }
+
+    #[test]
+    fn trailing_color_spans_land_on_the_weekly_percentage() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        // Usage: the weekly span starts after "<session> / ".
+        let a = acct("hot@x.com", Some(10.0), Some(96.0), false);
+        let (text, colors) = trailing_for_account(&a, bands(), now);
+        assert_eq!(text, "10% / 96%");
+        assert_eq!(colors, vec![(6, 3, Severity::Red)]);
+
+        // Session-locked: the red countdown, then the weekly percentage.
+        let locked = acct_with_resets(
+            "hot@x.com",
+            Some(100.0),
+            Some(97.0),
+            false,
+            Some(now + chrono::Duration::minutes(90)),
+            None,
+        );
+        let (text, colors) = trailing_for_account(&locked, bands(), now);
+        assert_eq!(text, "1h 30m / 97%");
+        assert_eq!(
+            colors,
+            vec![(0, 6, Severity::Red), (9, 3, Severity::Red)],
+            "countdown span, then weekly span after ' / '"
+        );
+    }
+
+    #[test]
+    fn account_header_row_offsets_colors_past_the_label() {
+        let sec = header_test_section("Claude");
+        let a = acct("hot@x.com", Some(10.0), Some(96.0), false);
+        let r = account_header_row(&sec, &a);
+        assert_eq!(r.plain, "hot@x.com\t10% / 96%");
+        assert_eq!(r.colors.len(), 1);
+        let (off, len, sev) = r.colors[0];
+        assert_eq!(sev, Severity::Red);
+        assert_eq!(span_text(&r.plain, off, len), "96%");
+    }
+
+    #[test]
+    fn quit_row_is_quit_tab_version() {
+        let q = quit_row_plain();
+        assert!(
+            q.starts_with(&format!("Quit\tusagio v{}", env!("CARGO_PKG_VERSION"))),
+            "{q}"
+        );
+        // A build tag is appended only when one was baked in at compile time.
+        match option_env!("USAGIO_BUILD_TAG") {
+            Some(tag) if !tag.is_empty() => assert!(q.contains(&format!("[{tag}]")), "{q}"),
+            _ => assert!(!q.contains('['), "{q}"),
+        }
+    }
+
+    #[test]
+    fn tray_target_ranks_a_missing_reading_below_zero_percent() {
+        // Claude has no reading yet, Codex sits at exactly 0% → Codex is the
+        // better "at risk" pick, whichever order the sections come in.
+        let no_data = acct("c@x", None, None, true);
+        let snap = two_section_snap(no_data, Some(0.0), None);
+        let (sec, _) = tray_target(&snap, None).expect("a target");
+        assert_eq!(sec.provider_id, "codex");
+
+        let snap = two_section_snap(acct("c@x", Some(0.0), None, true), None, None);
+        let (sec, _) = tray_target(&snap, None).expect("a target");
+        assert_eq!(sec.provider_id, CLAUDE_SLUG);
+    }
+
+    #[test]
+    fn tray_icon_bytes_follow_the_target_provider_and_fall_back_to_the_mark() {
+        let claude_icon = crate::icons::png16_for(CLAUDE_SLUG).expect("claude icon bundled");
+        let codex_icon = crate::icons::png16_for("codex").expect("codex icon bundled");
+        assert!(!claude_icon.is_empty() && claude_icon != codex_icon);
+
+        // Pinned to each provider in turn.
+        let snap = two_section_snap(
+            acct("c@x", Some(10.0), None, true),
+            Some(90.0),
+            Some("claude".to_string()),
+        );
+        assert_eq!(tray_icon_bytes(&snap), claude_icon);
+        let snap = two_section_snap(acct("c@x", Some(10.0), None, true), Some(90.0), None);
+        assert_eq!(
+            tray_icon_bytes(&snap),
+            codex_icon,
+            "at-risk target is codex"
+        );
+
+        // No target at all → the usagio mark.
+        let mark = crate::icons::usagio_tray_icon();
+        assert!(!mark.is_empty());
+        assert_eq!(tray_icon_bytes(&Snapshot::default()), mark);
+    }
+
+    #[test]
+    fn acctview_from_row_orders_windows_and_flags_the_active_account() {
+        let cell = |p: f64| crate::Cell {
+            pct: Some(p),
+            resets_at: None,
+        };
+        let row = crate::Row {
+            provider_id: CLAUDE_SLUG.to_string(),
+            needs_relogin: false,
+            no_subscription: false,
+            plan: None,
+            email: "a@x.com".to_string(),
+            session: cell(1.0),
+            weekly: cell(2.0),
+            opus: Some(cell(3.0)),
+            error: None,
+            fetched_at: None,
+        };
+        let v = acctview_from_row(
+            &row,
+            &Some("a@x.com".to_string()),
+            CLAUDE_SLUG,
+            &["weekly", "session"],
+        );
+        let ids: Vec<&str> = v.windows.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["weekly", "session", "opus"],
+            "declared order first, undeclared windows after"
+        );
+        assert!(v.active);
+        let v = acctview_from_row(
+            &row,
+            &Some("other@x.com".to_string()),
+            CLAUDE_SLUG,
+            &["session", "weekly"],
+        );
+        assert!(!v.active);
+        assert_eq!(v.windows[0].id, "session");
+        assert!(!acctview_from_row(&row, &None, CLAUDE_SLUG, &[]).active);
+    }
+
+    #[test]
+    fn submenu_info_rows_edge_cases_for_missing_data() {
+        let sec = claude_section();
+
+        // Windows present but no data fetched yet → just "no data yet".
+        let mut a = acct("a@x.com", Some(10.0), Some(20.0), true);
+        a.has_data = false;
+        assert_eq!(submenu_info_rows(&sec, &a), ["no data yet"]);
+
+        // A locked window leads, ahead of window order.
+        let mut a = acct("a@x.com", Some(50.0), Some(60.0), true);
+        a.windows.push(WindowView {
+            id: "opus".into(),
+            label: "Opus 7d".into(),
+            pct: Some(100.0),
+            reset: "1d".into(),
+        });
+        assert_eq!(
+            submenu_info_items(&sec, &a),
+            [
+                ("Opus locked · unlocks in 1d".to_string(), true),
+                ("Session renews in 3h".to_string(), false),
+                ("Weekly renews in 2d".to_string(), false),
+            ]
+        );
+
+        // Only Codex announces a window it doesn't report; for Claude an
+        // unreported window with nothing to say is simply omitted.
+        let mut a = acct("a@x.com", None, Some(40.0), true);
+        a.windows[0].reset.clear();
+        assert_eq!(submenu_info_rows(&sec, &a), ["Weekly renews in 2d"]);
+    }
+
+    #[test]
+    fn account_extra_info_rows_footer_and_burn_rate() {
+        let _g = crate::store::ScopedConfigDir::new();
+        let sec = claude_section();
+        let mk = || {
+            let mut a = acct("burn@x.com", Some(30.0), Some(60.0), true);
+            a.updated = "1m ago".into();
+            a
+        };
+        let a = mk();
+
+        // No history yet → just the freshness footer.
+        assert_eq!(account_extra_info_rows(&sec, &a), ["updated 1m ago"]);
+
+        // A steady climb over the last hour → a confident burn-rate row first.
+        let now = Utc::now();
+        for i in 0..8 {
+            crate::usage_log::append(&crate::usage_log::Snapshot {
+                ts: now - chrono::Duration::minutes(70 - i * 10),
+                provider: CLAUDE_SLUG.to_string(),
+                account: "burn@x.com".to_string(),
+                session_pct: Some(10.0),
+                weekly_pct: Some(20.0 + i as f32 * 3.0),
+                active_model: None,
+            })
+            .unwrap();
+        }
+        // The usage-log reader is mtime-cached process-wide; drop entries other
+        // tests (or the empty read above) left behind so ours is parsed fresh.
+        crate::usage_log::invalidate_cache();
+        let rows = account_extra_info_rows(&sec, &a);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[0].starts_with("Weekly · "), "{rows:?}");
+        assert_eq!(rows[1], "updated 1m ago");
+
+        // Weekly already locked → the burn forecast is redundant and skipped.
+        let mut locked = mk();
+        locked.windows[1].pct = Some(100.0);
+        assert_eq!(account_extra_info_rows(&sec, &locked), ["updated 1m ago"]);
+
+        // No fetched data / no windows / lapsed plan → nothing to add.
+        let mut no_data = mk();
+        no_data.has_data = false;
+        assert!(account_extra_info_rows(&sec, &no_data).is_empty());
+        let mut no_windows = mk();
+        no_windows.windows.clear();
+        assert!(account_extra_info_rows(&sec, &no_windows).is_empty());
+        let mut lapsed = mk();
+        lapsed.no_subscription = true;
+        assert!(account_extra_info_rows(&sec, &lapsed).is_empty());
+    }
+
+    // --- recovery status (tray title / tooltip) ----------------------------
+
+    fn locked_for(email: &str, now: DateTime<Utc>, active: bool) -> AcctView {
+        let mut a = acct(email, Some(100.0), Some(10.0), active);
+        a.session_reset_at = Some(now + chrono::Duration::minutes(60));
+        a.fetched_at = Some(now);
+        a
+    }
+
+    fn recovery_with(now: DateTime<Utc>, alt: AcctView) -> Option<(String, String)> {
+        let active = locked_for("active@x.com", now, true);
+        let mut sec = claude_section();
+        sec.accounts = vec![locked_for("active@x.com", now, true), alt];
+        recovery_status(&sec, &active, now)
+    }
+
+    #[test]
+    fn recovery_blocked_without_any_reset_time_still_reports_the_block() {
+        // Both limits maxed with no reset known anywhere: not "usage is fine".
+        let a = acct("solo@x.com", Some(100.0), Some(10.0), true);
+        assert_eq!(title_for(&one_section_snap(a)), "🔒");
+    }
+
+    #[test]
+    fn recovery_offers_a_healthy_alternative_and_skips_unusable_ones() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let healthy = || acct("alt@x.com", Some(0.0), Some(0.0), false);
+        let (title, detail) = recovery_with(now, healthy()).expect("recovery info");
+        assert_eq!(title, "Switch");
+        assert_eq!(detail, "alt@x.com · Usage available");
+
+        // Every kind of unusable alternative is passed over → the active
+        // account's own lock countdown is what the tray shows.
+        type Spoil = fn(&mut AcctView);
+        let kinds: [(&str, Spoil); 4] = [
+            ("needs re-login", |a| a.needs_relogin = true),
+            ("refresh error", |a| a.error = Some("boom".into())),
+            ("lapsed plan", |a| a.no_subscription = true),
+            ("no data", |a| a.has_data = false),
+        ];
+        for (what, mutate) in kinds {
+            let mut alt = healthy();
+            mutate(&mut alt);
+            let (title, _) = recovery_with(now, alt).expect("recovery info");
+            assert_eq!(title, "🔒 1h 0m", "{what} alternative must be skipped");
+        }
+    }
+
+    #[test]
+    fn recovery_only_offers_alternatives_the_provider_can_switch_to() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let alt = || acct("alt@x.com", Some(0.0), Some(0.0), false);
+        let active = locked_for("active@x.com", now, true);
+
+        // Provider can't switch: the healthy account is no way out, but the
+        // active account's own lock is still reported.
+        let mut sec = claude_section();
+        sec.supports_switching = false;
+        sec.accounts = vec![locked_for("active@x.com", now, true), alt()];
+        let (title, _) = recovery_status(&sec, &active, now).expect("recovery info");
+        assert_eq!(title, "🔒 1h 0m");
+
+        // An env override defeats any switch we make.
+        let mut sec = claude_section();
+        sec.env_override_active = true;
+        sec.accounts = vec![locked_for("active@x.com", now, true), alt()];
+        let (title, _) = recovery_status(&sec, &active, now).expect("recovery info");
+        assert_eq!(title, "🔒 1h 0m");
+    }
+
+    #[test]
+    fn recovery_prefers_the_first_of_two_equally_early_unlocks() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let (_, detail) =
+            recovery_with(now, locked_for("tie@x.com", now, false)).expect("recovery info");
+        assert!(
+            detail.contains("Next available: active@x.com"),
+            "a tie keeps the earlier entry: {detail}"
+        );
+    }
+
+    #[test]
+    fn recovery_does_not_offer_an_account_sitting_exactly_at_the_lock_threshold() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        // 99.5% with a reset that already passed and a fresh reading after it:
+        // not stale, not locked, but still effectively exhausted.
+        let mut edge = acct("edge@x.com", Some(99.5), Some(0.0), false);
+        edge.session_reset_at = Some(now - chrono::Duration::minutes(10));
+        edge.fetched_at = Some(now);
+        let (title, _) = recovery_with(now, edge).expect("recovery info");
+        assert_eq!(title, "🔒 1h 0m");
+    }
+
+    // --- cross-platform menu tree ------------------------------------------
+
+    fn find_submenu<'a>(
+        items: &'a [crate::platform::MenuItem],
+        wanted: &str,
+    ) -> &'a [crate::platform::MenuItem] {
+        items
+            .iter()
+            .find_map(|i| match i {
+                crate::platform::MenuItem::Submenu { label, items, .. } if label == wanted => {
+                    Some(items.as_slice())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no submenu {wanted:?}"))
+    }
+
+    fn checked_of(items: &[crate::platform::MenuItem], wanted_id: &str) -> bool {
+        items
+            .iter()
+            .find_map(|i| match i {
+                crate::platform::MenuItem::Action { id, checked, .. } if id == wanted_id => {
+                    Some(*checked)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no action {wanted_id:?}"))
+    }
+
+    #[test]
+    fn menu_tree_labels_spans_and_quit_row_come_from_the_row_builders() {
+        // The menu builder reads the usage log for burn-rate rows.
+        let _g = crate::store::ScopedConfigDir::new();
+        use crate::platform::{MenuItem, ValueColor, ValueSpan};
+        let snap = one_section_snap(acct("hot@x.com", Some(96.0), Some(97.0), true));
+        let tree = cross_platform::menu_tree_from_snapshot(&snap);
+        match &tree.items[1] {
+            MenuItem::Submenu {
+                label,
+                active,
+                value_spans,
+                ..
+            } => {
+                assert_eq!(label, "hot@x.com\t96% / 97%");
+                assert!(*active);
+                assert_eq!(
+                    value_spans,
+                    &vec![
+                        ValueSpan {
+                            start: 0,
+                            len: 3,
+                            color: ValueColor::Red
+                        },
+                        ValueSpan {
+                            start: 6,
+                            len: 3,
+                            color: ValueColor::Red
+                        },
+                    ],
+                    "spans are relative to the text after the tab"
+                );
+            }
+            other => panic!("expected the account submenu, got {other:?}"),
+        }
+        let quit = tree
+            .items
+            .iter()
+            .find_map(|i| match i {
+                MenuItem::Action { id, label, .. } if id == "quit" => Some(label.clone()),
+                _ => None,
+            })
+            .expect("quit row");
+        assert_eq!(quit, quit_row_plain());
+    }
+
+    #[test]
+    fn menu_tree_separates_provider_groups_but_does_not_lead_with_one() {
+        // The menu builder reads the usage log for burn-rate rows.
+        let _g = crate::store::ScopedConfigDir::new();
+        use crate::platform::MenuItem;
+        let snap = two_section_snap(acct("c@x", Some(40.0), Some(30.0), true), Some(90.0), None);
+        let tree = cross_platform::menu_tree_from_snapshot(&snap);
+        assert!(
+            matches!(tree.items[0], MenuItem::Static { .. }),
+            "group header first"
+        );
+        assert!(matches!(tree.items[1], MenuItem::Submenu { .. }));
+        assert!(
+            matches!(tree.items[2], MenuItem::Separator),
+            "between groups"
+        );
+        assert!(matches!(tree.items[3], MenuItem::Static { .. }));
+    }
+
+    #[test]
+    fn menu_tree_capture_submenu_lists_providers_when_either_bucket_has_one() {
+        // The menu builder reads the usage log for burn-rate rows.
+        let _g = crate::store::ScopedConfigDir::new();
+        use crate::platform::MenuItem;
+        // One_section_snap has a creds-on-disk provider and no API-key ones.
+        let snap = one_section_snap(acct("a@x.com", Some(1.0), Some(1.0), true));
+        let tree = cross_platform::menu_tree_from_snapshot(&snap);
+        let capture = find_submenu(&tree.items, "Capture current login");
+        assert_eq!(capture.len(), 1);
+        match &capture[0] {
+            MenuItem::Action {
+                id, label, enabled, ..
+            } => {
+                assert_eq!(id, "capture:claude");
+                assert_eq!(label, "Claude");
+                assert!(*enabled);
+            }
+            other => panic!("expected a capture action, got {other:?}"),
+        }
+        // Nothing registered at all → an explanatory disabled row.
+        let mut empty = one_section_snap(acct("a@x.com", Some(1.0), Some(1.0), true));
+        empty.capture_creds.clear();
+        let tree = cross_platform::menu_tree_from_snapshot(&empty);
+        let capture = find_submenu(&tree.items, "Capture current login");
+        assert!(matches!(
+            &capture[0],
+            MenuItem::Action { label, enabled: false, .. } if label == "(no providers registered)"
+        ));
+    }
+
+    #[test]
+    fn menu_tree_checks_the_current_autoswap_threshold_and_tray_mode() {
+        // The menu builder reads the usage log for burn-rate rows.
+        let _g = crate::store::ScopedConfigDir::new();
+        let mut snap = two_section_snap(
+            acct("c@x", Some(40.0), Some(30.0), true),
+            Some(90.0),
+            Some("codex".to_string()),
+        );
+        snap.autoswap = true;
+        snap.threshold = 85.0;
+        let tree = cross_platform::menu_tree_from_snapshot(&snap);
+        let settings = find_submenu(&tree.items, "Settings");
+        let auto = find_submenu(settings, "Auto-swap");
+        assert!(checked_of(auto, "autoswap:85"));
+        for id in ["autoswap:off", "autoswap:70", "autoswap:95", "autoswap:98"] {
+            assert!(!checked_of(auto, id), "{id} must not be checked");
+        }
+        let tray = find_submenu(settings, "Tray Icon");
+        assert!(checked_of(tray, "trayicon:codex"));
+        assert!(!checked_of(tray, "trayicon:claude"));
+        assert!(!checked_of(tray, "trayicon:at-risk"));
+
+        // Auto-swap off, tray following the at-risk agent.
+        snap.autoswap = false;
+        snap.tray_icon_mode = None;
+        let tree = cross_platform::menu_tree_from_snapshot(&snap);
+        let settings = find_submenu(&tree.items, "Settings");
+        assert!(checked_of(
+            find_submenu(settings, "Auto-swap"),
+            "autoswap:off"
+        ));
+        assert!(!checked_of(
+            find_submenu(settings, "Auto-swap"),
+            "autoswap:85"
+        ));
+        assert!(checked_of(
+            find_submenu(settings, "Tray Icon"),
+            "trayicon:at-risk"
+        ));
+    }
+
+    // --- cached state / snapshot pipeline ----------------------------------
+
+    #[test]
+    fn cached_state_rereads_only_when_the_file_changes() {
+        let _l = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::store::ScopedConfigDir::new();
+        let tag = next_mtime_tag();
+        let mut st = State {
+            trigger_pct: Some(90.0),
+            ..State::default()
+        };
+        save_state_with_mtime(&st, tag);
+        assert_eq!(
+            cached_state().trigger_pct,
+            Some(90.0),
+            "first read loads the file"
+        );
+
+        // New content, new mtime → re-read.
+        st.trigger_pct = Some(80.0);
+        let tag2 = next_mtime_tag();
+        save_state_with_mtime(&st, tag2);
+        assert_eq!(
+            cached_state().trigger_pct,
+            Some(80.0),
+            "changed mtime reloads"
+        );
+
+        // New content but the SAME mtime → the cache is trusted (no re-parse
+        // every 0.75s tick).
+        st.trigger_pct = Some(70.0);
+        save_state_with_mtime(&st, tag2);
+        assert_eq!(
+            cached_state().trigger_pct,
+            Some(80.0),
+            "unchanged mtime hits the cache"
+        );
+    }
+
+    #[test]
+    fn build_snapshot_buckets_accounts_by_provider_with_their_own_active() {
+        let _l = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::store::ScopedConfigDir::new();
+        let mut st = State::default();
+        st.accounts.push(restore_test_acct("a@x.com"));
+        st.accounts.push(restore_test_acct("b@x.com"));
+        st.active = Some("a@x.com".to_string());
+        st.upsert_provider_account("codex", codex_state_acct("cx@x.com"));
+        st.upsert_provider_account("codex", codex_state_acct("cy@x.com"));
+        st.provider_accounts_mut("codex").active = Some("cy@x.com".to_string());
+        st.trigger_pct = Some(88.0);
+        st.tray_icon_mode = Some("codex".to_string());
+        save_state_with_mtime(&st, next_mtime_tag());
+
+        let snap = build_snapshot();
+        assert!(snap.autoswap);
+        assert_eq!(snap.threshold, 88.0);
+        assert_eq!(snap.tray_icon_mode.as_deref(), Some("codex"));
+        let claude = snap
+            .sections
+            .iter()
+            .find(|s| s.provider_id == CLAUDE_SLUG)
+            .unwrap();
+        let codex = snap
+            .sections
+            .iter()
+            .find(|s| s.provider_id == "codex")
+            .unwrap();
+        let keys = |s: &ProviderSection| {
+            let mut k: Vec<String> = s.accounts.iter().map(|a| a.key.clone()).collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(claude), ["a@x.com", "b@x.com"]);
+        assert_eq!(keys(codex), ["cx@x.com", "cy@x.com"]);
+        let active = |s: &ProviderSection| {
+            s.accounts
+                .iter()
+                .filter(|a| a.active)
+                .map(|a| a.key.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            active(claude),
+            ["a@x.com"],
+            "Claude's active comes from state.active"
+        );
+        assert_eq!(
+            active(codex),
+            ["cy@x.com"],
+            "Codex's active comes from its own slot"
+        );
+        assert_eq!(snap.account_order.len(), 4);
+        assert!(snap.capture_creds.iter().all(|r| r.installed));
+        assert!(probe_installed("claude"));
+
+        // Auto-swap switched off in Settings is reflected.
+        st.autoswap_disabled = true;
+        save_state_with_mtime(&st, next_mtime_tag());
+        assert!(!build_snapshot().autoswap);
+    }
+
+    #[test]
+    fn next_reset_wake_is_the_soonest_future_reset_plus_the_settle_margin() {
+        let _l = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::store::ScopedConfigDir::new();
+        let now = Utc.timestamp_opt(2_000_000_000, 0).unwrap();
+        let at = |secs: i64| (now + chrono::Duration::seconds(secs)).to_rfc3339();
+        let state_with = |session: i64, weekly: i64| {
+            let mut a = restore_test_acct("a@x.com");
+            a.cached_usage = Some(cached(10.0, 10.0, &at(session), &at(weekly)));
+            let mut st = State::default();
+            st.accounts.push(a);
+            st
+        };
+
+        // Soonest of the future resets (50s) plus the 5s settle margin.
+        save_state_with_mtime(&state_with(50, 100), next_mtime_tag());
+        with_now(now, || assert_eq!(next_reset_wake_secs(), Some(55)));
+        save_state_with_mtime(&state_with(300, 100), next_mtime_tag());
+        with_now(now, || assert_eq!(next_reset_wake_secs(), Some(105)));
+
+        // A reset that is already past — or exactly now — is not upcoming.
+        save_state_with_mtime(&state_with(-10, 0), next_mtime_tag());
+        with_now(now, || assert_eq!(next_reset_wake_secs(), None));
+    }
+
+    #[test]
+    fn render_menu_png_produces_a_png() {
+        let _l = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::store::ScopedConfigDir::new();
+        save_state_with_mtime(&State::default(), next_mtime_tag());
+        let png = render_menu_png_for_theme("gnome", 1.0);
+        assert!(
+            png.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "not a PNG: {:?}",
+            &png[..png.len().min(8)]
+        );
+        assert!(
+            png.len() > 100,
+            "suspiciously small image: {} bytes",
+            png.len()
+        );
+    }
+
+    #[test]
+    fn accounts_needing_relogin_lists_claude_and_provider_accounts_sorted() {
+        let _g = crate::store::ScopedConfigDir::new();
+        let mut st = State::default();
+        let mut z = restore_test_acct("z@x.com");
+        z.needs_relogin = true;
+        st.accounts.push(z);
+        st.accounts.push(restore_test_acct("fine@x.com"));
+        let mut c = codex_state_acct("c@x.com");
+        c.needs_relogin = true;
+        st.upsert_provider_account("codex", c);
+        st.upsert_provider_account("codex", codex_state_acct("ok@x.com"));
+        st.save().unwrap();
+        assert_eq!(accounts_needing_relogin(), ["c@x.com", "z@x.com"]);
+
+        let _g2 = crate::store::ScopedConfigDir::new();
+        assert!(accounts_needing_relogin().is_empty());
+    }
+
+    // --- poll wake-up -------------------------------------------------------
+
+    #[test]
+    fn poll_request_cuts_the_sleep_short_and_is_consumed_once() {
+        use std::time::Instant;
+        let _l = POLL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = wait_for_poll_request(Duration::ZERO); // drain stray requests
+
+        // Nothing asked: it really waits out the timeout and says so.
+        let t0 = Instant::now();
+        assert!(!wait_for_poll_request(Duration::from_millis(300)));
+        assert!(t0.elapsed() >= Duration::from_millis(250), "returned early");
+
+        // A request wakes it immediately, once.
+        request_poll_now();
+        let t0 = Instant::now();
+        assert!(wait_for_poll_request(Duration::from_secs(10)));
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "request didn't wake the wait"
+        );
+        assert!(
+            !wait_for_poll_request(Duration::ZERO),
+            "request is consumed"
+        );
+
+        // The bounded sleep: nothing to sleep → false; a pending request ends
+        // it at once with true; an uneventful sleep reports false.
+        assert!(!sleep_bounded_detecting_suspend(0));
+        request_poll_now();
+        let t0 = Instant::now();
+        assert!(sleep_bounded_detecting_suspend(30));
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        assert!(!sleep_bounded_detecting_suspend(1));
+    }
+
+    // --- launchd / relaunch --------------------------------------------------
+
+    #[test]
+    fn launchd_managed_follows_the_xpc_service_name_env() {
+        use crate::env_lock::scoped_env_var;
+        scoped_env_var("XPC_SERVICE_NAME", Some(crate::AUTOSTART_LABEL), || {
+            assert!(is_launchd_managed());
+        });
+        scoped_env_var("XPC_SERVICE_NAME", Some("com.apple.Terminal"), || {
+            assert!(!is_launchd_managed());
+        });
+        scoped_env_var("XPC_SERVICE_NAME", None, || {
+            assert!(!is_launchd_managed());
+        });
+    }
+
+    #[test]
+    fn relaunch_and_self_restart_do_nothing_when_not_launchd_managed() {
+        let _g = crate::store::ScopedConfigDir::new(); // logging needs a config dir
+        crate::env_lock::scoped_env_var("XPC_SERVICE_NAME", None, || {
+            assert!(matches!(relaunch_via_launchd(), LaunchdRestart::NotManaged));
+            assert!(
+                !watchdog_self_restart(),
+                "no restart issued outside launchd"
+            );
+        });
+    }
+
+    #[test]
+    fn upgrade_check_leaves_an_unchanged_binary_alone() {
+        // The binary on disk is the one we started from → no relaunch. (A
+        // wrongly-taken relaunch path logs first, which panics here without a
+        // scoped config dir — deliberately not set up.)
+        let start = std::fs::canonicalize(crate::stable_exe_path()).expect("test exe path");
+        maybe_relaunch_after_upgrade(&start);
+    }
+
+    // --- click routing (state-observable arms) -------------------------------
+
+    #[test]
+    fn clicks_route_settings_actions_to_state() {
+        let _g = crate::store::ScopedConfigDir::new();
+        State::default().save().unwrap();
+        let load = || State::load().unwrap();
+
+        handle_click("autoswap:off");
+        assert!(load().autoswap_disabled);
+        handle_click("autoswap:90");
+        let st = load();
+        assert_eq!(st.trigger_pct, Some(90.0));
+        assert!(
+            !st.autoswap_disabled,
+            "picking a threshold re-enables auto-swap"
+        );
+        handle_click("autoswap:not-a-number");
+        assert_eq!(
+            load().trigger_pct,
+            Some(90.0),
+            "garbage threshold is ignored"
+        );
+
+        handle_click("trayicon:codex");
+        assert_eq!(load().tray_icon_mode.as_deref(), Some("codex"));
+        handle_click("trayicon:at-risk");
+        assert_eq!(load().tray_icon_mode, None);
+
+        let before = load().notification_config;
+        handle_click("notifications:threshold");
+        assert_eq!(
+            load().notification_config.threshold_enabled,
+            !before.threshold_enabled
+        );
+        handle_click("notifications:resetback");
+        assert_eq!(
+            load().notification_config.reset_back_enabled,
+            !before.reset_back_enabled
+        );
+        handle_click("notifications:pace");
+        assert_eq!(
+            load().notification_config.pace_enabled,
+            !before.pace_enabled
+        );
+        handle_click("notifications:bogus");
+        handle_click("noop");
+        handle_click("something-new:x:y");
+        let after = load().notification_config;
+        assert_eq!(after.threshold_enabled, !before.threshold_enabled);
+        assert_eq!(after.reset_back_enabled, !before.reset_back_enabled);
+        assert_eq!(after.pace_enabled, !before.pace_enabled);
+    }
+
+    #[test]
+    fn settings_handlers_write_exactly_their_field() {
+        let _g = crate::store::ScopedConfigDir::new();
+        State::default().save().unwrap();
+
+        set_autoswap(false);
+        assert!(State::load().unwrap().autoswap_disabled);
+        set_autoswap(true);
+        assert!(!State::load().unwrap().autoswap_disabled);
+
+        set_autoswap_threshold(77.0);
+        assert_eq!(State::load().unwrap().trigger_pct, Some(77.0));
+
+        set_tray_icon_mode("claude");
+        assert_eq!(
+            State::load().unwrap().tray_icon_mode.as_deref(),
+            Some("claude")
+        );
+        set_tray_icon_mode("at-risk");
+        assert_eq!(State::load().unwrap().tray_icon_mode, None);
+
+        // Each trigger flips only its own switch, and an unknown one flips none.
+        for trigger in ["threshold", "resetback", "pace"] {
+            let before = State::load().unwrap().notification_config;
+            toggle_notification_trigger(trigger);
+            let after = State::load().unwrap().notification_config;
+            let flipped = [
+                before.threshold_enabled != after.threshold_enabled,
+                before.reset_back_enabled != after.reset_back_enabled,
+                before.pace_enabled != after.pace_enabled,
+            ];
+            let expect = match trigger {
+                "threshold" => [true, false, false],
+                "resetback" => [false, true, false],
+                _ => [false, false, true],
+            };
+            assert_eq!(flipped, expect, "{trigger}");
+        }
+        let before = State::load().unwrap().notification_config;
+        toggle_notification_trigger("nonsense");
+        assert_eq!(State::load().unwrap().notification_config, before);
+    }
+
+    #[test]
+    fn capture_and_switch_clicks_reach_the_codex_handlers() {
+        let _l = POLL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::store::ScopedConfigDir::new();
+        let dir = tempfile::tempdir().unwrap();
+        crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+            let blob_a = codex_auth_json("a@example.com");
+            let blob_b = codex_auth_json("b@example.com");
+            for blob in [&blob_a, &blob_b] {
+                std::fs::write(dir.path().join("auth.json"), blob).unwrap();
+                handle_click("capture:codex");
+            }
+            let st = State::load().unwrap();
+            assert!(st.find_provider_account("codex", "a@example.com").is_some());
+            assert!(st.find_provider_account("codex", "b@example.com").is_some());
+            assert_eq!(
+                st.provider_accounts("codex").unwrap().active.as_deref(),
+                Some("b@example.com"),
+                "a fresh capture becomes the active account"
+            );
+
+            handle_click("switch:codex:a@example.com");
+            let st = State::load().unwrap();
+            assert_eq!(
+                st.provider_accounts("codex").unwrap().active.as_deref(),
+                Some("a@example.com")
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("auth.json")).unwrap(),
+                blob_a
+            );
+        });
+        let _ = wait_for_poll_request(Duration::ZERO); // the switch asked for a poll
+    }
+
+    #[test]
+    fn restore_without_drops_applies_the_chosen_backup() {
+        use crate::store::{ScopedConfigDir, State};
+        let _g = ScopedConfigDir::new();
+        let src = tempfile::tempdir().unwrap();
+        let file = src.path().join("backup.json");
+        let mut backup = State::default();
+        backup.accounts.push(restore_test_acct("restored@e.com"));
+        std::fs::write(&file, serde_json::to_vec(&backup).unwrap()).unwrap();
+
+        let dialog = crate::platform::MockFileDialog::default();
+        *dialog.pick_file_returns.borrow_mut() = Some(file);
+        handle_backup_restore_dialog_with(&dialog);
+
+        let keys: Vec<String> = State::load()
+            .unwrap()
+            .accounts
+            .iter()
+            .map(|a| a.key().to_string())
+            .collect();
+        assert_eq!(
+            keys,
+            ["restored@e.com"],
+            "no accounts dropped → no prompt, restore applied"
+        );
+    }
+
+    #[test]
+    fn run_cycle_reports_the_trigger_it_dispatched_on() {
+        let _g = crate::store::ScopedConfigDir::new();
+        let codex = tempfile::tempdir().unwrap();
+        crate::env_lock::scoped_env_var("CODEX_HOME", Some(codex.path().to_str().unwrap()), || {
+            let mut guards = SwapGuards::default();
+            let mut trigger = |st: &State, opts: &LoopOpts| {
+                st.save().unwrap();
+                run_cycle(&mut guards, false, opts).1
+            };
+            let mut st = State::default();
+            assert_eq!(trigger(&st, &LoopOpts::default()), 95.0, "default trigger");
+
+            st.trigger_pct = Some(80.0);
+            assert_eq!(trigger(&st, &LoopOpts::default()), 80.0, "Settings trigger");
+            let watch = LoopOpts {
+                trigger: Some(70.0),
+                ..LoopOpts::default()
+            };
+            assert_eq!(trigger(&st, &watch), 70.0, "`watch --trigger` wins");
+
+            // Auto-swap off -> an unreachable trigger, so the cycle only observes.
+            st.autoswap_disabled = true;
+            assert_eq!(trigger(&st, &LoopOpts::default()), 101.0);
+        });
+    }
+
+    #[test]
+    fn refresh_now_marks_a_refresh_in_flight_and_always_clears_it() {
+        use std::sync::atomic::Ordering;
+        let _l = REFRESH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::store::ScopedConfigDir::new();
+        REFRESH_IN_FLIGHT.store(false, Ordering::SeqCst);
+
+        // Hold the poller's swap guard so the refresh thread parks on it and
+        // the in-flight window is deterministic. The thread has no config-dir
+        // override, so its `run_cycle` then panics -- exactly the case the
+        // drop guard exists for: the flag must still clear.
+        let starts: [(&str, fn()); 2] = [
+            ("direct call", handle_refresh_now),
+            ("menu click", || handle_click("refresh:now")),
+        ];
+        for (how, start) in starts {
+            let shared = shared_swap_guard();
+            let held = shared.lock().unwrap_or_else(|e| e.into_inner());
+            start();
+            assert!(
+                REFRESH_IN_FLIGHT.load(Ordering::SeqCst),
+                "a started refresh must be marked in flight ({how})"
+            );
+            drop(held);
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while REFRESH_IN_FLIGHT.load(Ordering::SeqCst) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the in-flight flag was never cleared ({how})"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
 }

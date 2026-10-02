@@ -1400,4 +1400,90 @@ mod tests {
         );
         assert_eq!(claims.get("exp").and_then(|x| x.as_i64()), Some(1234567890));
     }
+
+    #[test]
+    fn parse_usage_reset_offset_is_clamped_to_400_days() {
+        let reset_after = |secs: i64| {
+            let body = serde_json::json!({
+                "rate_limit": { "primary_window": { "used_percent": 1.0, "reset_after_seconds": secs } }
+            });
+            let w = parse_usage_windows(&body);
+            (w[0].resets_at.unwrap() - Utc::now()).num_seconds()
+        };
+        let day = 60 * 60 * 24;
+        // An ordinary 30d offset passes through untouched.
+        assert!((reset_after(30 * day) - 30 * day).abs() < 60);
+        // A hostile offset is capped at exactly 400d, not rejected or wrapped.
+        assert!((reset_after(i64::MAX / 4) - 400 * day).abs() < 60);
+        // A negative offset clamps to "now".
+        assert!(reset_after(-5000).abs() < 60);
+    }
+
+    #[test]
+    fn capture_current_login_missing_auth_json_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+            assert!(CodexProvider.capture_current_login().unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn capture_current_login_unreadable_auth_json_is_io_error() {
+        // A directory squatting on the auth.json path: the read fails with
+        // something other than NotFound, which must surface rather than
+        // masquerade as "not logged in".
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("auth.json")).unwrap();
+        crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+            assert!(matches!(
+                CodexProvider.capture_current_login(),
+                Err(ProviderError::Io(_))
+            ));
+        });
+    }
+
+    #[test]
+    fn credential_freshness_reports_expires_in_within_skew_and_fresh_beyond() {
+        let soon = make_blob("u@e.com", Utc::now().timestamp() + 60);
+        match CodexProvider.credential_freshness(&soon) {
+            CredentialFreshness::ExpiresIn(d) => assert!(d.as_secs() > 0 && d.as_secs() <= 60),
+            other => panic!("expected ExpiresIn, got {other:?}"),
+        }
+        let later = make_blob("u@e.com", Utc::now().timestamp() + 3600);
+        assert_eq!(
+            CodexProvider.credential_freshness(&later),
+            CredentialFreshness::Fresh
+        );
+    }
+
+    /// Windows-only rename-retry path: a rename that can never succeed (the
+    /// target is a non-empty directory) must be retried with backoff before
+    /// the error surfaces, and must not leave the tmp file behind.
+    #[cfg(not(unix))]
+    #[test]
+    fn write_auth_json_atomically_writes_and_retries_failed_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok_path = dir.path().join("auth.json");
+        write_auth_json_atomically(&ok_path, "{\"a\":1}").unwrap();
+        assert_eq!(std::fs::read_to_string(&ok_path).unwrap(), "{\"a\":1}");
+
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir_all(blocked.join("child")).unwrap();
+        let started = std::time::Instant::now();
+        assert!(write_auth_json_atomically(&blocked, "x").is_err());
+        assert!(
+            started.elapsed() >= WINDOWS_RENAME_RETRY_DELAY * (WINDOWS_RENAME_RETRIES - 1),
+            "rename failure was not retried"
+        );
+        let leftovers = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".auth.json.tmp")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+    }
 }

@@ -550,4 +550,46 @@ mod tests {
             }
         );
     }
+
+    // ---- is_stale_after_reset: every condition must hold ----
+
+    #[test]
+    fn stale_after_reset_requires_all_conditions() {
+        let now = t(10_000);
+        let past = Some(t(9_000));
+        let before_reset = Some(t(8_000));
+        // All true: locked pct, reset passed, fetched before reset.
+        assert_eq!(
+            is_stale_after_reset(Some(100.0), past, before_reset, now),
+            past
+        );
+        // pct below threshold -> not stale even though reset passed and fetch predates it.
+        assert_eq!(
+            is_stale_after_reset(Some(50.0), past, before_reset, now),
+            None
+        );
+        // Reset still in the future -> still locked, not stale.
+        let future = Some(t(20_000));
+        assert_eq!(
+            is_stale_after_reset(Some(100.0), future, before_reset, now),
+            None
+        );
+        // Low pct AND future reset, fetch predates reset -> not stale.
+        assert_eq!(
+            is_stale_after_reset(Some(50.0), future, before_reset, now),
+            None
+        );
+        // Fetched after the reset -> reading is fresh, not stale.
+        assert_eq!(
+            is_stale_after_reset(Some(100.0), past, Some(t(9_500)), now),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_after_reset_fetch_exactly_at_reset_is_fresh() {
+        let now = t(10_000);
+        let reset = Some(t(9_000));
+        assert_eq!(is_stale_after_reset(Some(100.0), reset, reset, now), None);
+    }
 }

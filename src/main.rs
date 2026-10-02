@@ -624,8 +624,9 @@ fn cmd_switch(selector: Option<&str>, launch: Option<Launch>) -> Result<()> {
     // (state v2's `State::providers`) — this is the CLI half of routing a
     // switch by provider slug instead of assuming Claude, matching
     // `menubar.rs::handle_switch`.
-    // An explicit pick holds: auto-swap won't move off it until it's
-    // exhausted (see `State::manual_holds`).
+    // An explicit pick of an account already at/over the trigger holds:
+    // auto-swap won't move off it until it's exhausted (see
+    // `State::manual_holds`). A pick under the trigger auto-swaps as usual.
     if let Some(sel) = selector {
         let claude = (!state.accounts.is_empty()).then(|| state.resolve(sel));
         if let Some(Ok(email)) = &claude {
@@ -760,6 +761,7 @@ pub(crate) fn switch_to_provider_account(slug: &str, key: &str, hold: bool) -> R
             .provider_accounts_mut(slug)
             .active
             .replace(acct.key.clone());
+        let hold = hold && pick_holds(&state, slug, &acct.key);
         state.set_manual_hold(slug, hold.then_some(acct.key.as_str()));
         // The vendor credential file is already switched at this point; if
         // recording it in state.json fails, say so explicitly rather than
@@ -818,6 +820,18 @@ fn provider_rows(state: &State, slug: &str) -> Vec<Row> {
             })
             .unwrap_or_default()
     }
+}
+
+/// Whether a manual pick of `key` should hold. Only a pick of an account
+/// already at/over the trigger does: the user is acking it's over and owns
+/// the choice until it's exhausted. Under the trigger it's a plain switch
+/// that auto-swaps off at the trigger like any other.
+fn pick_holds(state: &State, slug: &str, key: &str) -> bool {
+    let trigger = state.trigger_pct.unwrap_or(TRIGGER_PCT);
+    provider_rows(state, slug)
+        .iter()
+        .find(|r| r.email.eq_ignore_ascii_case(key))
+        .is_some_and(|r| r.has_data() && r.max_pct() >= trigger)
 }
 
 /// The key of `slug`'s active account, if any.
@@ -1161,6 +1175,7 @@ fn switch_to_guarded(
             }
         }
         st.active = Some(email.to_string());
+        let hold = hold && pick_holds(&st, CLAUDE_SLUG, email);
         st.set_manual_hold(CLAUDE_SLUG, hold.then_some(email));
         // The login is already committed to the keychain + ~/.claude.json at this
         // point; if only the state.json bookkeeping write fails, say so clearly.
