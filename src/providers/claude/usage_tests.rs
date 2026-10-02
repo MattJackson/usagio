@@ -143,3 +143,56 @@ fn plan_label_maps_org_type_and_tier() {
     assert_eq!(plan_label(Some("something_new"), None), None);
     assert_eq!(plan_label(None, None), None);
 }
+
+#[test]
+fn plan_label_maps_every_org_type_and_tier() {
+    assert_eq!(
+        plan_label(Some("claude_team"), None).as_deref(),
+        Some("Team")
+    );
+    assert_eq!(
+        plan_label(Some("claude_enterprise"), None).as_deref(),
+        Some("Enterprise")
+    );
+    // A Max org with no / unrecognised tier is plain "Max", not a multiplier.
+    assert_eq!(plan_label(Some("claude_max"), None).as_deref(), Some("Max"));
+    assert_eq!(
+        plan_label(Some("claude_max"), Some("default_claude_max")).as_deref(),
+        Some("Max")
+    );
+}
+
+#[test]
+fn plan_status_from_profile_reports_label_and_activity() {
+    let s = plan_status_from_profile(&sample_profile()).unwrap();
+    assert!(s.active);
+    assert_eq!(s.label.as_deref(), Some("Max 20x"));
+
+    let lapsed = serde_json::json!({
+        "organization": { "organization_type": "claude_free", "subscription_status": "canceled" }
+    });
+    let s = plan_status_from_profile(&lapsed).unwrap();
+    assert!(!s.active);
+    assert_eq!(s.label.as_deref(), Some("Free"));
+
+    // No organization at all: unknown, not "lapsed".
+    assert!(plan_status_from_profile(&serde_json::json!({})).is_none());
+}
+
+#[test]
+fn fetch_error_display_texts() {
+    assert_eq!(
+        FetchError::RateLimited.to_string(),
+        "rate limited (HTTP 429)"
+    );
+    assert_eq!(
+        FetchError::Auth.to_string(),
+        "unauthorized (token expired or revoked)"
+    );
+    assert_eq!(FetchError::Forbidden.to_string(), "forbidden (HTTP 403)");
+    assert_eq!(
+        FetchError::Transient("x".into()).to_string(),
+        "transient error: x"
+    );
+    assert_eq!(FetchError::Other("y".into()).to_string(), "y");
+}

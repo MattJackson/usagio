@@ -71,4 +71,15 @@ mod approx_tests {
         let n = count_tokens(t, TokenizerHint::Anthropic);
         assert!((8..=16).contains(&n), "got {}", n);
     }
+
+    // Default build has no tiktoken: the OpenAi hint must fall back to the
+    // chars-based approximation rather than a fixed or empty count.
+    #[cfg(not(feature = "tiktoken"))]
+    #[test]
+    fn openai_hint_falls_back_to_approx() {
+        let t = "a".repeat(1000);
+        assert_eq!(count_tokens(&t, TokenizerHint::OpenAi), 275);
+        assert_eq!(count_tokens("a", TokenizerHint::OpenAi), 1);
+        assert_eq!(count_tokens("aaaa", TokenizerHint::OpenAi), 2);
+    }
 }

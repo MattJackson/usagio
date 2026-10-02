@@ -1061,3 +1061,284 @@ fn from_value_keeps_distinct_accounts_untouched() {
     assert!(s.find("a@example.com").is_some());
     assert!(s.find("b@example.com").is_some());
 }
+
+// --- mutation-gap tests: load/from_value edges, dump/stash uniquifying, ----
+// --- backup listing/pruning filters, fsync, provider drops -----------------
+
+/// Make `state.json` an unreadable *directory* so `fs::read` fails with a
+/// non-NotFound error on every platform.
+fn make_state_json_unreadable() {
+    let dir = config_dir().unwrap();
+    std::fs::create_dir_all(dir.join("state.json")).unwrap();
+}
+
+#[test]
+fn load_errors_on_unreadable_state_json_instead_of_defaulting() {
+    let _g = ScopedConfigDir::new();
+    make_state_json_unreadable();
+    // Only NotFound means "no accounts yet"; any other I/O error must surface
+    // rather than silently presenting an empty account list.
+    assert!(State::load().is_err());
+}
+
+#[test]
+fn accounts_dropped_by_errors_on_unreadable_state_json() {
+    let _g = ScopedConfigDir::new();
+    make_state_json_unreadable();
+    assert!(accounts_dropped_by(&State::default()).is_err());
+}
+
+#[test]
+fn first_save_does_not_log_a_read_failure_but_unreadable_state_does() {
+    let _g = ScopedConfigDir::new();
+    let log_path = config_dir().unwrap().join("usagio.log");
+    // Missing state.json is the normal first-run case: no warning.
+    make_state_with(&["a@e.com"]).save().unwrap();
+    let first = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        !first.contains("could not read existing state.json"),
+        "NotFound must not be logged as a read failure: {first}"
+    );
+
+    // A real read failure must be loud.
+    let _g2 = ScopedConfigDir::new();
+    make_state_json_unreadable();
+    let _ = make_state_with(&["a@e.com"]).save();
+    let log_path = config_dir().unwrap().join("usagio.log");
+    let logged = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        logged.contains("could not read existing state.json"),
+        "unreadable state.json must be logged: {logged}"
+    );
+}
+
+#[test]
+fn from_value_treats_null_oauth_account_as_absent_and_keeps_object() {
+    let v = serde_json::json!({
+        "accounts": [
+            {
+                "email": "n@e.com",
+                "access_token": "a", "refresh_token": "r",
+                "oauth_account": null,
+            },
+            {
+                "email": "o@e.com",
+                "access_token": "a", "refresh_token": "r",
+                "oauth_account": { "emailAddress": "o@e.com" },
+            },
+        ],
+    });
+    let s = State::from_value(&v);
+    assert!(s.find("n@e.com").unwrap().oauth_account.is_none());
+    assert!(s.find("o@e.com").unwrap().oauth_account.is_some());
+}
+
+#[test]
+fn from_value_dedup_on_equal_expiry_keeps_the_first_entry() {
+    let _g = ScopedConfigDir::new();
+    let v = serde_json::json!({
+        "accounts": [
+            { "email": "d@e.com", "access_token": "first", "refresh_token": "r", "expires_at": 7i64 },
+            { "email": "d@e.com", "access_token": "second", "refresh_token": "r", "expires_at": 7i64 },
+        ],
+    });
+    let s = State::from_value(&v);
+    assert_eq!(s.accounts.len(), 1);
+    // A tie is not "newer": the entry already kept stays.
+    assert_eq!(s.find("d@e.com").unwrap().access_token, "first");
+}
+
+/// Names of files in `dir`, sorted.
+fn file_names(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn rejected_dumps_in_the_same_second_get_unique_names_and_never_overwrite() {
+    let g = ScopedConfigDir::new();
+    make_state_with(&["a@e.com", "b@e.com"]).save().unwrap();
+    let backups = g.home().join(".config/usagio/backups");
+    std::fs::create_dir_all(&backups).unwrap();
+    // Pre-occupy the base and `-1` names for the next few seconds so the new
+    // dump must walk the counter to `-2` whatever second the save lands in.
+    let now = chrono::Utc::now().timestamp();
+    for t in now - 1..=now + 3 {
+        std::fs::write(backups.join(format!("state-rejected-{t}.json")), "seed").unwrap();
+        std::fs::write(backups.join(format!("state-rejected-{t}-1.json")), "seed").unwrap();
+    }
+    let before = file_names(&backups);
+
+    let mut bad = State::default();
+    bad.accounts.push(acct("a@e.com"));
+    bad.save().unwrap_err();
+
+    let after = file_names(&backups);
+    let new: Vec<&String> = after
+        .iter()
+        .filter(|n| n.starts_with("state-rejected-") && !before.contains(n))
+        .collect();
+    assert_eq!(new.len(), 1, "exactly one new dump: {new:?}");
+    assert!(
+        new[0].ends_with("-2.json"),
+        "counter advances by one: {new:?}"
+    );
+    for t in now - 1..=now + 3 {
+        assert_eq!(
+            std::fs::read_to_string(backups.join(format!("state-rejected-{t}-1.json"))).unwrap(),
+            "seed",
+            "an earlier dump was overwritten"
+        );
+    }
+}
+
+#[test]
+fn stash_pre_restore_in_the_same_second_gets_unique_names_and_never_overwrites() {
+    let g = ScopedConfigDir::new();
+    make_state_with(&["a@e.com"]).save().unwrap();
+    let backups = g.home().join(".config/usagio/backups");
+    std::fs::create_dir_all(&backups).unwrap();
+    let now = chrono::Utc::now().timestamp();
+    for t in now - 1..=now + 3 {
+        std::fs::write(backups.join(format!("pre-restore-{t}.json")), "seed").unwrap();
+        std::fs::write(backups.join(format!("pre-restore-{t}-1.json")), "seed").unwrap();
+    }
+    let stash = stash_pre_restore(&config_dir().unwrap()).unwrap().unwrap();
+    let name = stash.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.ends_with("-2.json"), "counter advances by one: {name}");
+    assert!(std::fs::read_to_string(&stash).unwrap().contains("a@e.com"));
+    for t in now - 1..=now + 3 {
+        assert_eq!(
+            std::fs::read_to_string(backups.join(format!("pre-restore-{t}-1.json"))).unwrap(),
+            "seed"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn fsync_dir_reports_failure_for_a_missing_dir_and_succeeds_for_a_real_one() {
+    let g = ScopedConfigDir::new();
+    assert!(fsync_dir(&g.home()).is_ok());
+    assert!(fsync_dir(&g.home().join("does-not-exist")).is_err());
+}
+
+#[test]
+fn accounts_dropped_by_reports_dropped_provider_accounts_as_slug_key() {
+    let _g = ScopedConfigDir::new();
+    let mut st = State::default();
+    st.upsert_provider_account("codex", provider_account("keep@e.com"));
+    st.upsert_provider_account("codex", provider_account("gone@e.com"));
+    st.save().unwrap();
+
+    let mut target = State::default();
+    target.upsert_provider_account("codex", provider_account("keep@e.com"));
+    assert_eq!(
+        accounts_dropped_by(&target).unwrap(),
+        vec!["codex:gone@e.com".to_string()]
+    );
+    // Nothing dropped when the provider account set is unchanged.
+    assert!(accounts_dropped_by(&st).unwrap().is_empty());
+}
+
+/// Create `name` in `dir` with mtime `secs` after the epoch-ish base.
+fn touch_at(dir: &Path, name: &str, secs: u64) {
+    let p = dir.join(name);
+    std::fs::write(&p, name).unwrap();
+    let ts =
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + secs);
+    std::fs::File::options()
+        .write(true)
+        .open(&p)
+        .unwrap()
+        .set_modified(ts)
+        .unwrap();
+}
+
+#[test]
+fn prune_backups_only_touches_state_json_files() {
+    let g = ScopedConfigDir::new();
+    let d = g.home();
+    touch_at(&d, "state-a.json", 1);
+    touch_at(&d, "other.json", 2);
+    touch_at(&d, "state-b.txt", 3);
+    touch_at(&d, "state-rejected-1.json", 4);
+    prune_backups(&d, 0).unwrap();
+    // Only the rolling backup goes; look-alikes and rejected dumps stay.
+    assert_eq!(
+        file_names(&d),
+        vec!["other.json", "state-b.txt", "state-rejected-1.json"]
+    );
+}
+
+#[test]
+fn prune_rejected_dumps_evicts_oldest_beyond_cap_and_only_rejected_json() {
+    let g = ScopedConfigDir::new();
+    let d = g.home();
+    touch_at(&d, "state-rejected-1.json", 1);
+    touch_at(&d, "state-rejected-2.json", 2);
+    touch_at(&d, "state-rejected-3.json", 3);
+    touch_at(&d, "state-20200101-000000.json", 0);
+    touch_at(&d, "other.json", 0);
+    touch_at(&d, "state-rejected-4.txt", 0);
+
+    // At the cap exactly: nothing is evicted.
+    prune_rejected_dumps(&d, 3).unwrap();
+    assert!(d.join("state-rejected-1.json").exists());
+
+    // Over the cap: oldest evicted, exactly `keep` remain, others untouched.
+    prune_rejected_dumps(&d, 2).unwrap();
+    assert_eq!(
+        file_names(&d),
+        vec![
+            "other.json",
+            "state-20200101-000000.json",
+            "state-rejected-2.json",
+            "state-rejected-3.json",
+            "state-rejected-4.txt",
+        ]
+    );
+}
+
+#[test]
+fn list_backups_returns_rolling_backups_newest_first_excluding_lookalikes() {
+    let g = ScopedConfigDir::new();
+    // No backups dir yet: empty, not an error.
+    assert!(list_backups().unwrap().is_empty());
+
+    let d = g.home().join(".config/usagio/backups");
+    std::fs::create_dir_all(&d).unwrap();
+    touch_at(&d, "state-old.json", 1);
+    touch_at(&d, "state-new.json", 5);
+    touch_at(&d, "state-rejected-9.json", 9);
+    touch_at(&d, "other.json", 9);
+    touch_at(&d, "state-x.txt", 9);
+    let names: Vec<String> = list_backups()
+        .unwrap()
+        .iter()
+        .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["state-new.json", "state-old.json"]);
+}
+
+#[test]
+fn state_json_path_is_state_json_under_the_config_dir() {
+    let _g = ScopedConfigDir::new();
+    assert_eq!(
+        state_json_path().unwrap(),
+        config_dir().unwrap().join("state.json")
+    );
+}
+
+#[test]
+fn write_private_writes_and_truncates_the_file() {
+    let g = ScopedConfigDir::new();
+    let p = g.home().join("secret.bin");
+    write_private(&p, b"first-longer").unwrap();
+    write_private(&p, b"second").unwrap();
+    assert_eq!(std::fs::read(&p).unwrap(), b"second");
+}

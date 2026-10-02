@@ -366,4 +366,114 @@ mod tests {
         // And it still resolves to real data.
         assert_eq!(fs::read(new.join("state.json")).unwrap(), b"{}");
     }
+
+    // --- migrate_between: parent creation + rename failure classification ---
+
+    #[test]
+    fn migrate_creates_missing_parent_of_new() {
+        let t = tmp();
+        let old = t.path().join("claude-usage");
+        let new = t.path().join("nested").join("deeper").join("usagio");
+        write(&old.join("state.json"), b"{}", 0o600);
+
+        let r = migrate_between(&old, &new).unwrap();
+        assert!(matches!(r, MigrationResult::Migrated { .. }));
+        assert_eq!(fs::read(new.join("state.json")).unwrap(), b"{}");
+    }
+
+    /// A rename that fails for a reason other than EXDEV must surface as
+    /// `RenameFailed` (no copy fallback attempted, old tree untouched).
+    #[test]
+    fn migrate_non_exdev_rename_failure_is_rename_failed() {
+        let t = tmp();
+        let old = t.path().join("claude-usage");
+        write(&old.join("state.json"), b"{}", 0o600);
+        // `new`'s parent is a regular file, so the rename can't succeed.
+        let blocker = t.path().join("blocker");
+        fs::write(&blocker, b"not a dir").unwrap();
+        let new = blocker.join("usagio");
+
+        let r = migrate_between(&old, &new);
+        assert!(matches!(r, Err(MigrationError::RenameFailed(_))), "{r:?}");
+        assert_eq!(fs::read(old.join("state.json")).unwrap(), b"{}");
+    }
+
+    /// Real EXDEV: rename across filesystems must fall back to copy + delete.
+    /// Only runs when a second filesystem is reachable (skips otherwise).
+    #[cfg(unix)]
+    #[test]
+    fn migrate_cross_device_falls_back_to_copy_and_delete() {
+        use std::os::unix::fs::MetadataExt;
+        let shm = Path::new("/dev/shm");
+        let t = tmp();
+        if !shm.is_dir()
+            || fs::metadata(shm).map(|m| m.dev()).ok()
+                == fs::metadata(t.path()).map(|m| m.dev()).ok()
+        {
+            return;
+        }
+        let Ok(other) = tempfile::tempdir_in(shm) else {
+            return;
+        };
+        let old = t.path().join("claude-usage");
+        let new = other.path().join("usagio");
+        write(&old.join("state.json"), b"{\"v\":2}", 0o600);
+        write(&old.join("logs").join("a.log"), b"a", 0o644);
+
+        let r = migrate_between(&old, &new).unwrap();
+        assert!(matches!(r, MigrationResult::Migrated { .. }), "{r:?}");
+        assert!(!old.exists(), "old removed after copy fallback");
+        assert_eq!(fs::read(new.join("state.json")).unwrap(), b"{\"v\":2}");
+        assert_eq!(fs::read(new.join("logs").join("a.log")).unwrap(), b"a");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn is_cross_device_true_only_for_exdev() {
+        assert!(is_cross_device(&io::Error::from_raw_os_error(18)));
+    }
+
+    #[test]
+    fn is_cross_device_false_for_other_errors() {
+        assert!(!is_cross_device(&io::Error::from_raw_os_error(2)));
+        assert!(!is_cross_device(&io::Error::other("boom")));
+    }
+
+    // --- config_base (XDG-first resolution) ---
+
+    #[test]
+    fn config_base_prefers_non_empty_xdg_config_home() {
+        crate::env_lock::scoped_env_var("XDG_CONFIG_HOME", Some("/some/xdg/dir"), || {
+            assert_eq!(config_base().unwrap(), PathBuf::from("/some/xdg/dir"));
+        });
+    }
+
+    #[test]
+    fn config_base_ignores_empty_xdg_and_falls_back_to_home() {
+        crate::env_lock::scoped_env_var("XDG_CONFIG_HOME", Some(""), || {
+            match std::env::var_os("HOME") {
+                Some(h) => assert_eq!(config_base().unwrap(), PathBuf::from(h).join(".config")),
+                None => assert!(matches!(config_base(), Err(MigrationError::NoConfigBase))),
+            }
+        });
+    }
+
+    // --- copy fallback preserves directory modes ---
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_recursive_preserves_directory_modes() {
+        let t = tmp();
+        let src = t.path().join("src");
+        let dst = t.path().join("dst");
+        write(&src.join("sub").join("f"), b"f", 0o600);
+        fs::set_permissions(src.join("sub"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o750)).unwrap();
+
+        copy_recursive(&src, &dst).unwrap();
+
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dst), 0o750);
+        assert_eq!(mode(&dst.join("sub")), 0o700);
+    }
 }

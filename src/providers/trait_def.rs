@@ -674,4 +674,88 @@ mod tests {
         };
         assert!(p.account_identifier(&id_anon).starts_with("anon-"));
     }
+
+    #[test]
+    fn provider_error_display_texts() {
+        assert_eq!(ProviderError::Unsupported.to_string(), "unsupported");
+        assert_eq!(ProviderError::NotLoggedIn.to_string(), "not logged in");
+        assert_eq!(
+            ProviderError::RateLimited {
+                retry_after_secs: Some(7)
+            }
+            .to_string(),
+            "rate limited (retry after 7s)"
+        );
+        assert_eq!(
+            ProviderError::RateLimited {
+                retry_after_secs: None
+            }
+            .to_string(),
+            "rate limited"
+        );
+        assert_eq!(ProviderError::Auth.to_string(), "auth error");
+        assert_eq!(
+            ProviderError::Transient("boom".into()).to_string(),
+            "transient: boom"
+        );
+        let io = std::io::Error::other("disk");
+        assert_eq!(ProviderError::Io(io).to_string(), "io: disk");
+        assert_eq!(ProviderError::Other("misc".into()).to_string(), "misc");
+    }
+
+    #[test]
+    fn provider_error_source_only_for_io() {
+        use std::error::Error;
+        let io = ProviderError::Io(std::io::Error::other("disk"));
+        assert_eq!(io.source().map(|s| s.to_string()).as_deref(), Some("disk"));
+        assert!(ProviderError::Auth.source().is_none());
+        assert!(ProviderError::Other("x".into()).source().is_none());
+    }
+
+    #[test]
+    fn expired_rank_is_exactly_minus_one() {
+        assert_eq!(CredentialFreshness::Expired.rank(), -1);
+        assert_eq!(CredentialFreshness::Invalid.rank(), -2);
+        assert_eq!(CredentialFreshness::Unknown.rank(), -3);
+        // An about-to-expire (0s) token still outranks an already-expired one.
+        assert!(
+            CredentialFreshness::ExpiresIn(std::time::Duration::ZERO).rank()
+                > CredentialFreshness::Expired.rank()
+        );
+    }
+
+    #[test]
+    fn default_trigger_ladder_and_window_order() {
+        let p = Dummy;
+        assert_eq!(p.trigger_options(), &[90.0, 95.0, 98.0]);
+        assert!(p.window_order().is_empty());
+    }
+
+    #[test]
+    fn account_display_prefers_email_then_name_then_generic() {
+        let p = Dummy;
+        let mut id = IdentitySnapshot {
+            email: Some("Foo@Example.com".into()),
+            uuid: None,
+            display_name: Some("Foo".into()),
+            native_blob: json!({}),
+        };
+        assert_eq!(p.account_display(&id), "Foo@Example.com");
+        id.email = None;
+        assert_eq!(p.account_display(&id), "Foo");
+        id.display_name = None;
+        assert_eq!(p.account_display(&id), "Dummy account");
+    }
+
+    #[test]
+    fn anon_account_identifier_is_stable_truncated_sha256() {
+        // sha256 of the compact JSON `{"a":1}`, first 8 bytes hex.
+        let id = IdentitySnapshot {
+            email: None,
+            uuid: None,
+            display_name: None,
+            native_blob: json!({"a":1}),
+        };
+        assert_eq!(Dummy.account_identifier(&id), "anon-015abd7f5cc57a2d");
+    }
 }

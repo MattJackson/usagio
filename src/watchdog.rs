@@ -539,8 +539,13 @@ mod tests {
             .any(|l| l.contains("event=keychain_watchdog")));
     }
 
+    /// Serialises the tests that read/write the process-global keychain-failure
+    /// counter (`record_keychain_result`, `RealEffects::respawn_watcher`).
+    static KC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn record_keychain_result_counts_consecutive_failures() {
+        let _kc = KC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Use a fresh baseline — other tests may have touched the global.
         record_keychain_result(true);
         assert_eq!(keychain_consecutive_failures(), 0);
@@ -567,5 +572,155 @@ mod tests {
         assert_eq!(fx.respawns, 1, "watcher should not be respawned again");
         assert_eq!(fx.self_restarts, 2, "should keep attempting restart");
         assert!(wd.already_respawned);
+    }
+
+    // --- fd counter ---
+
+    /// The count must track real descriptors: holding N more files open must
+    /// show up as at least N in the reading (not a constant).
+    #[cfg(unix)]
+    #[test]
+    fn count_open_fds_reflects_held_descriptors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"x").unwrap();
+        let held: Vec<std::fs::File> = (0..200)
+            .map(|_| std::fs::File::open(&path).unwrap())
+            .collect();
+        let n = count_open_fds().expect("fd count should be readable on unix");
+        assert!(n >= held.len(), "expected >= {} fds, got {n}", held.len());
+    }
+
+    /// Non-Unix has no fd table to read: the self-monitor stays inert.
+    #[cfg(not(unix))]
+    #[test]
+    fn count_open_fds_is_none_off_unix() {
+        assert_eq!(count_open_fds(), None);
+    }
+
+    // --- throttle ---
+
+    #[test]
+    fn maybe_run_runs_first_call_then_throttles_within_interval() {
+        let mut wd = Watchdog::default();
+        let mut fx = MockEffects::default();
+        assert!(wd.last_check.is_none());
+        wd.maybe_run(&mut fx);
+        let first = wd.last_check.expect("first call must run a check");
+        // An immediate second call is inside the interval: no new check.
+        wd.maybe_run(&mut fx);
+        assert_eq!(wd.last_check, Some(first), "second call must be throttled");
+    }
+
+    #[test]
+    fn maybe_run_runs_again_once_interval_has_elapsed() {
+        let mut wd = Watchdog::default();
+        let mut fx = MockEffects::default();
+        // `Instant` can't always be wound back (young monotonic clock): skip then.
+        let Some(old) = Instant::now().checked_sub(HEALTH_CHECK_INTERVAL * 2) else {
+            return;
+        };
+        wd.last_check = Some(old);
+        wd.maybe_run(&mut fx);
+        assert!(
+            wd.last_check.unwrap() > old,
+            "a due check must run and restamp the throttle clock"
+        );
+    }
+
+    // --- run_check log lines ---
+
+    #[test]
+    fn run_check_self_restart_logs_keychain_line_only_when_keychain_failing() {
+        let mut wd = Watchdog::default();
+        let mut fx = MockEffects::default();
+        wd.run_check(Some(4000), 0, &mut fx); // respawn
+        fx.logs.clear();
+        // fd-only escalation: no keychain line.
+        wd.run_check(Some(4000), 0, &mut fx);
+        assert!(fx.logs.iter().any(|l| l.contains("action=self_restart")));
+        assert!(
+            !fx.logs
+                .iter()
+                .any(|l| l.contains("event=keychain_watchdog")),
+            "keychain line must not fire below the threshold: {:?}",
+            fx.logs
+        );
+        // Keychain at threshold: the keychain line appears.
+        fx.logs.clear();
+        wd.run_check(Some(4000), KEYCHAIN_FAILURE_THRESHOLD, &mut fx);
+        assert!(fx.logs.iter().any(|l| {
+            l.contains("event=keychain_watchdog") && l.contains("action=self_restart")
+        }));
+    }
+
+    #[test]
+    fn run_check_respawn_log_renders_before_and_after_counts() {
+        let mut wd = Watchdog::default();
+        let mut fx = MockEffects::default();
+        wd.run_check(Some(4000), 0, &mut fx);
+        assert!(
+            fx.logs
+                .iter()
+                .any(|l| l.contains("action=watcher_respawn before=4000 after=42")),
+            "{:?}",
+            fx.logs
+        );
+    }
+
+    #[test]
+    fn opt_renders_value_or_question_mark() {
+        assert_eq!(opt(Some(1234)), "1234");
+        assert_eq!(opt(None), "?");
+    }
+
+    // --- RealEffects (isolated: scoped config dir, no watcher installed) ---
+
+    #[test]
+    fn real_effects_log_appends_to_debug_log() {
+        let _cfg = crate::store::ScopedConfigDir::new();
+        RealEffects.log("event=watchdog_test marker-123");
+        let path = crate::store::config_dir().unwrap().join("usagio.log");
+        let contents = std::fs::read_to_string(path).unwrap();
+        assert!(contents.contains("marker-123"), "got: {contents}");
+    }
+
+    #[test]
+    fn real_effects_respawn_reports_fd_counts_and_resets_keychain_counter() {
+        let _cfg = crate::store::ScopedConfigDir::new();
+        let _kc = KC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        record_keychain_result(false);
+        record_keychain_result(false);
+
+        let (before, after) = RealEffects.respawn_watcher();
+
+        #[cfg(unix)]
+        {
+            // stdin/out/err plus the directory handle: comfortably > 1.
+            assert!(before.is_some_and(|n| n > 1), "before: {before:?}");
+            assert!(after.is_some_and(|n| n > 1), "after: {after:?}");
+        }
+        #[cfg(not(unix))]
+        assert_eq!((before, after), (None, None));
+
+        assert_eq!(
+            keychain_consecutive_failures(),
+            0,
+            "respawn must reset the stale failure count"
+        );
+        // No watcher is installed under test, so the miss is logged.
+        let path = crate::store::config_dir().unwrap().join("usagio.log");
+        let contents = std::fs::read_to_string(path).unwrap();
+        assert!(
+            contents.contains("result=no_watcher_installed"),
+            "{contents}"
+        );
+    }
+
+    /// Not launchd-managed under `cargo test`, so no restart is issued.
+    #[test]
+    fn real_effects_self_restart_not_issued_when_unmanaged() {
+        let _cfg = crate::store::ScopedConfigDir::new();
+        assert!(!RealEffects.self_restart());
     }
 }
