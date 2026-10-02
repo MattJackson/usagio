@@ -1545,6 +1545,8 @@ struct Row {
     error: Option<String>,
     /// Unix epoch seconds when the cached usage was fetched (None = no data yet).
     fetched_at: Option<i64>,
+    /// Credits / breakdown / scoped limits the provider reported (never estimates).
+    reported: providers::trait_def::ReportedUsage,
 }
 
 struct Cell {
@@ -1601,6 +1603,7 @@ fn row_from_account(a: &Account) -> Row {
         }),
         error: None,
         fetched_at: c.map(|c| c.fetched_at),
+        reported: c.map(|c| c.reported.clone()).unwrap_or_default(),
     }
 }
 
@@ -1635,6 +1638,7 @@ pub(crate) fn row_from_provider_account(slug: &str, a: &ProviderAccount) -> Row 
         }),
         error: None,
         fetched_at: c.map(|c| c.fetched_at),
+        reported: c.map(|c| c.reported.clone()).unwrap_or_default(),
     }
 }
 
@@ -1656,6 +1660,8 @@ fn cached_from_usage(u: &usage::Usage) -> CachedUsage {
         opus_pct,
         opus_reset,
         fetched_at: Utc::now().timestamp(),
+        // Same provider-agnostic shape every provider's snapshot carries.
+        reported: usage::reported_usage(u),
     }
 }
 
@@ -2912,6 +2918,7 @@ fn cached_from_usage_snapshot(snap: &UsageSnapshot) -> CachedUsage {
         opus_pct: None,
         opus_reset: None,
         fetched_at: snap.fetched_at.timestamp(),
+        reported: snap.reported.clone(),
     };
     for w in &snap.windows {
         let reset = w.resets_at.map(|dt| dt.to_rfc3339());

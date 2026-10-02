@@ -37,6 +37,7 @@ use {
 };
 
 use crate::countdown::{self, AccountUsage, BlockingWindow, DisplayState};
+use crate::providers::trait_def::{Credits, ReportedUsage, UsageShare, UsageWindow};
 use crate::providers::{self, CaptureMode, Provider, SeverityBands};
 use crate::store::State;
 use crate::{
@@ -173,6 +174,9 @@ struct AcctView {
     no_subscription: bool,
     /// Plan label ("Max 20x", "Pro", "Free", …) when known.
     plan: Option<String>,
+    /// Credits / breakdown / scoped limits the provider reported, rendered by
+    /// [`reported_rows`]. Empty when the provider reported nothing.
+    reported: ReportedUsage,
 }
 
 /// One provider's block in the menu. Rendered only if `accounts` is non-empty
@@ -1642,6 +1646,7 @@ fn acctview_from_row(
         error: r.error.clone(),
         no_subscription: r.no_subscription,
         plan: r.plan.clone(),
+        reported: r.reported.clone(),
     }
 }
 
@@ -1897,6 +1902,85 @@ fn window_status_row(w: &WindowView) -> Option<(String, bool)> {
     }
 }
 
+/// "Credits · $3.10 used of $50.00" — `None` unless the provider reported
+/// credits switched on or a non-zero figure. Only ever the provider's own
+/// numbers; nothing here is estimated.
+fn credits_row(c: &Credits) -> Option<String> {
+    if !c.is_meaningful() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    match (&c.used, &c.limit) {
+        (Some(used), Some(limit)) => {
+            parts.push(format!("{} used of {}", used.display(), limit.display()))
+        }
+        (Some(used), None) => parts.push(format!("{} used", used.display())),
+        (None, Some(limit)) => parts.push(format!("limit {}", limit.display())),
+        (None, None) => {}
+    }
+    if let Some(balance) = &c.balance {
+        parts.push(format!("{} left", balance.display()));
+    }
+    if c.unlimited {
+        parts.push("unlimited".to_string());
+    }
+    if c.limit_reached {
+        parts.push("limit reached".to_string());
+    }
+    if parts.is_empty() {
+        parts.push("enabled".to_string());
+    }
+    Some(format!("Credits · {}", parts.join(" · ")))
+}
+
+/// "This week · Claude Code 82% · Chats 18%" — only when at least two
+/// surfaces have a non-zero share (a lone "Claude Code 100%" is noise).
+/// Sorted by share, zeros dropped.
+fn breakdown_row(shares: &[UsageShare]) -> Option<String> {
+    let mut nonzero: Vec<&UsageShare> = shares
+        .iter()
+        .filter(|s| s.percent.is_finite() && s.percent > 0.0)
+        .collect();
+    if nonzero.len() < 2 {
+        return None;
+    }
+    // Stable sort keeps provider order among equal shares.
+    nonzero.sort_by(|a, b| {
+        b.percent
+            .partial_cmp(&a.percent)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let parts: Vec<String> = nonzero
+        .iter()
+        .map(|s| format!("{} {}%", s.label, s.percent.round() as i64))
+        .collect();
+    Some(format!("This week · {}", parts.join(" · ")))
+}
+
+/// "Fable 7d · 42% · resets in 2d 3h" — a per-model/surface limit, only when
+/// it's actually in use (0% or unreported is skipped).
+fn scoped_limit_row(w: &UsageWindow) -> Option<String> {
+    let pct = w.utilization.filter(|p| p.is_finite() && *p > 0.0)?;
+    let mut row = format!("{} · {}%", w.label, pct.round() as i64);
+    if let Some(reset) = w.resets_at {
+        row.push_str(&format!(" · resets in {}", crate::humanize_until(reset)));
+    }
+    Some(row)
+}
+
+/// Every provider-reported row for an account, in render order: scoped
+/// limits, where the week went, then credits. Pure; provider-agnostic.
+fn reported_rows(r: &ReportedUsage) -> Vec<String> {
+    let mut rows: Vec<String> = r
+        .scoped_limits
+        .iter()
+        .filter_map(scoped_limit_row)
+        .collect();
+    rows.extend(breakdown_row(&r.breakdown));
+    rows.extend(r.credits.as_ref().and_then(credits_row));
+    rows
+}
+
 /// Non-clickable informational rows shown inside an account submenu — reset
 /// windows (or the has_data / no-usage-endpoint fallbacks). The account submenu
 /// builder renders each as an `enabled: true` `noop` item so it reads as normal
@@ -1975,6 +2059,9 @@ fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)
                     rows.push((format!("{} · Not reported", stat_display_label(w)), false));
                 }
             }
+            // What the provider itself reported beyond the windows (credits,
+            // where the week went, per-model limits) — never estimates.
+            rows.extend(reported_rows(&a.reported).into_iter().map(|r| (r, false)));
             if !rows.iter().any(|(r, _)| !r.starts_with("Plan · ")) {
                 rows.push(("no data yet".to_string(), false));
             }
@@ -2135,6 +2222,11 @@ fn menu_signature(snap: &Snapshot) -> String {
                     w.pct.map(|v| v.round() as i64).unwrap_or(-1),
                     w.reset,
                 ));
+            }
+            // Provider-reported rows exactly as rendered, so a credits /
+            // breakdown / scoped-limit change redraws an open menu.
+            for row in reported_rows(&a.reported) {
+                s.push_str(&format!("rep={row}|"));
             }
             // Deliberately EXCLUDE `a.updated` from the signature. It's the
             // human "Xs ago" / "Xm ago" string that changes every second for
@@ -3420,6 +3512,7 @@ mod tests {
             error: None,
             no_subscription: false,
             plan: None,
+            reported: ReportedUsage::default(),
         }
     }
 
@@ -3771,8 +3864,10 @@ mod tests {
 
     #[test]
     fn submenu_info_rows_never_include_a_percentage() {
-        // Item 3 of the redesign: percentages move to the main-list row;
-        // submenu rows are reset-window / burn-rate / footer text only.
+        // Item 3 of the redesign: window percentages move to the main-list
+        // row; submenu window rows are reset text only. (Provider-reported
+        // rows — scoped limits, the weekly breakdown — are the exception:
+        // they have no main-list slot. This fixture reports none.)
         let a = acct("a@x.com", Some(97.0), Some(88.0), true);
         let sec = ProviderSection {
             provider_id: CLAUDE_SLUG,
@@ -3874,6 +3969,218 @@ mod tests {
             "no stale window rows: {rows:?}"
         );
         assert!(account_extra_info_rows(&claude_section(), &a).is_empty());
+    }
+
+    // --- provider-reported rows (credits / breakdown / scoped limits) ---
+
+    use crate::providers::trait_def::Money;
+
+    fn usd(minor: i64) -> Option<Money> {
+        Money::new(minor, 2, "USD")
+    }
+
+    fn share(label: &str, percent: f64) -> UsageShare {
+        UsageShare {
+            key: label.to_ascii_lowercase(),
+            label: label.into(),
+            percent,
+        }
+    }
+
+    fn scoped(label: &str, pct: Option<f64>) -> UsageWindow {
+        UsageWindow {
+            id: format!("scoped:{label}"),
+            label: format!("{label} 7d"),
+            utilization: pct,
+            resets_at: None,
+        }
+    }
+
+    fn with_reported(r: ReportedUsage) -> Vec<String> {
+        let mut a = acct("a@x.com", Some(10.0), Some(20.0), true);
+        a.reported = r;
+        submenu_info_rows(&claude_section(), &a)
+    }
+
+    #[test]
+    fn no_reported_rows_when_nothing_reported() {
+        assert!(reported_rows(&ReportedUsage::default()).is_empty());
+        let rows = with_reported(ReportedUsage::default());
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.starts_with("Credits") || r.starts_with("This week")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn credits_row_formats_what_the_provider_reported() {
+        let row = |c: Credits| credits_row(&c);
+        assert_eq!(
+            row(Credits {
+                enabled: true,
+                used: usd(1234),
+                limit: usd(5000),
+                ..Credits::default()
+            })
+            .as_deref(),
+            Some("Credits · $12.34 used of $50.00")
+        );
+        assert_eq!(
+            row(Credits {
+                used: usd(310),
+                ..Credits::default()
+            })
+            .as_deref(),
+            Some("Credits · $3.10 used")
+        );
+        assert_eq!(
+            row(Credits {
+                enabled: true,
+                balance: Money::new(120, 0, Money::CREDITS),
+                ..Credits::default()
+            })
+            .as_deref(),
+            Some("Credits · 120 left")
+        );
+        assert_eq!(
+            row(Credits {
+                enabled: true,
+                limit_reached: true,
+                ..Credits::default()
+            })
+            .as_deref(),
+            Some("Credits · limit reached")
+        );
+        assert_eq!(
+            row(Credits {
+                enabled: true,
+                ..Credits::default()
+            })
+            .as_deref(),
+            Some("Credits · enabled")
+        );
+    }
+
+    #[test]
+    fn credits_row_suppressed_when_off_and_zero() {
+        // Claude's live shape with extra usage off: $0.00 used, not enabled.
+        assert_eq!(
+            credits_row(&Credits {
+                used: usd(0),
+                ..Credits::default()
+            }),
+            None
+        );
+        assert_eq!(credits_row(&Credits::default()), None);
+    }
+
+    #[test]
+    fn breakdown_row_needs_two_non_zero_shares() {
+        let lone = [
+            share("Claude Code", 100.0),
+            share("Chats", 0.0),
+            share("Cowork", 0.0),
+        ];
+        assert_eq!(breakdown_row(&lone), None);
+        assert_eq!(breakdown_row(&[]), None);
+        let split = [
+            share("Chats", 18.0),
+            share("Other", 0.0),
+            share("Claude Code", 82.0),
+        ];
+        assert_eq!(
+            breakdown_row(&split).as_deref(),
+            Some("This week · Claude Code 82% · Chats 18%")
+        );
+    }
+
+    #[test]
+    fn scoped_limit_rows_skip_zero_and_unreported() {
+        assert_eq!(scoped_limit_row(&scoped("Fable", Some(0.0))), None);
+        assert_eq!(scoped_limit_row(&scoped("Fable", None)), None);
+        assert_eq!(
+            scoped_limit_row(&scoped("Fable", Some(42.4))).as_deref(),
+            Some("Fable 7d · 42%")
+        );
+        let mut w = scoped("Fable", Some(42.0));
+        w.resets_at = Some(Utc::now() + chrono::Duration::days(3));
+        let row = scoped_limit_row(&w).unwrap();
+        assert!(row.starts_with("Fable 7d · 42% · resets in "), "{row}");
+    }
+
+    #[test]
+    fn submenu_renders_reported_rows_after_the_windows() {
+        let rows = with_reported(ReportedUsage {
+            credits: Some(Credits {
+                enabled: true,
+                used: usd(310),
+                ..Credits::default()
+            }),
+            breakdown: vec![share("Claude Code", 82.0), share("Chats", 18.0)],
+            scoped_limits: vec![scoped("Fable", Some(42.0)), scoped("Haiku", Some(0.0))],
+        });
+        let tail: Vec<&str> = rows
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                "Fable 7d · 42%",
+                "This week · Claude Code 82% · Chats 18%",
+                "Credits · $3.10 used",
+            ],
+            "{rows:?}"
+        );
+        assert_eq!(rows[0], "Session renews in 3h", "windows lead: {rows:?}");
+    }
+
+    #[test]
+    fn lapsed_account_shows_no_reported_rows() {
+        let mut a = acct("lapsed@x.com", Some(0.0), Some(0.0), false);
+        a.no_subscription = true;
+        a.reported = ReportedUsage {
+            credits: Some(Credits {
+                enabled: true,
+                used: usd(310),
+                ..Credits::default()
+            }),
+            breakdown: vec![share("Claude Code", 50.0), share("Chats", 50.0)],
+            scoped_limits: vec![scoped("Fable", Some(42.0))],
+        };
+        let rows = submenu_info_rows(&claude_section(), &a);
+        assert!(rows[0].contains("No subscription"), "{rows:?}");
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains("Credits") || r.contains("This week") || r.contains("Fable")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn menu_signature_changes_when_reported_rows_change() {
+        let base = one_section_snap(acct("you@work.com", Some(50.0), Some(60.0), true));
+        let sig1 = menu_signature(&base);
+        let mut changed = base;
+        changed.sections[0].accounts[0].reported.credits = Some(Credits {
+            enabled: true,
+            used: usd(310),
+            ..Credits::default()
+        });
+        let sig2 = menu_signature(&changed);
+        assert_ne!(sig1, sig2);
+        changed.sections[0].accounts[0].reported.credits = Some(Credits {
+            enabled: true,
+            used: usd(311),
+            ..Credits::default()
+        });
+        assert_ne!(sig2, menu_signature(&changed));
     }
 
     #[test]
@@ -5346,6 +5653,7 @@ mod tests {
             opus_pct: None,
             opus_reset: None,
             fetched_at: 0,
+            reported: Default::default(),
         }
     }
 
@@ -5534,6 +5842,7 @@ mod tests {
             opus: Some(cell(3.0)),
             error: None,
             fetched_at: None,
+            reported: Default::default(),
         };
         let v = acctview_from_row(
             &row,
