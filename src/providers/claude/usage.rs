@@ -3,6 +3,7 @@
 use serde::Deserialize;
 
 use super::config;
+use crate::providers::trait_def::{Credits, Money, ReportedUsage, UsageShare, UsageWindow};
 
 /// Why a usage fetch failed. Lets callers keep the last-known cache on transient
 /// failures (and back off on rate limits) instead of surfacing a hard error.
@@ -54,6 +55,153 @@ pub struct Usage {
     pub seven_day: Option<Window>,
     /// Weekly Opus-scoped limit, when present.
     pub seven_day_opus: Option<Window>,
+    /// Extra-usage (pay-as-you-go credits) settings and state. Kept as raw
+    /// JSON and read leniently by [`reported_usage`] so a renamed or retyped
+    /// field can never fail the whole usage parse.
+    #[serde(default)]
+    pub extra_usage: Option<serde_json::Value>,
+    /// Money actually spent on extra usage (`{used, limit, balance, …}`).
+    #[serde(default)]
+    pub spend: Option<serde_json::Value>,
+    /// Where this week's usage went (`{rows: [{key, display_name, percent}]}`).
+    #[serde(default)]
+    pub seven_day_breakdown: Option<serde_json::Value>,
+    /// Every limit the account has, including per-model scoped weekly ones.
+    #[serde(default)]
+    pub limits: Option<serde_json::Value>,
+}
+
+/// Parse a money object `{amount_minor, currency, exponent}`; `None` for null
+/// or any other shape.
+fn money(v: Option<&serde_json::Value>) -> Option<Money> {
+    let o = v?.as_object()?;
+    let amount = o.get("amount_minor")?.as_i64()?;
+    let exponent = u32::try_from(o.get("exponent").and_then(|x| x.as_u64()).unwrap_or(0)).ok()?;
+    let unit = o
+        .get("currency")
+        .and_then(|x| x.as_str())
+        .unwrap_or(Money::CREDITS);
+    Money::new(amount, exponent, unit)
+}
+
+fn get<'a>(o: Option<&'a serde_json::Value>, k: &str) -> Option<&'a serde_json::Value> {
+    o.and_then(|o| o.get(k))
+}
+
+fn flag(o: Option<&serde_json::Value>, k: &str) -> bool {
+    o.and_then(|o| o.get(k))
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false)
+}
+
+/// Credits from `spend` (preferred — it carries exact money) and
+/// `extra_usage` (flags, plus `used_credits` when it's an integer count of
+/// minor units alongside `decimal_places`). `None` unless meaningful.
+fn credits(u: &Usage) -> Option<Credits> {
+    let spend = u.spend.as_ref().filter(|v| v.is_object());
+    let extra = u.extra_usage.as_ref().filter(|v| v.is_object());
+    let used = money(get(spend, "used")).or_else(|| {
+        let amount = get(extra, "used_credits")?.as_i64()?;
+        let places = u32::try_from(get(extra, "decimal_places")?.as_u64()?).ok()?;
+        let unit = get(extra, "currency")
+            .and_then(|x| x.as_str())
+            .unwrap_or(Money::CREDITS);
+        Money::new(amount, places, unit)
+    });
+    let c = Credits {
+        enabled: flag(spend, "enabled") || flag(extra, "is_enabled"),
+        unlimited: false,
+        limit_reached: flag(extra, "spend_limit_reached"),
+        used,
+        limit: money(get(spend, "limit")).or_else(|| money(get(spend, "cap"))),
+        balance: money(get(spend, "balance")),
+    };
+    c.is_meaningful().then_some(c)
+}
+
+fn breakdown(u: &Usage) -> Vec<UsageShare> {
+    let rows = u
+        .seven_day_breakdown
+        .as_ref()
+        .and_then(|b| b.get("rows"))
+        .and_then(|r| r.as_array());
+    rows.into_iter()
+        .flatten()
+        .filter_map(|r| {
+            let percent = r.get("percent")?.as_f64()?;
+            let key = r.get("key").and_then(|x| x.as_str()).unwrap_or("");
+            let label = r
+                .get("display_name")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(key);
+            (!label.is_empty()).then(|| UsageShare {
+                key: key.to_string(),
+                label: label.to_string(),
+                percent,
+            })
+        })
+        .collect()
+}
+
+/// A scope's display name: `scope.model.display_name`, else a surface's.
+fn scope_name(scope: &serde_json::Value) -> Option<String> {
+    let name_of = |v: Option<&serde_json::Value>| -> Option<String> {
+        let v = v?;
+        v.as_str()
+            .or_else(|| v.get("display_name").and_then(|x| x.as_str()))
+            .or_else(|| v.get("id").and_then(|x| x.as_str()))
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    name_of(scope.get("model")).or_else(|| name_of(scope.get("surface")))
+}
+
+/// Per-model/surface scoped weekly limits with a reported percent. An Opus
+/// scope is skipped when `seven_day_opus` already carries it (it has its own
+/// fixed window).
+fn scoped_limits(u: &Usage) -> Vec<UsageWindow> {
+    let has_opus_window = u
+        .seven_day_opus
+        .as_ref()
+        .is_some_and(|w| w.utilization.is_some());
+    let limits = u.limits.as_ref().and_then(|l| l.as_array());
+    limits
+        .into_iter()
+        .flatten()
+        .filter_map(|l| {
+            let kind = l.get("kind").and_then(|x| x.as_str()).unwrap_or("");
+            let group = l.get("group").and_then(|x| x.as_str()).unwrap_or("");
+            if kind != "weekly_scoped" && !(group == "weekly" && kind.ends_with("_scoped")) {
+                return None;
+            }
+            let percent = l.get("percent")?.as_f64()?;
+            let name = scope_name(l.get("scope")?)?;
+            if has_opus_window && name.eq_ignore_ascii_case("opus") {
+                return None;
+            }
+            let resets_at = l
+                .get("resets_at")
+                .and_then(|x| x.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&chrono::Utc));
+            Some(UsageWindow {
+                id: format!("scoped:{}", name.to_ascii_lowercase()),
+                label: format!("{name} 7d"),
+                utilization: Some(percent),
+                resets_at,
+            })
+        })
+        .collect()
+}
+
+/// Everything beyond the fixed windows that the usage response reported.
+pub fn reported_usage(u: &Usage) -> ReportedUsage {
+    ReportedUsage {
+        credits: credits(u),
+        breakdown: breakdown(u),
+        scoped_limits: scoped_limits(u),
+    }
 }
 
 #[cfg(test)]

@@ -103,6 +103,7 @@ fn row(session: Option<f64>, weekly: Option<f64>) -> Row {
         opus: None,
         error: None,
         fetched_at: Some(0),
+        reported: Default::default(),
     }
 }
 
@@ -137,6 +138,7 @@ fn row_full_with_provider(
         opus: None,
         error: None,
         fetched_at: Some(Utc::now().timestamp()),
+        reported: Default::default(),
     }
 }
 
@@ -209,6 +211,57 @@ fn cached_from_usage_extracts_windows() {
     assert_eq!(c.session_reset.as_deref(), Some("2026-09-05T08:00:00Z"));
     assert!(c.opus_pct.is_none());
     assert!(c.fetched_at > 0);
+    assert!(c.reported.is_empty());
+}
+
+#[test]
+fn claude_and_generic_caches_carry_reported_usage_into_rows() {
+    let u: usage::Usage = serde_json::from_value(serde_json::json!({
+        "five_hour": { "utilization": 9.0 }, "seven_day": null, "seven_day_opus": null,
+        "spend": { "used": { "amount_minor": 310, "currency": "USD", "exponent": 2 }, "enabled": true },
+        "seven_day_breakdown": { "rows": [
+            { "key": "claude_code", "display_name": "Claude Code", "percent": 82 },
+            { "key": "chat", "display_name": "Chats", "percent": 18 }
+        ]}
+    }))
+    .unwrap();
+    // Claude: the usage-endpoint path.
+    let c = cached_from_usage(&u);
+    assert_eq!(c.reported, usage::reported_usage(&u));
+    assert_eq!(c.reported.breakdown.len(), 2);
+    let mut a = Account::from_keychain_blob(
+        r#"{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":0}}"#,
+    )
+    .unwrap();
+    a.cached_usage = Some(c.clone());
+    assert_eq!(row_from_account(&a).reported, c.reported);
+
+    // Generic providers: the same shape through the snapshot mapping.
+    let snap = UsageSnapshot {
+        windows: vec![],
+        fetched_at: Utc::now(),
+        plan: None,
+        reported: c.reported.clone(),
+    };
+    let g = cached_from_usage_snapshot(&snap);
+    assert_eq!(g.reported, c.reported);
+    let pa = ProviderAccount {
+        key: "k@example.com".into(),
+        secret_blob: String::new(),
+        access_token: String::new(),
+        refresh_token: String::new(),
+        expires_at: 0,
+        identity_email: None,
+        identity_uuid: None,
+        identity_display_name: None,
+        identity_native_blob: serde_json::Value::Null,
+        cached_usage: Some(g),
+        notif_state: Default::default(),
+        needs_relogin: false,
+        no_subscription: false,
+        plan: None,
+    };
+    assert_eq!(row_from_provider_account("codex", &pa).reported, c.reported);
 }
 
 #[test]
@@ -1306,6 +1359,7 @@ fn merged_cached_usage_prefers_existing_snapshot() {
         opus_pct: None,
         opus_reset: None,
         fetched_at: 123,
+        ..Default::default()
     }));
     let merged = merged_cached_usage(Some(&existing));
     assert_eq!(merged.unwrap().session_pct, Some(42.0));
@@ -2357,6 +2411,7 @@ fn reset_boundary_invalidates_recent_cache() {
         opus_pct: None,
         opus_reset: None,
         fetched_at: (now - Duration::seconds(10)).timestamp(),
+        ..Default::default()
     };
     assert!(cache_crossed_reset(&cu, now));
     cu.fetched_at = now.timestamp();
@@ -2502,6 +2557,7 @@ fn usage_at(pct: f64) -> CachedUsage {
         opus_pct: None,
         opus_reset: None,
         fetched_at: Utc::now().timestamp(),
+        reported: Default::default(),
     }
 }
 
@@ -2870,6 +2926,7 @@ fn dup(r: &Row) -> Row {
         opus: None,
         error: r.error.clone(),
         fetched_at: r.fetched_at,
+        reported: r.reported.clone(),
     }
 }
 
@@ -4666,6 +4723,7 @@ fn cu(session: f64, weekly: f64, age: i64) -> CachedUsage {
         opus_pct: None,
         opus_reset: None,
         fetched_at: Utc::now().timestamp() - age,
+        reported: Default::default(),
     }
 }
 

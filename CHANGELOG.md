@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-02
+
+### Added
+- **Account details show what the provider itself reports beyond your
+  limits**, and only when there's something to show:
+  - Credits / extra-usage spend, e.g. "Credits · $12.34 used of $50.00",
+    "Credits · 120 left" (Codex credits), or "Credits · limit reached".
+  - Where this week's usage went, when it's split across more than one
+    product, e.g. "This week · Claude Code 82% · Chats 18%".
+  - Per-model weekly limits once they're in use, e.g. "Fable 7d · 42% ·
+    resets in 2d 3h".
+
+  These are the provider's own numbers, never estimates. A provider that
+  changes or drops these fields never breaks the usage reading itself.
+
 ## [0.8.9] - 2026-10-01
 
 ### Fixed
@@ -1251,7 +1266,8 @@ fixes; every top finding was independently confirmed before fixing.
 - `token` — print a fresh access token for scripting.
 - Local, owner-only token store at `~/.config/claude-usage/state.json` (0600).
 
-[Unreleased]: https://github.com/MattJackson/usagio/compare/v0.8.9...HEAD
+[Unreleased]: https://github.com/MattJackson/usagio/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/MattJackson/usagio/compare/v0.8.9...v0.9.0
 [0.8.9]: https://github.com/MattJackson/usagio/compare/v0.8.8...v0.8.9
 [0.8.8]: https://github.com/MattJackson/usagio/compare/v0.8.7...v0.8.8
 [0.8.7]: https://github.com/MattJackson/usagio/compare/v0.8.6...v0.8.7
