@@ -209,4 +209,30 @@ mod tests {
             "expected the rotation-failed event to be appended, got: {contents}"
         );
     }
+
+    /// Cross-platform: the handle must be a real append-mode file at `path`
+    /// (writes land on disk, and a second open appends rather than truncates).
+    #[test]
+    fn open_append_private_creates_and_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usagio.log");
+        writeln!(open_append_private(&path).unwrap(), "one").unwrap();
+        writeln!(open_append_private(&path).unwrap(), "two").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+    }
+
+    #[test]
+    fn tok_prefix_keeps_first_20_chars_of_long_tokens() {
+        let tok = "abcdefghijklmnopqrstuvwxyz";
+        assert_eq!(tok_prefix(tok), "abcdefghijklmnopqrst..");
+        // Exactly 20 chars is the boundary: still sliced (no extra chars).
+        assert_eq!(tok_prefix("01234567890123456789"), "01234567890123456789..");
+    }
+
+    #[test]
+    fn tok_prefix_redacts_short_tokens_in_full() {
+        assert_eq!(tok_prefix("short"), "short..");
+        assert_eq!(tok_prefix("0123456789012345678"), "0123456789012345678..");
+        assert_eq!(tok_prefix(""), "..");
+    }
 }

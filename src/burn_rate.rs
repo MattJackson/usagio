@@ -276,6 +276,7 @@ mod tests {
     use super::*;
     use crate::providers::trait_def::Window;
     use crate::usage_log::{AccountKey, Snapshot};
+    use chrono::{Datelike, TimeZone};
 
     fn snap(mins_ago: i64, weekly: f32) -> Snapshot {
         Snapshot {
@@ -428,6 +429,210 @@ mod tests {
             format_short_duration(Duration::days(1) + Duration::hours(23)),
             "1d 23h"
         );
+    }
+
+    // ---- weighted_linear_fit: exact values on non-linear data ----
+    // Expected numbers come from an independent f64 reference implementation of
+    // the exponentially weighted regression (half-life = horizon / 2).
+
+    fn fixed_now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 6, 15, 12, 0, 0).unwrap()
+    }
+
+    fn series(now: DateTime<Utc>, ages_mins: &[i64], session: bool, ys: &[f32]) -> Vec<Snapshot> {
+        ages_mins
+            .iter()
+            .zip(ys)
+            .map(|(a, y)| Snapshot {
+                ts: now - Duration::minutes(*a),
+                provider: "claude".into(),
+                account: "matt@example.com".into(),
+                session_pct: session.then_some(*y),
+                weekly_pct: (!session).then_some(*y),
+                active_model: None,
+            })
+            .collect()
+    }
+
+    fn assert_close(got: f32, want: f32, what: &str) {
+        assert!((got - want).abs() < 0.02, "{what}: got {got}, want {want}");
+    }
+
+    #[test]
+    fn fit_session_matches_reference_values() {
+        let now = fixed_now();
+        let samples = series(
+            now,
+            &[290, 240, 180, 130, 90, 50, 20, 0],
+            true,
+            &[5.0, 9.0, 20.0, 24.0, 41.0, 45.0, 60.0, 62.0],
+        );
+        let (slope, intercept, r2) = weighted_linear_fit(&samples, Window::Session, now).unwrap();
+        assert_close(slope, 13.1212, "slope");
+        assert_close(intercept, 60.2986, "intercept");
+        assert_close(r2, 0.95282, "r2");
+    }
+
+    #[test]
+    fn fit_weekly_matches_reference_values() {
+        let now = fixed_now();
+        let samples = series(
+            now,
+            &[9600, 7800, 6000, 4200, 2400, 1200, 300, 0],
+            false,
+            &[2.0, 10.0, 12.0, 30.0, 31.0, 50.0, 52.0, 70.0],
+        );
+        let (slope, intercept, r2) = weighted_linear_fit(&samples, Window::Weekly, now).unwrap();
+        assert_close(slope, 0.41082, "slope");
+        assert_close(intercept, 58.6851, "intercept");
+        assert_close(r2, 0.87525, "r2");
+    }
+
+    #[test]
+    fn fit_exactly_min_samples_is_accepted() {
+        let now = fixed_now();
+        let samples = series(
+            now,
+            &[50, 40, 30, 20, 10, 0],
+            true,
+            &[1.0, 3.0, 2.0, 6.0, 5.0, 9.0],
+        );
+        assert_eq!(samples.len(), MIN_SAMPLES);
+        assert!(weighted_linear_fit(&samples, Window::Session, now).is_some());
+    }
+
+    #[test]
+    fn fit_identical_timestamps_has_no_slope() {
+        let now = fixed_now();
+        let samples = series(
+            now,
+            &[10, 10, 10, 10, 10, 10, 10],
+            true,
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+        );
+        assert!(weighted_linear_fit(&samples, Window::Session, now).is_none());
+    }
+
+    #[test]
+    fn fit_constant_pct_has_zero_confidence() {
+        let now = fixed_now();
+        let samples = series(
+            now,
+            &[100, 80, 60, 40, 20, 0],
+            true,
+            &[30.0, 30.0, 30.0, 30.0, 30.0, 30.0],
+        );
+        let (slope, _, r2) = weighted_linear_fit(&samples, Window::Session, now).unwrap();
+        assert_eq!(r2, 0.0);
+        assert!(slope.abs() < 1e-4, "{slope}");
+    }
+
+    // ---- estimate: end-to-end through a scoped history log ----
+
+    static LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Writes `(minutes_ago, pct)` rows for a unique account into a scoped
+    /// config dir's monthly history files and returns the guard + key + now.
+    fn with_history(
+        session: bool,
+        rows: &[(i64, f32)],
+    ) -> (
+        std::sync::MutexGuard<'static, ()>,
+        crate::store::ScopedConfigDir,
+        AccountKey,
+        DateTime<Utc>,
+    ) {
+        let lock = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = crate::store::ScopedConfigDir::new();
+        let dir = crate::store::config_dir().unwrap();
+        let now = Utc::now();
+        for (ago, pct) in rows {
+            let ts = now - Duration::minutes(*ago);
+            let snap = Snapshot {
+                ts,
+                provider: "claude".into(),
+                account: "burn@example.com".into(),
+                session_pct: session.then_some(*pct),
+                weekly_pct: (!session).then_some(*pct),
+                active_model: None,
+            };
+            let path = dir.join(format!("history.{:04}-{:02}.ndjson", ts.year(), ts.month()));
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            use std::io::Write;
+            writeln!(f, "{}", serde_json::to_string(&snap).unwrap()).unwrap();
+        }
+        crate::usage_log::invalidate_cache();
+        (
+            lock,
+            guard,
+            AccountKey::new("claude", "burn@example.com"),
+            now,
+        )
+    }
+
+    /// 10 pct/hr climb ending at 35% (one minute ago): 65 points left -> 6.5h,
+    /// truncated to 6h.
+    fn climbing_rows() -> Vec<(i64, f32)> {
+        (0..7)
+            .map(|k| (1 + k * 30, 35.0 - 5.0 * k as f32))
+            .collect()
+    }
+
+    #[test]
+    fn estimate_projects_empty_time_for_climbing_session() {
+        let (_l, _g, key, now) = with_history(true, &climbing_rows());
+        let est = estimate(&key, Window::Session, now).expect("enough samples");
+        assert_eq!(est.current_pct, 35.0);
+        assert!(
+            (est.rate_pct_per_hour - 10.0).abs() < 0.3,
+            "{}",
+            est.rate_pct_per_hour
+        );
+        assert!(est.confidence > 0.99);
+        assert_eq!(est.empty_at - now, Duration::hours(6));
+        assert!(est.reset_at.is_none());
+        assert!(est.margin.is_none());
+    }
+
+    #[test]
+    fn estimate_ignores_samples_outside_session_horizon() {
+        let mut rows = climbing_rows();
+        // Older than the 5h session horizon: must not influence the fit.
+        rows.extend([(330, 90.0), (360, 95.0), (420, 99.0)]);
+        let (_l, _g, key, now) = with_history(true, &rows);
+        let est = estimate(&key, Window::Session, now).expect("enough in-horizon samples");
+        assert!(
+            (est.rate_pct_per_hour - 10.0).abs() < 0.3,
+            "{}",
+            est.rate_pct_per_hour
+        );
+        assert_eq!(est.empty_at - now, Duration::hours(6));
+    }
+
+    #[test]
+    fn estimate_needs_min_samples_exactly() {
+        let rows = climbing_rows();
+        let (_l, _g, key, now) = with_history(true, &rows[..MIN_SAMPLES]);
+        assert!(estimate(&key, Window::Session, now).is_some());
+        drop((_l, _g));
+        let (_l, _g, key, now) = with_history(true, &rows[..MIN_SAMPLES - 1]);
+        assert!(estimate(&key, Window::Session, now).is_none());
+    }
+
+    #[test]
+    fn estimate_falling_usage_is_flat_and_capped() {
+        let rows: Vec<(i64, f32)> = (0..7)
+            .map(|k| (1 + k * 30, 20.0 + 5.0 * k as f32))
+            .collect();
+        let (_l, _g, key, now) = with_history(true, &rows);
+        let est = estimate(&key, Window::Session, now).expect("enough samples");
+        assert!(est.rate_pct_per_hour <= FLAT_SLOPE_THRESHOLD_PCT_PER_HOUR);
+        assert_eq!(est.empty_at - now, Duration::hours(MAX_EMPTY_IN_HOURS));
+        assert!(est.margin.is_none());
     }
 
     // Ignored by default — this hits the live usage_log crate function, which panics

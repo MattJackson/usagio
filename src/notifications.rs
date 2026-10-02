@@ -704,4 +704,100 @@ mod tests {
         assert!(json.contains("session"), "{json}");
         assert!(json.contains("weekly"), "{json}");
     }
+
+    // --- Mutation-gap tests: exact boundaries + exact pace projection --------
+
+    #[test]
+    fn threshold_alert_label_lists_the_ladder() {
+        assert_eq!(threshold_alert_label(), "Threshold alerts (70% / 90%)");
+    }
+
+    #[test]
+    fn evaluate_does_not_fire_when_prev_already_sits_exactly_on_the_threshold() {
+        // prev == 70 means 70 was already reached on the previous tick; only a
+        // strict below-to-at-or-above transition is a crossing.
+        let cfg = NotificationConfig::default();
+        let ts = evaluate(&snap(Some(70.0), None), &snap(Some(80.0), None), &cfg);
+        assert!(ts.is_empty(), "{ts:?}");
+        // ...while landing exactly ON the threshold from below does fire.
+        let ts = evaluate(&snap(Some(69.0), None), &snap(Some(70.0), None), &cfg);
+        assert_eq!(
+            ts,
+            vec![Trigger::Threshold {
+                window: Window::Session,
+                pct: 70
+            }]
+        );
+    }
+
+    #[test]
+    fn reset_requires_a_strict_drop_from_strictly_above_the_floor() {
+        let cfg = NotificationConfig::default();
+        let reset = |p: f32, c: f32| {
+            evaluate(&snap(Some(p), None), &snap(Some(c), None), &cfg).contains(
+                &Trigger::ResetBack {
+                    window: Window::Session,
+                },
+            )
+        };
+        assert!(reset(60.0, 5.0), "a real reset fires");
+        assert!(!reset(60.0, 60.0), "no change is not a reset");
+        assert!(!reset(50.0, 0.0), "the 50% floor is exclusive");
+        let a = snap(Some(60.0), None);
+        assert!(!is_reset(&a, &a, Window::Session));
+        assert!(!is_reset(
+            &snap(Some(50.0), None),
+            &snap(Some(0.0), None),
+            Window::Session
+        ));
+    }
+
+    fn pace_cfg() -> NotificationConfig {
+        NotificationConfig {
+            pace_enabled: true,
+            ..NotificationConfig::default()
+        }
+    }
+
+    #[test]
+    fn evaluate_pace_projects_the_exact_hit_time() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+        let pace = PaceEstimate {
+            slope_pct_per_hour: 10.0,
+            confidence: 0.9,
+            sample_count: 12,
+        };
+        // 50% left at 10%/h => exactly 5 hours out.
+        let t = evaluate_pace(Some(&pace), &snap(None, Some(50.0)), &pace_cfg(), now).unwrap();
+        assert_eq!(
+            t,
+            Trigger::WeeklyPace {
+                hit_time: Utc.with_ymd_and_hms(2026, 9, 1, 17, 0, 0).unwrap()
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_pace_accepts_confidence_exactly_at_the_floor() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+        let pace = PaceEstimate {
+            slope_pct_per_hour: 10.0,
+            confidence: 0.5,
+            sample_count: 12,
+        };
+        assert!(evaluate_pace(Some(&pace), &snap(None, Some(50.0)), &pace_cfg(), now).is_some());
+    }
+
+    #[test]
+    fn evaluate_pace_rejects_a_projection_too_far_out_to_represent() {
+        // A vanishingly small positive slope makes hours-to-100 overflow to
+        // infinity; that must read as "no usable projection", not a bogus time.
+        let now = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+        let pace = PaceEstimate {
+            slope_pct_per_hour: 1e-320,
+            confidence: 0.9,
+            sample_count: 12,
+        };
+        assert!(evaluate_pace(Some(&pace), &snap(None, Some(50.0)), &pace_cfg(), now).is_none());
+    }
 }
