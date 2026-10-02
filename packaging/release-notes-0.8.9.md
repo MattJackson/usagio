@@ -6,6 +6,9 @@
   sat at 99% without swapping. Now only a switch to an account already at or
   over the threshold holds (you're acking it's over); it still swaps off once
   it is exhausted (100%).
+- **A lapsed account's menu is one line.** An account with no subscription
+  now shows just `No subscription · Free plan` instead of two extra lines
+  about paused checks.
 
 ### Tests
 - About 300 new tests close gaps found by a full mutation-testing sweep
