@@ -5756,6 +5756,10 @@ fn removing_a_provider_account_requires_it_to_exist() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "reads or writes the OS secret store, which is only hermetic (in-memory) on macOS"
+)]
 fn capturing_the_claude_login_stores_it_as_the_active_account() {
     with_claude_home("cap@e.com", |_| {
         let blob = claude_account("cap@e.com", 3_600_000).keychain_blob;
