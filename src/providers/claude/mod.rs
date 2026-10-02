@@ -1103,4 +1103,243 @@ mod tests {
             ClaudeProvider.parse_stored_blob(&on_disk).unwrap();
         });
     }
+
+    #[test]
+    fn supports_active_refresh_is_true() {
+        assert!(ClaudeProvider.supports_active_refresh());
+    }
+
+    fn blob_with(access: &str, expires_at: i64) -> String {
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": access,
+                "refreshToken": "rt",
+                "expiresAt": expires_at,
+            }
+        })
+        .to_string()
+    }
+
+    fn identity_with(native_blob: Value) -> IdentitySnapshot {
+        IdentitySnapshot {
+            email: Some("a@example.com".into()),
+            uuid: None,
+            display_name: None,
+            native_blob,
+        }
+    }
+
+    #[test]
+    fn write_active_account_rejects_missing_or_null_oauth_account() {
+        // Both are refused before anything on disk / in the keychain is touched.
+        let blob = blob_with("at", 1);
+        for native in [
+            serde_json::json!({}),
+            serde_json::json!({ "oauthAccount": null, "userID": "u" }),
+        ] {
+            let err = ClaudeProvider
+                .write_active_account(&blob, &identity_with(native))
+                .unwrap_err();
+            assert!(
+                matches!(&err, ProviderError::Other(m) if m.contains("oauthAccount")),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn mirror_rotated_token_logs_where_it_wrote() {
+        if crate::platform::current().os_display_name() == "macOS" {
+            return; // would hit the real keychain
+        }
+        let cfg = crate::store::ScopedConfigDir::new();
+        let dir = cfg.home();
+        crate::env_lock::scoped_env_var("HOME", Some(dir.to_str().unwrap()), || {
+            ClaudeProvider
+                .mirror_rotated_token(&blob_with("at", 1))
+                .unwrap();
+        });
+        let log = std::fs::read_to_string(crate::store::config_dir().unwrap().join("usagio.log"))
+            .unwrap();
+        assert!(
+            log.contains("to=file:~/.claude/.credentials.json result=ok"),
+            "log was: {log}"
+        );
+    }
+
+    #[test]
+    fn read_active_slot_reads_the_credentials_file_off_macos() {
+        if crate::platform::current().os_display_name() == "macOS" {
+            return; // reads the real keychain
+        }
+        let dir = tempfile::tempdir().unwrap();
+        crate::env_lock::scoped_env_var("HOME", Some(dir.path().to_str().unwrap()), || {
+            // Nothing captured yet: an empty slot, not an error.
+            assert_eq!(ClaudeProvider.read_active_slot().unwrap(), None);
+
+            let creds = dir.path().join(".claude").join(".credentials.json");
+            std::fs::create_dir_all(&creds).unwrap();
+            // Present but unreadable (a directory): a real IO error.
+            assert!(matches!(
+                ClaudeProvider.read_active_slot(),
+                Err(ProviderError::Io(_))
+            ));
+
+            std::fs::remove_dir(&creds).unwrap();
+            std::fs::write(&creds, "slot-bytes").unwrap();
+            assert_eq!(
+                ClaudeProvider.read_active_slot().unwrap().as_deref(),
+                Some("slot-bytes")
+            );
+        });
+    }
+
+    fn state_with_account(
+        email: &str,
+        access: &str,
+        expires_at: i64,
+    ) -> crate::store::ScopedConfigDir {
+        let cfg = crate::store::ScopedConfigDir::new();
+        crate::credentials::with_state_lock(|| {
+            let mut st = crate::store::State::load()?;
+            let mut a = crate::store::Account::from_keychain_blob(&blob_with(access, expires_at))?;
+            a.email = Some(email.into());
+            st.upsert(a);
+            st.save()
+        })
+        .unwrap();
+        cfg
+    }
+
+    fn stored(email: &str) -> (String, i64) {
+        let st = crate::store::State::load().unwrap();
+        let a = st.find(email).unwrap();
+        (a.access_token.clone(), a.expires_at)
+    }
+
+    #[test]
+    fn absorb_credential_only_for_claude_keys() {
+        let _cfg = state_with_account("a@example.com", "old", 1000);
+        let blob = blob_with("new", 2000);
+        // Another provider's key must never touch Claude's slot.
+        let other = AccountKey::new("codex", "a@example.com");
+        ClaudeProvider.absorb_credential(&other, &blob).unwrap();
+        assert_eq!(stored("a@example.com"), ("old".to_string(), 1000));
+        // Our own key does.
+        let ours = AccountKey::new("claude", "a@example.com");
+        ClaudeProvider.absorb_credential(&ours, &blob).unwrap();
+        assert_eq!(stored("a@example.com"), ("new".to_string(), 2000));
+    }
+
+    #[test]
+    fn absorb_credential_overwrites_when_equal_but_never_with_older() {
+        let _cfg = state_with_account("a@example.com", "old", 1000);
+        let k = AccountKey::new("claude", "a@example.com");
+        // A stale read racing a concurrent refresh must not clobber it.
+        ClaudeProvider
+            .absorb_credential(&k, &blob_with("stale", 500))
+            .unwrap();
+        assert_eq!(stored("a@example.com"), ("old".to_string(), 1000));
+        // At-least-as-new includes equal expiry (a rotated token, same clock).
+        ClaudeProvider
+            .absorb_credential(&k, &blob_with("same-expiry", 1000))
+            .unwrap();
+        assert_eq!(stored("a@example.com"), ("same-expiry".to_string(), 1000));
+    }
+
+    #[test]
+    fn parse_rfc3339_utc_accepts_rfc3339_and_epoch_seconds() {
+        let a = parse_rfc3339_utc("2026-09-05T08:00:00+02:00").unwrap();
+        assert_eq!(a.to_rfc3339(), "2026-09-05T06:00:00+00:00");
+        let b = parse_rfc3339_utc("1700000000").unwrap();
+        assert_eq!(b.timestamp(), 1_700_000_000);
+        assert!(parse_rfc3339_utc("next tuesday").is_none());
+    }
+
+    #[test]
+    fn keychain_account_is_user_or_claude() {
+        crate::env_lock::scoped_env_var("USER", Some("alice"), || {
+            assert_eq!(keychain_account(), "alice");
+        });
+        crate::env_lock::scoped_env_var("USER", None, || {
+            assert_eq!(keychain_account(), "claude");
+        });
+    }
+
+    #[test]
+    fn keychain_read_of_an_unknown_account_is_none() {
+        crate::env_lock::scoped_env_var("USER", Some("usagio-test-no-such-account-8f3a1c"), || {
+            assert_eq!(keychain_read(), None);
+        });
+    }
+
+    #[test]
+    fn claude_json_path_is_home_dot_claude_json() {
+        crate::env_lock::scoped_env_var("HOME", Some("/some/home"), || {
+            assert_eq!(
+                claude_json_path(),
+                Some(std::path::PathBuf::from("/some/home").join(".claude.json"))
+            );
+        });
+        crate::env_lock::scoped_env_var("HOME", None, || {
+            assert_eq!(claude_json_path(), None);
+        });
+    }
+
+    #[test]
+    fn read_claude_identity_returns_account_and_user_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".claude.json");
+        crate::env_lock::scoped_env_var("HOME", Some(dir.path().to_str().unwrap()), || {
+            // Missing file and garbage both read as "no identity".
+            assert_eq!(read_claude_identity(), (None, None));
+            std::fs::write(&file, "not json").unwrap();
+            assert_eq!(read_claude_identity(), (None, None));
+
+            std::fs::write(
+                &file,
+                r#"{"oauthAccount":{"emailAddress":"a@example.com"},"userID":"uid-1"}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                read_claude_identity(),
+                (
+                    Some(serde_json::json!({"emailAddress":"a@example.com"})),
+                    Some("uid-1".to_string())
+                )
+            );
+
+            // An explicit null oauthAccount is "no account", not Some(null).
+            std::fs::write(&file, r#"{"oauthAccount":null,"userID":"uid-2"}"#).unwrap();
+            assert_eq!(read_claude_identity(), (None, Some("uid-2".to_string())));
+        });
+    }
+
+    #[test]
+    fn read_claude_json_raw_returns_bytes_and_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".claude.json");
+        crate::env_lock::scoped_env_var("HOME", Some(dir.path().to_str().unwrap()), || {
+            assert!(read_claude_json_raw().is_none());
+            std::fs::write(&file, b"{\"k\":1}").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
+            }
+            let (bytes, mode) = read_claude_json_raw().unwrap();
+            assert_eq!(bytes, b"{\"k\":1}");
+            #[cfg(unix)]
+            assert_eq!(mode & 0o777, 0o640);
+            #[cfg(not(unix))]
+            assert_eq!(mode, 0o600);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_json_mode_falls_back_to_0600_when_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(claude_json_mode(&dir.path().join("missing.json")), 0o600);
+    }
 }

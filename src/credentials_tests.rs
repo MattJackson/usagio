@@ -815,3 +815,334 @@ fn _fixture_identity(_: IdentitySnapshot) {}
 fn _fixture_snap(_: UsageSnapshot) {}
 #[allow(dead_code)]
 fn _fixture_launch(_: LaunchMode) {}
+
+// -----------------------------------------------------------------------------
+// Mutation-gap tests: lock depth bookkeeping + exclusion, last-chance ties,
+// refresh_inactive_if_stale against a mock token endpoint, watcher setup and
+// the watcher registry.
+// -----------------------------------------------------------------------------
+
+#[test]
+fn with_state_lock_holds_a_real_lock_and_tracks_nesting_depth() {
+    use fs2::FileExt;
+    with_isolated_home(|| {
+        let lock_path = crate::store::config_dir().unwrap().join("lock");
+        // Probe the lock from a SEPARATE open file description: it must be
+        // refused while with_state_lock is held and available once released.
+        let probe_is_blocked = || {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)
+                .unwrap();
+            let blocked = f.try_lock_exclusive().is_err();
+            let _ = fs2::FileExt::unlock(&f);
+            blocked
+        };
+        let depth = || STATE_LOCK_DEPTH.with(|d| d.get());
+
+        assert_eq!(depth(), 0);
+        with_state_lock(|| {
+            assert_eq!(depth(), 1);
+            assert!(probe_is_blocked(), "outer frame must hold the OS lock");
+            with_state_lock(|| {
+                assert_eq!(depth(), 2, "nesting increments the depth");
+                assert!(probe_is_blocked());
+                Ok(())
+            })?;
+            // The nested frame's guard must have unwound exactly one level, or
+            // a second nested call would try to re-take the lock and deadlock.
+            assert_eq!(depth(), 1, "nested frame unwinds one level");
+            assert!(probe_is_blocked(), "lock is still held by the outer frame");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(depth(), 0, "outer frame unwinds to zero");
+        assert!(
+            !probe_is_blocked(),
+            "lock is released after the outer frame"
+        );
+    });
+}
+
+#[test]
+fn last_chance_fallback_keeps_the_first_blob_on_a_freshness_tie() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = write_blob(dir.path(), "first.json", "FIRST_A");
+    let second = write_blob(dir.path(), "second.json", "SECOND_A");
+    let target = AccountKey::new("fake", "a@e.com");
+    let prov = FakeProvider::new("fake")
+        .with_path(first)
+        .with_path(second)
+        .route("FIRST_A", Some(target.clone()), CredentialFreshness::Fresh)
+        .route("SECOND_A", Some(target.clone()), CredentialFreshness::Fresh);
+    assert!(last_chance_fallback(&prov, &target));
+    let absorbs = prov.absorbs();
+    // Equally fresh is not "fresher": the earlier path keeps the slot.
+    assert_eq!(absorbs, vec![(target, "FIRST_A".to_string())]);
+}
+
+/// Clears the thread's OAuth token-URL override even if the test panics.
+struct TokenUrlGuard;
+impl TokenUrlGuard {
+    fn set(url: &str) -> Self {
+        crate::providers::claude::oauth::set_token_url_override(Some(url));
+        TokenUrlGuard
+    }
+}
+impl Drop for TokenUrlGuard {
+    fn drop(&mut self) {
+        crate::providers::claude::oauth::set_token_url_override(None);
+    }
+}
+
+/// In-process mock OAuth token endpoint. Every request is drained, `on_post`
+/// runs (e.g. to simulate a concurrent switch), then `status` + a token body
+/// is returned. Returns (url, POST count).
+type HitCounter = Arc<std::sync::atomic::AtomicUsize>;
+
+fn spawn_token_server(status: u16, on_post: impl Fn() + Send + 'static) -> (String, HitCounter) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{Shutdown, TcpListener};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock token server");
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_thread = Arc::clone(&hits);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            let mut reader = BufReader::new(&stream);
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                continue;
+            }
+            let mut content_length = 0usize;
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).unwrap_or(0) == 0 {
+                    break;
+                }
+                if header == "\r\n" || header == "\n" {
+                    break;
+                }
+                if let Some(v) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            if content_length > 0 {
+                let mut body_buf = vec![0u8; content_length];
+                let _ = reader.read_exact(&mut body_buf);
+            }
+            hits_thread.fetch_add(1, Ordering::SeqCst);
+            on_post();
+            let body = if status == 200 {
+                serde_json::json!({
+                    "access_token": "mock-refreshed-access-token",
+                    "refresh_token": "mock-refreshed-refresh-token",
+                    "expires_in": 3600,
+                })
+                .to_string()
+            } else {
+                "{}".to_string()
+            };
+            let resp = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            drop(reader);
+            let mut s = &stream;
+            let _ = s.write_all(resp.as_bytes());
+            let _ = s.flush();
+            let _ = stream.shutdown(Shutdown::Write);
+        }
+    });
+    (format!("http://{addr}/v1/oauth/token"), hits)
+}
+
+/// An already-expired account (forces `ensure_fresh` to hit the token
+/// endpoint) with a parseable keychain blob.
+fn expired_account(email: &str) -> crate::store::Account {
+    let blob = serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": "stale-at", "refreshToken": "stale-rt", "expiresAt": 0,
+        }
+    })
+    .to_string();
+    let mut a = crate::store::Account::from_keychain_blob(&blob).unwrap();
+    a.email = Some(email.to_string());
+    a
+}
+
+fn seed_state(accounts: Vec<crate::store::Account>, active: Option<&str>) {
+    with_state_lock(|| {
+        let st = crate::store::State {
+            accounts,
+            active: active.map(String::from),
+            ..Default::default()
+        };
+        st.save()
+    })
+    .unwrap();
+}
+
+#[test]
+fn refresh_inactive_if_stale_refreshes_an_expired_inactive_account_and_persists_it() {
+    use crate::store::State;
+    with_isolated_home(|| {
+        seed_state(
+            vec![
+                expired_account("inactive@e.com"),
+                expired_account("active@e.com"),
+            ],
+            Some("active@e.com"),
+        );
+        let (url, hits) = spawn_token_server(200, || {});
+        let _u = TokenUrlGuard::set(&url);
+
+        refresh_inactive_if_stale(None);
+
+        let st = State::load().unwrap();
+        let inactive = st.find("inactive@e.com").unwrap();
+        assert_eq!(inactive.access_token, "mock-refreshed-access-token");
+        assert_eq!(inactive.refresh_token, "mock-refreshed-refresh-token");
+        // The active account is never refreshed (the vendor CLI owns it).
+        assert_eq!(st.find("active@e.com").unwrap().access_token, "stale-at");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    });
+}
+
+#[test]
+fn refresh_inactive_if_stale_skips_accounts_already_flagged_needs_relogin() {
+    use crate::store::State;
+    with_isolated_home(|| {
+        let mut flagged = expired_account("dead@e.com");
+        flagged.needs_relogin = true;
+        seed_state(vec![flagged], None);
+        let (url, hits) = spawn_token_server(200, || {});
+        let _u = TokenUrlGuard::set(&url);
+
+        refresh_inactive_if_stale(None);
+
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a flagged account must not be re-tried every tick"
+        );
+        let st = State::load().unwrap();
+        assert_eq!(st.find("dead@e.com").unwrap().access_token, "stale-at");
+    });
+}
+
+#[test]
+fn refresh_inactive_if_stale_does_not_write_back_over_an_account_that_became_active() {
+    use crate::store::State;
+    with_isolated_home(|| {
+        seed_state(vec![expired_account("race@e.com")], None);
+        let state_json = crate::store::config_dir().unwrap().join("state.json");
+        // While the (mock) network refresh is in flight, a switch promotes the
+        // account to active — the write-back must then be a no-op.
+        let (url, hits) = spawn_token_server(200, move || {
+            let mut v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&state_json).unwrap()).unwrap();
+            v["active"] = serde_json::json!("race@e.com");
+            std::fs::write(&state_json, serde_json::to_vec(&v).unwrap()).unwrap();
+        });
+        let _u = TokenUrlGuard::set(&url);
+
+        refresh_inactive_if_stale(None);
+
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let st = State::load().unwrap();
+        assert_eq!(st.active.as_deref(), Some("race@e.com"));
+        assert_eq!(
+            st.find("race@e.com").unwrap().access_token,
+            "stale-at",
+            "refreshed tokens must not clobber what is now the active account"
+        );
+    });
+}
+
+#[test]
+fn refresh_inactive_if_stale_flags_needs_relogin_on_invalid_grant() {
+    use crate::store::State;
+    with_isolated_home(|| {
+        seed_state(vec![expired_account("revoked@e.com")], None);
+        let (url, hits) = spawn_token_server(400, || {});
+        let _u = TokenUrlGuard::set(&url);
+
+        refresh_inactive_if_stale(None);
+
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let st = State::load().unwrap();
+        assert!(
+            st.find("revoked@e.com").unwrap().needs_relogin,
+            "a rejected grant with no on-disk rotation must flag the account"
+        );
+    });
+}
+
+#[test]
+fn spawn_watchers_skips_a_credential_path_with_no_parent_directory() {
+    let g = crate::store::ScopedConfigDir::new();
+    // A bare relative filename has an empty parent: nothing sensible to watch.
+    let prov = FakeProvider::new("fake-bare").with_path(PathBuf::from("creds-no-parent.json"));
+    let prov_static: &'static FakeProvider = Box::leak(Box::new(prov));
+    let handle = spawn_watchers(vec![prov_static as &'static dyn Provider]);
+    assert!(handle.is_none());
+    let log =
+        std::fs::read_to_string(g.home().join(".config/usagio/usagio.log")).unwrap_or_default();
+    assert!(
+        !log.contains("watch(") && !log.contains("mkdir"),
+        "an empty parent must be skipped silently, not attempted: {log}"
+    );
+}
+
+#[test]
+fn spawn_watchers_refuses_to_watch_the_filesystem_root() {
+    let g = crate::store::ScopedConfigDir::new();
+    let prov = FakeProvider::new("fake-root").with_path(PathBuf::from("/usagio-test-creds.json"));
+    let prov_static: &'static FakeProvider = Box::leak(Box::new(prov));
+    let handle = spawn_watchers(vec![prov_static as &'static dyn Provider]);
+    assert!(handle.is_none(), "a watch on / is too broad to register");
+    let log =
+        std::fs::read_to_string(g.home().join(".config/usagio/usagio.log")).unwrap_or_default();
+    assert!(log.contains("too broad"), "skip must be logged: {log}");
+}
+
+#[test]
+fn install_then_respawn_watchers_rebuilds_the_registered_watcher() {
+    let td = tempfile::tempdir().unwrap();
+    let cred = td.path().join("creds").join("c.json");
+    let prov = FakeProvider::new("fake-reg").with_path(cred);
+    let prov_static: &'static FakeProvider = Box::leak(Box::new(prov));
+
+    // Start from an empty registry (nothing else in the suite touches it).
+    {
+        let mut reg = WATCHER_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        reg.handle = None;
+        reg.providers.clear();
+    }
+    assert!(
+        !respawn_watchers(),
+        "no providers installed: nothing to respawn"
+    );
+
+    install_watchers(vec![prov_static as &'static dyn Provider]);
+    {
+        let reg = WATCHER_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(reg.providers.len(), 1, "install records the provider list");
+        assert!(reg.handle.is_some(), "install stores the live watcher");
+    }
+    assert!(respawn_watchers());
+    {
+        let mut reg = WATCHER_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(reg.handle.is_some(), "respawn leaves a fresh watcher");
+        // Leave the registry empty again.
+        reg.handle = None;
+        reg.providers.clear();
+    }
+}

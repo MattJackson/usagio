@@ -227,10 +227,11 @@ swap — it notifies you of the soonest reset. It runs inside the menu-bar app (
 menu bar; both run the same loop and use the threshold and auto-swap setting from
 the menu (`usagio watch --trigger` overrides the threshold).
 
-**Your own picks stick.** When you switch to an account yourself — from the menu or
-with `usagio switch <acct>` / `start <acct>` / `continue <acct>` — auto-swap leaves
-it alone even past your threshold, and won't flip back off it either, until it is
-exhausted (100%) or its subscription lapses. Picking another account (or letting
+**Your own picks stick.** When you switch yourself — from the menu or with
+`usagio switch <acct>` / `start <acct>` / `continue <acct>` — to an account already
+at or over your threshold, auto-swap leaves it alone and won't flip back off it
+either, until it is exhausted (100%) or its subscription lapses. A pick under your
+threshold auto-swaps at the threshold like any other. Picking another account (or letting
 `usagio switch` with no account auto-pick) ends the hold.
 
 ## How it works

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.9] - 2026-10-01
+
+### Fixed
+- **A manual switch under your threshold auto-swaps as usual.** In 0.8.8 any
+  manual switch held, so an account picked at 79% rode past the threshold and
+  sat at 99% without swapping. Now only a switch to an account already at or
+  over the threshold holds (you're acking it's over); it still swaps off once
+  it is exhausted (100%).
+
 ## [0.8.8] - 2026-10-01
 
 ### Fixed
@@ -1239,7 +1248,8 @@ fixes; every top finding was independently confirmed before fixing.
 - `token` — print a fresh access token for scripting.
 - Local, owner-only token store at `~/.config/claude-usage/state.json` (0600).
 
-[Unreleased]: https://github.com/MattJackson/usagio/compare/v0.8.8...HEAD
+[Unreleased]: https://github.com/MattJackson/usagio/compare/v0.8.9...HEAD
+[0.8.9]: https://github.com/MattJackson/usagio/compare/v0.8.8...v0.8.9
 [0.8.8]: https://github.com/MattJackson/usagio/compare/v0.8.7...v0.8.8
 [0.8.7]: https://github.com/MattJackson/usagio/compare/v0.8.6...v0.8.7
 [0.8.6]: https://github.com/MattJackson/usagio/compare/v0.8.5...v0.8.6

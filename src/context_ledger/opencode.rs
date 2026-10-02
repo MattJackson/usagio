@@ -199,3 +199,47 @@ fn strip_jsonc_comments(input: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod strip_tests {
+    use super::*;
+
+    #[test]
+    fn line_comment_removed_newline_kept() {
+        assert_eq!(
+            strip_jsonc_comments("{\"a\":1} // note\n{}"),
+            "{\"a\":1} \n{}"
+        );
+    }
+
+    #[test]
+    fn block_comment_removed() {
+        assert_eq!(strip_jsonc_comments("a/* x */b"), "ab");
+        // A lone '*' or '/' inside the comment must not end it early.
+        assert_eq!(strip_jsonc_comments("a/* x/y * z */b"), "ab");
+        assert_eq!(strip_jsonc_comments("a/** doc **/b"), "ab");
+    }
+
+    #[test]
+    fn lone_slash_preserved() {
+        assert_eq!(strip_jsonc_comments("a/b"), "a/b");
+    }
+
+    #[test]
+    fn comment_markers_inside_strings_preserved() {
+        let s = r#"{"u":"http://x/*y*/"}"#;
+        assert_eq!(strip_jsonc_comments(s), s);
+    }
+
+    #[test]
+    fn escaped_quote_does_not_end_string() {
+        let s = r#"{"a":"q\" // still string"}"#;
+        assert_eq!(strip_jsonc_comments(s), s);
+    }
+
+    #[test]
+    fn string_end_re_enables_comment_stripping() {
+        assert_eq!(strip_jsonc_comments(r#""a" // c"#), r#""a" "#);
+        assert_eq!(strip_jsonc_comments(r#""a"/* c */"b""#), r#""a""b""#);
+    }
+}

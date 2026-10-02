@@ -933,4 +933,481 @@ mod tests {
         assert_eq!(out[0].account, "a@x.io");
         assert_eq!(out[0].provider, "claude");
     }
+
+    // --- retention / rotation boundaries ---
+
+    fn touch_with_mtime(path: &Path, mtime: SystemTime) {
+        std::fs::write(path, b"").unwrap();
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+
+    #[test]
+    fn rotate_retention_is_about_six_months() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
+        let ago = |days: i64| SystemTime::from(now - Duration::days(days));
+        let young = dir.path().join("history.2026-04.ndjson");
+        let old = dir.path().join("history.2026-02.ndjson");
+        touch_with_mtime(&young, ago(150)); // inside the 186-day window
+        touch_with_mtime(&old, ago(190)); // outside it
+        rotate_files(dir.path(), now).unwrap();
+        assert!(young.exists(), "150-day-old history must be retained");
+        assert!(!old.exists(), "190-day-old history must be pruned");
+    }
+
+    #[test]
+    fn rotate_keeps_file_exactly_at_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
+        let at_cutoff = dir.path().join("history.2026-03.ndjson");
+        touch_with_mtime(
+            &at_cutoff,
+            SystemTime::from(now - Duration::days(RETAIN_DAYS)),
+        );
+        rotate_files(dir.path(), now).unwrap();
+        assert!(
+            at_cutoff.exists(),
+            "mtime == cutoff is not older than cutoff"
+        );
+    }
+
+    #[test]
+    fn rotate_requires_both_history_prefix_and_ndjson_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let ancient = SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_700_000_000);
+        let wrong_suffix = dir.path().join("history.2024-01.txt");
+        let wrong_prefix = dir.path().join("other.2024-01.ndjson");
+        let real = dir.path().join("history.2024-01.ndjson");
+        for p in [&wrong_suffix, &wrong_prefix, &real] {
+            touch_with_mtime(p, ancient);
+        }
+        rotate_files(dir.path(), Utc::now()).unwrap();
+        assert!(wrong_suffix.exists());
+        assert!(wrong_prefix.exists());
+        assert!(!real.exists());
+    }
+
+    // --- Appender fsync batching ---
+
+    #[test]
+    fn appender_counts_rows_and_resets_at_fsync_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+        let s = snap("claude", "a@x.io", t, Some(1.0));
+        let mut a = Appender::open(&month_path(dir.path(), t)).unwrap();
+        for i in 1..FSYNC_BATCH {
+            a.write_snap(&s).unwrap();
+            assert_eq!(a.rows_since_fsync, i);
+        }
+        a.write_snap(&s).unwrap();
+        assert_eq!(a.rows_since_fsync, 0, "batch boundary resets the counter");
+        a.write_snap(&s).unwrap();
+        assert_eq!(a.rows_since_fsync, 1);
+    }
+
+    // --- sparkline cutoffs (exact boundaries) ---
+
+    #[test]
+    fn sparkline_cutoffs_are_half_open_at_exact_boundaries() {
+        let today = NaiveDate::from_ymd_opt(2026, 9, 6).unwrap();
+        let mk = |days_ago: i64, pct: f32| {
+            let day = today - Duration::days(days_ago);
+            let dt = NaiveDateTime::new(day, chrono::NaiveTime::from_hms_opt(12, 0, 0).unwrap());
+            snap(
+                "claude",
+                "a@x.io",
+                Local
+                    .from_local_datetime(&dt)
+                    .single()
+                    .unwrap()
+                    .with_timezone(&Utc),
+                Some(pct),
+            )
+        };
+        let snaps = vec![
+            mk(6, 0.0),  // [0,20)  -> ▁
+            mk(5, 20.0), // [20,40) -> ▂
+            mk(4, 40.0), // [40,60) -> ▄
+            mk(3, 60.0), // [60,80) -> ▇
+            mk(2, 80.0), // [80,..) -> █
+        ];
+        assert_eq!(sparkline_from_snaps(&snaps, today), "▁▂▄▇█··");
+    }
+
+    // --- pace window / sample-count edges ---
+
+    fn hourly(t0: DateTime<Utc>, pcts: &[f32]) -> Vec<Snapshot> {
+        pcts.iter()
+            .enumerate()
+            .map(|(i, p)| snap("claude", "a@x.io", t0 + Duration::hours(i as i64), Some(*p)))
+            .collect()
+    }
+
+    #[test]
+    fn pace_accepts_exactly_six_samples() {
+        let t0 = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
+        let snaps = hourly(t0, &[10.0, 12.0, 14.0, 16.0, 18.0, 20.0]);
+        let pe = pace_from_snaps(&snaps).expect("six samples is enough");
+        assert_eq!(pe.sample_count, 6);
+        assert!((pe.slope_pct_per_hour - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pace_drop_of_exactly_five_points_is_not_a_reset() {
+        let t0 = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
+        let snaps = hourly(
+            t0,
+            &[10.0, 20.0, 30.0, 40.0, 50.0, 45.0, 55.0, 65.0, 75.0, 85.0],
+        );
+        let pe = pace_from_snaps(&snaps).expect("5pp dip stays in one window");
+        assert_eq!(pe.sample_count, 10);
+    }
+
+    #[test]
+    fn pace_reset_detected_for_a_large_mid_range_drop() {
+        // 60 -> 30 is a 30pp drop: a reset. Only the six samples from 30 on count.
+        let t0 = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
+        let snaps = hourly(t0, &[50.0, 55.0, 60.0, 30.0, 33.0, 36.0, 39.0, 42.0, 45.0]);
+        let pe = pace_from_snaps(&snaps).unwrap();
+        assert_eq!(pe.sample_count, 6);
+        assert!((pe.slope_pct_per_hour - 3.0).abs() < 1e-9);
+    }
+
+    // --- cached range reads ---
+
+    fn utc(y: i32, m: u32, d: u32, h: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, m, d, h, 0, 0).unwrap()
+    }
+
+    fn weeklies(v: &[Snapshot]) -> Vec<f32> {
+        v.iter().map(|s| s.weekly_pct.unwrap()).collect()
+    }
+
+    // Each cached-read test uses its own distinct year(s): the month cache is
+    // process-global and keyed by (year, month), so disjoint months keep
+    // parallel tests from sharing entries.
+
+    #[test]
+    fn cached_range_filters_to_inclusive_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = AccountKey::new("claude", "b@x.io");
+        let key = AccountKey::new("claude", "a@x.io");
+        for (d, pct) in [(9, 1.0), (10, 2.0), (15, 3.0), (20, 4.0), (21, 5.0)] {
+            write_snap(
+                dir.path(),
+                &snap("claude", "a@x.io", utc(2041, 3, d, 0), Some(pct)),
+            );
+        }
+        write_snap(
+            dir.path(),
+            &snap("claude", "b@x.io", utc(2041, 3, 15, 0), Some(99.0)),
+        );
+        let out = read_range_cached(dir.path(), &key, utc(2041, 3, 10, 0), utc(2041, 3, 20, 0));
+        // Both endpoints are inclusive; outside rows and other accounts are not.
+        assert_eq!(weeklies(&out), vec![2.0, 3.0, 4.0]);
+        let out = read_range_cached(dir.path(), &other, utc(2041, 3, 1, 0), utc(2041, 3, 31, 0));
+        assert_eq!(weeklies(&out), vec![99.0]);
+    }
+
+    #[test]
+    fn cached_range_spans_multiple_months() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = AccountKey::new("claude", "a@x.io");
+        for (m, pct) in [(5, 1.0), (6, 2.0), (7, 3.0), (8, 4.0)] {
+            write_snap(
+                dir.path(),
+                &snap("claude", "a@x.io", utc(2042, m, 15, 0), Some(pct)),
+            );
+        }
+        let out = read_range_cached(dir.path(), &key, utc(2042, 5, 1, 0), utc(2042, 7, 31, 0));
+        assert_eq!(
+            weeklies(&out),
+            vec![1.0, 2.0, 3.0],
+            "start..=end months, no more"
+        );
+    }
+
+    #[test]
+    fn cached_range_wraps_across_year_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = AccountKey::new("claude", "a@x.io");
+        write_snap(
+            dir.path(),
+            &snap("claude", "a@x.io", utc(2043, 11, 15, 0), Some(1.0)),
+        );
+        write_snap(
+            dir.path(),
+            &snap("claude", "a@x.io", utc(2043, 12, 15, 0), Some(2.0)),
+        );
+        write_snap(
+            dir.path(),
+            &snap("claude", "a@x.io", utc(2044, 1, 15, 0), Some(3.0)),
+        );
+        write_snap(
+            dir.path(),
+            &snap("claude", "a@x.io", utc(2044, 2, 15, 0), Some(4.0)),
+        );
+        write_snap(
+            dir.path(),
+            &snap("claude", "a@x.io", utc(2044, 3, 15, 0), Some(5.0)),
+        );
+        let out = read_range_cached(dir.path(), &key, utc(2043, 11, 1, 0), utc(2044, 2, 28, 0));
+        assert_eq!(weeklies(&out), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn cached_range_with_from_after_to_terminates_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = AccountKey::new("claude", "a@x.io");
+        write_snap(
+            dir.path(),
+            &snap("claude", "a@x.io", utc(2045, 9, 15, 0), Some(1.0)),
+        );
+        // Same year, later month than `to`.
+        let out = read_range_cached(dir.path(), &key, utc(2045, 10, 1, 0), utc(2045, 8, 1, 0));
+        assert!(out.is_empty());
+        // Later year than `to`.
+        let out = read_range_cached(dir.path(), &key, utc(2046, 3, 1, 0), utc(2045, 8, 1, 0));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn cached_range_sorts_ascending_and_skips_corrupt_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = AccountKey::new("claude", "a@x.io");
+        let path = month_path_ym(dir.path(), 2047, 4);
+        let line = |d: u32, pct: f32| {
+            serde_json::to_string(&snap("claude", "a@x.io", utc(2047, 4, d, 0), Some(pct))).unwrap()
+        };
+        let body = format!("{}\nnot json\n\n{}\n", line(20, 2.0), line(10, 1.0));
+        std::fs::write(&path, body).unwrap();
+        let out = read_range_cached(dir.path(), &key, utc(2047, 4, 1, 0), utc(2047, 4, 30, 0));
+        assert_eq!(weeklies(&out), vec![1.0, 2.0]);
+    }
+
+    /// The cache serves a month from memory while its mtime is unchanged, and
+    /// re-parses as soon as the mtime moves.
+    #[test]
+    fn month_cache_is_keyed_on_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = AccountKey::new("claude", "a@x.io");
+        let path = month_path_ym(dir.path(), 2048, 6);
+        let body = |pct: f32| {
+            let s = snap("claude", "a@x.io", utc(2048, 6, 10, 0), Some(pct));
+            format!("{}\n", serde_json::to_string(&s).unwrap())
+        };
+        let read = || {
+            weeklies(&read_range_cached(
+                dir.path(),
+                &key,
+                utc(2048, 6, 1, 0),
+                utc(2048, 6, 30, 0),
+            ))
+        };
+        let set_mtime = |t: SystemTime| {
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+        };
+
+        std::fs::write(&path, body(10.0)).unwrap();
+        let stamp = SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_800_000_000);
+        set_mtime(stamp);
+        assert_eq!(read(), vec![10.0]);
+
+        // Content changes but the mtime is put back: still the cached parse.
+        std::fs::write(&path, body(20.0)).unwrap();
+        set_mtime(stamp);
+        assert_eq!(read(), vec![10.0], "unchanged mtime must hit the cache");
+
+        // Advancing the mtime invalidates the entry.
+        set_mtime(stamp + StdDuration::from_secs(10));
+        assert_eq!(read(), vec![20.0], "new mtime must re-parse");
+    }
+
+    // --- global-config entry points (scoped config dir) ---
+
+    /// Serialises tests that drive the process-global appender slot and the
+    /// once-per-process rotation flag.
+    static APPEND_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Drop the cache entries for the months a "last N days" read can touch.
+    /// Targeted (not `invalidate_cache`) so it can't evict another test's
+    /// entry for a far-future month mid-assertion.
+    fn evict_recent_months() {
+        let now = Utc::now();
+        let mut c = month_cache().lock().unwrap();
+        for back in 0..=3 {
+            let d = now - Duration::days(31 * back);
+            c.months.remove(&(d.year(), d.month()));
+        }
+    }
+
+    fn cfg_dir() -> PathBuf {
+        store::config_dir().unwrap()
+    }
+
+    #[test]
+    fn append_writes_the_snapshot_into_the_config_dir() {
+        let _l = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cfg = store::ScopedConfigDir::new();
+        let ts = utc(2049, 5, 5, 5);
+        append(&snap("claude", "a@x.io", ts, Some(12.5))).unwrap();
+        let body = std::fs::read_to_string(month_path(&cfg_dir(), ts)).unwrap();
+        assert!(body.contains("a@x.io") && body.contains("12.5"), "{body}");
+    }
+
+    #[test]
+    fn append_keeps_the_appender_in_the_global_slot() {
+        let _l = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cfg = store::ScopedConfigDir::new();
+        let ts = utc(2049, 6, 5, 5);
+        let want = month_path(&cfg_dir(), ts);
+        // Retry: another test's append (outside this lock) may swap the slot.
+        let held = (0..20).any(|_| {
+            append(&snap("claude", "a@x.io", ts, Some(1.0))).unwrap();
+            appender_slot()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|a| a.path == want)
+        });
+        assert!(held, "append must leave its appender in the shared slot");
+    }
+
+    #[test]
+    fn append_follows_month_boundary_into_new_file() {
+        let _l = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cfg = store::ScopedConfigDir::new();
+        let july = utc(2049, 7, 31, 23);
+        let aug = utc(2049, 8, 1, 1);
+        append(&snap("claude", "a@x.io", july, Some(1.0))).unwrap();
+        append(&snap("claude", "a@x.io", aug, Some(2.0))).unwrap();
+        let j = std::fs::read_to_string(month_path(&cfg_dir(), july)).unwrap();
+        let a = std::fs::read_to_string(month_path(&cfg_dir(), aug)).unwrap();
+        assert_eq!(j.lines().count(), 1, "july file: {j}");
+        assert_eq!(a.lines().count(), 1, "august file: {a}");
+        assert!(a.contains("\"weekly_pct\":2.0"), "{a}");
+    }
+
+    #[test]
+    fn append_prunes_only_on_first_append_per_process() {
+        let _l = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cfg = store::ScopedConfigDir::new();
+        let stale = cfg_dir().join("history.2020-01.ndjson");
+        touch_with_mtime(
+            &stale,
+            SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_700_000_000),
+        );
+        // Rotation has already happened in this process: no prune now.
+        BOOT_ROTATED.store(true, Ordering::SeqCst);
+        append(&snap("claude", "a@x.io", utc(2049, 9, 5, 5), Some(1.0))).unwrap();
+        assert!(stale.exists(), "later appends must not re-run the prune");
+    }
+
+    #[test]
+    fn rotate_if_needed_prunes_stale_files_in_config_dir() {
+        let _l = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cfg = store::ScopedConfigDir::new();
+        let stale = cfg_dir().join("history.2020-01.ndjson");
+        let fresh = cfg_dir().join("history.2026-08.ndjson");
+        let now = utc(2026, 9, 1, 0);
+        touch_with_mtime(&stale, SystemTime::from(now - Duration::days(300)));
+        touch_with_mtime(&fresh, SystemTime::from(now - Duration::days(10)));
+        rotate_if_needed(now).unwrap();
+        assert!(!stale.exists());
+        assert!(fresh.exists());
+        assert!(BOOT_ROTATED.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn last_n_days_returns_account_rows_inside_the_window() {
+        let _cfg = store::ScopedConfigDir::new();
+        let now = Utc::now();
+        let dir = cfg_dir();
+        write_snap(
+            &dir,
+            &snap("claude", "a@x.io", now - Duration::days(10), Some(1.0)),
+        );
+        write_snap(
+            &dir,
+            &snap("claude", "a@x.io", now - Duration::days(1), Some(2.0)),
+        );
+        write_snap(
+            &dir,
+            &snap("claude", "b@x.io", now - Duration::days(1), Some(3.0)),
+        );
+        evict_recent_months();
+        let out = last_n_days(&AccountKey::new("claude", "a@x.io"), 7);
+        assert_eq!(weeklies(&out), vec![2.0]);
+    }
+
+    #[test]
+    fn last_snapshot_is_the_newest_row_within_35_days() {
+        let _cfg = store::ScopedConfigDir::new();
+        let now = Utc::now();
+        let dir = cfg_dir();
+        let key = AccountKey::new("claude", "a@x.io");
+        write_snap(
+            &dir,
+            &snap("claude", "a@x.io", now - Duration::days(40), Some(1.0)),
+        );
+        evict_recent_months();
+        assert!(
+            last_snapshot(&key).is_none(),
+            "40-day-old row is out of range"
+        );
+
+        write_snap(
+            &dir,
+            &snap("claude", "a@x.io", now - Duration::days(3), Some(2.0)),
+        );
+        write_snap(
+            &dir,
+            &snap("claude", "a@x.io", now - Duration::hours(2), Some(3.0)),
+        );
+        write_snap(
+            &dir,
+            &snap("claude", "b@x.io", now - Duration::hours(1), Some(9.0)),
+        );
+        evict_recent_months();
+        let last = last_snapshot(&key).expect("recent rows exist");
+        assert_eq!(last.weekly_pct, Some(3.0));
+        assert_eq!(last.account, "a@x.io");
+    }
+
+    #[test]
+    fn sparkline_7d_marks_today_from_logged_usage() {
+        let _cfg = store::ScopedConfigDir::new();
+        write_snap(
+            &cfg_dir(),
+            &snap("claude", "a@x.io", Utc::now(), Some(85.0)),
+        );
+        evict_recent_months();
+        assert_eq!(
+            sparkline_7d(&AccountKey::new("claude", "a@x.io")),
+            "······█"
+        );
+    }
+
+    #[test]
+    fn pace_reads_recent_history_and_fits_a_slope() {
+        let _cfg = store::ScopedConfigDir::new();
+        let t0 = Utc::now() - Duration::hours(10);
+        for s in hourly(t0, &[10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0]) {
+            write_snap(&cfg_dir(), &s);
+        }
+        evict_recent_months();
+        let pe = pace(&AccountKey::new("claude", "a@x.io")).expect("8 rising samples");
+        assert_eq!(pe.sample_count, 8);
+        assert!((pe.slope_pct_per_hour - 2.0).abs() < 1e-6);
+    }
 }

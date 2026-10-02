@@ -151,3 +151,118 @@ fn submenu_label(label: &str, active: bool, value_spans: &[ValueSpan]) -> Row {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tree(items: Vec<MenuItem>) -> MenuTree {
+        MenuTree { items }
+    }
+
+    #[test]
+    fn render_menu_translates_every_item_in_order() {
+        let t = tree(vec![
+            MenuItem::Static {
+                label: "Claude".into(),
+                icon_png: None,
+            },
+            MenuItem::Action {
+                id: "refresh:now".into(),
+                label: "Refresh".into(),
+                icon_png: None,
+                enabled: true,
+                checked: false,
+                checkable: false,
+            },
+            MenuItem::Separator,
+            MenuItem::Info {
+                label: "note".into(),
+                color: None,
+            },
+        ]);
+        let menu = render_menu(&t);
+        assert_eq!(menu.len(), 4);
+        assert!(matches!(menu.items[0], Item::SectionHeader(_)));
+        match &menu.items[1] {
+            Item::Row(r) => {
+                assert_eq!(r.id.as_str(), "refresh:now");
+                assert_eq!(r.segments[0].text, "Refresh");
+            }
+            other => panic!("expected row, got {other:?}"),
+        }
+        assert!(matches!(menu.items[2], Item::Separator));
+        assert!(matches!(menu.items[3], Item::Row(_)));
+        assert!(render_menu(&tree(vec![])).is_empty());
+    }
+
+    #[test]
+    fn submenu_children_are_built_recursively() {
+        let t = tree(vec![MenuItem::Submenu {
+            label: "a@b.c\t10%".into(),
+            icon_png: None,
+            items: vec![MenuItem::Separator, MenuItem::Separator],
+            active: false,
+            value_spans: vec![],
+        }]);
+        let menu = render_menu(&t);
+        match &menu.items[0] {
+            Item::Submenu { menu, .. } => assert_eq!(menu.len(), 2),
+            other => panic!("expected submenu, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submenu_label_splits_name_and_value_with_span_runs() {
+        let spans = [
+            ValueSpan {
+                start: 0,
+                len: 3,
+                color: ValueColor::Amber,
+            },
+            ValueSpan {
+                start: 6,
+                len: 3,
+                color: ValueColor::Red,
+            },
+        ];
+        let row = submenu_label("me@x.io\t85% / 95%", false, &spans);
+        assert!(row.id.is_none());
+        assert_eq!(row.segments.len(), 2);
+        assert_eq!(row.segments[0].text, "me@x.io");
+        assert!(row.segments[0].runs.is_empty());
+        assert_eq!(row.segments[1].text, "85% / 95%");
+        assert_eq!(
+            row.segments[1].runs,
+            vec![
+                StyleRun::new(0, 3, Color::SystemOrange),
+                StyleRun::new(6, 3, Color::SystemRed),
+            ]
+        );
+    }
+
+    #[test]
+    fn submenu_label_without_spans_has_no_value_runs() {
+        let row = submenu_label("me@x.io\t10% / 20%", false, &[]);
+        assert_eq!(row.segments[1].text, "10% / 20%");
+        assert!(row.segments[1].runs.is_empty());
+    }
+
+    #[test]
+    fn submenu_label_active_name_is_bold_accent() {
+        let row = submenu_label("é@x.io\t1%", true, &[]);
+        let len = "é@x.io".encode_utf16().count();
+        assert_eq!(
+            row.segments[0].runs,
+            vec![StyleRun::new(0, len, Color::Accent).weight(Weight::Bold)]
+        );
+    }
+
+    #[test]
+    fn submenu_label_without_tab_is_a_plain_label() {
+        let row = submenu_label("Settings", false, &[]);
+        assert!(row.id.is_none());
+        assert_eq!(row.segments.len(), 1);
+        assert_eq!(row.segments[0].text, "Settings");
+    }
+}
