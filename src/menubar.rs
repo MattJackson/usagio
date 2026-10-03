@@ -5525,12 +5525,12 @@ mod tests {
     #[test]
     fn restore_drop_confirmation_names_dropped_emails_not_just_a_count() {
         let msg = super::restore_drop_confirmation(&[
-            "dev@getbusbar.com".to_string(),
+            "dev@example.com".to_string(),
             "matthew@pq.io".to_string(),
         ]);
         assert_eq!(
             msg,
-            "Restoring will drop dev@getbusbar.com, matthew@pq.io. Continue?"
+            "Restoring will drop dev@example.com, matthew@pq.io. Continue?"
         );
     }
 
@@ -5568,7 +5568,7 @@ mod tests {
         use crate::store::{accounts_dropped_by, ScopedConfigDir, State};
         let _g = ScopedConfigDir::new();
         let mut current = State::default();
-        for email in ["dev@getbusbar.com", "matthew@pq.io"] {
+        for email in ["dev@example.com", "matthew@pq.io"] {
             current.accounts.push(restore_test_acct(email));
         }
         current.save().unwrap();
@@ -5576,7 +5576,7 @@ mod tests {
         let mut restore_target = State::default();
         restore_target
             .accounts
-            .push(restore_test_acct("dev@getbusbar.com"));
+            .push(restore_test_acct("dev@example.com"));
 
         let dropped = accounts_dropped_by(&restore_target).unwrap();
         assert_eq!(dropped, vec!["matthew@pq.io".to_string()]);

@@ -220,12 +220,12 @@ fn upsert_appends_new_account() {
 #[test]
 fn resolve_exact_and_unique_prefix() {
     let mut s = State::default();
-    s.accounts.push(acct("dev@getbusbar.com"));
+    s.accounts.push(acct("dev@example.com"));
     s.accounts.push(acct("matthew@pq.io"));
     // Exact (case-insensitive).
-    assert_eq!(s.resolve("DEV@getbusbar.com").unwrap(), "dev@getbusbar.com");
+    assert_eq!(s.resolve("DEV@example.com").unwrap(), "dev@example.com");
     // Unique prefix.
-    assert_eq!(s.resolve("dev").unwrap(), "dev@getbusbar.com");
+    assert_eq!(s.resolve("dev").unwrap(), "dev@example.com");
     assert_eq!(s.resolve("matt").unwrap(), "matthew@pq.io");
 }
 
@@ -496,7 +496,7 @@ fn migrates_old_name_keyed_state() {
         "accounts": [
             {
                 "name": "dev1",
-                "email": "dev@getbusbar.com",
+                "email": "dev@example.com",
                 "access_token": "a1",
                 "refresh_token": "r1",
                 "expires_at": 1,
@@ -515,7 +515,7 @@ fn migrates_old_name_keyed_state() {
     });
     let s = State::from_value(&old);
     assert_eq!(s.accounts.len(), 2);
-    assert_eq!(s.find("dev@getbusbar.com").unwrap().access_token, "a1");
+    assert_eq!(s.find("dev@example.com").unwrap().access_token, "a1");
     // email backfilled from oauth_account.emailAddress
     assert!(s.find("matthew@pq.io").is_some());
     // active migrated from the legacy name to that account's email
@@ -590,11 +590,11 @@ fn reconciler_never_persists_silent_account_drop() {
 #[test]
 fn accounts_dropped_by_reports_specific_emails_not_just_a_count() {
     let _g = ScopedConfigDir::new();
-    make_state_with(&["dev@getbusbar.com", "matthew@pq.io"])
+    make_state_with(&["dev@example.com", "matthew@pq.io"])
         .save()
         .unwrap();
 
-    let restore_target = make_state_with(&["dev@getbusbar.com"]);
+    let restore_target = make_state_with(&["dev@example.com"]);
     let dropped = accounts_dropped_by(&restore_target).unwrap();
     assert_eq!(dropped, vec!["matthew@pq.io".to_string()]);
 }
@@ -846,7 +846,7 @@ fn v1_state_json_loads_and_upgrades_to_v2() {
     let v1 = serde_json::json!({
         "accounts": [
             {
-                "email": "dev@getbusbar.com",
+                "email": "dev@example.com",
                 "access_token": "a1",
                 "refresh_token": "r1",
                 "expires_at": 1_700_000_000_000i64,
@@ -857,7 +857,7 @@ fn v1_state_json_loads_and_upgrades_to_v2() {
                 }
             }
         ],
-        "active": "dev@getbusbar.com",
+        "active": "dev@example.com",
         "autoswap_disabled": true,
         "trigger_pct": 90.0
     });
@@ -867,10 +867,10 @@ fn v1_state_json_loads_and_upgrades_to_v2() {
     // the policy bits all survive untouched.
     assert_eq!(s.schema_version, STATE_SCHEMA_VERSION);
     assert_eq!(s.accounts.len(), 1);
-    let acct = s.find("dev@getbusbar.com").unwrap();
+    let acct = s.find("dev@example.com").unwrap();
     assert_eq!(acct.access_token, "a1");
     assert_eq!(acct.cached_usage.as_ref().unwrap().session_pct, Some(42.0));
-    assert_eq!(s.active.as_deref(), Some("dev@getbusbar.com"));
+    assert_eq!(s.active.as_deref(), Some("dev@example.com"));
     assert!(s.autoswap_disabled);
     assert_eq!(s.trigger_pct, Some(90.0));
     // The new v2 bucket is simply empty — no non-Claude accounts existed to
@@ -1354,7 +1354,7 @@ fn claude_cached_usage_without_reported_field_still_loads() {
     // extras simply empty.
     let old = serde_json::json!({
         "accounts": [{
-            "email": "dev@getbusbar.com",
+            "email": "dev@example.com",
             "access_token": "a1",
             "refresh_token": "r1",
             "expires_at": 1_700_000_000_000i64,
@@ -1368,7 +1368,7 @@ fn claude_cached_usage_without_reported_field_still_loads() {
     });
     let s = State::from_value(&old);
     let cu = s
-        .find("dev@getbusbar.com")
+        .find("dev@example.com")
         .unwrap()
         .cached_usage
         .clone()
@@ -1421,7 +1421,7 @@ fn reported_usage_round_trips_through_state() {
         }],
         scoped_limits: vec![],
     };
-    let mut a = acct("dev@getbusbar.com");
+    let mut a = acct("dev@example.com");
     a.cached_usage = Some(CachedUsage {
         weekly_pct: Some(5.0),
         fetched_at: 1,
@@ -1433,7 +1433,7 @@ fn reported_usage_round_trips_through_state() {
     let v = serde_json::to_value(&s).unwrap();
     let reloaded = State::from_value(&v);
     let cu = reloaded
-        .find("dev@getbusbar.com")
+        .find("dev@example.com")
         .unwrap()
         .cached_usage
         .clone()

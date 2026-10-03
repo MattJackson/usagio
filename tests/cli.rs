@@ -55,7 +55,7 @@ fn seed_state(home: &TempDir, json: &str) {
 const TWO_ACCOUNTS: &str = r#"{
   "accounts": [
     {"email":"matthew@pq.io","access_token":"a","refresh_token":"b","expires_at":0,"keychain_blob":"{}","oauth_account":null,"user_id":null,"cached_usage":null},
-    {"email":"dev@getbusbar.com","access_token":"c","refresh_token":"d","expires_at":0,"keychain_blob":"{}","oauth_account":null,"user_id":null,"cached_usage":null}
+    {"email":"dev@example.com","access_token":"c","refresh_token":"d","expires_at":0,"keychain_blob":"{}","oauth_account":null,"user_id":null,"cached_usage":null}
   ],
   "active": null,
   "autoswap_disabled": false,
@@ -65,7 +65,7 @@ const TWO_ACCOUNTS: &str = r#"{
 /// The legacy name-keyed shape, to prove migration on load.
 const OLD_SHAPE: &str = r#"{
   "accounts": [
-    {"name":"dev1","email":"dev@getbusbar.com","access_token":"c","refresh_token":"d","expires_at":0,"keychain_blob":"{}"},
+    {"name":"dev1","email":"dev@example.com","access_token":"c","refresh_token":"d","expires_at":0,"keychain_blob":"{}"},
     {"name":"Personal","email":"matthew@pq.io","access_token":"a","refresh_token":"b","expires_at":0,"keychain_blob":"{}"}
   ],
   "active": "Personal"
@@ -168,14 +168,14 @@ fn switch_with_no_accounts_errors() {
 fn rm_removes_seeded_account_by_prefix() {
     let home = TempDir::new().unwrap();
     seed_state(&home, TWO_ACCOUNTS);
-    // Unique prefix "dev" resolves to dev@getbusbar.com.
+    // Unique prefix "dev" resolves to dev@example.com.
     bin(&home)
         .args(["rm", "dev"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Removed dev@getbusbar.com"));
+        .stdout(predicate::str::contains("Removed dev@example.com"));
     let emails = account_emails_lower(&home);
-    assert!(!emails.contains(&"dev@getbusbar.com".to_string()));
+    assert!(!emails.contains(&"dev@example.com".to_string()));
     assert!(emails.contains(&"matthew@pq.io".to_string()));
 }
 
@@ -190,7 +190,7 @@ fn rm_is_case_insensitive() {
         .stdout(predicate::str::contains("Removed matthew@pq.io"));
     let emails = account_emails_lower(&home);
     assert!(!emails.contains(&"matthew@pq.io".to_string()));
-    assert!(emails.contains(&"dev@getbusbar.com".to_string()));
+    assert!(emails.contains(&"dev@example.com".to_string()));
 }
 
 #[test]
@@ -218,6 +218,6 @@ fn migrates_old_name_keyed_state_on_load() {
     bin(&home)
         .assert()
         .success()
-        .stdout(predicate::str::contains("dev@getbusbar.com"))
+        .stdout(predicate::str::contains("dev@example.com"))
         .stdout(predicate::str::contains("matthew@pq.io"));
 }
