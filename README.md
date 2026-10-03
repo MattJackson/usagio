@@ -129,6 +129,13 @@ Notes:
   Capturing an email that already exists just **refreshes** it; it never silently
   creates a duplicate or overwrites a different account.
 - You log in **once per account**; after that `usagio` refreshes tokens itself.
+- When an account's login is about to expire (or has), its row says
+  `renew · 2d` (or `⚠ renew`) and you get one notification. Click **Renew
+  login…** in its submenu: usagio opens its own small sign-in window for that
+  account — separate from your browser, with that account's claude.ai session
+  remembered — so it's usually a single **Authorize** click. No `claude` /
+  `/login` needed, and it never changes which account is active. From a
+  terminal: `usagio renew <email>` (uses your browser).
 - Remove an account from the menu, or with `usagio rm <email>`.
 
 ## Menu bar app
@@ -151,6 +158,7 @@ active account's **session %** at a glance. Click it for a dropdown:
     `Credits · 120 left`), where this week's usage went
     (`This week · Claude Code 82% · Chats 18%`), and per-model weekly limits in
     use (`Fable 7d · 42% · resets in 2d 3h`). Never estimated.
+  - **Renew login…** — sign this account in again in usagio's own window
   - **Remove…**
 - **Auto-swap at high usage ▸ Off / 90% / 95% / 98%**, plus **Switch to best
   account now** (jump immediately to the account with room that resets soonest)
@@ -174,6 +182,7 @@ usagio switch [acct]       Make <acct> the active login (no launch)
 usagio start [acct]        Switch, then launch a fresh `claude`
 usagio continue [acct]     Switch, then launch `claude --continue`
 usagio token <acct>        Print a fresh access token (for scripting)
+usagio renew <acct>        Sign <acct> in again in your browser (fresh login)
 usagio rm <acct>           Forget an account
 usagio menubar             Run the menu-bar app
 usagio watch               Headless auto-swap (foreground, no menu bar)

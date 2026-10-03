@@ -89,6 +89,10 @@ pub struct NotifState {
     /// during its current weekly window.
     #[serde(default)]
     pub pace_fired_this_window: bool,
+    /// The login expiry (unix millis) already warned about. A renewal moves
+    /// the expiry, so the next approach warns again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_expiry_warned: Option<i64>,
 }
 
 /// Thresholds we check on every tick, ascending so a `Vec<Trigger>` from
@@ -542,6 +546,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             pace_fired_this_window: true,
+            ..NotifState::default()
         };
         // A weekly reset happens; `dedup_and_apply` must clear both.
         let prev = snap(None, Some(85.0));
@@ -559,6 +564,7 @@ mod tests {
         let mut state = NotifState {
             crossings: BTreeSet::new(),
             pace_fired_this_window: true,
+            ..NotifState::default()
         };
         let prev = snap(Some(85.0), None);
         let curr = snap(Some(3.0), None);
@@ -695,6 +701,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             pace_fired_this_window: true,
+            ..NotifState::default()
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: NotifState = serde_json::from_str(&json).unwrap();
