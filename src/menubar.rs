@@ -2535,6 +2535,7 @@ fn handle_click(id: &str) {
         ("switch", Some(slug), Some(key)) => handle_switch(slug, key),
         ("remove", Some(slug), Some(key)) => handle_remove(slug, key),
         ("renew", Some(slug), Some(key)) => handle_renew(slug, key),
+        ("signin", Some(slug), None) => handle_sign_in(slug),
         ("backup", Some("save"), None) => handle_backup_save(),
         ("backup", Some("restore"), None) => handle_backup_restore_dialog(),
         ("refresh", Some("now"), None) => handle_refresh_now(),
@@ -2854,49 +2855,90 @@ fn handle_renew(slug: &str, key: &str) {
     let Some(provider) = providers::get(slug) else {
         return;
     };
-    let started = crate::login::start(provider, Some(key.to_string()), |result| match result {
+    let store = State::load()
+        .ok()
+        .and_then(|st| st.find(key).and_then(|a| a.login_store.clone()))
+        .unwrap_or_else(|| key.to_string());
+    let target = crate::login::Target::Renew(key.to_string());
+    let started = crate::login::start(provider, target, |result| match result {
         Ok(r) => {
             notify(&renewed_message(&r));
             request_poll_now();
         }
         Err(e) => notify(&format!("Renew failed: {e:#}")),
     });
-    let started = match started {
-        Ok(s) => s,
-        Err(e) => {
-            notify(&format!("Renew failed: {e:#}"));
-            return;
-        }
+    match started {
+        Ok(s) => show_sign_in(&format!("Renew {key} — usagio"), slug, &store, &s),
+        Err(e) => notify(&format!("Renew failed: {e:#}")),
+    }
+}
+
+/// "Sign in to a new <Provider> account…": the same login as Renew, in a
+/// fresh sign-in window store, adding whichever account signs in (never
+/// switching to it). The account remembers that store for its renewals.
+fn handle_sign_in(slug: &str) {
+    let Some(provider) = providers::get(slug) else {
+        return;
     };
-    let title = format!("Renew {key} — usagio");
+    let store = crate::login::new_store_key();
+    let target = crate::login::Target::Add {
+        store: store.clone(),
+    };
+    let started = crate::login::start(provider, target, |result| match result {
+        Ok(r) => {
+            notify(&added_message(&r));
+            request_poll_now();
+        }
+        Err(e) => notify(&format!("Sign-in failed: {e:#}")),
+    });
+    match started {
+        Ok(s) => show_sign_in(
+            &format!("Sign in to {} — usagio", provider.display_name()),
+            slug,
+            &store,
+            &s,
+        ),
+        Err(e) => notify(&format!("Sign-in failed: {e:#}")),
+    }
+}
+
+/// Show a started login in the sign-in window, or the default browser where
+/// no window can be shown here.
+fn show_sign_in(title: &str, slug: &str, store: &str, started: &crate::login::Started) {
     let platform = crate::platform();
     let in_window = platform.sign_in_window_available()
         && match platform.open_sign_in_window(
-            &title,
+            title,
             &started.url,
             slug,
-            key,
+            store,
             std::sync::Arc::clone(&started.progress),
         ) {
             Ok(()) => true,
             Err(e) => {
-                crate::logging::log(&format!(
-                    "renew: sign-in window failed, using browser: {e:#}"
-                ));
+                crate::logging::log(&format!("sign-in window failed, using browser: {e:#}"));
                 false
             }
         };
     if !in_window {
         if let Err(e) = platform.open_url(&started.url) {
             started.progress.cancel();
-            notify(&format!("Renew failed: {e:#}"));
+            notify(&format!("Sign-in failed: {e:#}"));
         }
     }
 }
 
-/// "dev@example.com renewed — login good until Oct 31 · live in Claude Code".
+/// "dev@example.com renewed — login good until Oct 31 · live now".
 fn renewed_message(r: &crate::login::Renewed) -> String {
-    let mut msg = format!("{} renewed", r.key);
+    login_message(format!("{} renewed", r.key), r)
+}
+
+/// "Added dev@example.com — login good until Oct 31".
+fn added_message(r: &crate::login::Renewed) -> String {
+    login_message(format!("Added {}", r.key), r)
+}
+
+fn login_message(mut msg: String, r: &crate::login::Renewed) -> String {
     if let Some(at) = r.login_expires_at.and_then(DateTime::from_timestamp_millis) {
         msg.push_str(&format!(
             " — login good until {}",
@@ -3313,6 +3355,14 @@ mod cross_platform {
                 };
                 capture_items.push(action(format!("{prefix}:{}", reg.provider_id), title, true));
             }
+        }
+        // Sign in to a new account — every provider usagio can log in itself.
+        for p in providers::all().iter().filter(|p| p.login_spec().is_some()) {
+            items.push(action(
+                format!("signin:{}", p.provider_id()),
+                format!("Sign in to a new {} account…", p.display_name()),
+                true,
+            ));
         }
         items.push(plain_submenu("Capture current login", capture_items));
 
