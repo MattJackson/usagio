@@ -15,19 +15,19 @@ Needed to compile usagio from source (`cargo build` / `cargo install`).
 ### Ubuntu / Debian
 
 ```sh
-sudo apt install libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libssl-dev pkg-config
+sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libxdo-dev libssl-dev pkg-config
 ```
 
 ### Fedora
 
 ```sh
-sudo dnf install gtk3-devel libappindicator-gtk3-devel libxdo-devel openssl-devel pkgconf-pkg-config
+sudo dnf install gtk3-devel webkit2gtk4.1-devel libappindicator-gtk3-devel libxdo-devel openssl-devel pkgconf-pkg-config
 ```
 
 ### Arch Linux / Manjaro
 
 ```sh
-sudo pacman -S gtk3 libappindicator-gtk3 xdotool openssl pkgconf
+sudo pacman -S gtk3 webkit2gtk-4.1 libappindicator-gtk3 xdotool openssl pkgconf
 ```
 
 (`libayatana-appindicator3` is preferred where available; Arch's
@@ -42,22 +42,27 @@ Needed to *run* the built `usagio` binary (menubar / tray mode).
 ### Ubuntu / Debian
 
 ```sh
-sudo apt install libgtk-3-0 libayatana-appindicator3-1 libsecret-1-0 xdg-desktop-portal
+sudo apt install libgtk-3-0 libwebkit2gtk-4.1-0 libayatana-appindicator3-1 libsecret-1-0 xdg-desktop-portal
 ```
 
 ### Fedora
 
 ```sh
-sudo dnf install gtk3 libayatana-appindicator3 libsecret xdg-desktop-portal
+sudo dnf install gtk3 webkit2gtk4.1 libayatana-appindicator3 libsecret xdg-desktop-portal
 ```
 
 ### Arch Linux / Manjaro
 
 ```sh
-sudo pacman -S gtk3 libayatana-appindicator libsecret xdg-desktop-portal
+sudo pacman -S gtk3 webkit2gtk-4.1 libayatana-appindicator libsecret xdg-desktop-portal
 ```
 
 ## Notes on optional pieces
+
+- **Sign-in window** ("Renew login…") is a WebKitGTK web view
+  (`libwebkit2gtk-4.1`), one persistent cookie store per account under
+  `~/.config/usagio/webview/`. It's the same engine GNOME Web uses; without
+  a display the menu falls back to opening the default browser.
 
 - **Secret storage** (`keyring` crate, Secret Service backend) talks to
   whatever D-Bus Secret Service provider is running — GNOME Keyring, KWallet

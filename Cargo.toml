@@ -1,6 +1,6 @@
 [package]
 name = "usagio"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Track usage / limits across every AI coding CLI you use, and switch between accounts."
@@ -120,6 +120,13 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "c
 # the caret to "0.11" deliberately only when muri makes its next MINOR (pre-1.0
 # minors may break per muri's migration guidance §7); patch bumps ride the lock.
 muri = { version = "0.14.7", features = ["muda-compat"] }
+# Built-in "Renew login" window (src/login): the OS's own engine — WKWebView on
+# macOS, WebView2 on Windows, WebKitGTK on Linux (built on the GTK loop we
+# already drive, so no X11 feature). One persistent cookie store per account
+# keeps each provider login separate from the user's everyday browser.
+wry = { version = "0.57", default-features = false, features = ["os-webview"] }
+raw-window-handle = "0.6"
+url = "2"
 
 # macOS menu bar is driven by a native NSApplication run loop (no tao): tao added
 # its run-loop observer to kCFRunLoopCommonModes, which fires during a status
@@ -165,6 +172,7 @@ objc2-foundation = { version = "0.3", features = [
     "NSDictionary",       # empty NSTextTab options dict
     "NSGeometry",         # NSRange (re-exported at crate root)
     "NSData",             # NSImage::initWithData for bundled provider PNGs
+    "NSProcessInfo",      # OS version gate for the per-account sign-in window
 ] }
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
@@ -197,6 +205,8 @@ objc2-app-kit = { version = "0.3", features = [
     "NSStatusItem",       # status_item.button() anchor
     "NSStatusBarButton",  # the concrete anchor view type
     "NSEvent",            # mouseDown dispatch on row views
+    "NSWindow",           # "Renew login…" sign-in window (src/login/window.rs)
+    "NSGraphics",         # NSBackingStoreType for that window
 ] }
 block2 = "0.6"
 
@@ -243,6 +253,11 @@ windows = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Console", # GetConsoleWindow — hide the menubar daemon's console
+    # "Renew login…" sign-in window (src/login/window.rs): its own Win32
+    # window hosting WebView2, which needs an STA thread.
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
 ] }
 # Credential Manager-backed secret storage (Platform::secrets()). `v1` gives
 # the simple Entry::new/get_password/set_password/delete_credential surface;

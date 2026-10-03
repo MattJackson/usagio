@@ -14,3 +14,17 @@ pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 
 /// Beta header required for OAuth-bearer requests.
 pub const OAUTH_BETA: &str = "oauth-2025-04-20";
+
+/// claude.ai login page for Claude Code's OAuth client (subscription accounts).
+pub const AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
+
+/// Scopes Claude Code requests on a claude.ai login — what its keychain
+/// credential carries, so a usagio-made login is indistinguishable.
+pub const LOGIN_SCOPES: &[&str] = &[
+    "user:profile",
+    "user:inference",
+    "user:sessions:claude_code",
+    "user:mcp_servers",
+    "user:file_upload",
+    "user:plugins",
+];

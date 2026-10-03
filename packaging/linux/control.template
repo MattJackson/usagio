@@ -4,7 +4,7 @@ Section: utils
 Priority: optional
 Architecture: amd64
 Maintainer: Matthew Jackson <1085847+MattJackson@users.noreply.github.com>
-Depends: libgtk-3-0, libayatana-appindicator3-1, libsecret-1-0
+Depends: libgtk-3-0, libwebkit2gtk-4.1-0, libayatana-appindicator3-1, libsecret-1-0
 Homepage: https://usagio.dev
 Description: Track usage / limits across every AI coding CLI you use
  usagio is a menu-bar / tray app that tracks usage and limits across every
