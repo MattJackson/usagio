@@ -192,11 +192,6 @@ pub(crate) struct ProviderSection {
     provider_id: &'static str,
     display_name: &'static str,
     supports_switching: bool,
-    /// Gates the "Launch client" row. Independent of
-    /// `supports_switching` — a provider can have one wired without the
-    /// other; the row must not appear (and error on click) for a provider
-    /// whose `launch_client` is still the `Unsupported` trait default.
-    supports_launch: bool,
     /// Gates the "Remove…" row. Defaults `true` for
     /// every current provider — removing a captured account is a generic
     /// state.json operation — but stays explicit so a provider needing extra
@@ -1766,7 +1761,6 @@ fn build_snapshot() -> Snapshot {
             provider_id: slug,
             display_name: provider.display_name(),
             supports_switching: caps.supports_switching,
-            supports_launch: caps.supports_launch,
             supports_remove: caps.supports_remove,
             supports_usage: caps.supports_usage,
             severity_bands: provider.severity_bands(),
@@ -2191,7 +2185,6 @@ struct AccountSubmenuRows {
     /// `Some(false)` → render a clickable "Switch to this account" row.
     /// `None` → the provider doesn't support switching; render neither.
     switch_row: Option<bool>,
-    launch_row: bool,
     /// "Renew login…" — usagio can run this provider's login itself.
     renew_row: bool,
     remove_row: bool,
@@ -2203,7 +2196,6 @@ fn account_submenu_rows(sec: &ProviderSection, a: &AcctView) -> AccountSubmenuRo
         // active one still shows "✓ Active" so it's clear where you are).
         switch_row: (sec.supports_switching && (a.active || !a.no_subscription))
             .then_some(a.active),
-        launch_row: sec.supports_launch && !a.no_subscription,
         renew_row: a.renewable,
         remove_row: sec.supports_remove,
     }
@@ -2542,7 +2534,6 @@ fn handle_click(id: &str) {
         ("apikey", Some(slug), None) => handle_apikey_capture(slug),
         ("switch", Some(slug), Some(key)) => handle_switch(slug, key),
         ("remove", Some(slug), Some(key)) => handle_remove(slug, key),
-        ("launch", Some(slug), Some(key)) => handle_launch(slug, key),
         ("renew", Some(slug), Some(key)) => handle_renew(slug, key),
         ("backup", Some("save"), None) => handle_backup_save(),
         ("backup", Some("restore"), None) => handle_backup_restore_dialog(),
@@ -2999,32 +2990,6 @@ fn handle_remove(slug: &str, key: &str) {
     }
 }
 
-/// Launch the vendor CLI for `slug`. Providers whose `launch_client` returns
-/// `Unsupported` (the trait default) surface that as a notification rather
-/// than silently doing nothing.
-///
-/// The launch is dispatched onto a background thread — the Claude
-/// implementation calls `Command::status()` (synchronous wait on the child)
-/// and every click is drained inside the main-thread NSTimer tick, so calling
-/// it inline would freeze the entire menu-bar UI (no ticks, no redraws, no
-/// clicks) until the launched `claude` exits, which under a menu-bar app with
-/// no controlling TTY is effectively indefinite.
-fn handle_launch(slug: &str, _key: &str) {
-    let Some(provider) = providers::get(slug) else {
-        notify(&format!(
-            "Launch failed: provider '{slug}' is not registered"
-        ));
-        return;
-    };
-    // `providers::get` returns `&'static dyn Provider`; the trait is `Send +
-    // Sync + 'static`, so the reference is trivially safe to move.
-    std::thread::spawn(move || {
-        if let Err(e) = provider.launch_client(crate::providers::LaunchMode::Continue) {
-            notify(&format!("Launch failed: {e}"));
-        }
-    });
-}
-
 // Context Ledger menu rendering + click handler removed in 0.4.2. The
 // submenu shelled out via osascript to open a new Terminal window, which
 // silently failed for anyone who hadn't granted Automation permission — a
@@ -3259,13 +3224,6 @@ mod cross_platform {
                 true,
             )),
             None => {}
-        }
-        if rows.launch_row {
-            items.push(action(
-                format!("launch:{}:{}", sec.provider_id, a.key),
-                "Launch client",
-                true,
-            ));
         }
         if rows.renew_row {
             items.push(action(
@@ -3671,7 +3629,6 @@ mod tests {
                 display_name: "Claude",
                 supports_switching: true,
                 supports_usage: true,
-                supports_launch: true,
                 supports_remove: true,
                 severity_bands: bands(),
                 env_override_active: false,
@@ -3707,7 +3664,6 @@ mod tests {
             display_name: name,
             supports_switching: true,
             supports_usage: true,
-            supports_launch: false,
             supports_remove: true,
             severity_bands: bands(),
             env_override_active: false,
@@ -4022,7 +3978,6 @@ mod tests {
             display_name: "Claude",
             supports_switching: true,
             supports_usage: true,
-            supports_launch: true,
             supports_remove: true,
             severity_bands: bands(),
             env_override_active: false,
@@ -4039,7 +3994,6 @@ mod tests {
             display_name: "Claude",
             supports_switching: true,
             supports_usage: true,
-            supports_launch: true,
             supports_remove: true,
             severity_bands: bands(),
             env_override_active: false,
@@ -4387,15 +4341,13 @@ mod tests {
     }
 
     #[test]
-    fn lapsed_subscription_hides_switch_and_launch() {
+    fn lapsed_subscription_hides_switch() {
         let mut sec = claude_section();
         sec.supports_switching = true;
-        sec.supports_launch = true;
         let mut a = acct("lapsed@x.com", Some(0.0), Some(0.0), false);
         a.no_subscription = true;
         let rows = account_submenu_rows(&sec, &a);
         assert_eq!(rows.switch_row, None);
-        assert!(!rows.launch_row);
         // Still active → keep the "✓ Active" marker.
         a.active = true;
         assert_eq!(account_submenu_rows(&sec, &a).switch_row, Some(true));
@@ -4528,7 +4480,6 @@ mod tests {
             display_name: "Claude",
             supports_switching: true,
             supports_usage: true,
-            supports_launch: true,
             supports_remove: true,
             severity_bands: bands(),
             env_override_active: false,
@@ -4567,7 +4518,6 @@ mod tests {
             display_name: "Claude",
             supports_switching: true,
             supports_usage: true,
-            supports_launch: true,
             supports_remove: true,
             severity_bands: bands(),
             env_override_active: false,
@@ -4598,7 +4548,6 @@ mod tests {
             display_name: "Claude",
             supports_switching: true,
             supports_usage: false,
-            supports_launch: true,
             supports_remove: true,
             severity_bands: bands(),
             env_override_active: false,
@@ -4773,7 +4722,6 @@ mod tests {
                     display_name: "Claude",
                     supports_switching: true,
                     supports_usage: true,
-                    supports_launch: true,
                     supports_remove: true,
                     severity_bands: bands(),
                     env_override_active: false,
@@ -4784,7 +4732,6 @@ mod tests {
                     display_name: "Codex",
                     supports_switching: true,
                     supports_usage: true,
-                    supports_launch: true,
                     supports_remove: true,
                     severity_bands: bands(),
                     env_override_active: false,
@@ -5000,7 +4947,6 @@ mod tests {
             provider_id: "claude",
             display_name,
             supports_switching: true,
-            supports_launch: true,
             supports_remove: true,
             supports_usage: true,
             severity_bands: bands(),
@@ -5144,7 +5090,6 @@ mod tests {
             display_name,
             supports_switching: true,
             supports_usage: true,
-            supports_launch: true,
             supports_remove: true,
             severity_bands: bands(),
             env_override_active: false,
@@ -5441,22 +5386,16 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Capability-gated menu rows. `supports_switching`
-    // used to be the sole gate for BOTH the "Switch to this account" row AND
-    // the "Launch client" row, and "Remove…" had no gate at all. A provider
-    // like Codex (usage-only, no switching, no launch wired) would still get
-    // a "Launch client" row that always errored on click.
+    // gates the "Switch to this account" row and `supports_remove` the
+    // "Remove…" row, so a usage-only provider like Codex shows neither
+    // action it can't perform.
     // -----------------------------------------------------------------------
 
-    fn section_with_caps(
-        supports_switching: bool,
-        supports_launch: bool,
-        supports_remove: bool,
-    ) -> ProviderSection {
+    fn section_with_caps(supports_switching: bool, supports_remove: bool) -> ProviderSection {
         ProviderSection {
             provider_id: "codex",
             display_name: "Codex",
             supports_switching,
-            supports_launch,
             supports_remove,
             supports_usage: true,
             severity_bands: bands(),
@@ -5466,59 +5405,31 @@ mod tests {
     }
 
     #[test]
-    fn submenu_rows_omit_launch_when_supports_launch_is_false() {
-        // Codex today: supports_switching == false AND supports_launch ==
-        // false. Neither the Switch nor the Launch row may appear.
-        let sec = section_with_caps(false, false, true);
+    fn submenu_rows_omit_switch_when_unsupported() {
+        // Codex today: supports_switching == false — no Switch row.
+        let sec = section_with_caps(false, true);
         let a = acct("user@example.com", Some(10.0), Some(20.0), false);
         let rows = account_submenu_rows(&sec, &a);
         assert_eq!(rows.switch_row, None, "no switch row: {rows:?}");
-        assert!(!rows.launch_row, "no launch row: {rows:?}");
-    }
-
-    #[test]
-    fn submenu_rows_can_omit_launch_even_when_switching_is_supported() {
-        // The two capabilities are independent: a provider could (in
-        // principle) support switching without a wired client launcher.
-        // supports_launch alone must gate the Launch row.
-        let sec = section_with_caps(true, false, true);
-        let a = acct("user@example.com", Some(10.0), Some(20.0), false);
-        let rows = account_submenu_rows(&sec, &a);
-        assert_eq!(
-            rows.switch_row,
-            Some(false),
-            "clickable switch row present: {rows:?}"
-        );
-        assert!(
-            !rows.launch_row,
-            "launch row absent even though switching is supported: {rows:?}"
-        );
-    }
-
-    #[test]
-    fn submenu_rows_include_launch_when_supports_launch_is_true() {
-        let sec = section_with_caps(true, true, true);
-        let a = acct("user@example.com", Some(10.0), Some(20.0), false);
-        assert!(account_submenu_rows(&sec, &a).launch_row);
     }
 
     #[test]
     fn submenu_rows_marks_active_account_instead_of_a_clickable_switch_row() {
-        let sec = section_with_caps(true, true, true);
+        let sec = section_with_caps(true, true);
         let a = acct("user@example.com", Some(10.0), Some(20.0), true);
         assert_eq!(account_submenu_rows(&sec, &a).switch_row, Some(true));
     }
 
     #[test]
     fn submenu_rows_omit_remove_when_supports_remove_is_false() {
-        let sec = section_with_caps(false, false, false);
+        let sec = section_with_caps(false, false);
         let a = acct("user@example.com", Some(10.0), Some(20.0), false);
         assert!(!account_submenu_rows(&sec, &a).remove_row);
     }
 
     #[test]
     fn submenu_rows_include_remove_when_supports_remove_is_true() {
-        let sec = section_with_caps(false, false, true);
+        let sec = section_with_caps(false, true);
         let a = acct("user@example.com", Some(10.0), Some(20.0), false);
         assert!(account_submenu_rows(&sec, &a).remove_row);
     }

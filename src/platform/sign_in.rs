@@ -61,8 +61,11 @@ mod imp {
 
     use anyhow::{Context, Result};
     use block2::RcBlock;
+    use objc2::sel;
     use objc2::MainThreadMarker;
-    use objc2_app_kit::{NSApplication, NSBackingStoreType, NSWindow, NSWindowStyleMask};
+    use objc2_app_kit::{
+        NSApplication, NSBackingStoreType, NSMenu, NSMenuItem, NSWindow, NSWindowStyleMask,
+    };
     use objc2_foundation::{
         NSOperatingSystemVersion, NSPoint, NSProcessInfo, NSRect, NSSize, NSString, NSTimer,
     };
@@ -91,6 +94,42 @@ mod imp {
             minorVersion: 0,
             patchVersion: 0,
         })
+    }
+
+    /// ⌘V/⌘C/⌘X/⌘A/⌘Z reach a web view only through the app's Edit menu key
+    /// equivalents, and a menu-bar-only app has no main menu — so paste into
+    /// the sign-in page silently did nothing. Install a minimal (never shown)
+    /// Edit menu once.
+    fn ensure_edit_menu(mtm: MainThreadMarker) {
+        let app = NSApplication::sharedApplication(mtm);
+        if app.mainMenu().is_some() {
+            return;
+        }
+        let edit = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Edit"));
+        for (title, action, key) in [
+            ("Undo", sel!(undo:), "z"),
+            ("Redo", sel!(redo:), "Z"),
+            ("Cut", sel!(cut:), "x"),
+            ("Copy", sel!(copy:), "c"),
+            ("Paste", sel!(paste:), "v"),
+            ("Select All", sel!(selectAll:), "a"),
+        ] {
+            // SAFETY: standard responder-chain actions with a nil target.
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    mtm.alloc(),
+                    &NSString::from_str(title),
+                    Some(action),
+                    &NSString::from_str(key),
+                )
+            };
+            edit.addItem(&item);
+        }
+        let edit_item = NSMenuItem::new(mtm);
+        edit_item.setSubmenu(Some(&edit));
+        let main = NSMenu::new(mtm);
+        main.addItem(&edit_item);
+        app.setMainMenu(Some(&main));
     }
 
     pub fn open(
@@ -130,6 +169,7 @@ mod imp {
             .with_data_store_identifier(crate::login::store_id(slug, key))
             .build(&handle)
             .context("creating the sign-in web view")?;
+        ensure_edit_menu(mtm);
         window.makeKeyAndOrderFront(None);
         // A menu-bar (accessory) app must activate to bring a window forward.
         #[allow(deprecated)]

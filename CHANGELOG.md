@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-10-03
+
+### Fixed
+- **Paste works in the sign-in window.** ⌘V (and ⌘C/⌘X/⌘A/⌘Z) did nothing
+  in "Renew login…", so the emailed code had to be typed by hand.
+
+### Removed
+- **"Launch client" in the account menu.** It never opened anything from the
+  menu bar. `usagio start` / `usagio continue` still launch `claude` from a
+  terminal.
+
 ## [0.10.0] - 2026-10-03
 
 ### Added
