@@ -6821,6 +6821,7 @@ fn persist_login_renews_an_existing_claude_account_without_switching() {
     let r = persist_login(
         provider.as_ref(),
         renewed_capture("dev@example.com", "new-at", 77),
+        None,
     )
     .unwrap();
 
@@ -6853,6 +6854,7 @@ fn persist_login_adds_an_account_it_has_never_seen() {
     persist_login(
         provider.as_ref(),
         renewed_capture("new@example.com", "at", 5),
+        Some("new:abc"),
     )
     .unwrap();
     let st = State::load().unwrap();
@@ -6860,6 +6862,11 @@ fn persist_login_adds_an_account_it_has_never_seen() {
     assert_eq!(
         a.oauth_account.as_ref().unwrap()["accountUuid"],
         "from-login"
+    );
+    assert_eq!(
+        a.login_store.as_deref(),
+        Some("new:abc"),
+        "renewals reuse that store"
     );
     assert_eq!(st.active, None);
 }

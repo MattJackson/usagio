@@ -336,6 +336,7 @@ fn print_help() {
          usagio context [OPTS]    Audit CLI auto-injected context (per turn)\n  \
                                         --provider <slug>  claude|codex|opencode\n  \
                                         --project  <path>  scope in-tree instructions to this project\n  \
+         usagio login             Sign in to a new account in your browser (adds it)\n  \
          usagio renew <email>     Sign that account in again in your browser (fresh login)\n  \
          usagio rm <email>        Forget an account\n\n\
          With no [email], switch/start/continue auto-pick the account that has room\n  \
@@ -524,14 +525,18 @@ pub(crate) fn capture_current_generic(slug: &str) -> Result<(String, bool)> {
 /// active; but if the account already IS active, the vendor CLI's live login
 /// is rewritten too, so running sessions pick it up without their own
 /// `/login`.
+///
+/// `new_store` is the sign-in window store a brand-new sign-in used; it's
+/// remembered on the account so later renewals reuse that session.
 pub(crate) fn persist_login(
     provider: &dyn providers::trait_def::Provider,
     captured: providers::trait_def::CapturedAccount,
+    new_store: Option<&str>,
 ) -> Result<login::Renewed> {
     let slug = provider.provider_id();
     let key = provider.account_identifier(&captured.identity);
     if slug == CLAUDE_SLUG {
-        return persist_claude_login(provider, key, captured);
+        return persist_claude_login(provider, key, captured, new_store);
     }
     let expires_at = Utc::now().timestamp() + captured.tokens.expires_in_secs;
     let active = with_state_lock(|| {
@@ -579,6 +584,7 @@ fn persist_claude_login(
     provider: &dyn providers::trait_def::Provider,
     email: String,
     captured: providers::trait_def::CapturedAccount,
+    new_store: Option<&str>,
 ) -> Result<login::Renewed> {
     let fresh = Account::from_keychain_blob(&captured.secret_blob)?;
     let native = &captured.identity.native_blob;
@@ -601,6 +607,9 @@ fn persist_claude_login(
                 acct.oauth_account = native.get("oauthAccount").cloned().filter(|v| !v.is_null());
                 state.upsert(acct);
             }
+        }
+        if let (Some(store), Some(a)) = (new_store, state.find_mut(&email)) {
+            a.login_store = Some(store.to_string());
         }
         state.save()?;
         let a = state
@@ -669,11 +678,12 @@ fn warn_expiring_logins() {
     }
 }
 
-/// `usagio renew <email> [--provider <slug>]`: run the provider's own login in
-/// the default browser and save it for that account (the CLI side of the
-/// menu's "Renew login…"; see `crate::login`).
+/// `usagio login|renew [<email>] [--provider <slug>]`: run the provider's own
+/// login in the default browser — renewing `<email>`, or adding whichever
+/// account signs in when none is given (the CLI side of the menu's "Renew
+/// login…" / "Sign in to a new account…"; see `crate::login`).
 fn cmd_renew(args: &[String]) -> Result<()> {
-    const USAGE: &str = "usage: usagio renew <email> [--provider <slug>]";
+    const USAGE: &str = "usage: usagio login|renew [<email>] [--provider <slug>]";
     let mut slug = CLAUDE_SLUG.to_string();
     let mut selector = None;
     let mut it = args.iter();
@@ -683,23 +693,32 @@ fn cmd_renew(args: &[String]) -> Result<()> {
             other => selector = Some(other.to_string()),
         }
     }
-    let selector = selector.context(USAGE)?;
     let provider = provider_by_slug(&slug)?;
     let state = State::load()?;
-    let key = if slug == CLAUDE_SLUG {
-        state.resolve(&selector)?
-    } else {
-        state
-            .find_provider_account(&slug, &selector)
-            .map(|a| a.key.clone())
-            .unwrap_or(selector)
+    let target = match selector {
+        Some(sel) if slug == CLAUDE_SLUG => login::Target::Renew(state.resolve(&sel)?),
+        Some(sel) => login::Target::Renew(
+            state
+                .find_provider_account(&slug, &sel)
+                .map(|a| a.key.clone())
+                .unwrap_or(sel),
+        ),
+        // The browser keeps its own session; this store key is never shown
+        // in a window, it just marks the account as browser-added.
+        None => login::Target::Add {
+            store: login::new_store_key(),
+        },
+    };
+    let who = match &target {
+        login::Target::Renew(key) => key.clone(),
+        login::Target::Add { .. } => "the account to add".to_string(),
     };
     let (tx, rx) = std::sync::mpsc::channel();
-    let started = login::start(provider, Some(key.clone()), move |r| {
+    let started = login::start(provider, target, move |r| {
         let _ = tx.send(r);
     })?;
     println!(
-        "Sign in as {key} in your browser. If it didn't open, visit:\n\n  {}\n",
+        "Sign in as {who} in your browser. If it didn't open, visit:\n\n  {}\n",
         started.url
     );
     if let Err(e) = platform().open_url(&started.url) {
@@ -717,7 +736,7 @@ fn cmd_renew(args: &[String]) -> Result<()> {
         })
         .unwrap_or_default();
     let live = if renewed.made_live { " (live now)" } else { "" };
-    println!("Renewed {}{until}{live}", renewed.key);
+    println!("Signed in {}{until}{live}", renewed.key);
     Ok(())
 }
 
