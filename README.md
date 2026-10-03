@@ -120,8 +120,11 @@ usagio capture          #  ->  Captured you@personal.com
 usagio
 ```
 
-From the **menu-bar app** you never need the terminal: `claude` → `/login` as the new
-account, then click the icon → **Capture current login…**.
+From the **menu-bar app** you don't even need `claude`: click the icon → **Sign in
+to a new Claude account…**, sign in as that account in usagio's own window (email
+code, then **Authorize**), and it's added — without switching to it. Or the
+original way: `claude` → `/login` as the new account, then **Capture current
+login…**. From a terminal, `usagio login` signs a new account in via your browser.
 
 Notes:
 
@@ -162,7 +165,7 @@ active account's **session %** at a glance. Click it for a dropdown:
   - **Remove…**
 - **Auto-swap at high usage ▸ Off / 90% / 95% / 98%**, plus **Switch to best
   account now** (jump immediately to the account with room that resets soonest)
-- **Capture current login…**
+- **Sign in to a new Claude account…** / **Capture current login…**
 - **Launch at login** (toggle)
 - **Quit**
 
@@ -182,6 +185,7 @@ usagio switch [acct]       Make <acct> the active login (no launch)
 usagio start [acct]        Switch, then launch a fresh `claude`
 usagio continue [acct]     Switch, then launch `claude --continue`
 usagio token <acct>        Print a fresh access token (for scripting)
+usagio login               Sign in to a new account in your browser (adds it)
 usagio renew <acct>        Sign <acct> in again in your browser (fresh login)
 usagio rm <acct>           Forget an account
 usagio menubar             Run the menu-bar app

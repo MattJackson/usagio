@@ -348,12 +348,43 @@ pub struct Started {
     pub progress: Arc<Progress>,
 }
 
-/// Begin a login for `provider`. `expected` is the account being renewed; a
-/// sign-in as anyone else is refused (nothing saved). `on_done` runs on the
-/// worker thread once the flow ends.
+/// What a login is for.
+#[derive(Clone, Debug)]
+pub enum Target {
+    /// Renew this account; a sign-in as anyone else is refused (nothing saved).
+    Renew(String),
+    /// Add whichever account signs in. `store` is the fresh sign-in window
+    /// store it used, remembered on the account so its renewals reuse that
+    /// session (see [`new_store_key`]).
+    Add { store: String },
+}
+
+impl Target {
+    fn expected(&self) -> Option<&str> {
+        match self {
+            Target::Renew(key) => Some(key),
+            Target::Add { .. } => None,
+        }
+    }
+
+    fn new_store(&self) -> Option<&str> {
+        match self {
+            Target::Add { store } => Some(store),
+            Target::Renew(_) => None,
+        }
+    }
+}
+
+/// A never-used sign-in store key for "Sign in to a new account…".
+pub fn new_store_key() -> String {
+    format!("new:{}", random_token(12))
+}
+
+/// Begin a login for `provider`. `on_done` runs on the worker thread once the
+/// flow ends.
 pub fn start(
     provider: &'static dyn Provider,
-    expected: Option<String>,
+    target: Target,
     on_done: impl FnOnce(Result<Renewed>) + Send + 'static,
 ) -> Result<Started> {
     let spec = provider
@@ -367,7 +398,7 @@ pub fn start(
         &pkce.challenge,
         &state,
         &loopback.redirect_uri,
-        expected.as_deref(),
+        target.expected(),
     )?;
     let progress = Arc::new(Progress::default());
     let worker = Arc::clone(&progress);
@@ -380,9 +411,9 @@ pub fn start(
                 .map_err(|e| anyhow!("{e}"))?;
             check_signed_in_as(
                 &provider.account_identifier(&captured.identity),
-                expected.as_deref(),
+                target.expected(),
             )?;
-            crate::persist_login(provider, captured)
+            crate::persist_login(provider, captured, target.new_store())
         })();
         worker.finished.store(true, Ordering::SeqCst);
         crate::logging::log(&match &result {
