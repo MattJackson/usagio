@@ -309,3 +309,20 @@ fn expiry_warning_fires_once_per_expiry_inside_the_window() {
         "already dead"
     );
 }
+
+#[test]
+fn an_add_never_reuses_an_existing_store_or_expects_an_account() {
+    let a = new_store_key();
+    assert!(a.starts_with("new:"));
+    assert_ne!(a, new_store_key());
+    assert_ne!(
+        store_id("claude", &a),
+        store_id("claude", "dev@example.com")
+    );
+    let add = Target::Add { store: a.clone() };
+    assert_eq!(add.expected(), None);
+    assert_eq!(add.new_store(), Some(a.as_str()));
+    let renew = Target::Renew("dev@example.com".into());
+    assert_eq!(renew.expected(), Some("dev@example.com"));
+    assert_eq!(renew.new_store(), None);
+}

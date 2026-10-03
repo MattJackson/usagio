@@ -132,6 +132,12 @@ pub struct Account {
     /// back to the captured `oauth_account` when never checked.
     #[serde(default)]
     pub plan: Option<String>,
+    /// Which of usagio's sign-in window cookie stores holds this account's
+    /// vendor session (`crate::login::store_id`); `None` = the one keyed by
+    /// its own email. Set when the account was added via "Sign in to a new
+    /// account…", whose store existed before the email was known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_store: Option<String>,
 }
 
 impl Account {
@@ -167,6 +173,7 @@ impl Account {
             needs_relogin: false,
             no_subscription: false,
             plan: None,
+            login_store: None,
         })
     }
 
@@ -612,6 +619,10 @@ impl State {
                         .and_then(|x| x.as_bool())
                         .unwrap_or(false),
                     plan: obj.get("plan").and_then(|x| x.as_str()).map(String::from),
+                    login_store: obj
+                        .get("login_store")
+                        .and_then(|x| x.as_str())
+                        .map(String::from),
                 };
                 // robustness-05 (v0.5.1 audit): dedup by lowercased email as we
                 // build the list. Every account-keyed lookup elsewhere in
