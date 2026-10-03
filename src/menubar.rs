@@ -177,6 +177,12 @@ struct AcctView {
     /// Credits / breakdown / scoped limits the provider reported, rendered by
     /// [`reported_rows`]. Empty when the provider reported nothing.
     reported: ReportedUsage,
+    /// When this account's login itself dies (its refresh token's expiry),
+    /// if known. Within [`crate::login::RENEW_WINDOW_SECS`] the row asks for a
+    /// renewal.
+    login_expires_at: Option<DateTime<Utc>>,
+    /// usagio can run this provider's login itself ("Renew login…").
+    renewable: bool,
 }
 
 /// One provider's block in the menu. Rendered only if `accounts` is non-empty
@@ -492,6 +498,24 @@ fn main_row(provider_display: &str, a: &AcctView, bands: SeverityBands) -> RowSt
     }
 }
 
+/// Time left on a renewable account's login, when it's inside the renew window.
+fn login_expiring_in(a: &AcctView, now: DateTime<Utc>) -> Option<chrono::Duration> {
+    if !a.renewable {
+        return None;
+    }
+    let left = a.login_expires_at? - now;
+    (left <= chrono::Duration::seconds(crate::login::RENEW_WINDOW_SECS)).then_some(left)
+}
+
+/// Coarse "time left" for a login expiry: days, then hours.
+fn login_left_label(left: chrono::Duration) -> String {
+    match (left.num_days(), left.num_hours()) {
+        (d, _) if d >= 1 => format!("{d}d"),
+        (_, h) if h >= 1 => format!("{h}h"),
+        _ => "<1h".to_string(),
+    }
+}
+
 /// The header row of one account's BLOCK — `{provider}
 /// · {email}\t{sa} / {sb}` (or `\t<locked countdown>` when the account is
 /// fully consumed, same rule `main_row` uses). Provider grouping is no longer
@@ -532,13 +556,26 @@ fn trailing_for_account(
     bands: SeverityBands,
     now: DateTime<Utc>,
 ) -> (String, Vec<(usize, usize, Severity)>) {
+    // No plan, no usage: a countdown to a reset that frees nothing would lie.
+    // Outranks auth trouble too — a Free account is unusable whether or not
+    // its login is healthy, so the plan is the headline, not "re-login".
+    if a.no_subscription {
+        let t = a.plan.clone().unwrap_or_else(|| "Free".to_string());
+        let len = u16len(&t);
+        return (t, vec![(0, len, Severity::Red)]);
+    }
     // Auth trouble outranks any usage/lock display: an account whose refresh
     // token was rejected can never refresh, so its cached pct is frozen and a
     // "-% / -%" or stale countdown would misrepresent a dead login as a
     // transient poll gap. Surface the reason instead (full detail lands in the
     // submenu status row).
     if a.needs_relogin {
-        let t = "⚠ re-login".to_string();
+        let t = if a.renewable {
+            "⚠ renew"
+        } else {
+            "⚠ re-login"
+        }
+        .to_string();
         let len = u16len(&t);
         return (t, vec![(0, len, Severity::Red)]);
     }
@@ -547,9 +584,12 @@ fn trailing_for_account(
         let len = u16len(&t);
         return (t, vec![(0, len, Severity::Red)]);
     }
-    // No plan, no usage: a countdown to a reset that frees nothing would lie.
-    if a.no_subscription {
-        return ("-".to_string(), vec![(0, 1, Severity::Red)]);
+    // A login about to die outranks usage: once it's gone the numbers freeze
+    // and the account can't be switched to. Full detail is in the submenu.
+    if let Some(left) = login_expiring_in(a, now) {
+        let t = format!("renew · {}", login_left_label(left));
+        let len = u16len(&t);
+        return (t, vec![(0, len, Severity::Amber)]);
     }
     match countdown::compute_display(&account_usage_for(a), now) {
         DisplayState::Locked {
@@ -1647,6 +1687,9 @@ fn acctview_from_row(
         no_subscription: r.no_subscription,
         plan: r.plan.clone(),
         reported: r.reported.clone(),
+        // Filled in by `build_snapshot`, which has the stored credential.
+        login_expires_at: None,
+        renewable: false,
     }
 }
 
@@ -1708,6 +1751,16 @@ fn build_snapshot() -> Snapshot {
         // the exact comparator `flat_account_order` uses, so this section vec
         // and the rendered `account_order` are always identical.
         accounts.sort_by(|a, b| account_priority_cmp(a, b, now));
+        let renewable = provider.login_spec().is_some();
+        for a in &mut accounts {
+            a.renewable = renewable;
+            if slug == CLAUDE_SLUG {
+                a.login_expires_at = st
+                    .find(&a.key)
+                    .and_then(|x| x.refresh_token_expires_at())
+                    .and_then(DateTime::from_timestamp_millis);
+            }
+        }
         let caps = provider.capabilities();
         sections.push(ProviderSection {
             provider_id: slug,
@@ -2002,24 +2055,8 @@ fn submenu_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
 /// [`submenu_info_rows`] plus whether each line is a lock (rendered red).
 fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)> {
     let mut rows: Vec<(String, bool)> = Vec::new();
-    // Auth trouble is the account's headline state — spell out the reason and
-    // the fix before any (now-frozen) usage numbers. Mirrors the `⚠` trailing
-    // that `trailing_for_account` puts on the row header.
-    if a.needs_relogin {
-        rows.push(("⚠ Re-login required — token expired".to_string(), true));
-        rows.push((
-            format!(
-                "Fix: log in with `claude`, then `usagio capture` ({})",
-                a.key
-            ),
-            false,
-        ));
-        return rows;
-    }
-    if let Some(err) = &a.error {
-        rows.push((format!("⚠ Refresh error: {err}"), true));
-        return rows;
-    }
+    // A lapsed plan is the headline even over auth trouble (mirrors
+    // `trailing_for_account`): the account is unusable either way.
     if a.no_subscription {
         rows.push((
             format!(
@@ -2028,6 +2065,37 @@ fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)
             ),
             true,
         ));
+        return rows;
+    }
+    // Auth trouble is the account's headline state — spell out the reason and
+    // the fix before any (now-frozen) usage numbers. Mirrors the `⚠` trailing
+    // that `trailing_for_account` puts on the row header.
+    if a.needs_relogin {
+        if a.renewable {
+            rows.push(("⚠ Login expired — Renew login… below".to_string(), true));
+        } else {
+            rows.push(("⚠ Re-login required — token expired".to_string(), true));
+            rows.push((
+                format!(
+                    "Fix: log in with `claude`, then `usagio capture` ({})",
+                    a.key
+                ),
+                false,
+            ));
+        }
+        return rows;
+    }
+    if let Some(left) = login_expiring_in(a, now_utc()) {
+        rows.push((
+            format!(
+                "Login expires in {} — Renew login… below",
+                login_left_label(left)
+            ),
+            true,
+        ));
+    }
+    if let Some(err) = &a.error {
+        rows.push((format!("⚠ Refresh error: {err}"), true));
         return rows;
     }
     if let Some(plan) = &a.plan {
@@ -2124,6 +2192,8 @@ struct AccountSubmenuRows {
     /// `None` → the provider doesn't support switching; render neither.
     switch_row: Option<bool>,
     launch_row: bool,
+    /// "Renew login…" — usagio can run this provider's login itself.
+    renew_row: bool,
     remove_row: bool,
 }
 
@@ -2134,6 +2204,7 @@ fn account_submenu_rows(sec: &ProviderSection, a: &AcctView) -> AccountSubmenuRo
         switch_row: (sec.supports_switching && (a.active || !a.no_subscription))
             .then_some(a.active),
         launch_row: sec.supports_launch && !a.no_subscription,
+        renew_row: a.renewable,
         remove_row: sec.supports_remove,
     }
 }
@@ -2215,6 +2286,10 @@ fn menu_signature(snap: &Snapshot) -> String {
                 a.no_subscription,
                 a.plan.as_deref().unwrap_or(""),
             ));
+            if let Some(left) = login_expiring_in(a, now) {
+                s.push_str(&format!("renew={}|", login_left_label(left)));
+            }
+            s.push_str(&format!("rn={}|", a.renewable));
             for w in &a.windows {
                 s.push_str(&format!(
                     "{}={}:r={}|",
@@ -2265,6 +2340,12 @@ fn recovery_status(
     active: &AcctView,
     now: DateTime<Utc>,
 ) -> Option<(String, String)> {
+    if active.no_subscription {
+        return Some((
+            "No plan".into(),
+            format!("{} · No subscription", active.display),
+        ));
+    }
     if active.needs_relogin {
         return Some((
             "Re-login".into(),
@@ -2275,12 +2356,6 @@ fn recovery_status(
         return Some((
             "⚠ error".into(),
             format!("{} · Refresh error", active.display),
-        ));
-    }
-    if active.no_subscription {
-        return Some((
-            "No plan".into(),
-            format!("{} · No subscription", active.display),
         ));
     }
     let state = countdown::compute_display(&account_usage_for(active), now);
@@ -2468,6 +2543,7 @@ fn handle_click(id: &str) {
         ("switch", Some(slug), Some(key)) => handle_switch(slug, key),
         ("remove", Some(slug), Some(key)) => handle_remove(slug, key),
         ("launch", Some(slug), Some(key)) => handle_launch(slug, key),
+        ("renew", Some(slug), Some(key)) => handle_renew(slug, key),
         ("backup", Some("save"), None) => handle_backup_save(),
         ("backup", Some("restore"), None) => handle_backup_restore_dialog(),
         ("refresh", Some("now"), None) => handle_refresh_now(),
@@ -2661,7 +2737,8 @@ fn accounts_needing_relogin() -> Vec<String> {
     let mut out: Vec<String> = st
         .accounts
         .iter()
-        .filter(|a| a.needs_relogin)
+        // A Free account renders as its plan, not "re-login" — don't nag about it.
+        .filter(|a| a.needs_relogin && !a.no_subscription)
         .map(|a| a.key().to_string())
         .chain(
             st.providers
@@ -2777,6 +2854,68 @@ fn handle_capture(slug: &str) {
         )),
         Err(e) => notify(&format!("Capture failed: {e}")),
     }
+}
+
+/// "Renew login…": run the provider's own login in usagio's sign-in window —
+/// the default browser where no window can be shown — and save the result
+/// (see `crate::login`). Runs on the UI thread; the wait happens off it.
+fn handle_renew(slug: &str, key: &str) {
+    let Some(provider) = providers::get(slug) else {
+        return;
+    };
+    let started = crate::login::start(provider, Some(key.to_string()), |result| match result {
+        Ok(r) => {
+            notify(&renewed_message(&r));
+            request_poll_now();
+        }
+        Err(e) => notify(&format!("Renew failed: {e:#}")),
+    });
+    let started = match started {
+        Ok(s) => s,
+        Err(e) => {
+            notify(&format!("Renew failed: {e:#}"));
+            return;
+        }
+    };
+    let title = format!("Renew {key} — usagio");
+    let platform = crate::platform();
+    let in_window = platform.sign_in_window_available()
+        && match platform.open_sign_in_window(
+            &title,
+            &started.url,
+            slug,
+            key,
+            std::sync::Arc::clone(&started.progress),
+        ) {
+            Ok(()) => true,
+            Err(e) => {
+                crate::logging::log(&format!(
+                    "renew: sign-in window failed, using browser: {e:#}"
+                ));
+                false
+            }
+        };
+    if !in_window {
+        if let Err(e) = platform.open_url(&started.url) {
+            started.progress.cancel();
+            notify(&format!("Renew failed: {e:#}"));
+        }
+    }
+}
+
+/// "dev@example.com renewed — login good until Oct 31 · live in Claude Code".
+fn renewed_message(r: &crate::login::Renewed) -> String {
+    let mut msg = format!("{} renewed", r.key);
+    if let Some(at) = r.login_expires_at.and_then(DateTime::from_timestamp_millis) {
+        msg.push_str(&format!(
+            " — login good until {}",
+            at.with_timezone(&chrono::Local).format("%b %-d")
+        ));
+    }
+    if r.made_live {
+        msg.push_str(" · live now");
+    }
+    msg
 }
 
 fn handle_switch(slug: &str, key: &str) {
@@ -3125,6 +3264,13 @@ mod cross_platform {
             items.push(action(
                 format!("launch:{}:{}", sec.provider_id, a.key),
                 "Launch client",
+                true,
+            ));
+        }
+        if rows.renew_row {
+            items.push(action(
+                format!("renew:{}:{}", sec.provider_id, a.key),
+                "Renew login…",
                 true,
             ));
         }
@@ -3513,6 +3659,8 @@ mod tests {
             no_subscription: false,
             plan: None,
             reported: ReportedUsage::default(),
+            login_expires_at: None,
+            renewable: false,
         }
     }
 
@@ -3950,9 +4098,64 @@ mod tests {
             );
             a.no_subscription = true;
             let (trailing, colors) = trailing_for_account(&a, bands(), now);
-            assert_eq!(trailing, "-");
-            assert_eq!(colors, vec![(0, 1, Severity::Red)]);
+            assert_eq!(trailing, "Free", "no plan name known → Free");
+            assert_eq!(colors, vec![(0, 4, Severity::Red)]);
+            a.plan = Some("Pro".into());
+            assert_eq!(trailing_for_account(&a, bands(), now).0, "Pro");
         });
+    }
+
+    #[test]
+    fn an_expiring_login_asks_for_a_renewal() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        with_now(now, || {
+            let mut a = acct("dev@example.com", Some(10.0), Some(20.0), false);
+            a.login_expires_at = Some(now + chrono::Duration::hours(50));
+            // Not renewable from usagio → nothing to offer; usage stays.
+            assert_eq!(trailing_for_account(&a, bands(), now).0, "10% / 20%");
+            a.renewable = true;
+            let (t, colors) = trailing_for_account(&a, bands(), now);
+            assert_eq!(t, "renew · 2d");
+            assert_eq!(colors[0].2, Severity::Amber);
+            let rows = submenu_info_rows(&claude_section(), &a);
+            assert!(rows[0].starts_with("Login expires in 2d"), "{rows:?}");
+            assert!(account_submenu_rows(&claude_section(), &a).renew_row);
+            // Far from expiry: back to usage.
+            a.login_expires_at = Some(now + chrono::Duration::days(20));
+            assert_eq!(trailing_for_account(&a, bands(), now).0, "10% / 20%");
+        });
+    }
+
+    #[test]
+    fn a_dead_renewable_login_points_at_renew_not_the_cli() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let mut a = acct("dev@example.com", Some(10.0), Some(20.0), false);
+        a.needs_relogin = true;
+        a.renewable = true;
+        assert_eq!(trailing_for_account(&a, bands(), now).0, "⚠ renew");
+        let rows = submenu_info_rows(&claude_section(), &a);
+        assert_eq!(rows, vec!["⚠ Login expired — Renew login… below"]);
+    }
+
+    #[test]
+    fn login_left_label_is_coarse() {
+        assert_eq!(login_left_label(chrono::Duration::hours(71)), "2d");
+        assert_eq!(login_left_label(chrono::Duration::minutes(150)), "2h");
+        assert_eq!(login_left_label(chrono::Duration::minutes(20)), "<1h");
+    }
+
+    #[test]
+    fn lapsed_subscription_outranks_needs_relogin() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let mut a = acct("lapsed@example.com", Some(0.0), Some(100.0), false);
+        a.no_subscription = true;
+        a.needs_relogin = true;
+        a.plan = Some("Free".into());
+        assert_eq!(trailing_for_account(&a, bands(), now).0, "Free");
+        assert_eq!(
+            submenu_info_rows(&claude_section(), &a),
+            vec!["No subscription · Free plan"]
+        );
     }
 
     #[test]
@@ -5526,11 +5729,11 @@ mod tests {
     fn restore_drop_confirmation_names_dropped_emails_not_just_a_count() {
         let msg = super::restore_drop_confirmation(&[
             "dev@example.com".to_string(),
-            "matthew@pq.io".to_string(),
+            "personal@example.org".to_string(),
         ]);
         assert_eq!(
             msg,
-            "Restoring will drop dev@example.com, matthew@pq.io. Continue?"
+            "Restoring will drop dev@example.com, personal@example.org. Continue?"
         );
     }
 
@@ -5568,7 +5771,7 @@ mod tests {
         use crate::store::{accounts_dropped_by, ScopedConfigDir, State};
         let _g = ScopedConfigDir::new();
         let mut current = State::default();
-        for email in ["dev@example.com", "matthew@pq.io"] {
+        for email in ["dev@example.com", "personal@example.org"] {
             current.accounts.push(restore_test_acct(email));
         }
         current.save().unwrap();
@@ -5579,10 +5782,10 @@ mod tests {
             .push(restore_test_acct("dev@example.com"));
 
         let dropped = accounts_dropped_by(&restore_target).unwrap();
-        assert_eq!(dropped, vec!["matthew@pq.io".to_string()]);
+        assert_eq!(dropped, vec!["personal@example.org".to_string()]);
         assert_eq!(
             restore_drop_confirmation(&dropped),
-            "Restoring will drop matthew@pq.io. Continue?"
+            "Restoring will drop personal@example.org. Continue?"
         );
     }
 

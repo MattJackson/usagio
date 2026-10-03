@@ -220,36 +220,8 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
             continue;
         }
         match crate::providers::claude::oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
-            Ok(true) => {
-                let save_result = with_state_lock(|| {
-                    let mut st = State::load()?;
-                    // Belt-and-braces: don't clobber tokens for what is now
-                    // the active account (a switch may have completed while
-                    // we were doing the network refresh).
-                    if st.active.as_deref() == Some(email.as_str()) {
-                        return Ok(());
-                    }
-                    if let Some(a) = st.find_mut(&email) {
-                        a.set_tokens_if_newer(
-                            acct.access_token.clone(),
-                            acct.refresh_token.clone(),
-                            acct.expires_at,
-                        );
-                    }
-                    st.save()
-                });
-                // Surface persist failures (state.json write refused / lock
-                // poisoned / disk full). Same posture as the sibling
-                // InvalidGrant branch below — a silent `let _ =` here was
-                // exactly the pattern the earlier R2-EH-01 fix targeted.
-                if let Err(e) = save_result {
-                    crate::logging::log(&format!(
-                        "refresh_inactive_if_stale: post-refresh state save \
-                         failed for {email}: {e:#}"
-                    ));
-                }
-            }
-            Ok(false) => {}
+            // `ensure_fresh` saved any rotation itself.
+            Ok(_) => {}
             Err(crate::providers::claude::oauth::RefreshError::InvalidGrant) => {
                 // Before flagging, run the last-chance fallback: another
                 // process may have rotated the credential on disk while we

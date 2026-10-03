@@ -33,8 +33,8 @@ use std::time::Duration;
 
 use crate::providers::trait_def::{
     AccountKey, Capabilities, CaptureMode, CapturedAccount, CredentialFreshness, IdentitySnapshot,
-    LaunchMode, PResult, Provider, ProviderError, SecretBackend, TokenGrant, UsageSnapshot,
-    UsageWindow,
+    LaunchMode, LoginSpec, PResult, Provider, ProviderError, SecretBackend, TokenGrant,
+    TokenRequestStyle, UsageSnapshot, UsageWindow,
 };
 
 /// Read/write timeout applied to every outbound HTTP call this provider
@@ -192,6 +192,38 @@ impl Provider for ClaudeProvider {
             secret_blob: blob,
             tokens,
         }))
+    }
+
+    /// Claude Code's own `/login` (claude.ai account), run by usagio.
+    fn login_spec(&self) -> Option<LoginSpec> {
+        Some(LoginSpec {
+            authorize_url: config::AUTHORIZE_URL,
+            token_url: config::TOKEN_URL,
+            client_id: config::CLIENT_ID,
+            scopes: config::LOGIN_SCOPES,
+            redirect_port: None,
+            redirect_path: "/callback",
+            extra_authorize_params: &[("code", "true")],
+            login_hint_param: Some("login_hint"),
+            token_request: TokenRequestStyle::Json {
+                include_state: true,
+            },
+        })
+    }
+
+    fn complete_login(&self, token_response: &Value) -> PResult<CapturedAccount> {
+        let access = token_response
+            .get("access_token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProviderError::Other("sign-in returned no access token".into()))?;
+        let profile = usage::fetch_profile(access).ok_or_else(|| {
+            ProviderError::Other("couldn't read the signed-in account's profile".into())
+        })?;
+        login_capture(
+            token_response,
+            &profile,
+            chrono::Utc::now().timestamp_millis(),
+        )
     }
 
     // --- Token lifecycle ----------------------------------------------------
@@ -539,6 +571,9 @@ impl Provider for ClaudeProvider {
                 // caller's read may race with a concurrent refresh.
                 if expires_at >= a.expires_at {
                     a.set_tokens(access, refresh, expires_at);
+                    if let Some(at) = crate::store::blob_refresh_token_expires_at(blob) {
+                        a.set_refresh_token_expires_at(at);
+                    }
                 }
             }
             Ok(())
@@ -577,6 +612,65 @@ pub(crate) fn extract_claude_email(v: &Value) -> Option<String> {
 
 /// Decode a Claude keychain blob (`{"claudeAiOauth": {...}}`) into
 /// `(access_token, refresh_token, expires_at_epoch_millis)`.
+/// Build the keychain credential + identity Claude Code itself would store
+/// after `/login`, from the token response and the account's profile. Pure.
+fn login_capture(tok: &Value, profile: &Value, now_ms: i64) -> PResult<CapturedAccount> {
+    let field = |k: &str| tok.get(k).and_then(Value::as_str);
+    let missing = |what: &str| ProviderError::Other(format!("sign-in returned no {what}"));
+    let access = field("access_token").ok_or_else(|| missing("access token"))?;
+    let refresh = field("refresh_token").ok_or_else(|| missing("refresh token"))?;
+    let expires_in = tok
+        .get("expires_in")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| missing("token lifetime"))?;
+    let oauth_account = usage::oauth_account_from_profile(profile)
+        .ok_or_else(|| ProviderError::Other("the profile has no account".into()))?;
+    let str_of = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(String::from);
+    let email = str_of(&oauth_account, "emailAddress")
+        .ok_or_else(|| ProviderError::Other("the profile has no email".into()))?;
+    let org = profile.get("organization").cloned().unwrap_or(Value::Null);
+    let scopes: Vec<&str> = match field("scope") {
+        Some(s) => s.split_whitespace().collect(),
+        None => config::LOGIN_SCOPES.to_vec(),
+    };
+    let mut oauth = serde_json::json!({
+        "accessToken": access,
+        "refreshToken": refresh,
+        "expiresAt": now_ms.saturating_add(expires_in.saturating_mul(1000)),
+        "scopes": scopes,
+        "subscriptionType": subscription_type(str_of(&org, "organization_type").as_deref()),
+        "rateLimitTier": org.get("rate_limit_tier").cloned().unwrap_or(Value::Null),
+    });
+    if let Some(secs) = tok.get("refresh_token_expires_in").and_then(Value::as_i64) {
+        oauth["refreshTokenExpiresAt"] = now_ms.saturating_add(secs.saturating_mul(1000)).into();
+    }
+    Ok(CapturedAccount {
+        identity: IdentitySnapshot {
+            email: Some(email),
+            uuid: str_of(&oauth_account, "accountUuid"),
+            display_name: str_of(&oauth_account, "displayName"),
+            native_blob: serde_json::json!({ "oauthAccount": oauth_account, "userID": null }),
+        },
+        secret_blob: serde_json::json!({ "claudeAiOauth": oauth }).to_string(),
+        tokens: TokenGrant {
+            access: access.to_string(),
+            refresh: Some(refresh.to_string()),
+            expires_in_secs: expires_in,
+        },
+    })
+}
+
+/// Claude Code's `subscriptionType` for a profile's organization type.
+fn subscription_type(org_type: Option<&str>) -> Value {
+    match org_type {
+        Some("claude_max") => "max".into(),
+        Some("claude_pro") => "pro".into(),
+        Some("claude_team") => "team".into(),
+        Some("claude_enterprise") => "enterprise".into(),
+        _ => Value::Null,
+    }
+}
+
 fn parse_claude_blob(blob: &str) -> PResult<(String, String, i64)> {
     let v: Value = serde_json::from_str(blob)
         .map_err(|e| ProviderError::Other(format!("keychain value is not valid JSON: {e}")))?;
@@ -776,6 +870,74 @@ fn write_claude_identity(oauth_account: &Value, user_id: Option<&str>) -> PResul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_capture_builds_the_credential_claude_code_would_store() {
+        let tok = serde_json::json!({
+            "access_token": "sk-ant-oat01-new",
+            "refresh_token": "sk-ant-ort01-new",
+            "expires_in": 28_800,
+            "refresh_token_expires_in": 2_419_200,
+            "scope": "user:profile user:inference",
+        });
+        let profile = serde_json::json!({
+            "account": { "uuid": "acct-1", "email": "dev@example.com", "display_name": "Dev" },
+            "organization": {
+                "uuid": "org-1",
+                "organization_type": "claude_max",
+                "rate_limit_tier": "default_claude_max_20x",
+            },
+        });
+        let now = 1_000_000_000_000;
+        let c = login_capture(&tok, &profile, now).unwrap();
+        assert_eq!(c.identity.email.as_deref(), Some("dev@example.com"));
+        assert_eq!(c.identity.uuid.as_deref(), Some("acct-1"));
+        assert_eq!(
+            c.identity.native_blob["oauthAccount"]["emailAddress"],
+            "dev@example.com"
+        );
+        let blob: Value = serde_json::from_str(&c.secret_blob).unwrap();
+        let o = &blob["claudeAiOauth"];
+        assert_eq!(o["accessToken"], "sk-ant-oat01-new");
+        assert_eq!(o["refreshToken"], "sk-ant-ort01-new");
+        assert_eq!(o["expiresAt"], now + 28_800_000);
+        assert_eq!(o["refreshTokenExpiresAt"], now + 2_419_200_000);
+        assert_eq!(
+            o["scopes"],
+            serde_json::json!(["user:profile", "user:inference"])
+        );
+        assert_eq!(o["subscriptionType"], "max");
+        assert_eq!(o["rateLimitTier"], "default_claude_max_20x");
+        // The stored blob round-trips through the normal parser.
+        assert_eq!(
+            parse_claude_blob(&c.secret_blob).unwrap().0,
+            "sk-ant-oat01-new"
+        );
+    }
+
+    #[test]
+    fn login_capture_rejects_a_response_without_tokens() {
+        let profile = serde_json::json!({ "account": { "email": "dev@example.com" } });
+        let tok = serde_json::json!({ "access_token": "a", "expires_in": 1 });
+        assert!(
+            login_capture(&tok, &profile, 0).is_err(),
+            "no refresh token"
+        );
+        let tok = serde_json::json!({ "access_token": "a", "refresh_token": "r", "expires_in": 1 });
+        assert!(
+            login_capture(&tok, &serde_json::json!({}), 0).is_err(),
+            "no account"
+        );
+    }
+
+    #[test]
+    fn claude_publishes_its_login_spec() {
+        let spec = ClaudeProvider.login_spec().expect("claude can renew");
+        assert_eq!(spec.client_id, config::CLIENT_ID);
+        assert_eq!(spec.token_url, config::TOKEN_URL);
+        assert_eq!(spec.redirect_path, "/callback");
+        assert!(spec.scopes.contains(&"user:inference"));
+    }
 
     #[test]
     fn identity_and_capabilities_are_locked() {

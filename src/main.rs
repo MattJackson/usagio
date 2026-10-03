@@ -17,6 +17,7 @@ mod credentials;
 mod env_lock;
 mod icons;
 mod logging;
+mod login;
 mod menubar;
 mod notifications;
 mod paths;
@@ -291,6 +292,7 @@ fn run() -> Result<()> {
         Some("install") => cmd_install(),
         Some("uninstall") => cmd_uninstall(),
         Some("rm") | Some("remove") => cmd_rm(args.get(1).map(String::as_str)),
+        Some("renew") | Some("login") => cmd_renew(&args[1..]),
         // Internal, undocumented — see `cmd_secrets_selftest` doc comment.
         Some("__secrets_selftest") => cmd_secrets_selftest(&args[1..]),
         // Internal, undocumented — headless screenshot renderer (see cmd doc).
@@ -334,6 +336,7 @@ fn print_help() {
          usagio context [OPTS]    Audit CLI auto-injected context (per turn)\n  \
                                         --provider <slug>  claude|codex|opencode\n  \
                                         --project  <path>  scope in-tree instructions to this project\n  \
+         usagio renew <email>     Sign that account in again in your browser (fresh login)\n  \
          usagio rm <email>        Forget an account\n\n\
          With no [email], switch/start/continue auto-pick the account that has room\n  \
          and whose weekly limit resets soonest (use it before the quota resets).\n  \
@@ -514,6 +517,208 @@ pub(crate) fn capture_current_generic(slug: &str) -> Result<(String, bool)> {
         "event=capture provider={slug} account={key} existed={existed}"
     ));
     Ok((key, existed))
+}
+
+/// Save a login the user just completed in usagio's sign-in window or browser
+/// ("Renew login…"). Unlike `capture`, it never changes which account is
+/// active; but if the account already IS active, the vendor CLI's live login
+/// is rewritten too, so running sessions pick it up without their own
+/// `/login`.
+pub(crate) fn persist_login(
+    provider: &dyn providers::trait_def::Provider,
+    captured: providers::trait_def::CapturedAccount,
+) -> Result<login::Renewed> {
+    let slug = provider.provider_id();
+    let key = provider.account_identifier(&captured.identity);
+    if slug == CLAUDE_SLUG {
+        return persist_claude_login(provider, key, captured);
+    }
+    let expires_at = Utc::now().timestamp() + captured.tokens.expires_in_secs;
+    let active = with_state_lock(|| {
+        let mut state = State::load()?;
+        let existing = state.find_provider_account(slug, &key).cloned();
+        let acct = ProviderAccount {
+            key: key.clone(),
+            secret_blob: captured.secret_blob.clone(),
+            access_token: captured.tokens.access.clone(),
+            refresh_token: captured.tokens.refresh.clone().unwrap_or_default(),
+            expires_at,
+            identity_email: captured.identity.email.clone(),
+            identity_uuid: captured.identity.uuid.clone(),
+            identity_display_name: captured.identity.display_name.clone(),
+            identity_native_blob: captured.identity.native_blob.clone(),
+            cached_usage: existing.as_ref().and_then(|a| a.cached_usage.clone()),
+            notif_state: existing
+                .as_ref()
+                .map(|a| a.notif_state.clone())
+                .unwrap_or_default(),
+            needs_relogin: false,
+            no_subscription: existing.as_ref().is_some_and(|a| a.no_subscription),
+            plan: existing.as_ref().and_then(|a| a.plan.clone()),
+        };
+        state.upsert_provider_account(slug, acct);
+        let active = state.provider_accounts_mut(slug).active.as_deref() == Some(key.as_str());
+        state.save()?;
+        // Inside the lock, so a concurrent switch can't land between the
+        // "is it active" check and this write.
+        if active {
+            provider
+                .write_active_account(&captured.secret_blob, &captured.identity)
+                .map_err(|e| anyhow!("saved, but making it live failed: {e}"))?;
+        }
+        Ok(active)
+    })?;
+    Ok(login::Renewed {
+        key,
+        login_expires_at: None,
+        made_live: active,
+    })
+}
+
+fn persist_claude_login(
+    provider: &dyn providers::trait_def::Provider,
+    email: String,
+    captured: providers::trait_def::CapturedAccount,
+) -> Result<login::Renewed> {
+    let fresh = Account::from_keychain_blob(&captured.secret_blob)?;
+    let native = &captured.identity.native_blob;
+    let (blob, active) = with_state_lock(|| {
+        let mut state = State::load()?;
+        let active = state
+            .active
+            .as_deref()
+            .is_some_and(|a| a.eq_ignore_ascii_case(&email));
+        match state.find_mut(&email) {
+            Some(a) => {
+                a.adopt_login(&fresh);
+                if a.oauth_account.is_none() {
+                    a.oauth_account = native.get("oauthAccount").cloned().filter(|v| !v.is_null());
+                }
+            }
+            None => {
+                let mut acct = fresh.clone();
+                acct.email = Some(email.clone());
+                acct.oauth_account = native.get("oauthAccount").cloned().filter(|v| !v.is_null());
+                state.upsert(acct);
+            }
+        }
+        state.save()?;
+        let a = state
+            .find(&email)
+            .context("account vanished while saving")?;
+        let identity = providers::trait_def::IdentitySnapshot {
+            native_blob: serde_json::json!({
+                "oauthAccount": a.oauth_account.clone().unwrap_or_else(|| native["oauthAccount"].clone()),
+                "userID": a.user_id,
+            }),
+            ..captured.identity.clone()
+        };
+        // Inside the lock, so a concurrent switch can't land between the
+        // "is it active" check and this write.
+        if active {
+            provider
+                .write_active_account(&a.keychain_blob, &identity)
+                .map_err(|e| anyhow!("saved, but making it live failed: {e}"))?;
+        }
+        Ok((a.keychain_blob.clone(), active))
+    })?;
+    Ok(login::Renewed {
+        key: email,
+        login_expires_at: store::blob_refresh_token_expires_at(&blob),
+        made_live: active,
+    })
+}
+
+/// Once per expiry, tell the user a renewable login is about to die (Claude
+/// Code itself starts nagging "Your login expires in N days" at the same
+/// point). Lapsed-plan accounts are skipped — they render as their plan.
+fn warn_expiring_logins() {
+    if providers::get(CLAUDE_SLUG)
+        .and_then(|p| p.login_spec())
+        .is_none()
+    {
+        return;
+    }
+    let now = Utc::now().timestamp_millis();
+    let due = with_state_lock(|| {
+        let mut st = State::load()?;
+        let mut due = Vec::new();
+        for a in st.accounts.iter_mut().filter(|a| !a.no_subscription) {
+            let at = a.refresh_token_expires_at();
+            if login::should_warn_expiry(at, now, a.notif_state.login_expiry_warned) {
+                a.notif_state.login_expiry_warned = at;
+                due.push((a.key().to_string(), at.unwrap_or(now)));
+            }
+        }
+        if !due.is_empty() {
+            st.save()?;
+        }
+        Ok(due)
+    })
+    .unwrap_or_default();
+    for (email, at) in due {
+        let days = ((at - now) / 86_400_000).max(0);
+        let when = if days >= 1 {
+            format!("in {days}d")
+        } else {
+            "today".to_string()
+        };
+        notify(&format!(
+            "{email}: login expires {when} — Renew login… in usagio"
+        ));
+    }
+}
+
+/// `usagio renew <email> [--provider <slug>]`: run the provider's own login in
+/// the default browser and save it for that account (the CLI side of the
+/// menu's "Renew login…"; see `crate::login`).
+fn cmd_renew(args: &[String]) -> Result<()> {
+    const USAGE: &str = "usage: usagio renew <email> [--provider <slug>]";
+    let mut slug = CLAUDE_SLUG.to_string();
+    let mut selector = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--provider" | "-p" => slug = it.next().context(USAGE)?.clone(),
+            other => selector = Some(other.to_string()),
+        }
+    }
+    let selector = selector.context(USAGE)?;
+    let provider = provider_by_slug(&slug)?;
+    let state = State::load()?;
+    let key = if slug == CLAUDE_SLUG {
+        state.resolve(&selector)?
+    } else {
+        state
+            .find_provider_account(&slug, &selector)
+            .map(|a| a.key.clone())
+            .unwrap_or(selector)
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let started = login::start(provider, Some(key.clone()), move |r| {
+        let _ = tx.send(r);
+    })?;
+    println!(
+        "Sign in as {key} in your browser. If it didn't open, visit:\n\n  {}\n",
+        started.url
+    );
+    if let Err(e) = platform().open_url(&started.url) {
+        eprintln!("({e:#})");
+    }
+    let renewed = rx.recv().context("the sign-in ended without a result")??;
+    let until = renewed
+        .login_expires_at
+        .and_then(DateTime::from_timestamp_millis)
+        .map(|t| {
+            format!(
+                "; login good until {}",
+                t.with_timezone(&chrono::Local).format("%b %-d")
+            )
+        })
+        .unwrap_or_default();
+    let live = if renewed.made_live { " (live now)" } else { "" };
+    println!("Renewed {}{until}{live}", renewed.key);
+    Ok(())
 }
 
 /// Remove a captured account from a non-Claude provider's state v2 slot
@@ -1116,6 +1321,10 @@ fn switch_to_guarded(
     hold: bool,
 ) -> Result<Option<String>> {
     let label = acct.email.clone().unwrap_or_else(|| email.to_string());
+    // Wait out any refresh in flight for this account, so the commit below
+    // sees its saved rotation instead of writing a just-consumed refresh
+    // token to the keychain.
+    let _refresh = oauth::refresh_lock();
     let switched = with_state_lock(|| {
         let mut st = State::load()?;
         if let Some(exp) = expect_active {
@@ -1154,22 +1363,16 @@ fn switch_to_guarded(
         let mut acct = acct.clone();
         if let Some(cur) = st.find(email) {
             if cur.expires_at > acct.expires_at {
-                acct.set_tokens(
-                    cur.access_token.clone(),
-                    cur.refresh_token.clone(),
-                    cur.expires_at,
-                );
+                acct.adopt_tokens_if_newer(cur);
             }
         }
         let from = st.active.clone();
         // ~/.claude.json first, keychain last (the commit point), rollback on fail.
         apply_account(provider, &acct, identity, from.as_deref(), &label)?;
         if let Some(a) = st.find_mut(email) {
-            a.set_tokens_if_newer(
-                acct.access_token.clone(),
-                acct.refresh_token.clone(),
-                acct.expires_at,
-            );
+            // Rotations are already saved by `oauth::ensure_fresh`; this
+            // records an active-slot adoption from `prepare_switch`.
+            a.adopt_tokens_if_newer(&acct);
             if backfilled {
                 a.oauth_account = Some(identity.clone());
             }
@@ -1449,7 +1652,7 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
     // already been superseded on disk.
     let provider = providers::get(CLAUDE_SLUG)
         .ok_or_else(|| anyhow!("internal: provider '{CLAUDE_SLUG}' not registered"))?;
-    let refreshed = if state.active.as_deref() == Some(email.as_str()) {
+    let adopted = if state.active.as_deref() == Some(email.as_str()) {
         // GUARANTEE: never POST /token for the ACTIVE account (single-use refresh
         // token would invalidate the live vendor CLI's copy → forced re-login).
         // `usagio token` for the active account ADOPTS the vendor slot's current
@@ -1468,7 +1671,8 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
         }
     } else {
         match ensure_fresh_with_fallback(provider, &email, &mut acct) {
-            Ok(b) => b,
+            // `ensure_fresh` saved any rotation itself.
+            Ok(_) => false,
             Err(oauth::RefreshError::InvalidGrant) => {
                 flag_needs_relogin(&email);
                 bail!(
@@ -1480,24 +1684,16 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
         }
     };
     let token = acct.access_token.clone();
-    // Phase 2 (locked): persist a rotation without clobbering a fresher one.
-    if refreshed {
+    // Phase 2 (locked): persist the vendor slot's token we just adopted,
+    // without clobbering a fresher one.
+    if adopted {
         with_state_lock(|| {
             let mut st = State::load()?;
             if let Some(a) = st.find_mut(&email) {
-                a.set_tokens_if_newer(
-                    acct.access_token.clone(),
-                    acct.refresh_token.clone(),
-                    acct.expires_at,
-                );
+                a.adopt_tokens_if_newer(&acct);
             }
-            // The token was already rotated server-side (single-use); if we can't
-            // persist it, say so — the stored refresh token is now stale.
-            st.save().context(
-                "the token was refreshed but recording the rotation in state.json \
-                 failed; if refreshes start failing, run `usagio capture` for \
-                 this account",
-            )
+            st.save()
+                .context("recording the adopted token in state.json failed")
         })?;
     }
     println!("{token}");
@@ -2869,18 +3065,10 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
         let mut st = State::load()?;
         for (email, acct, cu, ns) in &updates {
             if let Some(a) = st.find_mut(email) {
-                // Recency-guarded (matching switch_to): a concurrent switch that
-                // adopted a keychain rotation while we were fetching must not be
-                // clobbered by our older phase-1 snapshot.
-                a.set_tokens_if_newer(
-                    acct.access_token.clone(),
-                    acct.refresh_token.clone(),
-                    acct.expires_at,
-                );
+                // Tokens are already saved: rotations by `oauth::ensure_fresh`,
+                // active-slot adoptions by the CAS above.
                 // Propagate the flag from the phase-1/2 snapshot to the
-                // locked state. `set_tokens_if_newer` only writes on a real
-                // refresh, so we mirror this bit explicitly here — but only
-                // ever OR it in. A plain overwrite (`a.needs_relogin =
+                // locked state — but only ever OR it in. A plain overwrite (`a.needs_relogin =
                 // acct.needs_relogin`) could silently clobber `true` back to
                 // `false` if a concurrent path (switch, capture,
                 // `flag_needs_relogin`) set the flag on the locked state
@@ -4442,6 +4630,7 @@ fn watch_cycle(
     credentials::refresh_inactive_if_stale(State::load().ok().and_then(|s| s.active).as_deref());
 
     let claude_refresh = refresh_usage_cache(force);
+    warn_expiring_logins();
     // Gap-4 (codex-switch-e2e): drive the active-account CAS refresh for
     // every non-Claude provider that has one wired (currently just codex),
     // then poll their usage under the same fetch policy as Claude.

@@ -76,6 +76,30 @@ pub trait Platform: Send + Sync + 'static {
     fn notify(&self, _summary: &str, _body: &str) -> Result<()> {
         Ok(())
     }
+
+    /// Whether usagio's own per-account sign-in window ("Renew login…", see
+    /// `crate::login`) can be shown here. When not, callers use `open_url`.
+    fn sign_in_window_available(&self) -> bool {
+        sign_in::available()
+    }
+
+    /// Show `url` in the sign-in window keyed to `(slug, key)`'s own cookie
+    /// store. UI thread only; closes itself when `progress` finishes.
+    fn open_sign_in_window(
+        &self,
+        title: &str,
+        url: &str,
+        slug: &str,
+        key: &str,
+        progress: std::sync::Arc<crate::login::Progress>,
+    ) -> Result<()> {
+        sign_in::open(title, url, slug, key, progress)
+    }
+
+    /// Open `url` in the user's default browser.
+    fn open_url(&self, url: &str) -> Result<()> {
+        sign_in::open_url(url)
+    }
 }
 
 // ---------- MenuBackend ---------------------------------------------------
@@ -339,6 +363,9 @@ mod windows;
 // impls). muri renders identically on all three, so there is exactly one
 // `MenuTree` → live-menu path.
 pub(crate) mod render;
+
+// "Renew login…" sign-in window (wry) + default-browser opener.
+mod sign_in;
 
 // Test-only failure-injection seam, shared by ALL platforms' `SecretStore::set`
 // (macOS mock, Linux keyring/fallback, Windows Credential Manager). Lets

@@ -333,6 +333,38 @@ pub struct CapturedAccount {
     pub tokens: TokenGrant,
 }
 
+/// A provider's browser login: OAuth 2.0 authorization code + PKCE (RFC 7636)
+/// with a loopback redirect — the flow every vendor CLI's own `login` runs.
+/// One engine (`crate::login`) drives it for every provider; a provider only
+/// describes its endpoints here and turns the token response into its own
+/// credential blob in [`Provider::complete_login`].
+#[derive(Clone, Debug)]
+pub struct LoginSpec {
+    pub authorize_url: &'static str,
+    pub token_url: &'static str,
+    pub client_id: &'static str,
+    pub scopes: &'static [&'static str],
+    /// Loopback redirect port; `None` = any free port. Some vendors register
+    /// one fixed port (Codex: 1455).
+    pub redirect_port: Option<u16>,
+    /// Loopback redirect path, e.g. `/callback`.
+    pub redirect_path: &'static str,
+    /// Vendor-specific authorize query params, added verbatim.
+    pub extra_authorize_params: &'static [(&'static str, &'static str)],
+    /// Authorize param that pre-fills the sign-in email, if the vendor has one.
+    pub login_hint_param: Option<&'static str>,
+    pub token_request: TokenRequestStyle,
+}
+
+/// How the authorization-code exchange is encoded.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TokenRequestStyle {
+    /// JSON body; `include_state` echoes `state` (Anthropic expects it).
+    Json { include_state: bool },
+    /// `application/x-www-form-urlencoded` (RFC 6749 §4.1.3).
+    Form,
+}
+
 /// How to launch the vendor CLI after a swap. Providers that don't shell out
 /// (reporting-only) may ignore this.
 #[derive(Copy, Clone, Debug)]
@@ -506,6 +538,21 @@ pub trait Provider: Send + Sync + 'static {
     /// `capture_mode` is `CredsOnDisk`.
     fn capture_api_key(&self, nickname: String, key: String) -> PResult<CapturedAccount> {
         let _ = (nickname, key);
+        Err(ProviderError::Unsupported)
+    }
+
+    /// This provider's browser login, if usagio can run it itself (the "Renew
+    /// login…" action). `None` = the user must log in through the vendor CLI.
+    fn login_spec(&self) -> Option<LoginSpec> {
+        None
+    }
+
+    /// Turn a successful authorization-code exchange (the token endpoint's
+    /// JSON response) into a captured account: identity resolved from the
+    /// provider (never trusted from the window) plus the credential blob the
+    /// vendor CLI would have written.
+    fn complete_login(&self, token_response: &Value) -> PResult<CapturedAccount> {
+        let _ = token_response;
         Err(ProviderError::Unsupported)
     }
 
