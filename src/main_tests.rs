@@ -6764,3 +6764,102 @@ fn codex_boundaries_are_exact() {
     assert_eq!(active(base - 1), 0);
     reset_usage_fetch_tracker(&tracker);
 }
+
+fn renewed_capture(
+    email: &str,
+    at: &str,
+    rt_expires_at: i64,
+) -> providers::trait_def::CapturedAccount {
+    providers::trait_def::CapturedAccount {
+        identity: providers::trait_def::IdentitySnapshot {
+            email: Some(email.to_string()),
+            uuid: Some("from-login".into()),
+            display_name: None,
+            native_blob: serde_json::json!({
+                "oauthAccount": { "emailAddress": email, "accountUuid": "from-login" },
+                "userID": null,
+            }),
+        },
+        secret_blob: serde_json::json!({ "claudeAiOauth": {
+            "accessToken": at, "refreshToken": "new-rt", "expiresAt": 9,
+            "refreshTokenExpiresAt": rt_expires_at,
+        }})
+        .to_string(),
+        tokens: TokenGrant {
+            access: at.to_string(),
+            refresh: Some("new-rt".into()),
+            expires_in_secs: 60,
+        },
+    }
+}
+
+#[test]
+fn persist_login_renews_an_existing_claude_account_without_switching() {
+    use crate::store::ScopedConfigDir;
+    let _g = ScopedConfigDir::new();
+    let mut old = Account::from_keychain_blob(
+        &serde_json::json!({ "claudeAiOauth": {
+            "accessToken": "old-at", "refreshToken": "old-rt", "expiresAt": 1, "clientId": "kept",
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    old.email = Some("dev@example.com".into());
+    old.needs_relogin = true;
+    old.oauth_account =
+        Some(serde_json::json!({ "emailAddress": "dev@example.com", "accountUuid": "original" }));
+    let mut other = old.clone();
+    other.email = Some("other@example.com".into());
+    let st = State {
+        accounts: vec![old, other],
+        active: Some("other@example.com".into()),
+        ..Default::default()
+    };
+    st.save().unwrap();
+
+    let provider = providers::claude::new();
+    let r = persist_login(
+        provider.as_ref(),
+        renewed_capture("dev@example.com", "new-at", 77),
+    )
+    .unwrap();
+
+    assert_eq!(r.key, "dev@example.com");
+    assert!(
+        !r.made_live,
+        "an inactive account isn't written to the live slot"
+    );
+    assert_eq!(r.login_expires_at, Some(77));
+    let st = State::load().unwrap();
+    assert_eq!(
+        st.active.as_deref(),
+        Some("other@example.com"),
+        "renew never switches"
+    );
+    let a = st.find("dev@example.com").unwrap();
+    assert_eq!(a.access_token, "new-at");
+    assert!(!a.needs_relogin);
+    assert_eq!(a.refresh_token_expires_at(), Some(77));
+    assert_eq!(a.oauth_account.as_ref().unwrap()["accountUuid"], "original");
+    assert!(a.keychain_blob.contains("\"clientId\":\"kept\""));
+}
+
+#[test]
+fn persist_login_adds_an_account_it_has_never_seen() {
+    use crate::store::ScopedConfigDir;
+    let _g = ScopedConfigDir::new();
+    State::default().save().unwrap();
+    let provider = providers::claude::new();
+    persist_login(
+        provider.as_ref(),
+        renewed_capture("new@example.com", "at", 5),
+    )
+    .unwrap();
+    let st = State::load().unwrap();
+    let a = st.find("new@example.com").expect("added");
+    assert_eq!(
+        a.oauth_account.as_ref().unwrap()["accountUuid"],
+        "from-login"
+    );
+    assert_eq!(st.active, None);
+}

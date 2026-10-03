@@ -943,6 +943,7 @@ fn spawn_token_server(status: u16, on_post: impl Fn() + Send + 'static) -> (Stri
                     "access_token": "mock-refreshed-access-token",
                     "refresh_token": "mock-refreshed-refresh-token",
                     "expires_in": 3600,
+                    "refresh_token_expires_in": 2_419_200,
                 })
                 .to_string()
             } else {
@@ -1012,6 +1013,115 @@ fn refresh_inactive_if_stale_refreshes_an_expired_inactive_account_and_persists_
         // The active account is never refreshed (the vendor CLI owns it).
         assert_eq!(st.find("active@e.com").unwrap().access_token, "stale-at");
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    });
+}
+
+#[test]
+fn refresh_carries_the_refresh_token_expiry_into_the_saved_blob() {
+    // Claude Code warns "Your login expires in N days" off the blob's
+    // refreshTokenExpiresAt; a rotation that left it at the capture-time
+    // value produced a false warning on every switch.
+    use crate::store::State;
+    with_isolated_home(|| {
+        seed_state(vec![expired_account("rt@example.com")], None);
+        let (url, _hits) = spawn_token_server(200, || {});
+        let _u = TokenUrlGuard::set(&url);
+
+        refresh_inactive_if_stale(None);
+
+        let at = State::load()
+            .unwrap()
+            .find("rt@example.com")
+            .unwrap()
+            .refresh_token_expires_at()
+            .expect("refreshTokenExpiresAt recorded");
+        let want = chrono::Utc::now().timestamp_millis() + 2_419_200_000;
+        assert!((want - at).abs() < 60_000, "expiry ≈ now + 28d, got {at}");
+    });
+}
+
+#[test]
+fn ensure_fresh_adopts_a_rotation_already_saved_instead_of_reposting() {
+    // dev2's false re-login: two refreshers held the same single-use refresh
+    // token; the loser's POST got invalid_grant. The second refresher must
+    // pick up the first one's saved rotation and never spend the dead token.
+    use crate::store::State;
+    with_isolated_home(|| {
+        let mut saved = expired_account("twice@example.com");
+        saved.set_tokens(
+            "rotated-at".into(),
+            "rotated-rt".into(),
+            chrono::Utc::now().timestamp_millis() + 3_600_000,
+        );
+        seed_state(vec![saved], None);
+        let (url, hits) = spawn_token_server(400, || {});
+        let _u = TokenUrlGuard::set(&url);
+
+        let mut stale = expired_account("twice@example.com");
+        let changed = crate::providers::claude::oauth::ensure_fresh(&mut stale, 900).unwrap();
+
+        assert!(changed);
+        assert_eq!(stale.refresh_token, "rotated-rt");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "no POST");
+        assert!(
+            !State::load()
+                .unwrap()
+                .find("twice@example.com")
+                .unwrap()
+                .needs_relogin
+        );
+    });
+}
+
+#[test]
+fn a_refresh_in_flight_never_overwrites_a_renewed_login() {
+    // "Renew login…" saved a brand-new login while a poll's refresh of the
+    // old grant was on the wire; the older family must not win on expiry.
+    use crate::store::State;
+    with_isolated_home(|| {
+        seed_state(vec![expired_account("renewed@example.com")], None);
+        let state_json = crate::store::config_dir().unwrap().join("state.json");
+        let (url, hits) = spawn_token_server(200, move || {
+            let mut v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&state_json).unwrap()).unwrap();
+            v["accounts"][0]["refresh_token"] = "renewed-rt".into();
+            std::fs::write(&state_json, serde_json::to_vec(&v).unwrap()).unwrap();
+        });
+        let _u = TokenUrlGuard::set(&url);
+
+        refresh_inactive_if_stale(None);
+
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let st = State::load().unwrap();
+        assert_eq!(
+            st.find("renewed@example.com").unwrap().refresh_token,
+            "renewed-rt"
+        );
+    });
+}
+
+#[test]
+fn ensure_fresh_never_spends_the_grant_of_an_account_that_went_active() {
+    use crate::store::State;
+    with_isolated_home(|| {
+        seed_state(
+            vec![expired_account("now-active@example.com")],
+            Some("now-active@example.com"),
+        );
+        let (url, hits) = spawn_token_server(200, || {});
+        let _u = TokenUrlGuard::set(&url);
+        let mut stale = expired_account("now-active@example.com");
+        let changed = crate::providers::claude::oauth::ensure_fresh(&mut stale, 900).unwrap();
+        assert!(!changed);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "no POST");
+        assert_eq!(
+            State::load()
+                .unwrap()
+                .find("now-active@example.com")
+                .unwrap()
+                .refresh_token,
+            "stale-rt"
+        );
     });
 }
 

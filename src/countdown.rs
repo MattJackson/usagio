@@ -324,7 +324,7 @@ mod tests {
 
     #[test]
     fn not_locked_is_not_skippable() {
-        // Both windows below threshold → must refresh (the pq.io case).
+        // Both windows below threshold → must refresh (the idle-account case).
         let u = usage(Some(83.0), Some(2000), Some(75.0), Some(5000));
         assert!(!is_locked_until_reset(&u, t(1000)));
     }

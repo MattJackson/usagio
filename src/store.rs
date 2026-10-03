@@ -185,6 +185,76 @@ impl Account {
             .map(String::from)
     }
 
+    /// When the refresh token itself dies (unix millis), as recorded in the
+    /// blob's `refreshTokenExpiresAt`. Claude Code warns "Your login expires in
+    /// N days" off this field, so it must track every rotation we make.
+    pub fn refresh_token_expires_at(&self) -> Option<i64> {
+        blob_refresh_token_expires_at(&self.keychain_blob)
+    }
+
+    /// Record a new refresh-token expiry in the blob (what the keychain gets).
+    pub fn set_refresh_token_expires_at(&mut self, at: i64) {
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&self.keychain_blob) {
+            if let Some(o) = v.get_mut("claudeAiOauth").and_then(|x| x.as_object_mut()) {
+                o.insert("refreshTokenExpiresAt".into(), serde_json::Value::from(at));
+                self.keychain_blob = v.to_string();
+            }
+        }
+    }
+
+    /// Take a brand-new login for this account (usagio's "Renew login…"):
+    /// its tokens unconditionally, plus whatever the new credential says about
+    /// the login (expiry, scopes, plan) — keeping every other field Claude
+    /// Code put in the blob.
+    pub fn adopt_login(&mut self, fresh: &Account) {
+        self.set_tokens(
+            fresh.access_token.clone(),
+            fresh.refresh_token.clone(),
+            fresh.expires_at,
+        );
+        let Ok(new) = serde_json::from_str::<serde_json::Value>(&fresh.keychain_blob) else {
+            return;
+        };
+        let Some(new) = new.get("claudeAiOauth").and_then(|x| x.as_object()) else {
+            return;
+        };
+        let mut blob = serde_json::from_str::<serde_json::Value>(&self.keychain_blob)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        if !blob.get("claudeAiOauth").is_some_and(|x| x.is_object()) {
+            blob["claudeAiOauth"] = serde_json::json!({});
+        }
+        let Some(old) = blob["claudeAiOauth"].as_object_mut() else {
+            return;
+        };
+        for (k, v) in new {
+            if !v.is_null() {
+                old.insert(k.clone(), v.clone());
+            }
+        }
+        // The old login's expiry must not outlive it: a new login that
+        // doesn't state one has an unknown expiry, not the old date.
+        if !new.contains_key("refreshTokenExpiresAt") {
+            old.remove("refreshTokenExpiresAt");
+        }
+        self.keychain_blob = blob.to_string();
+    }
+
+    /// [`Self::set_tokens_if_newer`] from another copy of this account,
+    /// carrying its refresh-token expiry along with the tokens.
+    pub fn adopt_tokens_if_newer(&mut self, src: &Account) -> bool {
+        let applied = self.set_tokens_if_newer(
+            src.access_token.clone(),
+            src.refresh_token.clone(),
+            src.expires_at,
+        );
+        if applied {
+            if let Some(at) = src.refresh_token_expires_at() {
+                self.set_refresh_token_expires_at(at);
+            }
+        }
+        applied
+    }
+
     /// Update tokens only if `expires_at` is at least as new as what we already
     /// hold. Prevents a stale phase-1 snapshot (captured before a lock) from
     /// clobbering a fresher token a concurrent refresh rotated in the meantime —
@@ -451,6 +521,15 @@ pub fn config_dir() -> Result<PathBuf> {
     // failure here must not break every caller of `config_dir()`.
     let _ = ensure_dir_0700(&p);
     Ok(p)
+}
+
+/// `claudeAiOauth.refreshTokenExpiresAt` from a Claude keychain blob.
+pub fn blob_refresh_token_expires_at(blob: &str) -> Option<i64> {
+    serde_json::from_str::<serde_json::Value>(blob)
+        .ok()?
+        .get("claudeAiOauth")?
+        .get("refreshTokenExpiresAt")?
+        .as_i64()
 }
 
 fn state_path() -> Result<PathBuf> {

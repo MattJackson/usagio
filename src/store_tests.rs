@@ -221,12 +221,12 @@ fn upsert_appends_new_account() {
 fn resolve_exact_and_unique_prefix() {
     let mut s = State::default();
     s.accounts.push(acct("dev@example.com"));
-    s.accounts.push(acct("matthew@pq.io"));
+    s.accounts.push(acct("personal@example.org"));
     // Exact (case-insensitive).
     assert_eq!(s.resolve("DEV@example.com").unwrap(), "dev@example.com");
     // Unique prefix.
     assert_eq!(s.resolve("dev").unwrap(), "dev@example.com");
-    assert_eq!(s.resolve("matt").unwrap(), "matthew@pq.io");
+    assert_eq!(s.resolve("pers").unwrap(), "personal@example.org");
 }
 
 #[test]
@@ -504,7 +504,7 @@ fn migrates_old_name_keyed_state() {
             },
             {
                 "name": "Personal",
-                "oauth_account": { "emailAddress": "matthew@pq.io", "accountUuid": "u1" },
+                "oauth_account": { "emailAddress": "personal@example.org", "accountUuid": "u1" },
                 "access_token": "a2",
                 "refresh_token": "r2",
                 "expires_at": 2,
@@ -517,9 +517,9 @@ fn migrates_old_name_keyed_state() {
     assert_eq!(s.accounts.len(), 2);
     assert_eq!(s.find("dev@example.com").unwrap().access_token, "a1");
     // email backfilled from oauth_account.emailAddress
-    assert!(s.find("matthew@pq.io").is_some());
+    assert!(s.find("personal@example.org").is_some());
     // active migrated from the legacy name to that account's email
-    assert_eq!(s.active.as_deref(), Some("matthew@pq.io"));
+    assert_eq!(s.active.as_deref(), Some("personal@example.org"));
 }
 
 // ---------------------------------------------------------------------------
@@ -590,13 +590,13 @@ fn reconciler_never_persists_silent_account_drop() {
 #[test]
 fn accounts_dropped_by_reports_specific_emails_not_just_a_count() {
     let _g = ScopedConfigDir::new();
-    make_state_with(&["dev@example.com", "matthew@pq.io"])
+    make_state_with(&["dev@example.com", "personal@example.org"])
         .save()
         .unwrap();
 
     let restore_target = make_state_with(&["dev@example.com"]);
     let dropped = accounts_dropped_by(&restore_target).unwrap();
-    assert_eq!(dropped, vec!["matthew@pq.io".to_string()]);
+    assert_eq!(dropped, vec!["personal@example.org".to_string()]);
 }
 
 #[test]
@@ -1439,4 +1439,54 @@ fn reported_usage_round_trips_through_state() {
         .clone()
         .unwrap();
     assert_eq!(cu.reported, reported);
+}
+
+#[test]
+fn adopt_login_takes_the_new_credential_and_keeps_the_rest() {
+    let mut a = acct("dev@example.com");
+    a.needs_relogin = true;
+    let mut v: serde_json::Value = serde_json::from_str(&a.keychain_blob).unwrap();
+    v["claudeAiOauth"]["clientId"] = "kept".into();
+    v["claudeAiOauth"]["subscriptionType"] = "max".into();
+    a.keychain_blob = v.to_string();
+
+    let fresh = Account::from_keychain_blob(
+        &serde_json::json!({ "claudeAiOauth": {
+            "accessToken": "new-at", "refreshToken": "new-rt", "expiresAt": 5,
+            "refreshTokenExpiresAt": 99, "subscriptionType": null,
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    a.adopt_login(&fresh);
+
+    assert_eq!(
+        (a.access_token.as_str(), a.refresh_token.as_str()),
+        ("new-at", "new-rt")
+    );
+    assert_eq!(a.expires_at, 5, "a new login wins even if older-dated");
+    assert!(!a.needs_relogin);
+    assert_eq!(a.refresh_token_expires_at(), Some(99));
+    let o: serde_json::Value = serde_json::from_str(&a.keychain_blob).unwrap();
+    assert_eq!(o["claudeAiOauth"]["clientId"], "kept");
+    assert_eq!(
+        o["claudeAiOauth"]["subscriptionType"], "max",
+        "null never erases"
+    );
+    assert_eq!(o["claudeAiOauth"]["accessToken"], "new-at");
+}
+
+#[test]
+fn adopt_login_drops_an_expiry_the_new_login_does_not_state() {
+    let mut a = acct("dev@example.com");
+    a.set_refresh_token_expires_at(42);
+    let fresh = Account::from_keychain_blob(
+        &serde_json::json!({ "claudeAiOauth": {
+            "accessToken": "n", "refreshToken": "r", "expiresAt": 5,
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    a.adopt_login(&fresh);
+    assert_eq!(a.refresh_token_expires_at(), None);
 }
