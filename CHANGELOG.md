@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-10-03
+
+### Fixed
+- **A manual switch sticks until the trigger.** Switching by hand to an
+  account under the trigger no longer flips back to another account (e.g.
+  one with a sooner weekly reset) five minutes later; it stays until it
+  reaches the trigger, then auto-swaps as usual. A switch to an account
+  already at/over the trigger still stays until it's exhausted.
+
 ## [0.10.2] - 2026-10-03
 
 ### Added
