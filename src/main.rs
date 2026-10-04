@@ -848,9 +848,9 @@ fn cmd_switch(selector: Option<&str>, launch: Option<Launch>) -> Result<()> {
     // (state v2's `State::providers`) — this is the CLI half of routing a
     // switch by provider slug instead of assuming Claude, matching
     // `menubar.rs::handle_switch`.
-    // An explicit pick of an account already at/over the trigger holds:
-    // auto-swap won't move off it until it's exhausted (see
-    // `State::manual_holds`). A pick under the trigger auto-swaps as usual.
+    // An explicit pick under the trigger stays until the trigger (no
+    // proactive flip-back), then auto-swaps as usual. A pick already at/over
+    // the trigger holds until it's exhausted (see `State::manual_holds`).
     if let Some(sel) = selector {
         let claude = (!state.accounts.is_empty()).then(|| state.resolve(sel));
         if let Some(Ok(email)) = &claude {
@@ -985,6 +985,7 @@ pub(crate) fn switch_to_provider_account(slug: &str, key: &str, hold: bool) -> R
             .provider_accounts_mut(slug)
             .active
             .replace(acct.key.clone());
+        state.set_manual_pick(slug, hold.then_some(acct.key.as_str()));
         let hold = hold && pick_holds(&state, slug, &acct.key);
         state.set_manual_hold(slug, hold.then_some(acct.key.as_str()));
         // The vendor credential file is already switched at this point; if
@@ -1048,8 +1049,9 @@ fn provider_rows(state: &State, slug: &str) -> Vec<Row> {
 
 /// Whether a manual pick of `key` should hold. Only a pick of an account
 /// already at/over the trigger does: the user is acking it's over and owns
-/// the choice until it's exhausted. Under the trigger it's a plain switch
-/// that auto-swaps off at the trigger like any other.
+/// the choice until it's exhausted. Under the trigger it only blocks
+/// proactive flip-back (`State::manual_picks`) and auto-swaps off at the
+/// trigger like any other.
 fn pick_holds(state: &State, slug: &str, key: &str) -> bool {
     let trigger = state.trigger_pct.unwrap_or(TRIGGER_PCT);
     provider_rows(state, slug)
@@ -1397,6 +1399,7 @@ fn switch_to_guarded(
             }
         }
         st.active = Some(email.to_string());
+        st.set_manual_pick(CLAUDE_SLUG, hold.then_some(email));
         let hold = hold && pick_holds(&st, CLAUDE_SLUG, email);
         st.set_manual_hold(CLAUDE_SLUG, hold.then_some(email));
         // The login is already committed to the keychain + ~/.claude.json at this
@@ -4041,6 +4044,10 @@ pub(crate) struct SwapGuard {
     // until it is exhausted or lapses, and never prepares a switch away from
     // it while every account is blocked.
     manual_locked_choice: Option<(String, String)>,
+    // Any account the user switched to by hand, as `(slug, key)`. Mirrors
+    // `State::manual_pick`. Blocks proactive flip-back off it; reaching the
+    // trigger still swaps.
+    manual_pick: Option<(String, String)>,
 }
 
 /// Anti-thrash state for every provider: one independent `SwapGuard` each, so
@@ -4189,14 +4196,21 @@ fn fresh_since_left(r: &Row, guard: &SwapGuard) -> bool {
     r.fetched_at.is_some_and(|f| f > left_ts)
 }
 
-/// True if `act` is the account the user manually switched to.
+/// True if `act` is the account the user manually switched to at/over the
+/// trigger.
 fn held_on(guard: &SwapGuard, act: &Row) -> bool {
-    guard
-        .manual_locked_choice
-        .as_ref()
-        .is_some_and(|(provider, key)| {
-            provider == &act.provider_id && key.eq_ignore_ascii_case(&act.email)
-        })
+    is_choice(guard.manual_locked_choice.as_ref(), act)
+}
+
+/// True if `act` is the account the user manually switched to.
+fn picked_on(guard: &SwapGuard, act: &Row) -> bool {
+    is_choice(guard.manual_pick.as_ref(), act)
+}
+
+fn is_choice(choice: Option<&(String, String)>, act: &Row) -> bool {
+    choice.is_some_and(|(provider, key)| {
+        provider == &act.provider_id && key.eq_ignore_ascii_case(&act.email)
+    })
 }
 
 /// A manual pick stays put past the trigger (and through any proactive
@@ -4337,7 +4351,9 @@ fn evaluate_swap(
         .collect();
     let act_effective = effective_active_max_pct_for_swap_fire(act, trigger);
     let in_trouble = act_lapsed || act_effective >= trigger;
-    if hold_applies(guard, act) {
+    // A manual pick is only left once it must be: optional moves (flip-back,
+    // all-blocked preparation) never override the user's choice.
+    if hold_applies(guard, act) || (picked_on(guard, act) && !in_trouble) {
         return none;
     }
     // Every other account is past the trigger too, but the active one must be
@@ -4685,6 +4701,9 @@ fn watch_cycle(
         guard.manual_locked_choice = state
             .manual_hold(slug)
             .map(|k| (slug.to_string(), k.to_string()));
+        guard.manual_pick = state
+            .manual_pick(slug)
+            .map(|k| (slug.to_string(), k.to_string()));
         let (swapped, actionable) = match active.as_deref() {
             Some(a) => provider_swap_cycle(slug, &mut rows, a, trigger, ceiling, guard)?,
             None => (None, false),
@@ -4819,6 +4838,7 @@ fn provider_swap_cycle(
     guard.last_swap = Some(std::time::Instant::now());
     guard.stuck_notified = false;
     guard.manual_locked_choice = None;
+    guard.manual_pick = None;
     prune_swap_guard(guard);
     log_event(&serde_json::json!({
         "ts": Utc::now().timestamp(),

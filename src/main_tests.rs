@@ -2127,10 +2127,14 @@ fn switch_to_provider_account_writes_auth_json_and_updates_active() {
         assert_eq!(state.manual_hold("codex"), Some("a@example.com"));
         switch_to_provider_account("codex", "b@example.com", false).unwrap();
         assert_eq!(State::load().unwrap().manual_hold("codex"), None);
-        // A manual switch under the trigger (B has no usage yet) doesn't hold.
+        assert_eq!(State::load().unwrap().manual_pick("codex"), None);
+        // A manual switch under the trigger (B has no usage yet) doesn't hold,
+        // but is recorded as a pick.
         switch_to_provider_account("codex", "a@example.com", true).unwrap();
         switch_to_provider_account("codex", "b@example.com", true).unwrap();
-        assert_eq!(State::load().unwrap().manual_hold("codex"), None);
+        let state = State::load().unwrap();
+        assert_eq!(state.manual_hold("codex"), None);
+        assert_eq!(state.manual_pick("codex"), Some("b@example.com"));
     });
 }
 
@@ -2599,6 +2603,46 @@ fn manual_hold_blocks_proactive_flip_back() {
     };
     let eval = evaluate_swap(&rows, "manual@e.com", 95.0, 95.0, &held);
     assert!(eval.target.is_none() && eval.target_ignoring_cooldown.is_none());
+}
+
+#[test]
+fn manual_pick_blocks_flip_back_until_the_trigger() {
+    // 0.10.2 miss: a pick of dev@ at 93% (95% trigger) flipped back to dev2@
+    // (sooner weekly reset) as soon as the 5-minute cooldown cleared.
+    let now = Utc::now();
+    let mut rows = vec![
+        row_full("manual@e.com", 0.0, 93.0, now + Duration::days(6)),
+        row_full("sooner@e.com", 0.0, 37.0, now + Duration::days(3)),
+    ];
+    let unpicked = evaluate_swap(&rows, "manual@e.com", 95.0, 95.0, &SwapGuard::default());
+    assert_eq!(
+        unpicked.target.as_deref(),
+        Some("sooner@e.com"),
+        "precondition: an unpicked account would flip to the sooner reset"
+    );
+    let picked = SwapGuard {
+        manual_pick: Some((CLAUDE_SLUG.to_string(), "manual@e.com".to_string())),
+        ..SwapGuard::default()
+    };
+    let eval = evaluate_swap(&rows, "manual@e.com", 95.0, 95.0, &picked);
+    assert!(eval.target.is_none() && eval.target_ignoring_cooldown.is_none());
+    // At the trigger it swaps like any other account.
+    rows[0].weekly.pct = Some(95.0);
+    let eval = evaluate_swap(&rows, "manual@e.com", 95.0, 95.0, &picked);
+    assert!(eval.urgent);
+    assert_eq!(eval.target.as_deref(), Some("sooner@e.com"));
+    // A pick of some other account doesn't protect this one.
+    rows[0].weekly.pct = Some(93.0);
+    let other = SwapGuard {
+        manual_pick: Some((CLAUDE_SLUG.to_string(), "sooner@e.com".to_string())),
+        ..SwapGuard::default()
+    };
+    assert_eq!(
+        evaluate_swap(&rows, "manual@e.com", 95.0, 95.0, &other)
+            .target
+            .as_deref(),
+        Some("sooner@e.com")
+    );
 }
 
 #[test]
@@ -6526,9 +6570,12 @@ fn switch_command_activates_the_pick_and_holds_it_only_when_over_the_trigger() {
         let st = State::load().unwrap();
         assert_eq!(st.active.as_deref(), Some("calm@e.com"));
         assert_eq!(st.manual_hold(CLAUDE_SLUG), None);
+        assert_eq!(st.manual_pick(CLAUDE_SLUG), Some("calm@e.com"));
         // With no selector the best account is auto-picked and not held.
         cmd_switch(None, None).unwrap();
-        assert_eq!(State::load().unwrap().manual_hold(CLAUDE_SLUG), None);
+        let st = State::load().unwrap();
+        assert_eq!(st.manual_hold(CLAUDE_SLUG), None);
+        assert_eq!(st.manual_pick(CLAUDE_SLUG), None);
     });
 }
 
