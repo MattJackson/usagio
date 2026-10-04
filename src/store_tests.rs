@@ -151,16 +151,18 @@ fn manual_hold_round_trips_and_applies_only_while_active() {
         ..State::default()
     };
     state.set_manual_hold("claude", Some("dev@e.com"));
+    state.set_manual_pick("claude", Some("dev@e.com"));
     let s = State::from_value(&serde_json::to_value(&state).unwrap());
     assert_eq!(s.manual_hold("claude"), Some("dev@e.com"));
+    assert_eq!(s.manual_pick("claude"), Some("dev@e.com"));
     // A switch we didn't record (e.g. `claude /login`) makes the hold stale.
     state.active = Some("dev4@e.com".to_string());
     assert_eq!(state.manual_hold("claude"), None);
+    assert_eq!(state.manual_pick("claude"), None);
     state.set_manual_hold("claude", None);
-    assert!(serde_json::to_value(&state)
-        .unwrap()
-        .get("manual_holds")
-        .is_none());
+    state.set_manual_pick("claude", None);
+    let v = serde_json::to_value(&state).unwrap();
+    assert!(v.get("manual_holds").is_none() && v.get("manual_picks").is_none());
 }
 
 #[test]
