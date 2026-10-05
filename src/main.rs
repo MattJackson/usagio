@@ -1060,6 +1060,64 @@ fn pick_holds(state: &State, slug: &str, key: &str) -> bool {
         .is_some_and(|r| r.has_data() && r.max_pct() >= trigger)
 }
 
+/// How long after a manual switch its first reading still settles whether
+/// the pick holds (see `settle_manual_pick`).
+const MANUAL_PICK_SETTLE_SECS: i64 = 300;
+
+/// Re-decide `slug`'s manual hold on the first reading of the picked account
+/// taken after the switch. `pick_holds` decided from the cached reading, which
+/// for an account that wasn't active can be minutes old: a pick read at 93%
+/// that was really at 96% would otherwise auto-swap away instead of holding.
+/// A reading later than `MANUAL_PICK_SETTLE_SECS` after the switch (usage
+/// 429s can delay it) no longer says where the pick started, so it keeps the
+/// switch-time decision. Returns whether `state` changed.
+fn settle_manual_pick(state: &mut State, slug: &str, rows: &[Row], trigger: f64) -> bool {
+    let Some(at) = state.manual_pick_at.get(slug).copied() else {
+        return false;
+    };
+    let Some(key) = state.manual_pick(slug).map(str::to_string) else {
+        return false;
+    };
+    let Some(row) = rows.iter().find(|r| r.email.eq_ignore_ascii_case(&key)) else {
+        return false;
+    };
+    let Some(fetched) = row.fetched_at.filter(|&f| f > at && row.has_data()) else {
+        return false;
+    };
+    state.manual_pick_at.remove(slug);
+    if fetched > at + MANUAL_PICK_SETTLE_SECS {
+        return true;
+    }
+    let hold = row.max_pct() >= trigger;
+    state.set_manual_hold(slug, hold.then_some(key.as_str()));
+    logging::log(&format!(
+        "event=manual_pick_settled provider={slug} account={key} pct={:.0} hold={hold}",
+        row.max_pct()
+    ));
+    true
+}
+
+/// `settle_manual_pick` for every provider with a pick still waiting on a
+/// post-switch reading.
+fn settle_manual_picks(trigger: f64) {
+    let settled = with_state_lock(|| {
+        let mut st = State::load()?;
+        let slugs: Vec<String> = st.manual_pick_at.keys().cloned().collect();
+        let mut changed = false;
+        for slug in slugs {
+            let rows = provider_rows(&st, &slug);
+            changed |= settle_manual_pick(&mut st, &slug, &rows, trigger);
+        }
+        if changed {
+            st.save()?;
+        }
+        Ok(())
+    });
+    if let Err(e) = settled {
+        logging::log(&format!("settling manual pick failed: {e:#}"));
+    }
+}
+
 /// The key of `slug`'s active account, if any.
 fn provider_active(state: &State, slug: &str) -> Option<String> {
     if slug == CLAUDE_SLUG {
@@ -4202,6 +4260,17 @@ fn held_on(guard: &SwapGuard, act: &Row) -> bool {
     is_choice(guard.manual_locked_choice.as_ref(), act)
 }
 
+/// The active account's usage as the "must we leave it now" check sees it.
+/// A manual pick is only left on a real reading at the trigger: a usage 429
+/// near it doesn't count (0.10.3 miss: a pick at 93% flipped on one 429).
+fn swap_fire_pct(act: &Row, trigger: f64, guard: &SwapGuard) -> f64 {
+    if picked_on(guard, act) {
+        act.max_pct()
+    } else {
+        effective_active_max_pct_for_swap_fire(act, trigger)
+    }
+}
+
 /// True if `act` is the account the user manually switched to.
 fn picked_on(guard: &SwapGuard, act: &Row) -> bool {
     is_choice(guard.manual_pick.as_ref(), act)
@@ -4349,8 +4418,7 @@ fn evaluate_swap(
         .copied()
         .filter(|r| r.eligible_target(ceiling, trigger))
         .collect();
-    let act_effective = effective_active_max_pct_for_swap_fire(act, trigger);
-    let in_trouble = act_lapsed || act_effective >= trigger;
+    let in_trouble = act_lapsed || swap_fire_pct(act, trigger, guard) >= trigger;
     // A manual pick is only left once it must be: optional moves (flip-back,
     // all-blocked preparation) never override the user's choice.
     if hold_applies(guard, act) || (picked_on(guard, act) && !in_trouble) {
@@ -4468,7 +4536,7 @@ fn evaluate_swap_verified(
             // reading, no reading since we left them) never refresh during an
             // active 429 — the poll skips inactive fetches that cycle — so
             // re-check the best stale one directly instead of waiting blind.
-            if rescues >= MAX_STALE_RESCUES || !active_in_trouble(rows, active, trigger) {
+            if rescues >= MAX_STALE_RESCUES || !active_in_trouble(rows, active, trigger, guard) {
                 return eval;
             }
             let Some(stale) = stale_swap_candidate(rows, active, guard, &tried) else {
@@ -4524,10 +4592,9 @@ fn evaluate_swap_verified(
 
 /// Whether the active account must be left now — the same test
 /// `evaluate_swap` uses for an urgent swap.
-fn active_in_trouble(rows: &[Row], active: &str, trigger: f64) -> bool {
+fn active_in_trouble(rows: &[Row], active: &str, trigger: f64, guard: &SwapGuard) -> bool {
     rows.iter().find(|r| r.email == active).is_some_and(|a| {
-        a.no_subscription
-            || (a.has_data() && effective_active_max_pct_for_swap_fire(a, trigger) >= trigger)
+        a.no_subscription || (a.has_data() && swap_fire_pct(a, trigger, guard) >= trigger)
     })
 }
 
@@ -4675,6 +4742,7 @@ fn watch_cycle(
         }
     }
     let provider_rate_limited = refresh_provider_usage_caches(force, trigger);
+    settle_manual_picks(trigger);
 
     let state = State::load()?;
     let mut providers_out = Vec::new();
