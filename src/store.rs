@@ -464,6 +464,11 @@ pub struct State {
     /// move off it; reaching the trigger still swaps as usual.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub manual_picks: std::collections::HashMap<String, String>,
+    /// When each provider's manual pick was made (unix secs), until the first
+    /// reading taken after it settles whether the pick holds. The reading the
+    /// switch decided on may be minutes old (see `settle_manual_pick`).
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub manual_pick_at: std::collections::HashMap<String, i64>,
     /// Emails this in-memory state has explicitly requested be dropped via
     /// `remove()`. NOT serialized — transient authorization consumed by
     /// `save_state_safe`, so `save()` can distinguish "the caller meant to
@@ -756,6 +761,10 @@ impl State {
                 .get("manual_picks")
                 .and_then(|x| serde_json::from_value(x.clone()).ok())
                 .unwrap_or_default(),
+            manual_pick_at: v
+                .get("manual_pick_at")
+                .and_then(|x| serde_json::from_value(x.clone()).ok())
+                .unwrap_or_default(),
             pending_removals: HashSet::new(),
             pending_provider_removals: HashSet::new(),
         }
@@ -796,6 +805,15 @@ impl State {
     /// auto-swap or auto-pick moved it).
     pub fn set_manual_pick(&mut self, slug: &str, key: Option<&str>) {
         set_or_clear(&mut self.manual_picks, slug, key);
+        match key {
+            Some(_) => {
+                self.manual_pick_at
+                    .insert(slug.to_string(), chrono::Utc::now().timestamp());
+            }
+            None => {
+                self.manual_pick_at.remove(slug);
+            }
+        }
     }
 
     /// Persist this state to `~/.config/usagio/state.json`.

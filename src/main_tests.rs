@@ -591,6 +591,41 @@ fn first_429_near_trigger_swaps_immediately_even_after_a_recent_swap() {
 }
 
 #[test]
+fn a_429_near_the_trigger_does_not_move_a_manual_pick() {
+    // 0.10.3 miss: a pick of dev2@ at 93% (95% trigger) flipped to dev4@ on
+    // the first usage 429, and again a second after re-picking it.
+    let email = escalation_test_email("manual_pick");
+    record_usage_fetch_success(&email);
+    record_usage_fetch_429(&email);
+    let reset = Utc::now() + Duration::hours(24);
+    let mut rows = vec![
+        row_full(&email, 93.0, 76.0, reset),
+        row_full("dev4@e.com", 24.0, 9.0, reset + Duration::hours(24)),
+    ];
+    rows[0].fetched_at = Some(Utc::now().timestamp());
+    let picked = SwapGuard {
+        manual_pick: Some((CLAUDE_SLUG.to_string(), email.clone())),
+        ..SwapGuard::default()
+    };
+    let eval = evaluate_swap(&rows, &email, 95.0, 95.0, &picked);
+    assert!(eval.target.is_none() && !eval.urgent);
+    assert!(!active_in_trouble(&rows, &email, 95.0, &picked));
+    // Unpicked, the same 429 still forces the swap.
+    assert!(active_in_trouble(
+        &rows,
+        &email,
+        95.0,
+        &SwapGuard::default()
+    ));
+    // A real reading at the trigger still moves the pick.
+    rows[0].session.pct = Some(95.0);
+    let eval = evaluate_swap(&rows, &email, 95.0, 95.0, &picked);
+    assert!(eval.urgent);
+    assert_eq!(eval.target.as_deref(), Some("dev4@e.com"));
+    reset_usage_fetch_tracker(&email);
+}
+
+#[test]
 fn swap_target_ceiling_follows_the_trigger() {
     let reset = Utc::now() + Duration::hours(24);
     // Trigger 95, ceiling = trigger: a 90% session is a usable target now
@@ -2585,6 +2620,87 @@ fn manual_pick_holds_only_at_or_over_the_trigger() {
 }
 
 #[test]
+fn manual_pick_hold_settles_on_the_first_reading_after_the_switch() {
+    // A pick decided on a stale 93% that was really at 96% must hold, not
+    // auto-swap away on the first fresh reading.
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let mut state = State {
+        trigger_pct: Some(95.0),
+        ..State::default()
+    };
+    let mut a = acct_with_cache(Some(usage_at(93.0)));
+    a.email = Some("pick@e.com".to_string());
+    state.upsert(a);
+    state.active = Some("pick@e.com".to_string());
+    state.set_manual_pick(CLAUDE_SLUG, Some("pick@e.com"));
+    let at = Utc::now().timestamp() - 60;
+    state.manual_pick_at.insert(CLAUDE_SLUG.to_string(), at);
+    // The reading the switch decided on predates it: nothing to settle yet.
+    let cached = state.find_mut("pick@e.com").unwrap();
+    cached.cached_usage.as_mut().unwrap().fetched_at = at - 300;
+    let rows = provider_rows(&state, CLAUDE_SLUG);
+    assert!(!settle_manual_pick(&mut state, CLAUDE_SLUG, &rows, 95.0));
+    assert_eq!(state.manual_hold(CLAUDE_SLUG), None);
+    // First reading after the switch: at the trigger, so it holds.
+    state.find_mut("pick@e.com").unwrap().cached_usage = Some(usage_at(96.0));
+    let rows = provider_rows(&state, CLAUDE_SLUG);
+    assert!(settle_manual_pick(&mut state, CLAUDE_SLUG, &rows, 95.0));
+    assert_eq!(state.manual_hold(CLAUDE_SLUG), Some("pick@e.com"));
+    assert!(state.manual_pick_at.is_empty());
+    // Settled once: later readings don't re-decide it.
+    let rows = provider_rows(&state, CLAUDE_SLUG);
+    assert!(!settle_manual_pick(&mut state, CLAUDE_SLUG, &rows, 95.0));
+}
+
+#[test]
+fn a_stale_hold_drops_when_the_first_fresh_reading_is_under_the_trigger() {
+    // Picked on a stale 97% after its window reset: the fresh 10% means the
+    // pick was under the trigger, so it holds only until the trigger.
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let mut state = State {
+        trigger_pct: Some(95.0),
+        ..State::default()
+    };
+    let mut a = acct_with_cache(Some(usage_at(97.0)));
+    a.email = Some("pick@e.com".to_string());
+    state.upsert(a);
+    state.active = Some("pick@e.com".to_string());
+    state.set_manual_pick(CLAUDE_SLUG, Some("pick@e.com"));
+    state.set_manual_hold(CLAUDE_SLUG, Some("pick@e.com"));
+    state
+        .manual_pick_at
+        .insert(CLAUDE_SLUG.to_string(), Utc::now().timestamp() - 60);
+    state.find_mut("pick@e.com").unwrap().cached_usage = Some(usage_at(10.0));
+    let rows = provider_rows(&state, CLAUDE_SLUG);
+    assert!(settle_manual_pick(&mut state, CLAUDE_SLUG, &rows, 95.0));
+    assert_eq!(state.manual_hold(CLAUDE_SLUG), None);
+    assert_eq!(state.manual_pick(CLAUDE_SLUG), Some("pick@e.com"));
+}
+
+#[test]
+fn a_late_first_reading_keeps_the_switch_time_decision() {
+    // 429s held off the first reading for 10 minutes; by then 96% says how
+    // far it climbed since the pick, not where the pick started.
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let mut state = State {
+        trigger_pct: Some(95.0),
+        ..State::default()
+    };
+    let mut a = acct_with_cache(Some(usage_at(96.0)));
+    a.email = Some("pick@e.com".to_string());
+    state.upsert(a);
+    state.active = Some("pick@e.com".to_string());
+    state.set_manual_pick(CLAUDE_SLUG, Some("pick@e.com"));
+    state
+        .manual_pick_at
+        .insert(CLAUDE_SLUG.to_string(), Utc::now().timestamp() - 600);
+    let rows = provider_rows(&state, CLAUDE_SLUG);
+    assert!(settle_manual_pick(&mut state, CLAUDE_SLUG, &rows, 95.0));
+    assert_eq!(state.manual_hold(CLAUDE_SLUG), None);
+    assert!(state.manual_pick_at.is_empty());
+}
+
+#[test]
 fn manual_hold_blocks_proactive_flip_back() {
     let now = Utc::now();
     let rows = vec![
@@ -3304,21 +3420,22 @@ fn active_in_trouble_fixture() -> Vec<Row> {
 #[test]
 fn active_in_trouble_means_lapsed_or_at_the_trigger_with_data() {
     let mut rows = active_in_trouble_fixture();
+    let none = SwapGuard::default();
     // A healthy active account is not in trouble, whatever the others are at.
-    assert!(!active_in_trouble(&rows, "active@e.com", 95.0));
+    assert!(!active_in_trouble(&rows, "active@e.com", 95.0, &none));
     // An unknown account never is.
-    assert!(!active_in_trouble(&rows, "ghost@e.com", 95.0));
+    assert!(!active_in_trouble(&rows, "ghost@e.com", 95.0, &none));
     // At the trigger exactly.
     rows[0].weekly.pct = Some(95.0);
-    assert!(active_in_trouble(&rows, "active@e.com", 95.0));
+    assert!(active_in_trouble(&rows, "active@e.com", 95.0, &none));
     rows[0].weekly.pct = Some(94.9);
-    assert!(!active_in_trouble(&rows, "active@e.com", 95.0));
+    assert!(!active_in_trouble(&rows, "active@e.com", 95.0, &none));
     // No reading: not in trouble by usage, but a lapsed plan is, data or not.
     rows[0].weekly.pct = Some(99.0);
     rows[0].fetched_at = None;
-    assert!(!active_in_trouble(&rows, "active@e.com", 95.0));
+    assert!(!active_in_trouble(&rows, "active@e.com", 95.0, &none));
     rows[0].no_subscription = true;
-    assert!(active_in_trouble(&rows, "active@e.com", 95.0));
+    assert!(active_in_trouble(&rows, "active@e.com", 95.0, &none));
 }
 
 fn stale_row(email: &str, session: f64, age_secs: i64) -> Row {
