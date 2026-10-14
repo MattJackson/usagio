@@ -2569,22 +2569,29 @@ fn no_flip_back_into_the_429_escalation_band() {
 }
 
 #[test]
-fn reactive_swap_prefers_targets_below_the_band() {
+fn reactive_swap_drains_a_banded_account_that_resets_soonest() {
+    // 0.10.4 miss: matthew@ left at 100% for dev2@ (55%, resets Oct 21) while
+    // dev5@ sat at 94% (95% trigger) resetting 6h sooner — its last point
+    // would expire unused.
     let now = Utc::now();
     let rows = vec![
         row_full("active@e.com", 0.0, 96.0, now + Duration::days(4)),
-        row_full("banded@e.com", 0.0, 90.0, now + Duration::days(1)),
+        row_full("banded@e.com", 0.0, 94.0, now + Duration::days(1)),
         row_full("roomy@e.com", 0.0, 40.0, now + Duration::days(3)),
     ];
     let eval = evaluate_swap(&rows, "active@e.com", 95.0, 95.0, &SwapGuard::default());
-    assert_eq!(eval.target.as_deref(), Some("roomy@e.com"));
-    assert!(!eval.fallback);
-    // Only banded accounts left: the fallback still moves to the most room.
-    let mut rows = rows;
-    rows.pop();
-    let eval = evaluate_swap(&rows, "active@e.com", 95.0, 95.0, &SwapGuard::default());
     assert_eq!(eval.target.as_deref(), Some("banded@e.com"));
-    assert!(eval.fallback);
+    assert!(!eval.fallback);
+    // Still ranked by reset: a banded account resetting later loses.
+    let mut rows = rows;
+    rows[1].weekly.resets_at = Some(now + Duration::days(5));
+    let eval = evaluate_swap(&rows, "active@e.com", 95.0, 95.0, &SwapGuard::default());
+    assert_eq!(eval.target.as_deref(), Some("roomy@e.com"));
+    // At the trigger it is no target at all, even resetting soonest.
+    rows[1].weekly.resets_at = Some(now + Duration::days(1));
+    rows[1].weekly.pct = Some(95.0);
+    let eval = evaluate_swap(&rows, "active@e.com", 95.0, 95.0, &SwapGuard::default());
+    assert_eq!(eval.target.as_deref(), Some("roomy@e.com"));
 }
 
 fn usage_at(pct: f64) -> CachedUsage {
