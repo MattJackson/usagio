@@ -2116,6 +2116,16 @@ impl Row {
         session <= session_ceiling && session < limit && self.weekly.pct.unwrap_or(0.0) < limit
     }
 
+    /// Eligible as a target only when the active account must be left: both
+    /// windows under the trigger, even inside the band `eligible_target`
+    /// refuses. Ranked like any candidate, so a banded account wins only when
+    /// it resets soonest — its last points would otherwise expire unused.
+    /// Never a proactive flip-back target, so the v0.8.7 walk-back can't recur.
+    fn forced_target(&self, session_ceiling: f64, trigger: f64) -> bool {
+        let session = self.session.pct.unwrap_or(0.0);
+        session <= session_ceiling && session < trigger && self.weekly.pct.unwrap_or(0.0) < trigger
+    }
+
     /// Remaining percent on the tightest of session/weekly.
     fn headroom(&self) -> f64 {
         100.0 - self.max_pct()
@@ -4413,12 +4423,14 @@ fn evaluate_swap(
         // leaving (e.g. 93% frozen by a 429) may be well past the trigger.
         .filter(|r| fresh_since_left(r, guard))
         .collect();
+    let in_trouble = act_lapsed || swap_fire_pct(act, trigger, guard) >= trigger;
     let mut candidates: Vec<&Row> = usable
         .iter()
         .copied()
-        .filter(|r| r.eligible_target(ceiling, trigger))
+        .filter(|r| {
+            r.eligible_target(ceiling, trigger) || (in_trouble && r.forced_target(ceiling, trigger))
+        })
         .collect();
-    let in_trouble = act_lapsed || swap_fire_pct(act, trigger, guard) >= trigger;
     // A manual pick is only left once it must be: optional moves (flip-back,
     // all-blocked preparation) never override the user's choice.
     if hold_applies(guard, act) || (picked_on(guard, act) && !in_trouble) {
@@ -4882,6 +4894,8 @@ fn provider_swap_cycle(
             target_row.max_pct(),
             if eval.fallback {
                 " reason=fallback_most_room"
+            } else if !target_row.eligible_target(ceiling, trigger) {
+                " reason=soonest_reset_in_band"
             } else {
                 ""
             }
