@@ -146,11 +146,51 @@ pub struct ReportedUsage {
     /// bucket), beyond the fixed windows. `label` is display-ready.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scoped_limits: Vec<UsageWindow>,
+    /// One-shot usage-limit reset grants the provider is offering this account
+    /// (Claude's `cedar_ember` promo resets). Empty when none are banked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reset_grants: Vec<ResetGrant>,
 }
 
 impl ReportedUsage {
     pub fn is_empty(&self) -> bool {
-        self.credits.is_none() && self.breakdown.is_empty() && self.scoped_limits.is_empty()
+        self.credits.is_none()
+            && self.breakdown.is_empty()
+            && self.scoped_limits.is_empty()
+            && self.reset_grants.is_empty()
+    }
+}
+
+/// A one-shot usage-limit reset the provider has banked for this account — the
+/// thing Anthropic hands out as a launch/referral promo (`cedar_ember`). A
+/// grant with `resets_left >= 1` is still available; `usable_now` is true only
+/// when it can be spent right now (typically the account is at its limit).
+/// Provider-agnostic so a Codex equivalent can fill the same shape.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResetGrant {
+    /// Stable grant id — the dedup key for "already notified" and the value
+    /// POSTed to claim it.
+    pub id: String,
+    /// Human label the provider gives the grant (e.g. "Claude Opus 5.5
+    /// launch: one usage-limit reset for Pro and Max").
+    #[serde(default)]
+    pub label: String,
+    /// How many resets remain on this grant (0 == already spent).
+    #[serde(default)]
+    pub resets_left: u32,
+    /// Whether the reset can be claimed right now (vs. banked until the
+    /// account actually hits a limit, or still in cooldown).
+    #[serde(default)]
+    pub usable_now: bool,
+    /// When the grant expires and can no longer be claimed, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl ResetGrant {
+    /// A grant worth surfacing: it still has a reset left to spend.
+    pub fn is_available(&self) -> bool {
+        self.resets_left >= 1
     }
 }
 

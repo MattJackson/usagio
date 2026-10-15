@@ -1428,6 +1428,7 @@ fn reported_usage_round_trips_through_state() {
             percent: 18.0,
         }],
         scoped_limits: vec![],
+        ..ReportedUsage::default()
     };
     let mut a = acct("dev@example.com");
     a.cached_usage = Some(CachedUsage {
