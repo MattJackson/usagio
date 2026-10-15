@@ -18,6 +18,7 @@ use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::providers::trait_def::ResetGrant;
 use crate::usage_log::{AccountKey, PaceEstimate, Snapshot};
 
 /// Which usage window a trigger pertains to. Serialized as a kebab-case
@@ -53,6 +54,13 @@ pub enum Trigger {
     /// Weekly pace projects hitting 100% at `hit_time` before the weekly
     /// reset. Fires at most once per weekly window.
     WeeklyPace { hit_time: DateTime<Utc> },
+    /// A one-shot usage-limit reset grant just appeared on this account (the
+    /// "hey, you got a reset!" moment). Fires once per grant id. `label` is the
+    /// provider's description of the grant.
+    ResetGrantAvailable { label: String },
+    /// A banked reset is now usable right now — the account is at a limit and
+    /// the reset can be spent to unblock it. Fires once per grant id.
+    ResetUsableNow { label: String },
 }
 
 /// Per-trigger enable flags. Thresholds and reset-back default on; pace is
@@ -93,6 +101,14 @@ pub struct NotifState {
     /// the expiry, so the next approach warns again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login_expiry_warned: Option<i64>,
+    /// Reset-grant ids we've already announced ("you got a reset!"), so the
+    /// arrival notification fires once per grant, not every poll.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub reset_grants_seen: BTreeSet<String>,
+    /// Reset-grant ids we've already announced as usable-now, so the
+    /// "claim it now" notification fires once per grant.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub reset_grants_usable_fired: BTreeSet<String>,
 }
 
 /// Thresholds we check on every tick, ascending so a `Vec<Trigger>` from
@@ -219,6 +235,9 @@ pub fn dedup_and_apply(
                 state.pace_fired_this_window = true;
                 kept.push(t);
             }
+            // Reset-grant triggers are deduped at their source
+            // (`reset_grant_triggers`), not here — pass them through unchanged.
+            Trigger::ResetGrantAvailable { .. } | Trigger::ResetUsableNow { .. } => kept.push(t),
         }
     }
     kept
@@ -259,6 +278,34 @@ pub fn evaluate_pace(
     Some(Trigger::WeeklyPace { hit_time: hit })
 }
 
+/// Reset-grant notifications for this tick, deduped in place against `state`.
+/// Two moments, each fired once per grant id:
+///   * arrival — a grant with a reset left that we've never announced
+///     (`ResetGrantAvailable`);
+///   * usable — a grant that can be spent right now (`ResetUsableNow`), the
+///     "you're blocked and have a reset to claim" alert.
+///
+/// Edge-triggered purely through `state`, so it needs no prev snapshot and is
+/// correct even on the first poll after launch. Ids are never pruned: a grant
+/// that's been spent drops out of `grants` (its `resets_left` hits 0) and
+/// shouldn't re-announce if it transiently reappears.
+pub fn reset_grant_triggers(state: &mut NotifState, grants: &[ResetGrant]) -> Vec<Trigger> {
+    let mut out = Vec::new();
+    for g in grants.iter().filter(|g| g.is_available()) {
+        if state.reset_grants_seen.insert(g.id.clone()) {
+            out.push(Trigger::ResetGrantAvailable {
+                label: g.label.clone(),
+            });
+        }
+        if g.usable_now && state.reset_grants_usable_fired.insert(g.id.clone()) {
+            out.push(Trigger::ResetUsableNow {
+                label: g.label.clone(),
+            });
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Presentation + delivery
 // ---------------------------------------------------------------------------
@@ -279,6 +326,17 @@ pub fn format_message(trigger: &Trigger, account: &AccountKey) -> (String, Strin
                 "Weekly on pace to hit 100% at {}",
                 hit_time.format("%Y-%m-%d %H:%M UTC")
             )
+        }
+        Trigger::ResetGrantAvailable { label } => {
+            if label.is_empty() {
+                "🎁 You got a usage-limit reset! Claim it from usagio when you're blocked."
+                    .to_string()
+            } else {
+                format!("🎁 You got a usage-limit reset! {label}")
+            }
+        }
+        Trigger::ResetUsableNow { .. } => {
+            "You're out of usage — claim your banked reset now from usagio.".to_string()
         }
     };
     (summary, body)
@@ -690,6 +748,90 @@ mod tests {
         let (s, b) = format_message(&Trigger::WeeklyPace { hit_time: hit }, &ak());
         assert_eq!(s, "claude · dev@example.com");
         assert_eq!(b, "Weekly on pace to hit 100% at 2026-09-05 14:30 UTC");
+    }
+
+    // --- reset grants: arrival + usable, each fire once --------------------
+
+    fn grant(id: &str, resets_left: u32, usable_now: bool) -> ResetGrant {
+        ResetGrant {
+            id: id.to_string(),
+            label: "Opus launch reset".to_string(),
+            resets_left,
+            usable_now,
+            expires_at: None,
+        }
+    }
+
+    #[test]
+    fn reset_grant_arrival_fires_once_then_dedups() {
+        let mut state = NotifState::default();
+        let grants = [grant("g1", 1, false)];
+        let first = reset_grant_triggers(&mut state, &grants);
+        assert_eq!(
+            first,
+            vec![Trigger::ResetGrantAvailable {
+                label: "Opus launch reset".to_string()
+            }]
+        );
+        // Same grant next tick — already announced, nothing fires.
+        assert!(reset_grant_triggers(&mut state, &grants).is_empty());
+    }
+
+    #[test]
+    fn reset_grant_usable_fires_separately_and_once() {
+        let mut state = NotifState::default();
+        // Arrives banked (not usable) — only the arrival fires.
+        let banked = [grant("g1", 1, false)];
+        assert_eq!(reset_grant_triggers(&mut state, &banked).len(), 1);
+        // Later it becomes usable — only the usable alert fires (arrival is deduped).
+        let usable = [grant("g1", 1, true)];
+        assert_eq!(
+            reset_grant_triggers(&mut state, &usable),
+            vec![Trigger::ResetUsableNow {
+                label: "Opus launch reset".to_string()
+            }]
+        );
+        // Still usable next tick — nothing re-fires.
+        assert!(reset_grant_triggers(&mut state, &usable).is_empty());
+    }
+
+    #[test]
+    fn reset_grant_both_fire_when_usable_on_arrival() {
+        let mut state = NotifState::default();
+        let usable = [grant("g1", 1, true)];
+        let out = reset_grant_triggers(&mut state, &usable);
+        assert_eq!(out.len(), 2, "arrival + usable both fire on first sight");
+        assert!(matches!(out[0], Trigger::ResetGrantAvailable { .. }));
+        assert!(matches!(out[1], Trigger::ResetUsableNow { .. }));
+    }
+
+    #[test]
+    fn reset_grant_spent_is_ignored() {
+        let mut state = NotifState::default();
+        // resets_left == 0 → not available → nothing fires.
+        assert!(reset_grant_triggers(&mut state, &[grant("g1", 0, true)]).is_empty());
+    }
+
+    #[test]
+    fn golden_reset_grant_messages() {
+        let (s, b) = format_message(
+            &Trigger::ResetGrantAvailable {
+                label: "Opus 5.5 launch reset".to_string(),
+            },
+            &ak(),
+        );
+        assert_eq!(s, "claude · dev@example.com");
+        assert_eq!(b, "🎁 You got a usage-limit reset! Opus 5.5 launch reset");
+        let (_, b) = format_message(
+            &Trigger::ResetUsableNow {
+                label: String::new(),
+            },
+            &ak(),
+        );
+        assert_eq!(
+            b,
+            "You're out of usage — claim your banked reset now from usagio."
+        );
     }
 
     // --- NotifState round-trips through serde -------------------------------

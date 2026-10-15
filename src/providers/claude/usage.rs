@@ -3,7 +3,9 @@
 use serde::Deserialize;
 
 use super::config;
-use crate::providers::trait_def::{Credits, Money, ReportedUsage, UsageShare, UsageWindow};
+use crate::providers::trait_def::{
+    Credits, Money, ReportedUsage, ResetGrant, UsageShare, UsageWindow,
+};
 
 /// Why a usage fetch failed. Lets callers keep the last-known cache on transient
 /// failures (and back off on rate limits) instead of surfacing a hard error.
@@ -69,6 +71,12 @@ pub struct Usage {
     /// Every limit the account has, including per-model scoped weekly ones.
     #[serde(default)]
     pub limits: Option<serde_json::Value>,
+    /// The `cedar_ember` reset-grant block, present only when the request asks
+    /// for it (`?cedar_ember=1`) with a current `claude-cli` user-agent. Kept
+    /// as raw JSON and read leniently by [`reset_grants`] so a shape change
+    /// can never fail the whole usage parse.
+    #[serde(default)]
+    pub cedar_ember: Option<serde_json::Value>,
 }
 
 /// Parse a money object `{amount_minor, currency, exponent}`; `None` for null
@@ -195,12 +203,62 @@ fn scoped_limits(u: &Usage) -> Vec<UsageWindow> {
         .collect()
 }
 
+/// The `cedar_ember` reset grants on this account, read leniently. A grant is
+/// kept only when it still has a reset left to spend (`resets_left >= 1`), so a
+/// spent or empty grant never surfaces. `usable_now` reflects the block's own
+/// flag AND that the account is at a limit — a reset banked for later reads as
+/// not-usable until you're actually blocked.
+fn reset_grants(u: &Usage) -> Vec<ResetGrant> {
+    let block = u.cedar_ember.as_ref().and_then(|v| v.as_object());
+    let Some(block) = block else {
+        return Vec::new();
+    };
+    let grants = block.get("grants").and_then(|g| g.as_array());
+    grants
+        .into_iter()
+        .flatten()
+        .filter_map(|g| {
+            let id = g
+                .get("id")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())?;
+            let resets_left =
+                u32::try_from(g.get("resets_left").and_then(|x| x.as_u64()).unwrap_or(0)).ok()?;
+            if resets_left < 1 {
+                return None;
+            }
+            let label = g
+                .get("label")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let usable_now = g
+                .get("usable_now")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false);
+            let expires_at = g
+                .get("ends_at")
+                .and_then(|x| x.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&chrono::Utc));
+            Some(ResetGrant {
+                id: id.to_string(),
+                label,
+                resets_left,
+                usable_now,
+                expires_at,
+            })
+        })
+        .collect()
+}
+
 /// Everything beyond the fixed windows that the usage response reported.
 pub fn reported_usage(u: &Usage) -> ReportedUsage {
     ReportedUsage {
         credits: credits(u),
         breakdown: breakdown(u),
         scoped_limits: scoped_limits(u),
+        reset_grants: reset_grants(u),
     }
 }
 
@@ -234,9 +292,13 @@ fn usage_url() -> String {
 pub fn fetch(access_token: &str) -> std::result::Result<Usage, FetchError> {
     let resp = super::http_agent()
         .get(&usage_url())
+        // Ask for the `cedar_ember` reset-grant block; the CLI user-agent is
+        // what makes the account eligible to see it (see `config::CLI_USER_AGENT`).
+        .query("cedar_ember", "1")
         .set("Authorization", &format!("Bearer {access_token}"))
         .set("anthropic-beta", config::OAUTH_BETA)
         .set("anthropic-version", "2023-06-01")
+        .set("User-Agent", config::CLI_USER_AGENT)
         .set("Content-Type", "application/json")
         .call();
     match resp {
@@ -254,6 +316,88 @@ pub fn fetch(access_token: &str) -> std::result::Result<Usage, FetchError> {
                 "usage endpoint returned HTTP {code}"
             )))
         }
+        Err(e) => Err(FetchError::Transient(e.to_string())),
+    }
+}
+
+/// What the reset-claim endpoint reported. The happy path is `Reset`; the rest
+/// are benign "nothing happened" states the UI surfaces verbatim so the user
+/// knows why a click did nothing (e.g. the grant was already spent, or the
+/// account isn't actually at a limit yet).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// The reset was applied — windows cleared.
+    Reset,
+    /// A non-success outcome the server named (`already_used`, `not_limited`,
+    /// `cooldown`, `ineligible`, `unavailable`, or anything new).
+    NoChange(String),
+}
+
+impl ClaimOutcome {
+    fn from_status(s: &str) -> Self {
+        if s == "reset" {
+            ClaimOutcome::Reset
+        } else {
+            ClaimOutcome::NoChange(s.to_string())
+        }
+    }
+}
+
+/// A fresh idempotency id for a claim request. `rand` is already a dependency;
+/// a UUID crate would be overkill for a single random token.
+fn request_id() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 16] = rng.gen();
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("req_{hex}")
+}
+
+/// Claim a banked usage-limit reset for `org_uuid`'s `grant_id`. POSTs the
+/// `cedar_ember` program to the organization's `reset_rate_limits` endpoint and
+/// maps the response `status` to a [`ClaimOutcome`]. This SPENDS a one-shot
+/// reset — only ever call it from an explicit user action, never automatically.
+/// Not gated on `cfg(test)`: no test invokes it (so none hits the network), and
+/// gating it out would break the test build of its `main::claim_claude_reset`
+/// caller.
+pub fn claim_reset(
+    access_token: &str,
+    org_uuid: &str,
+    grant_id: &str,
+) -> std::result::Result<ClaimOutcome, FetchError> {
+    let body = serde_json::json!({
+        "program": config::RESET_PROGRAM,
+        "grant_id": grant_id,
+        "request_id": request_id(),
+    });
+    let resp = super::http_agent()
+        .post(&config::reset_claim_url(org_uuid))
+        .set("Authorization", &format!("Bearer {access_token}"))
+        .set("anthropic-beta", config::OAUTH_BETA)
+        .set("anthropic-version", "2023-06-01")
+        .set("User-Agent", config::CLI_USER_AGENT)
+        .set("Content-Type", "application/json")
+        .send_json(body);
+    match resp {
+        Ok(r) => {
+            let v: serde_json::Value = r
+                .into_json()
+                .map_err(|e| FetchError::Other(format!("parsing claim response: {e}")))?;
+            let status = v
+                .get("status")
+                .or_else(|| v.get("outcome"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("unknown");
+            Ok(ClaimOutcome::from_status(status))
+        }
+        Err(ureq::Error::Status(429, _)) => Err(FetchError::RateLimited),
+        Err(ureq::Error::Status(401, _)) => Err(FetchError::Auth),
+        Err(ureq::Error::Status(403, _)) => Err(FetchError::Forbidden),
+        // Don't fold the response body into the error — same hygiene rule as
+        // `fetch` (it can echo account/request detail into the debug log).
+        Err(ureq::Error::Status(code, _)) => Err(FetchError::Other(format!(
+            "reset claim returned HTTP {code}"
+        ))),
         Err(e) => Err(FetchError::Transient(e.to_string())),
     }
 }
@@ -308,6 +452,17 @@ pub fn subscription_active_from_profile(profile: &serde_json::Value) -> Option<b
     let lapsed = org_type == Some("claude_free")
         || matches!(status, Some("canceled" | "unpaid" | "incomplete_expired"));
     Some(!lapsed)
+}
+
+/// The organization uuid from a profile response — the `{org}` segment the
+/// reset-claim endpoint needs. `None` if the profile has no organization.
+pub fn org_uuid_from_profile(profile: &serde_json::Value) -> Option<String> {
+    profile
+        .get("organization")?
+        .get("uuid")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
 }
 
 /// Map Anthropic's org type / rate-limit tier to what the user bought.
