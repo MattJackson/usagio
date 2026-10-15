@@ -270,6 +270,77 @@ fn live_shape_parses_with_no_credits_and_raw_extras() {
     );
 }
 
+/// The live `cedar_ember` reset-grant block shape (captured 2026-10-14 from a
+/// Max 20x account), parameterised on the two fields the UI/notifications key
+/// off: how many resets remain and whether it's usable right now.
+fn cedar_ember_json(resets_left: u32, usable_now: bool) -> serde_json::Value {
+    serde_json::json!({
+        "cedar_ember": {
+            "eligible": true,
+            "ineligible_reason": null,
+            "at_limit": usable_now,
+            "exhausted": [],
+            "grants": [{
+                "id": "opus55-launch-promax-20260921",
+                "label": "Claude Opus 5.5 launch: one usage-limit reset for Pro and Max",
+                "resets_total": 1,
+                "resets_left": resets_left,
+                "starts_at": "2026-09-22T16:00:00+00:00",
+                "ends_at": "2026-10-22T16:00:00+00:00",
+                "clears": ["five_hour", "seven_day", "seven_day_overage_included"],
+                "paused": false,
+                "usable_now": usable_now,
+                "use_requires_limit": true,
+                "percent_used": { "five_hour": 52, "seven_day": 14 },
+                "blocking": [],
+                "arm": null
+            }],
+            "next_grant_id": null,
+            "weekly_resets_at": "2026-10-21T05:00:00+00:00",
+            "cooldown_until": null
+        }
+    })
+}
+
+#[test]
+fn cedar_ember_available_grant_is_reported() {
+    let u = parse(cedar_ember_json(1, true));
+    let g = reported_usage(&u).reset_grants;
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].id, "opus55-launch-promax-20260921");
+    assert!(g[0].label.contains("Opus 5.5 launch"));
+    assert_eq!(g[0].resets_left, 1);
+    assert!(g[0].usable_now);
+    assert!(g[0].is_available());
+    assert_eq!(
+        g[0].expires_at.unwrap().to_rfc3339(),
+        "2026-10-22T16:00:00+00:00"
+    );
+}
+
+#[test]
+fn cedar_ember_banked_grant_is_reported_not_usable() {
+    // resets_left >= 1 but not usable yet (banked until the account is limited).
+    let u = parse(cedar_ember_json(1, false));
+    let g = reported_usage(&u).reset_grants;
+    assert_eq!(g.len(), 1);
+    assert!(g[0].is_available());
+    assert!(!g[0].usable_now);
+}
+
+#[test]
+fn cedar_ember_spent_grant_is_dropped() {
+    // resets_left == 0 (already claimed) → not surfaced at all.
+    let u = parse(cedar_ember_json(0, false));
+    assert!(reported_usage(&u).reset_grants.is_empty());
+}
+
+#[test]
+fn no_cedar_ember_block_means_no_grants() {
+    let u = parse(live_usage_json());
+    assert!(reported_usage(&u).reset_grants.is_empty());
+}
+
 #[test]
 fn missing_extras_report_nothing() {
     let u =

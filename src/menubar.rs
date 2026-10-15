@@ -37,7 +37,7 @@ use {
 };
 
 use crate::countdown::{self, AccountUsage, BlockingWindow, DisplayState};
-use crate::providers::trait_def::{Credits, ReportedUsage, UsageShare, UsageWindow};
+use crate::providers::trait_def::{Credits, ReportedUsage, ResetGrant, UsageShare, UsageWindow};
 use crate::providers::{self, CaptureMode, Provider, SeverityBands};
 use crate::store::State;
 use crate::{
@@ -2015,14 +2015,32 @@ fn scoped_limit_row(w: &UsageWindow) -> Option<String> {
     Some(row)
 }
 
-/// Every provider-reported row for an account, in render order: scoped
-/// limits, where the week went, then credits. Pure; provider-agnostic.
+/// "🎁 Reset available · claim below" / "🎁 Reset banked · usable when limited"
+/// — a one-shot usage-limit reset the provider is offering. Shown only when the
+/// grant still has a reset left (`is_available`); `usable_now` picks the verb.
+/// A banked-but-not-yet-usable grant says so (and names when it expires) so the
+/// absent "claim" row doesn't read as a bug.
+fn reset_grant_row(g: &ResetGrant) -> Option<String> {
+    if !g.is_available() {
+        return None;
+    }
+    let mut row = if g.usable_now {
+        "🎁 Reset available · claim below".to_string()
+    } else {
+        "🎁 Reset banked · usable once you're limited".to_string()
+    };
+    if let Some(exp) = g.expires_at {
+        row.push_str(&format!(" · expires in {}", crate::humanize_until(exp)));
+    }
+    Some(row)
+}
+
+/// Every provider-reported row for an account, in render order: reset grants
+/// (good news up top), scoped limits, where the week went, then credits. Pure;
+/// provider-agnostic.
 fn reported_rows(r: &ReportedUsage) -> Vec<String> {
-    let mut rows: Vec<String> = r
-        .scoped_limits
-        .iter()
-        .filter_map(scoped_limit_row)
-        .collect();
+    let mut rows: Vec<String> = r.reset_grants.iter().filter_map(reset_grant_row).collect();
+    rows.extend(r.scoped_limits.iter().filter_map(scoped_limit_row));
     rows.extend(breakdown_row(&r.breakdown));
     rows.extend(r.credits.as_ref().and_then(credits_row));
     rows
@@ -2188,6 +2206,8 @@ struct AccountSubmenuRows {
     /// "Renew login…" — usagio can run this provider's login itself.
     renew_row: bool,
     remove_row: bool,
+    /// "Claim reset…" — a banked usage-limit reset is usable right now.
+    claim_reset_row: bool,
 }
 
 fn account_submenu_rows(sec: &ProviderSection, a: &AcctView) -> AccountSubmenuRows {
@@ -2198,6 +2218,13 @@ fn account_submenu_rows(sec: &ProviderSection, a: &AcctView) -> AccountSubmenuRo
             .then_some(a.active),
         renew_row: a.renewable,
         remove_row: sec.supports_remove,
+        // Only offer the claim when a grant can actually be spent now — a
+        // banked-but-not-usable grant would just return `not_limited`.
+        claim_reset_row: a
+            .reported
+            .reset_grants
+            .iter()
+            .any(|g| g.is_available() && g.usable_now),
     }
 }
 
@@ -2535,6 +2562,7 @@ fn handle_click(id: &str) {
         ("switch", Some(slug), Some(key)) => handle_switch(slug, key),
         ("remove", Some(slug), Some(key)) => handle_remove(slug, key),
         ("renew", Some(slug), Some(key)) => handle_renew(slug, key),
+        ("claim", Some(slug), Some(key)) => handle_claim(slug, key),
         ("signin", Some(slug), None) => handle_sign_in(slug),
         ("backup", Some("save"), None) => handle_backup_save(),
         ("backup", Some("restore"), None) => handle_backup_restore_dialog(),
@@ -2871,6 +2899,30 @@ fn handle_renew(slug: &str, key: &str) {
         Ok(s) => show_sign_in(&format!("Renew {key} — usagio"), slug, &store, &s),
         Err(e) => notify(&format!("Renew failed: {e:#}")),
     }
+}
+
+/// "Claim reset…": spend a banked usage-limit reset for this account. Claude
+/// only (the single provider with a known claim endpoint); a click id for any
+/// other slug is ignored. Runs off the UI thread — the claim does a token
+/// refresh, a profile fetch and a POST — and refreshes usage on success so the
+/// cleared windows show up right away. This SPENDS a one-shot reset, so it only
+/// ever runs from this explicit click, never automatically.
+fn handle_claim(slug: &str, key: &str) {
+    if slug != CLAUDE_SLUG {
+        return;
+    }
+    let key = key.to_string();
+    std::thread::spawn(move || match crate::claim_claude_reset(&key) {
+        Ok(crate::providers::claude::usage::ClaimOutcome::Reset) => {
+            notify(&format!("Reset claimed for {key} — limits cleared"));
+            request_poll_now();
+        }
+        Ok(crate::providers::claude::usage::ClaimOutcome::NoChange(status)) => {
+            notify(&format!("No reset applied for {key}: {status}"));
+            request_poll_now();
+        }
+        Err(e) => notify(&format!("Claim failed for {key}: {e}")),
+    });
 }
 
 /// "Sign in to a new <Provider> account…": the same login as Renew, in a
@@ -3266,6 +3318,13 @@ mod cross_platform {
                 true,
             )),
             None => {}
+        }
+        if rows.claim_reset_row {
+            items.push(action(
+                format!("claim:{}:{}", sec.provider_id, a.key),
+                "Claim reset…",
+                true,
+            ));
         }
         if rows.renew_row {
             items.push(action(
@@ -4318,6 +4377,51 @@ mod tests {
     }
 
     #[test]
+    fn reset_grant_row_text_by_state() {
+        let mk = |resets_left: u32, usable_now: bool| ResetGrant {
+            id: "g1".into(),
+            label: "Opus launch".into(),
+            resets_left,
+            usable_now,
+            expires_at: None,
+        };
+        // Spent → no row.
+        assert_eq!(reset_grant_row(&mk(0, true)), None);
+        // Usable now → the claim invitation.
+        assert_eq!(
+            reset_grant_row(&mk(1, true)).as_deref(),
+            Some("🎁 Reset available · claim below")
+        );
+        // Banked but not usable → say so, don't invite a claim.
+        assert_eq!(
+            reset_grant_row(&mk(1, false)).as_deref(),
+            Some("🎁 Reset banked · usable once you're limited")
+        );
+        // Expiry is appended when known.
+        let mut g = mk(1, true);
+        g.expires_at = Some(Utc::now() + chrono::Duration::days(3));
+        assert!(reset_grant_row(&g)
+            .unwrap()
+            .starts_with("🎁 Reset available · claim below · expires in "));
+    }
+
+    #[test]
+    fn reset_grant_rows_lead_reported_rows() {
+        let rows = reported_rows(&ReportedUsage {
+            scoped_limits: vec![scoped("Fable", Some(42.0))],
+            reset_grants: vec![ResetGrant {
+                id: "g1".into(),
+                label: "Opus launch".into(),
+                resets_left: 1,
+                usable_now: true,
+                expires_at: None,
+            }],
+            ..ReportedUsage::default()
+        });
+        assert_eq!(rows[0], "🎁 Reset available · claim below", "{rows:?}");
+    }
+
+    #[test]
     fn submenu_renders_reported_rows_after_the_windows() {
         let rows = with_reported(ReportedUsage {
             credits: Some(Credits {
@@ -4327,6 +4431,7 @@ mod tests {
             }),
             breakdown: vec![share("Claude Code", 82.0), share("Chats", 18.0)],
             scoped_limits: vec![scoped("Fable", Some(42.0)), scoped("Haiku", Some(0.0))],
+            ..ReportedUsage::default()
         });
         let tail: Vec<&str> = rows
             .iter()
@@ -4359,6 +4464,7 @@ mod tests {
             }),
             breakdown: vec![share("Claude Code", 50.0), share("Chats", 50.0)],
             scoped_limits: vec![scoped("Fable", Some(42.0))],
+            ..ReportedUsage::default()
         };
         let rows = submenu_info_rows(&claude_section(), &a);
         assert!(rows[0].contains("No subscription"), "{rows:?}");

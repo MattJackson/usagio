@@ -1360,6 +1360,47 @@ fn ensure_fresh_with_fallback(
     }
 }
 
+/// Claim a banked usage-limit reset for the Claude account keyed by `email`.
+/// Refreshes the token (a claim must authenticate), reads the org uuid from the
+/// profile and the grant id from the cached usage the menu was built from, then
+/// POSTs the claim. Returns the server's [`ClaimOutcome`] or a user-facing
+/// error string. SPENDS a one-shot reset — only ever called from the explicit
+/// "Claim reset…" menu action.
+pub(crate) fn claim_claude_reset(email: &str) -> std::result::Result<usage::ClaimOutcome, String> {
+    let provider = providers::get(CLAUDE_SLUG).ok_or("claude provider unavailable")?;
+    let mut acct = State::load()
+        .map_err(|e| format!("loading state: {e:#}"))?
+        .find(email)
+        .cloned()
+        .ok_or_else(|| format!("account {email} not found"))?;
+    // Pick the grant from the cache the menu row was built from — the one the
+    // user saw as claimable. First available + usable-now wins.
+    let grant_id = acct
+        .cached_usage
+        .as_ref()
+        .map(|c| &c.reported.reset_grants)
+        .into_iter()
+        .flatten()
+        .find(|g| g.is_available() && g.usable_now)
+        .map(|g| g.id.clone())
+        .ok_or("no claimable reset on this account")?;
+    match ensure_fresh_with_fallback(provider, email, &mut acct) {
+        Ok(_) => {}
+        Err(oauth::RefreshError::InvalidGrant) => {
+            flag_needs_relogin(email);
+            return Err(format!(
+                "{email} needs re-login before a reset can be claimed"
+            ));
+        }
+        Err(e) => return Err(format!("token refresh for {email} failed: {e}")),
+    }
+    let profile = usage::fetch_profile(&acct.access_token)
+        .ok_or("could not read account profile (for organization id)")?;
+    let org =
+        usage::org_uuid_from_profile(&profile).ok_or("account profile has no organization id")?;
+    usage::claim_reset(&acct.access_token, &org, &grant_id).map_err(|e| e.to_string())
+}
+
 /// Best-effort: mark an account `needs_relogin=true` in state.json. If the
 /// state lock is held or the save fails, the next `refresh_usage_cache` tick
 /// re-observes the invalid_grant and sets it again — callers that need
@@ -3112,8 +3153,17 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
                 weekly_pct: cu.weekly_pct.map(|p| p as f32),
                 active_model: None,
             };
+            // One NotifState for the whole tick, carried across both the
+            // threshold/pace path (needs a prev snapshot) and the reset-grant
+            // path (edge-triggered purely through state, so it runs even on the
+            // first poll). Persisted once at the end if anything changed.
+            let mut ns = acct.notif_state.clone();
+            for trig in &notifications::reset_grant_triggers(&mut ns, &cu.reported.reset_grants) {
+                if let Err(e) = notifications::fire(trig, &account_key) {
+                    logging::log(&format!("notify: {email}: {e:#}"));
+                }
+            }
             if let Some(prev) = prev_snap {
-                let mut ns = acct.notif_state.clone();
                 let raw = notifications::evaluate(&prev, &curr_snap, &notif_cfg);
                 let mut kept = notifications::dedup_and_apply(&mut ns, &prev, &curr_snap, raw);
                 // Pace check (default off) — feeds through the same dedup path.
@@ -3137,9 +3187,11 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
                         logging::log(&format!("notify: {email}: {e:#}"));
                     }
                 }
-                if ns != acct.notif_state {
-                    new_notif_state = Some(ns);
-                }
+            }
+            // Persist the tick's NotifState if either path changed it (threshold
+            // crossings, pace, or newly-announced reset grants).
+            if ns != acct.notif_state {
+                new_notif_state = Some(ns);
             }
             // Append LAST: all reads for this account (last_snapshot above, pace
             // in the prev block) have completed against the warm cache.

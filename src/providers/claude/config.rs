@@ -15,6 +15,27 @@ pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 /// Beta header required for OAuth-bearer requests.
 pub const OAUTH_BETA: &str = "oauth-2025-04-20";
 
+/// `User-Agent` sent on OAuth-bearer requests, matching what the Claude Code
+/// CLI sends. The `cedar_ember` reset-grant block on `/usage` is gated on a
+/// *current* CLI version: a stale (or absent) user-agent comes back
+/// `eligible: false, ineligible_reason: "cli_version"`. The base usage numbers
+/// are returned regardless — only the reset-grant eligibility depends on this,
+/// so a drift here degrades to "no reset offered", never to broken usage.
+/// Bump this when the gate moves the floor forward.
+pub const CLI_USER_AGENT: &str = "claude-cli/2.1.300 (external, cli)";
+
+/// Reset-grant program key used both to request the `cedar_ember` block on
+/// `/usage` (`?cedar_ember=1`) and as the `program` field when claiming.
+pub const RESET_PROGRAM: &str = "cedar_ember";
+
+/// Claim endpoint for a banked usage-limit reset. `{org}` is the account's
+/// organization uuid (from the profile endpoint). POST `{program, grant_id,
+/// request_id}`; outcomes include `reset`, `already_used`, `not_limited`,
+/// `cooldown`, `ineligible`, `unavailable`.
+pub fn reset_claim_url(org_uuid: &str) -> String {
+    format!("https://api.anthropic.com/api/organizations/{org_uuid}/reset_rate_limits")
+}
+
 /// claude.ai login page for Claude Code's OAuth client (subscription accounts).
 pub const AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
 
