@@ -36,6 +36,14 @@ pub fn reset_claim_url(org_uuid: &str) -> String {
     format!("https://api.anthropic.com/api/organizations/{org_uuid}/reset_rate_limits")
 }
 
+/// Prepaid credit wallet for `{org}` — the "Usage credits" balance claude.ai
+/// shows. `/usage` reports `spend.balance: null` even when the wallet holds
+/// money, so this is the only place the real balance comes from. GET with the
+/// OAuth bearer; the CLI reads `amount` (minor units) + `currency`.
+pub fn prepaid_credits_url(org_uuid: &str) -> String {
+    format!("https://api.anthropic.com/api/oauth/organizations/{org_uuid}/prepaid/credits")
+}
+
 /// claude.ai login page for Claude Code's OAuth client (subscription accounts).
 pub const AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
 

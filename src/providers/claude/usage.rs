@@ -109,7 +109,10 @@ fn credits(u: &Usage) -> Option<Credits> {
     let spend = u.spend.as_ref().filter(|v| v.is_object());
     let extra = u.extra_usage.as_ref().filter(|v| v.is_object());
     let used = money(get(spend, "used")).or_else(|| {
-        let amount = get(extra, "used_credits")?.as_i64()?;
+        // Live responses send this as a float (`5463.0`) — `as_i64` alone
+        // rejects that.
+        let amount = get(extra, "used_credits")
+            .and_then(|x| x.as_i64().or_else(|| x.as_f64().map(|f| f.round() as i64)))?;
         let places = u32::try_from(get(extra, "decimal_places")?.as_u64()?).ok()?;
         let unit = get(extra, "currency")
             .and_then(|x| x.as_str())
@@ -400,6 +403,49 @@ pub fn claim_reset(
         ))),
         Err(e) => Err(FetchError::Transient(e.to_string())),
     }
+}
+
+/// The prepaid wallet balance from a `prepaid/credits` response: `balance.money`
+/// when present, else `balance.credits` / top-level `amount` (both minor units)
+/// in the top-level `currency`. `None` for any other shape.
+pub fn prepaid_balance(body: &serde_json::Value) -> Option<Money> {
+    let balance = body.get("balance").filter(|v| v.is_object());
+    if let Some(m) = money(get(balance, "money")) {
+        return Some(m);
+    }
+    let unit = body
+        .get("currency")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(Money::CREDITS);
+    if let Some(c) = get(balance, "credits").and_then(|c| c.as_object()) {
+        if let Some(amount) = c.get("amount_minor").and_then(|x| x.as_i64()) {
+            let exponent = c.get("exponent").and_then(|x| x.as_u64()).unwrap_or(2);
+            return Money::new(amount, u32::try_from(exponent).ok()?, unit);
+        }
+    }
+    let amount = body.get("amount")?;
+    let amount = amount
+        .as_i64()
+        .or_else(|| amount.as_f64().map(|f| f.round() as i64))?;
+    Money::new(amount, 2, unit)
+}
+
+/// Best-effort prepaid wallet balance for `org_uuid` (see
+/// [`config::prepaid_credits_url`]). `None` on any failure — the caller keeps
+/// whatever it last knew.
+pub fn fetch_prepaid_balance(access_token: &str, org_uuid: &str) -> Option<Money> {
+    let body: serde_json::Value = super::http_agent()
+        .get(&config::prepaid_credits_url(org_uuid))
+        .set("Authorization", &format!("Bearer {access_token}"))
+        .set("anthropic-beta", config::OAUTH_BETA)
+        .set("anthropic-version", "2023-06-01")
+        .set("User-Agent", config::CLI_USER_AGENT)
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
+    prepaid_balance(&body)
 }
 
 /// Best-effort account email from the profile endpoint.
