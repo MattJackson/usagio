@@ -417,6 +417,45 @@ fn extra_usage_used_credits_fall_back_when_spend_is_absent() {
 }
 
 #[test]
+fn extra_usage_used_credits_accepts_the_live_float() {
+    // Live responses send `used_credits: 5463.0`, not an integer.
+    let mut v = live_usage_json();
+    v["spend"] = serde_json::Value::Null;
+    v["extra_usage"]["is_enabled"] = true.into();
+    v["extra_usage"]["used_credits"] = 5463.0.into();
+    v["extra_usage"]["decimal_places"] = 2.into();
+    v["extra_usage"]["currency"] = "USD".into();
+    let c = reported_usage(&parse(v)).credits.unwrap();
+    assert_eq!(c.used.unwrap().display(), "$54.63");
+}
+
+#[test]
+fn prepaid_balance_reads_the_live_wallet_shape() {
+    // Live `prepaid/credits` response (trimmed), 2026-10-23.
+    let body = serde_json::json!({
+        "amount": 90335, "currency": "USD",
+        "balance": { "money": null, "credits": { "amount_minor": 90335, "exponent": 2 } },
+        "balance_credits": 903, "auto_reload_settings": null,
+        "tranches": [{ "remaining_amount_minor_units": 90334, "currency": "USD",
+                       "granted_amount_minor_units": 100000 }]
+    });
+    assert_eq!(prepaid_balance(&body).unwrap().display(), "$903.35");
+}
+
+#[test]
+fn prepaid_balance_prefers_money_then_falls_back_to_amount() {
+    let money = serde_json::json!({
+        "amount": 1, "currency": "USD",
+        "balance": { "money": { "amount_minor": 1250, "currency": "USD", "exponent": 2 } }
+    });
+    assert_eq!(prepaid_balance(&money).unwrap().display(), "$12.50");
+    let bare = serde_json::json!({ "amount": 97802, "currency": "USD", "balance": null });
+    assert_eq!(prepaid_balance(&bare).unwrap().display(), "$978.02");
+    assert!(prepaid_balance(&serde_json::json!({})).is_none());
+    assert!(prepaid_balance(&serde_json::json!({ "amount": "lots" })).is_none());
+}
+
+#[test]
 fn scoped_opus_limit_defers_to_the_fixed_opus_window() {
     let mut v = live_usage_json();
     v["seven_day_opus"] = serde_json::json!({ "utilization": 12.0 });

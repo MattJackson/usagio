@@ -1982,6 +1982,36 @@ fn cached_from_usage(u: &usage::Usage) -> CachedUsage {
     }
 }
 
+/// Fill in the real prepaid wallet balance for an account with credits on.
+/// `/usage` reports `spend.balance: null` even when the wallet holds money, so
+/// the balance comes from the org's `prepaid/credits` endpoint. Best-effort: on
+/// a failed fetch keep the balance from the previous snapshot rather than
+/// blanking it.
+fn attach_prepaid_balance(cu: &mut CachedUsage, acct: &Account) {
+    let Some(credits) = cu.reported.credits.as_mut() else {
+        return;
+    };
+    if !credits.enabled || credits.balance.is_some() {
+        return;
+    }
+    let org = acct
+        .oauth_account
+        .as_ref()
+        .and_then(|o| o.get("organizationUuid"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let fetched = org.and_then(|org| usage::fetch_prepaid_balance(&acct.access_token, org));
+    credits.balance = fetched.or_else(|| {
+        acct.cached_usage
+            .as_ref()?
+            .reported
+            .credits
+            .as_ref()?
+            .balance
+            .clone()
+    });
+}
+
 /// Compare two candidate rows for auto-pick / auto-swap: soonest weekly reset
 /// first, then MORE headroom (lower usage) first.
 fn candidate_order(a: &Row, b: &Row) -> std::cmp::Ordering {
@@ -3073,7 +3103,9 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
         let cu = match usage::fetch(&acct.access_token) {
             Ok(u) => {
                 record_usage_fetch_success(email);
-                Some(cached_from_usage(&u))
+                let mut cu = cached_from_usage(&u);
+                attach_prepaid_balance(&mut cu, &acct);
+                Some(cu)
             }
             Err(usage::FetchError::RateLimited) => {
                 // Only the ACTIVE account's 429 slows the global loop. An
@@ -4709,7 +4741,11 @@ fn verify_swap_target(slug: &str, key: &str) -> Option<Row> {
             return None;
         }
         match usage::fetch(&acct.access_token) {
-            Ok(u) => Ok(cached_from_usage(&u)),
+            Ok(u) => {
+                let mut cu = cached_from_usage(&u);
+                attach_prepaid_balance(&mut cu, acct);
+                Ok(cu)
+            }
             Err(e) => {
                 if matches!(e, usage::FetchError::RateLimited) {
                     record_usage_fetch_429(&tracker);
