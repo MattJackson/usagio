@@ -2482,6 +2482,165 @@ fn all_blocked_prepares_earliest_fully_recovered_account_without_churn() {
         .is_none());
 }
 
+/// Give `r` usage credits: `spendable_minor` cents left (wallet balance, no cap).
+fn with_credits(mut r: Row, spendable_minor: i64) -> Row {
+    use providers::trait_def::{Credits, Money};
+    r.reported.credits = Some(Credits {
+        enabled: true,
+        balance: Money::new(spendable_minor, 2, "USD"),
+        ..Credits::default()
+    });
+    r
+}
+
+fn credits_guard() -> SwapGuard {
+    SwapGuard {
+        use_credits: true,
+        ..SwapGuard::default()
+    }
+}
+
+#[test]
+fn credits_off_never_moves_onto_a_credits_account() {
+    let now = Utc::now();
+    let rows = vec![
+        row_full("active@e.com", 0.0, 100.0, now + Duration::days(5)),
+        with_credits(
+            row_full("paid@e.com", 0.0, 100.0, now + Duration::days(6)),
+            60_000,
+        ),
+    ];
+    let eval = evaluate_swap(&rows, "active@e.com", 95.0, 95.0, &SwapGuard::default());
+    assert!(eval.target.is_none());
+    assert!(!eval.credits);
+}
+
+#[test]
+fn every_plan_used_up_moves_onto_the_account_with_the_most_credits() {
+    let now = Utc::now();
+    let mut capped = with_credits(
+        row_full("capped@e.com", 0.0, 100.0, now + Duration::days(1)),
+        90_000,
+    );
+    capped.reported.credits.as_mut().unwrap().limit_reached = true;
+    let rows = vec![
+        row_full("active@e.com", 0.0, 100.0, now + Duration::days(5)),
+        with_credits(
+            row_full("small@e.com", 0.0, 100.0, now + Duration::days(2)),
+            1_000,
+        ),
+        with_credits(
+            row_full("big@e.com", 0.0, 100.0, now + Duration::days(6)),
+            60_000,
+        ),
+        capped,
+    ];
+    let eval = evaluate_swap(&rows, "active@e.com", 95.0, 95.0, &credits_guard());
+    assert_eq!(eval.target.as_deref(), Some("big@e.com"));
+    assert!(eval.credits && eval.urgent && !eval.preparing);
+}
+
+#[test]
+fn plan_headroom_always_beats_credits() {
+    let now = Utc::now();
+    let rows = vec![
+        row_full("active@e.com", 0.0, 100.0, now + Duration::days(5)),
+        with_credits(
+            row_full("paid@e.com", 0.0, 100.0, now + Duration::days(1)),
+            60_000,
+        ),
+        row_full("plan@e.com", 10.0, 40.0, now + Duration::days(6)),
+    ];
+    let eval = evaluate_swap(&rows, "active@e.com", 95.0, 95.0, &credits_guard());
+    assert_eq!(eval.target.as_deref(), Some("plan@e.com"));
+    assert!(!eval.credits);
+    // A plan account past the trigger but with real room left still beats
+    // paying: the most-room fallback runs before credits.
+    let mut rows = rows;
+    rows[2] = row_full("plan@e.com", 0.0, 90.0, now + Duration::days(6));
+    let eval = evaluate_swap(&rows, "active@e.com", 85.0, 85.0, &credits_guard());
+    assert_eq!(eval.target.as_deref(), Some("plan@e.com"));
+    assert!(eval.fallback && !eval.credits);
+}
+
+#[test]
+fn credits_wait_until_the_active_plan_is_actually_used_up() {
+    // At the trigger but with plan usage left: don't start paying yet.
+    let now = Utc::now();
+    let rows = vec![
+        row_full("active@e.com", 0.0, 97.0, now + Duration::days(5)),
+        with_credits(
+            row_full("paid@e.com", 0.0, 100.0, now + Duration::days(6)),
+            60_000,
+        ),
+    ];
+    let eval = evaluate_swap(&rows, "active@e.com", 95.0, 95.0, &credits_guard());
+    assert!(!eval.credits);
+    assert_ne!(eval.target.as_deref(), Some("paid@e.com"));
+}
+
+#[test]
+fn an_active_account_on_credits_is_never_prepared_away_onto_a_blocked_one() {
+    // All plans used up; the active one still runs on credits. Preparing a
+    // switch to the soonest-reset blocked account would stop work.
+    let now = Utc::now();
+    let rows = vec![
+        with_credits(
+            row_full("paid@e.com", 0.0, 100.0, now + Duration::days(5)),
+            60_000,
+        ),
+        row_full("next@e.com", 0.0, 100.0, now + Duration::hours(1)),
+    ];
+    for guard in [SwapGuard::default(), credits_guard()] {
+        let eval = evaluate_swap(&rows, "paid@e.com", 95.0, 95.0, &guard);
+        assert!(eval.target.is_none() && !eval.preparing);
+    }
+}
+
+#[test]
+fn credits_flip_back_to_plan_usage_as_soon_as_a_plan_frees_up() {
+    let now = Utc::now();
+    let mut rows = vec![
+        with_credits(
+            row_full("paid@e.com", 0.0, 100.0, now + Duration::days(5)),
+            60_000,
+        ),
+        row_full("plan@e.com", 0.0, 100.0, now + Duration::hours(1)),
+    ];
+    assert!(
+        evaluate_swap(&rows, "paid@e.com", 95.0, 95.0, &credits_guard())
+            .target
+            .is_none()
+    );
+    rows[1].weekly.pct = Some(0.0);
+    rows[1].weekly.resets_at = Some(now + Duration::days(7));
+    let eval = evaluate_swap(&rows, "paid@e.com", 95.0, 95.0, &credits_guard());
+    assert_eq!(eval.target.as_deref(), Some("plan@e.com"));
+    assert!(eval.urgent && !eval.credits);
+}
+
+#[test]
+fn returning_to_credits_ignores_the_no_return_window() {
+    // We left the credits account for a plan that has now run out too. The
+    // locked credits account isn't re-polled while inactive, so the usual
+    // "fresh reading since we left" gate would strand us on a dead account.
+    let now = Utc::now();
+    let rows = vec![
+        row_full("plan@e.com", 0.0, 100.0, now + Duration::days(7)),
+        with_credits(
+            row_full("paid@e.com", 0.0, 100.0, now + Duration::days(5)),
+            60_000,
+        ),
+    ];
+    let mut guard = credits_guard();
+    guard
+        .left_at
+        .insert("paid@e.com".to_string(), std::time::Instant::now());
+    let eval = evaluate_swap(&rows, "plan@e.com", 95.0, 95.0, &guard);
+    assert_eq!(eval.target.as_deref(), Some("paid@e.com"));
+    assert!(eval.credits);
+}
+
 #[test]
 fn blocked_preparation_preserves_manual_choice_but_allows_recovered_target() {
     let now = Utc::now();

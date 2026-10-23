@@ -241,6 +241,8 @@ struct Snapshot {
     capture_api_key: Vec<RegisteredProvider>,
     autoswap: bool,
     threshold: f64,
+    /// Settings ▸ Auto-swap ▸ "Use credits when every plan is used up".
+    use_credits: bool,
     /// Settings ▸ Notifications ▸ per-trigger enable checkboxes.
     notification_config: crate::notifications::NotificationConfig,
     /// Settings ▸ Tray Icon: `None` = "at risk" (the agent closest to its
@@ -586,7 +588,16 @@ fn trailing_for_account(
         let len = u16len(&t);
         return (t, vec![(0, len, Severity::Amber)]);
     }
-    match countdown::compute_display(&account_usage_for(a), now) {
+    let display = countdown::compute_display(&account_usage_for(a), now);
+    // Plan used up but usage credits still pay for requests: the account
+    // works, so show what's left to spend, not a lock countdown. The unlock
+    // time stays in the submenu.
+    if matches!(display, DisplayState::Locked { .. }) {
+        if let Some(left) = spendable_credits(a) {
+            return (format!("{} credits", left.display_whole()), Vec::new());
+        }
+    }
+    match display {
         DisplayState::Locked {
             until,
             window: BlockingWindow::Weekly,
@@ -629,6 +640,11 @@ fn trailing_for_account(
             (trailing, colors)
         }
     }
+}
+
+/// Credits the account can still spend, if it can run on them at all.
+fn spendable_credits(a: &AcctView) -> Option<crate::providers::trait_def::Money> {
+    a.reported.credits.as_ref()?.spendable()
 }
 
 /// Indent applied to each account row so it visually reads as sitting under
@@ -1798,6 +1814,7 @@ fn build_snapshot() -> Snapshot {
         capture_api_key,
         autoswap,
         threshold,
+        use_credits: st.use_credits_when_exhausted,
         notification_config: st.notification_config.clone(),
         tray_icon_mode: st.tray_icon_mode.clone(),
     }
@@ -2134,8 +2151,11 @@ fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)
                 if weekly_locked && !w.pct.is_some_and(|p| p >= 100.0) {
                     continue;
                 }
-                if let Some(row) = window_status_row(w) {
-                    rows.push(row); // (text, locked)
+                if let Some((mut text, locked)) = window_status_row(w) {
+                    if locked && spendable_credits(a).is_some() {
+                        text.push_str(" · using credits");
+                    }
+                    rows.push((text, locked)); // (text, locked)
                 } else if sec.provider_id == "codex" && w.pct.is_none() {
                     rows.push((format!("{} · Not reported", stat_display_label(w)), false));
                 }
@@ -2541,6 +2561,7 @@ fn handle_click(id: &str) {
         ("quit", _, _) => std::process::exit(0),
         ("noop", _, _) => {}
         ("autoswap", Some("off"), None) => set_autoswap(false),
+        ("autoswap", Some("credits"), None) => toggle_use_credits(),
         ("autoswap", Some("now"), None) => match optimize_now() {
             Ok(Some(email)) => {
                 notify(&format!("Switched to {email}"));
@@ -3104,6 +3125,19 @@ fn set_autoswap(enabled: bool) {
     }
 }
 
+/// Settings ▸ Auto-swap ▸ "Use credits when every plan is used up". Flips the
+/// stored value under the lock (not the possibly stale menu snapshot's).
+fn toggle_use_credits() {
+    let r = with_state_lock(|| {
+        let mut st = State::load()?;
+        st.use_credits_when_exhausted = !st.use_credits_when_exhausted;
+        st.save()
+    });
+    if let Err(e) = r {
+        notify(&format!("Could not save the credits setting: {e}"));
+    }
+}
+
 /// Settings ▸ Tray Icon selection. `"at-risk"` clears the pin (the default —
 /// tray follows the agent closest to its limit); any other value pins the tray
 /// to that provider slug. Reads-then-writes under the lock so a stale menu
@@ -3466,6 +3500,13 @@ mod cross_platform {
             ));
         }
         autoswap_items.push(PMenuItem::Separator);
+        autoswap_items.push(checkbox(
+            "autoswap:credits",
+            "Use credits when every plan is used up",
+            true,
+            snap.use_credits,
+        ));
+        autoswap_items.push(PMenuItem::Separator);
         autoswap_items.push(action("autoswap:now", "Switch to best account now", true));
 
         let backups = vec![
@@ -3753,6 +3794,7 @@ mod tests {
             }],
             capture_api_key: Vec::new(),
             autoswap: false,
+            use_credits: false,
             threshold: 95.0,
             notification_config: crate::notifications::NotificationConfig::default(),
             tray_icon_mode: None,
@@ -3788,6 +3830,7 @@ mod tests {
             capture_creds: Vec::new(),
             capture_api_key: Vec::new(),
             autoswap: false,
+            use_credits: false,
             threshold: 95.0,
             notification_config: crate::notifications::NotificationConfig::default(),
             tray_icon_mode,
@@ -4133,6 +4176,35 @@ mod tests {
             assert!(!trailing.contains('%'), "no percentage on a dead login");
             assert_eq!(colors.len(), 1, "single red span over the whole run");
             assert_eq!(colors[0].2, Severity::Red);
+        });
+    }
+
+    #[test]
+    fn locked_account_with_credits_shows_money_left_not_a_countdown() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let reset = now + chrono::Duration::days(4);
+        with_now(now, || {
+            let mut a = acct_with_resets(
+                "paid@x.com",
+                Some(0.0),
+                Some(100.0),
+                true,
+                Some(reset),
+                Some(reset),
+            );
+            a.reported.credits = Some(Credits {
+                enabled: true,
+                used: usd(37_225),
+                limit: usd(100_000),
+                balance: usd(62_706),
+                ..Credits::default()
+            });
+            let (trailing, colors) = trailing_for_account(&a, bands(), now);
+            assert_eq!(trailing, "$627 credits");
+            assert!(colors.is_empty(), "a working account isn't painted red");
+            // Cap reached: back to the lock countdown.
+            a.reported.credits.as_mut().unwrap().limit_reached = true;
+            assert_eq!(trailing_for_account(&a, bands(), now).0, "4d 0h");
         });
     }
 
@@ -4911,6 +4983,7 @@ mod tests {
             capture_creds: Vec::new(),
             capture_api_key: Vec::new(),
             autoswap: false,
+            use_credits: false,
             threshold: 95.0,
             notification_config: crate::notifications::NotificationConfig::default(),
             tray_icon_mode: None,
@@ -5525,6 +5598,7 @@ mod tests {
             capture_creds: Vec::new(),
             capture_api_key: Vec::new(),
             autoswap: false,
+            use_credits: false,
             threshold: 95.0,
             notification_config: crate::notifications::NotificationConfig::default(),
             tray_icon_mode: None,
