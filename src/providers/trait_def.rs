@@ -254,11 +254,21 @@ impl Money {
 
     /// Display form: "$12.34", "€5.00", "12.34 CAD", or "120" for credits.
     pub fn display(&self) -> String {
+        self.render(false)
+    }
+
+    /// Whole units only, rounded down: "$627" for $627.06. For tight spots
+    /// like an account row; `display` keeps the exact figure.
+    pub fn display_whole(&self) -> String {
+        self.render(true)
+    }
+
+    fn render(&self, whole_only: bool) -> String {
         let scale = 10i128.pow(self.exponent);
         let abs = i128::from(self.amount_minor).abs();
-        let whole = abs / scale;
-        let number = if self.exponent == 0 {
-            whole.to_string()
+        let whole = group_thousands(abs / scale);
+        let number = if self.exponent == 0 || whole_only {
+            whole
         } else {
             format!(
                 "{whole}.{:0width$}",
@@ -281,6 +291,19 @@ impl Money {
             None => format!("{sign}{number} {}", self.unit),
         }
     }
+}
+
+/// "1234567" → "1,234,567".
+fn group_thousands(n: i128) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Credits / extra-usage spend as the provider reports it.
@@ -317,6 +340,41 @@ impl Credits {
                 .into_iter()
                 .flatten()
                 .any(|m| !m.is_zero())
+    }
+
+    /// Money that can still be spent right now: the smaller of the wallet
+    /// balance and what's left under the spend cap, whichever are reported.
+    /// `None` when credits are off, the cap is reached, nothing is reported,
+    /// or nothing is left — i.e. "can this account keep working on credits".
+    pub fn spendable(&self) -> Option<Money> {
+        if !(self.enabled || self.unlimited) || self.limit_reached {
+            return None;
+        }
+        let under_cap = match (&self.limit, &self.used) {
+            (Some(limit), Some(used))
+                if limit.unit == used.unit && limit.exponent == used.exponent =>
+            {
+                Some(Money {
+                    amount_minor: limit.amount_minor - used.amount_minor,
+                    ..limit.clone()
+                })
+            }
+            (Some(limit), None) => Some(limit.clone()),
+            _ => None,
+        };
+        let left = match (&self.balance, under_cap) {
+            (Some(b), Some(c)) if b.unit == c.unit && b.exponent == c.exponent => {
+                if c.amount_minor < b.amount_minor {
+                    c
+                } else {
+                    b.clone()
+                }
+            }
+            (Some(b), _) => b.clone(),
+            (None, Some(c)) => c,
+            (None, None) => return None,
+        };
+        (left.amount_minor > 0).then_some(left)
     }
 }
 
@@ -799,8 +857,51 @@ mod tests {
         assert_eq!(m(1999, 2, "CAD"), "19.99 CAD");
         assert_eq!(m(120, 0, Money::CREDITS), "120");
         // Past f64's exact-integer range: no float drift.
-        assert_eq!(m(9_007_199_254_740_993, 2, "USD"), "$90071992547409.93");
+        assert_eq!(m(9_007_199_254_740_993, 2, "USD"), "$90,071,992,547,409.93");
         assert!(Money::new(1, 13, "USD").is_none());
+        assert_eq!(m(100_000, 2, "USD"), "$1,000.00");
+        assert_eq!(m(-123_456, 0, Money::CREDITS), "-123,456");
+        let w = |a, e, u| Money::new(a, e, u).unwrap().display_whole();
+        assert_eq!(w(62_706, 2, "USD"), "$627");
+        assert_eq!(w(123_456_789, 2, "USD"), "$1,234,567");
+        assert_eq!(w(99, 2, "USD"), "$0");
+    }
+
+    #[test]
+    fn credits_spendable_is_the_tighter_of_balance_and_cap() {
+        let usd = |a| Money::new(a, 2, "USD");
+        let on = |used, limit, balance| Credits {
+            enabled: true,
+            used,
+            limit,
+            balance,
+            ..Credits::default()
+        };
+        let amt = |c: Credits| c.spendable().map(|m| m.amount_minor);
+        // Live 2026-10-23: $627.06 in the wallet, $627.75 left under the cap.
+        assert_eq!(
+            amt(on(usd(37_225), usd(100_000), usd(62_706))),
+            Some(62_706)
+        );
+        // A $400 cap with $372.25 spent leaves $27.75, whatever the wallet holds.
+        assert_eq!(amt(on(usd(37_225), usd(40_000), usd(62_706))), Some(2_775));
+        // Only one side reported: use it.
+        assert_eq!(amt(on(None, None, usd(500))), Some(500));
+        assert_eq!(amt(on(usd(100), usd(1_000), None)), Some(900));
+        // Nothing left, nothing known, switched off, or cap hit: not spendable.
+        assert_eq!(amt(on(usd(1_000), usd(1_000), usd(500))), None);
+        assert_eq!(amt(on(usd(0), None, None)), None);
+        assert_eq!(amt(on(None, None, usd(0))), None);
+        let off = Credits {
+            enabled: false,
+            ..on(None, None, usd(500))
+        };
+        assert_eq!(amt(off), None);
+        let capped = Credits {
+            limit_reached: true,
+            ..on(None, None, usd(500))
+        };
+        assert_eq!(amt(capped), None);
     }
 
     #[test]

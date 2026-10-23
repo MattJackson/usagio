@@ -2197,6 +2197,23 @@ impl Row {
         session <= session_ceiling && session < trigger && self.weekly.pct.unwrap_or(0.0) < trigger
     }
 
+    /// Plan usage is used up: a window at the limit, so only credits (if
+    /// any) let the account keep working.
+    fn plan_exhausted(&self) -> bool {
+        self.max_pct() >= 99.5
+    }
+
+    /// Money the account can still spend on usage credits — see
+    /// `Credits::spendable`. `None` means it can't run on credits.
+    fn spendable_credits(&self) -> Option<providers::trait_def::Money> {
+        self.reported.credits.as_ref()?.spendable()
+    }
+
+    /// Can keep serving requests on credits once its plan is used up.
+    fn runs_on_credits(&self) -> bool {
+        self.spendable_credits().is_some()
+    }
+
     /// Remaining percent on the tightest of session/weekly.
     fn headroom(&self) -> f64 {
         100.0 - self.max_pct()
@@ -4200,6 +4217,9 @@ pub(crate) struct SwapGuard {
     // `State::manual_pick`. Blocks proactive flip-back off it; reaching the
     // trigger still swaps.
     manual_pick: Option<(String, String)>,
+    // Settings ▸ Auto-swap ▸ "Use credits when every plan is used up".
+    // Mirrors `State::use_credits_when_exhausted`, refreshed every cycle.
+    use_credits: bool,
 }
 
 /// Anti-thrash state for every provider: one independent `SwapGuard` each, so
@@ -4323,6 +4343,9 @@ struct SwapEval {
     /// No account is under the trigger, so the target is simply the one with
     /// the most room (at least `FALLBACK_MIN_GAIN_PTS` more than the active).
     fallback: bool,
+    /// Every plan is used up and the target is an account with usage
+    /// credits to spend (`State::use_credits_when_exhausted`).
+    credits: bool,
     /// The account to switch to right now, if any (cooldown/no-return/
     /// eligibility have all already been consulted).
     target: Option<String>,
@@ -4445,6 +4468,7 @@ fn evaluate_swap(
         preparing: false,
         urgent: false,
         fallback: false,
+        credits: false,
         target: None,
         blocked_by_cooldown: false,
         target_ignoring_cooldown: None,
@@ -4464,7 +4488,7 @@ fn evaluate_swap(
     if env_override_active(&act.provider_id) {
         return none;
     }
-    let usable: Vec<&Row> = rows
+    let switchable: Vec<&Row> = rows
         .iter()
         // A row is only a valid swap candidate if its owning provider has both
         // a usage signal (so we can compare its cached utilization to the
@@ -4483,6 +4507,10 @@ fn evaluate_swap(
         // switch to them would be silently ignored by the vendor CLI.
         .filter(|r| !env_override_active(&r.provider_id))
         .filter(|r| r.has_data() && r.email != active)
+        .collect();
+    let usable: Vec<&Row> = switchable
+        .iter()
+        .copied()
         // Never infer renewed capacity from a reset clock alone. A successful
         // post-reset fetch must precede a switch to this account.
         .filter(|r| {
@@ -4541,6 +4569,33 @@ fn evaluate_swap(
             fallback = true;
         }
     }
+    // Every plan is used up and the active account can't run on credits:
+    // move to the account with the most credits left to spend, when the user
+    // allowed it. Last resort only — any plan headroom above won first. Not
+    // gated on the no-return window or a post-leave reading: a locked inactive
+    // account isn't re-polled, and returning to credits only happens once the
+    // plan account we moved to is used up too, so it can't thrash.
+    let mut credits = false;
+    if candidates.is_empty()
+        && guard.use_credits
+        && (act_lapsed || act.plan_exhausted())
+        && !act.runs_on_credits()
+    {
+        if let Some(most_credits) = switchable
+            .iter()
+            .copied()
+            .filter(|r| r.runs_on_credits())
+            .max_by_key(|r| r.spendable_credits().map_or(0, |m| m.amount_minor))
+        {
+            candidates.push(most_credits);
+            credits = true;
+        }
+    }
+    // An active account still working on credits is never swapped onto a
+    // blocked one just to be ready for its reset — that would stop work.
+    if candidates.is_empty() && !act_lapsed && act.runs_on_credits() {
+        return none;
+    }
     let preparing = candidates.is_empty();
     if preparing {
         let Some(target) = earliest_blocked_target(rows, act, guard, Utc::now()) else {
@@ -4581,6 +4636,7 @@ fn evaluate_swap(
             preparing,
             urgent,
             fallback,
+            credits,
             target: None,
             blocked_by_cooldown: true,
             target_ignoring_cooldown: Some(best.email.clone()),
@@ -4590,6 +4646,7 @@ fn evaluate_swap(
             preparing,
             urgent,
             fallback,
+            credits,
             target: Some(best.email.clone()),
             blocked_by_cooldown: false,
             target_ignoring_cooldown: Some(best.email.clone()),
@@ -4872,6 +4929,7 @@ fn watch_cycle(
         guard.manual_pick = state
             .manual_pick(slug)
             .map(|k| (slug.to_string(), k.to_string()));
+        guard.use_credits = state.use_credits_when_exhausted;
         let (swapped, actionable) = match active.as_deref() {
             Some(a) => provider_swap_cycle(slug, &mut rows, a, trigger, ceiling, guard)?,
             None => (None, false),
@@ -4933,6 +4991,11 @@ fn provider_swap_cycle(
                          reason=cooldown"
                     ));
                 }
+            } else if act_row.is_some_and(|r| r.plan_exhausted() && r.runs_on_credits()) {
+                logging::log(&format!(
+                    "event=swap_decision provider={slug} active={active_email} action=stayed \
+                     reason=on_credits"
+                ));
             } else {
                 logging::log(&format!(
                     "event=swap_decision provider={slug} active={active_email} action=stayed \
@@ -4982,6 +5045,8 @@ fn provider_swap_cycle(
             target_row.max_pct(),
             if eval.fallback {
                 " reason=fallback_most_room"
+            } else if eval.credits {
+                " reason=plans_used_up_using_credits"
             } else if !target_row.eligible_target(ceiling, trigger) {
                 " reason=soonest_reset_in_band"
             } else {
