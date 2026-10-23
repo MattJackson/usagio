@@ -1949,14 +1949,18 @@ fn window_status_row(w: &WindowView) -> Option<(String, bool)> {
     }
 }
 
-/// "Credits · $3.10 used of $50.00" — `None` unless the provider reported
-/// credits switched on or a non-zero figure. Only ever the provider's own
-/// numbers; nothing here is estimated.
+/// "Credits · $903.35 left · $3.10 used of $50.00" — `None` unless the provider
+/// reported credits switched on or a non-zero figure. The wallet balance leads:
+/// it's the money actually available; used-of-limit is the monthly spend cap.
+/// Only ever the provider's own numbers; nothing here is estimated.
 fn credits_row(c: &Credits) -> Option<String> {
     if !c.is_meaningful() {
         return None;
     }
     let mut parts: Vec<String> = Vec::new();
+    if let Some(balance) = &c.balance {
+        parts.push(format!("{} left", balance.display()));
+    }
     match (&c.used, &c.limit) {
         (Some(used), Some(limit)) => {
             parts.push(format!("{} used of {}", used.display(), limit.display()))
@@ -1964,9 +1968,6 @@ fn credits_row(c: &Credits) -> Option<String> {
         (Some(used), None) => parts.push(format!("{} used", used.display())),
         (None, Some(limit)) => parts.push(format!("limit {}", limit.display())),
         (None, None) => {}
-    }
-    if let Some(balance) = &c.balance {
-        parts.push(format!("{} left", balance.display()));
     }
     if c.unlimited {
         parts.push("unlimited".to_string());
@@ -4309,6 +4310,18 @@ mod tests {
             })
             .as_deref(),
             Some("Credits · 120 left")
+        );
+        // Claude: wallet balance from `prepaid/credits` leads the monthly cap.
+        assert_eq!(
+            row(Credits {
+                enabled: true,
+                used: usd(5463),
+                limit: usd(10000),
+                balance: usd(90335),
+                ..Credits::default()
+            })
+            .as_deref(),
+            Some("Credits · $903.35 left · $54.63 used of $100.00")
         );
         assert_eq!(
             row(Credits {
