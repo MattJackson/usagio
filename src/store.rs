@@ -439,6 +439,12 @@ pub struct State {
     /// Menu-bar: swap trigger threshold percent (defaults to 95).
     #[serde(default)]
     pub trigger_pct: Option<f64>,
+    /// Auto-swap may move onto an account that runs on usage credits (paid
+    /// extra usage) once every account's plan usage is used up. Off by
+    /// default: it spends real money. Plan usage always wins when there is
+    /// any, and the swap leaves credits as soon as a plan account frees up.
+    #[serde(default)]
+    pub use_credits_when_exhausted: bool,
     /// Menu-bar: what the tray icon/title reflects. `None` (the default) =
     /// "at risk" — the captured agent closest to its limit across every
     /// provider. `Some(slug)` pins the tray to one registered provider's
@@ -737,6 +743,10 @@ impl State {
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false),
             trigger_pct: v.get("trigger_pct").and_then(|x| x.as_f64()),
+            use_credits_when_exhausted: v
+                .get("use_credits_when_exhausted")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
             tray_icon_mode: v
                 .get("tray_icon_mode")
                 .and_then(|x| x.as_str())
@@ -1368,6 +1378,7 @@ pub(crate) fn redact_state_for_dump(state: &State) -> serde_json::Value {
         "providers": providers,
         "autoswap_disabled": state.autoswap_disabled,
         "trigger_pct": state.trigger_pct,
+        "use_credits_when_exhausted": state.use_credits_when_exhausted,
         "tray_icon_mode": state.tray_icon_mode,
         "pending_removals": state.pending_removals.iter().collect::<Vec<_>>(),
         "pending_provider_removals": state
