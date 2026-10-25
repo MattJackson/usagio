@@ -2844,6 +2844,37 @@ fn a_stale_hold_drops_when_the_first_fresh_reading_is_under_the_trigger() {
 }
 
 #[test]
+fn a_hold_ends_once_the_held_account_resets() {
+    // 2026-10-25: dev8 picked at 100% held; it reset, ran back to 100%, and
+    // the leftover hold kept preparation from moving to the account that
+    // reset 40 minutes sooner.
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let mut state = State {
+        trigger_pct: Some(95.0),
+        ..State::default()
+    };
+    let mut a = acct_with_cache(Some(usage_at(100.0)));
+    a.email = Some("pick@e.com".to_string());
+    state.upsert(a);
+    state.active = Some("pick@e.com".to_string());
+    state.set_manual_pick(CLAUDE_SLUG, Some("pick@e.com"));
+    state.set_manual_hold(CLAUDE_SLUG, Some("pick@e.com"));
+    // Still settling the first reading: leave it to settle_manual_pick.
+    let rows = provider_rows(&state, CLAUDE_SLUG);
+    assert!(!release_reset_hold(&mut state, CLAUDE_SLUG, &rows, 95.0));
+    state.manual_pick_at.clear();
+    // Still over the trigger: the hold stands.
+    assert!(!release_reset_hold(&mut state, CLAUDE_SLUG, &rows, 95.0));
+    assert_eq!(state.manual_hold(CLAUDE_SLUG), Some("pick@e.com"));
+    // Window reset: the hold ends, the pick stays.
+    state.find_mut("pick@e.com").unwrap().cached_usage = Some(usage_at(3.0));
+    let rows = provider_rows(&state, CLAUDE_SLUG);
+    assert!(release_reset_hold(&mut state, CLAUDE_SLUG, &rows, 95.0));
+    assert_eq!(state.manual_hold(CLAUDE_SLUG), None);
+    assert_eq!(state.manual_pick(CLAUDE_SLUG), Some("pick@e.com"));
+}
+
+#[test]
 fn a_late_first_reading_keeps_the_switch_time_decision() {
     // 429s held off the first reading for 10 minutes; by then 96% says how
     // far it climbed since the pick, not where the pick started.
