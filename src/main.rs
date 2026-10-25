@@ -1097,16 +1097,47 @@ fn settle_manual_pick(state: &mut State, slug: &str, rows: &[Row], trigger: f64)
     true
 }
 
+/// End `slug`'s manual hold once the held account reads under the trigger.
+/// A hold only exists because the account was picked at/over the trigger;
+/// once its window resets it is a fresh account like any other, and a hold
+/// left over would keep auto-swap from preparing the soonest-resetting
+/// account when it runs out again. The pick itself stays (it still blocks
+/// proactive flip-back). Returns whether `state` changed.
+fn release_reset_hold(state: &mut State, slug: &str, rows: &[Row], trigger: f64) -> bool {
+    if state.manual_pick_at.contains_key(slug) {
+        return false; // first post-switch reading still decides the hold
+    }
+    let Some(key) = state.manual_hold(slug).map(str::to_string) else {
+        return false;
+    };
+    let Some(row) = rows.iter().find(|r| r.email.eq_ignore_ascii_case(&key)) else {
+        return false;
+    };
+    if !row.has_data() || row.max_pct() >= trigger {
+        return false;
+    }
+    state.set_manual_hold(slug, None);
+    logging::log(&format!(
+        "event=manual_hold_released provider={slug} account={key} pct={:.0} reason=reset",
+        row.max_pct()
+    ));
+    true
+}
+
 /// `settle_manual_pick` for every provider with a pick still waiting on a
-/// post-switch reading.
+/// post-switch reading, and `release_reset_hold` for every held one.
 fn settle_manual_picks(trigger: f64) {
     let settled = with_state_lock(|| {
         let mut st = State::load()?;
-        let slugs: Vec<String> = st.manual_pick_at.keys().cloned().collect();
+        let mut slugs: Vec<String> = st.manual_pick_at.keys().cloned().collect();
+        slugs.extend(st.manual_holds.keys().cloned());
+        slugs.sort();
+        slugs.dedup();
         let mut changed = false;
         for slug in slugs {
             let rows = provider_rows(&st, &slug);
             changed |= settle_manual_pick(&mut st, &slug, &rows, trigger);
+            changed |= release_reset_hold(&mut st, &slug, &rows, trigger);
         }
         if changed {
             st.save()?;
