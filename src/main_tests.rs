@@ -3186,6 +3186,8 @@ fn cycle(slug: &str, active: &str, max_pct: f64, rate_limited: bool) -> Provider
         rate_limited,
         max_pct: Some(max_pct),
         actionable: true,
+        urgency: None,
+        next_check_at: None,
     }
 }
 
@@ -4155,6 +4157,7 @@ fn seed_history(email: &str, n: usize, pct: impl Fn(f64, usize) -> (f64, f64)) {
             session_pct: Some(s as f32),
             weekly_pct: Some(w as f32),
             active_model: None,
+            ..Default::default()
         })
         .unwrap();
     }
@@ -5293,12 +5296,46 @@ fn locked_inactive_accounts_are_skipped_until_stale_or_forced() {
     ignore = "reads or writes the OS secret store, which is only hermetic (in-memory) on macOS"
 )]
 fn the_active_account_is_polled_even_when_it_looks_locked() {
+    // Flipped for auto-swap v2 (design §5.7, R3-B2): an lb-blocked active
+    // account is NOT polled — its full reading is a lower bound valid until
+    // the window resets. It is read again once the window is reset-pending,
+    // at the 12 h staleness cap, or on a forced refresh.
     let e = uniq("locked-active");
-    let hits = fetches(Fx::new(
+    let one = |cache: CachedUsage, force: bool| {
+        let fx = Fx::new(vec![account_with_cache(&e, Some(cache))], Some(&e));
+        fetches(if force { fx.force() } else { fx })
+    };
+    assert_eq!(one(cu_locked(5 * 3600), false), 0, "lb-blocked: not polled");
+    assert_eq!(one(cu_locked(13 * 3600), false), 1, "past the 12 h cap");
+    assert_eq!(
+        one(cu_locked(5 * 3600), true),
+        1,
+        "a forced refresh reads it"
+    );
+    let mut pending = cu_locked(5 * 3600);
+    pending.session_reset = Some((Utc::now() - Duration::seconds(30)).to_rfc3339());
+    assert_eq!(one(pending, false), 1, "reset-pending: read at once");
+    reset_usage_fetch_tracker(&e);
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "reads or writes the OS secret store, which is only hermetic (in-memory) on macOS"
+)]
+fn the_classic_engine_still_polls_a_locked_active_account() {
+    // v1 stays selectable for one release with its own polling.
+    let e = uniq("locked-active-v1");
+    let mut fx = Fx::new(
         vec![account_with_cache(&e, Some(cu_locked(5 * 3600)))],
         Some(&e),
-    ));
-    assert_eq!(hits, 1);
+    );
+    fx.before = Some(Box::new(|| {
+        let mut st = State::load().unwrap();
+        st.autoswap_engine = Some("v1".to_string());
+        st.save().unwrap();
+    }));
+    assert_eq!(fetches(fx), 1);
 }
 
 #[test]
@@ -5452,6 +5489,7 @@ fn a_fetched_reading_is_saved_and_its_notification_state_persisted() {
             session_pct: Some(40.0),
             weekly_pct: Some(40.0),
             active_model: None,
+            ..Default::default()
         })
         .unwrap();
     }));
@@ -5672,6 +5710,21 @@ fn codex_rows() -> Vec<Row> {
     provider_rows(&State::load().unwrap(), "codex")
 }
 
+/// `slug`'s persisted auto-swap v2 memory.
+fn swap_memory(slug: &str) -> autoswap::SwapMemory {
+    State::load()
+        .unwrap()
+        .swap_memory
+        .get(slug)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Edit `slug`'s persisted auto-swap v2 memory.
+fn set_swap_memory(slug: &str, f: impl FnOnce(&mut autoswap::SwapMemory)) {
+    autoswap::shell::update_memory(slug, f).unwrap();
+}
+
 fn history_events() -> Vec<serde_json::Value> {
     std::fs::read_to_string(store::config_dir().unwrap().join("history.jsonl"))
         .unwrap_or_default()
@@ -5695,11 +5748,12 @@ fn provider_swap_cycle_moves_off_an_exhausted_account_and_records_it() {
         );
         let mut rows = codex_rows();
         // A stale hold on the account being moved TO is dropped by the move.
-        let mut guard = SwapGuard {
-            stuck_notified: true,
-            manual_locked_choice: Some(("codex".to_string(), "cool@example.com".to_string())),
-            ..SwapGuard::default()
-        };
+        let mut st = State::load().unwrap();
+        st.manual_holds
+            .insert("codex".to_string(), "cool@example.com".to_string());
+        st.save().unwrap();
+        set_swap_memory("codex", |m| m.stuck_notified = true);
+        let mut guard = SwapGuard::default();
         let (swapped, actionable) = provider_swap_cycle(
             "codex",
             &mut rows,
@@ -5721,11 +5775,16 @@ fn provider_swap_cycle_moves_off_an_exhausted_account_and_records_it() {
             provider_active(&State::load().unwrap(), "codex").as_deref(),
             Some("cool@example.com")
         );
-        // The guard remembers the move.
-        assert!(guard.left_at.contains_key("hot@example.com"));
-        assert!(guard.last_swap.is_some());
-        assert!(!guard.stuck_notified);
-        assert!(guard.manual_locked_choice.is_none());
+        // The persisted swap memory remembers the move (v2: state.json).
+        let mem = swap_memory("codex");
+        assert!(mem.left_at("hot@example.com").is_some());
+        assert!(mem.last_switch_at.is_some());
+        assert!(!mem.stuck_notified);
+        assert!(
+            mem.trigger_latch("hot@example.com").is_some(),
+            "left by Trigger: latched for its epoch"
+        );
+        assert!(State::load().unwrap().manual_hold("codex").is_none());
         // And the history/log say what happened, with the target's numbers.
         let ev = history_events()
             .into_iter()
@@ -5822,8 +5881,9 @@ fn provider_swap_cycle_stays_put_and_says_why() {
                 .unwrap();
         assert_eq!(swapped, None);
         assert!(!actionable);
-        assert!(guard.stuck_notified, "the user is told once");
-        assert!(read_log().contains("action=stayed reason=no_eligible_target"));
+        assert!(swap_memory("codex").stuck_notified, "the user is told once");
+        // v2 names the stay by its rule (was `no_eligible_target` in v1).
+        assert!(read_log().contains("action=stayed reason=all_blocked"));
         // A manual hold on the exhausted-but-not-empty account is reported as such.
         let mut guard = SwapGuard::default();
         let mut rows = codex_rows();
@@ -5832,10 +5892,16 @@ fn provider_swap_cycle_stays_put_and_says_why() {
             r.session.pct = Some(96.0);
             r.weekly.pct = Some(96.0);
         }
-        guard.manual_locked_choice = Some(("codex".to_string(), key.clone()));
+        let mut st = State::load().unwrap();
+        st.set_manual_pick("codex", Some(&key));
+        st.set_manual_pick_tier("codex", Some("draining"));
+        st.save().unwrap();
         provider_swap_cycle("codex", &mut rows, &key, 95.0, 95.0, &mut guard).unwrap();
         assert!(read_log().contains("action=stayed reason=manual_hold"));
-        assert!(!guard.stuck_notified, "a held account is not 'stuck'");
+        assert!(
+            !swap_memory("codex").stuck_notified,
+            "a held account is not 'stuck'"
+        );
     });
 }
 
@@ -5855,22 +5921,25 @@ fn provider_swap_cycle_tracks_the_stuck_notice_only_while_stuck() {
         let run = |guard: &mut SwapGuard, rows: &mut Vec<Row>| {
             provider_swap_cycle("codex", rows, "a@example.com", 95.0, 95.0, guard).unwrap()
         };
+        let stuck = || set_swap_memory("codex", |m| m.stuck_notified = true);
         // Healthy and nothing better: no longer stuck, the notice re-arms.
-        let mut guard = SwapGuard {
-            stuck_notified: true,
-            ..SwapGuard::default()
-        };
+        stuck();
+        let mut guard = SwapGuard::default();
         assert_eq!(run(&mut guard, &mut codex_rows()).0, None);
-        assert!(!guard.stuck_notified);
+        assert!(!swap_memory("codex").stuck_notified);
         // Same while the user holds a healthy account.
-        let mut guard = SwapGuard {
-            stuck_notified: true,
-            manual_locked_choice: Some(("codex".to_string(), "a@example.com".to_string())),
-            ..SwapGuard::default()
-        };
+        stuck();
+        let mut st = State::load().unwrap();
+        st.set_manual_pick("codex", Some("a@example.com"));
+        st.set_manual_pick_tier("codex", Some("draining"));
+        st.save().unwrap();
+        let mut guard = SwapGuard::default();
         assert_eq!(run(&mut guard, &mut codex_rows()).0, None);
-        assert!(!guard.stuck_notified);
-        // An account with no usable reading is neither over the trigger nor stuck.
+        assert!(!swap_memory("codex").stuck_notified);
+        // An account with no usable reading is neither over the trigger nor
+        // stuck — but per §3.6 (review fix) an Unknown spell during a 429
+        // streak does NOT re-arm the notice: only a switch, Ready/held, or a
+        // Real-backed tier change does. (Its fetch is in backoff: I8.)
         let mut rows = codex_rows();
         let a = rows
             .iter_mut()
@@ -5878,12 +5947,16 @@ fn provider_swap_cycle_tracks_the_stuck_notice_only_while_stuck() {
             .unwrap();
         a.error = Some("boom".to_string());
         a.session.pct = Some(99.0);
-        let mut guard = SwapGuard {
-            stuck_notified: true,
-            ..SwapGuard::default()
-        };
+        let tracker = fetch_tracker_key("codex", "a@example.com");
+        record_fetch_attempt_failed(&tracker, Utc::now().timestamp());
+        stuck();
+        let mut guard = SwapGuard::default();
         assert_eq!(run(&mut guard, &mut rows).0, None);
-        assert!(!guard.stuck_notified);
+        assert!(
+            swap_memory("codex").stuck_notified,
+            "no re-arm (so no repeat notice) on an Unknown spell"
+        );
+        reset_usage_fetch_tracker(&tracker);
     });
 }
 
@@ -5909,10 +5982,13 @@ fn provider_swap_cycle_reports_a_cooldown_blocked_preparation() {
                 now + Duration::hours(2)
             });
         }
-        let mut guard = SwapGuard {
-            last_swap: Some(std::time::Instant::now()),
-            ..SwapGuard::default()
-        };
+        // A switch a moment ago: the cooldown (v2: persisted memory) blocks
+        // the optional Prepare move.
+        set_swap_memory("codex", |m| {
+            m.last_switch_at = Some(Utc::now().timestamp());
+            m.last_seen_active = Some("a@example.com".to_string());
+        });
+        let mut guard = SwapGuard::default();
         let (swapped, actionable) =
             provider_swap_cycle("codex", &mut rows, "a@example.com", 95.0, 95.0, &mut guard)
                 .unwrap();
@@ -6898,18 +6974,17 @@ fn provider_swap_cycle_labels_urgent_and_prepared_moves_as_non_proactive() {
     let _cfg = crate::store::ScopedConfigDir::new();
     let dir = tempfile::tempdir().unwrap();
     crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
-        // A 429 near the trigger makes the move urgent although the reading
-        // itself is still under it.
+        // Flipped for v2 (design §8.4): a 429 no longer counts as being at the
+        // trigger; a Real reading at 96 makes the move a Trigger.
         seed_codex_pair(
             dir.path(),
             "a@example.com",
             [
-                ("a@example.com", cu(93.0, 40.0, 10)),
+                ("a@example.com", cu(96.0, 40.0, 10)),
                 ("b@example.com", cu(10.0, 10.0, 10)),
             ],
         );
         let key = fetch_tracker_key("codex", "a@example.com");
-        record_usage_fetch_429(&key);
         let mut rows = codex_rows();
         let mut guard = SwapGuard::default();
         let (swapped, _) =
@@ -6982,7 +7057,10 @@ fn watch_cycle_reports_the_claude_429_and_swaps_claude_accounts() {
         for k in [&a, &b] {
             claim_subscription_check(k, Utc::now().timestamp(), false);
         }
-        let active = account_with_cache(&a, Some(cu(93.0, 10.0, 1000)));
+        // Flipped for v2 (design §8.4, D1): the active reading is 61 s old
+        // (due for a fetch, not yet blind), the fetch 429s. A 429 is no
+        // information (I8): it is reported, and nobody moves.
+        let active = account_with_cache(&a, Some(cu(93.0, 10.0, 61)));
         prime_active_slot(&active.keychain_blob);
         seed_claude_state(
             vec![active, account_with_cache(&b, Some(cu(10.0, 10.0, 10)))],
@@ -6991,8 +7069,7 @@ fn watch_cycle_reports_the_claude_429_and_swaps_claude_accounts() {
         let out = watch_cycle(95.0, 95.0, &mut SwapGuards::default(), false).unwrap();
         usage::set_usage_url_override(None);
         assert_eq!(hit_count(&hits), 1);
-        // The 429 on the active account counts as being at the trigger: moved.
-        assert_eq!(State::load().unwrap().active.as_deref(), Some(b.as_str()));
+        assert_eq!(State::load().unwrap().active.as_deref(), Some(a.as_str()));
         reset_usage_fetch_tracker(&a);
         reset_usage_fetch_tracker(&b);
         out
@@ -7003,12 +7080,55 @@ fn watch_cycle_reports_the_claude_429_and_swaps_claude_accounts() {
         .find(|p| p.slug == CLAUDE_SLUG)
         .unwrap();
     assert!(claude.rate_limited);
-    assert!(claude.swapped.is_some());
+    assert!(claude.swapped.is_none());
+    assert_eq!(claude.urgency, Some(autoswap::Urgency::Band));
     let codex_limited = outcome
         .providers
         .iter()
         .any(|p| p.slug != CLAUDE_SLUG && p.rate_limited);
     assert!(!codex_limited);
+}
+
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "reads or writes the OS secret store, which is only hermetic (in-memory) on macOS"
+)]
+#[test]
+fn watch_cycle_classic_engine_still_swaps_on_a_429_near_the_trigger() {
+    // The classic engine stays selectable for one release (rollback), with its
+    // v0.8.7 behavior: a 429 in the TIGHT band counts as the trigger.
+    use crate::providers::claude::usage;
+    let _poll = POLL_ACTIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    with_claude_home("scratch-json@e.com", |_| {
+        let (url, hits) = spawn_mock_usage_server(429, String::new());
+        usage::set_usage_url_override(Some(&format!("{url}/api/oauth/usage")));
+        let a = uniq("wc1-active");
+        let b = uniq("wc1-target");
+        for k in [&a, &b] {
+            claim_subscription_check(k, Utc::now().timestamp(), false);
+        }
+        let active = account_with_cache(&a, Some(cu(93.0, 10.0, 1000)));
+        prime_active_slot(&active.keychain_blob);
+        seed_claude_state(
+            vec![active, account_with_cache(&b, Some(cu(10.0, 10.0, 10)))],
+            Some(&a),
+        );
+        let mut st = State::load().unwrap();
+        st.autoswap_engine = Some("v1".to_string());
+        st.save().unwrap();
+        let out = watch_cycle(95.0, 95.0, &mut SwapGuards::default(), false).unwrap();
+        usage::set_usage_url_override(None);
+        assert_eq!(hit_count(&hits), 1);
+        assert_eq!(State::load().unwrap().active.as_deref(), Some(b.as_str()));
+        let claude = out
+            .providers
+            .iter()
+            .find(|p| p.slug == CLAUDE_SLUG)
+            .unwrap();
+        assert!(claude.urgency.is_none(), "classic cadence");
+        reset_usage_fetch_tracker(&a);
+        reset_usage_fetch_tracker(&b);
+    });
 }
 
 // --- mutation-hardening: exact-second boundaries of the refresh policy ---
@@ -7230,4 +7350,405 @@ fn persist_login_adds_an_account_it_has_never_seen() {
         "renewals reuse that store"
     );
     assert_eq!(st.active, None);
+}
+
+// --- auto-swap v2 (0.12.2): counterparts of the flipped v1 tests (§8.4) ---
+
+#[test]
+fn next_interval_v2_holds_the_active_at_60s_in_the_tight_band() {
+    // Flip of the `next_interval_*` 30 s TIGHT expectations: under v2 the
+    // active poll floor in band is 60 s (it ships with the blind projection).
+    use autoswap::Urgency;
+    let t = TRIGGER_FOR_TESTS;
+    assert_eq!(
+        next_interval_v2(180, 180, false, Urgency::Band, Some(94.9), t, true),
+        60
+    );
+    assert_eq!(
+        next_interval_v2(180, 180, false, Urgency::Band, Some(90.0), t, false),
+        60
+    );
+    // Draining/Blocked: TIGHT only with something to catch (actionable).
+    assert_eq!(
+        next_interval_v2(180, 180, false, Urgency::Draining, Some(97.0), t, true),
+        60
+    );
+    assert_eq!(
+        next_interval_v2(180, 180, false, Urgency::Draining, Some(97.0), t, false),
+        180
+    );
+    assert_eq!(
+        next_interval_v2(180, 180, false, Urgency::Blocked, Some(100.0), t, false),
+        180
+    );
+    // Calm: the ramp, with TIGHT at 60 s.
+    assert_eq!(
+        next_interval_v2(180, 180, false, Urgency::Calm, Some(87.0), t, false),
+        60
+    );
+    assert_eq!(
+        next_interval_v2(180, 180, false, Urgency::Calm, Some(80.0), t, false),
+        120
+    );
+    assert_eq!(
+        next_interval_v2(180, 180, false, Urgency::Calm, Some(40.0), t, false),
+        180
+    );
+    // A 429 in band or Draining backs off at most to 120 s…
+    assert_eq!(
+        next_interval_v2(60, 180, true, Urgency::Band, Some(93.0), t, true),
+        120
+    );
+    assert_eq!(
+        next_interval_v2(120, 180, true, Urgency::Draining, Some(97.0), t, true),
+        120
+    );
+    // …outside the band the doubling applies, up to the max.
+    assert_eq!(
+        next_interval_v2(180, 180, true, Urgency::Calm, Some(40.0), t, false),
+        360
+    );
+    assert_eq!(
+        next_interval_v2(
+            WATCH_MAX_INTERVAL_SECS,
+            180,
+            true,
+            Urgency::Calm,
+            Some(40.0),
+            t,
+            false
+        ),
+        WATCH_MAX_INTERVAL_SECS
+    );
+}
+
+#[test]
+fn cadence_wakes_at_the_v2_next_check_time() {
+    let _g = crate::store::ScopedConfigDir::new();
+    let mut c = Cadence::new(180);
+    let mut p = cycle(CLAUDE_SLUG, "a@e.com", 40.0, false);
+    p.urgency = Some(autoswap::Urgency::Calm);
+    p.next_check_at = Some(Utc::now() + Duration::seconds(45));
+    let secs = c.advance(&CycleOutcome { providers: vec![p] }, 95.0);
+    assert!((40..=45).contains(&secs), "{secs}");
+    // Never spins faster than the check floor.
+    let mut p = cycle(CLAUDE_SLUG, "a@e.com", 40.0, false);
+    p.urgency = Some(autoswap::Urgency::Calm);
+    p.next_check_at = Some(Utc::now() + Duration::seconds(1));
+    assert_eq!(
+        c.advance(&CycleOutcome { providers: vec![p] }, 95.0),
+        NEXT_CHECK_MIN_SECS
+    );
+}
+
+#[test]
+fn auto_pick_v2_ranks_by_runway_then_expiring_room() {
+    let now = Utc::now();
+    let far = now + Duration::days(5);
+    // v1 picked the soonest reset (dev4, 3 points to the trigger); v2 picks
+    // the runway (D2: dev8 has 5).
+    let rows = vec![
+        row_full("dev4@e.com", 16.0, 92.0, far - Duration::hours(5)),
+        row_full("dev8@e.com", 40.0, 90.0, far),
+    ];
+    assert_eq!(auto_pick_v2(&rows, 95.0, 95.0, now).unwrap(), "dev8@e.com");
+    // A Ready account whose weekly resets inside the 6 h horizon goes first.
+    let rows = vec![
+        row_full("roomy@e.com", 10.0, 10.0, far),
+        row_full("expiring@e.com", 10.0, 50.0, now + Duration::hours(2)),
+    ];
+    assert_eq!(
+        auto_pick_v2(&rows, 95.0, 95.0, now).unwrap(),
+        "expiring@e.com"
+    );
+    // Every account at its limit: an error naming the soonest reset.
+    let mut full = row_full("full@e.com", 10.0, 100.0, now + Duration::hours(3));
+    full.weekly.resets_at = Some(now + Duration::hours(3));
+    let err = auto_pick_v2(&[full], 95.0, 95.0, now)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("full@e.com"), "{err}");
+}
+
+#[test]
+fn manual_holds_migrate_to_the_v2_pick_tier() {
+    let v = serde_json::json!({
+        "accounts": [],
+        "manual_holds": {"claude": "held@e.com", "codex": "stale@e.com"},
+        "manual_picks": {"claude": "held@e.com", "codex": "newer@e.com"},
+    });
+    let st = State::from_value(&v);
+    assert_eq!(
+        st.manual_pick_tier.get("claude").map(String::as_str),
+        Some("draining")
+    );
+    assert!(
+        !st.manual_pick_tier.contains_key("codex"),
+        "the hold no longer matches the pick"
+    );
+    // An explicit tier wins over the legacy hold.
+    let v = serde_json::json!({
+        "manual_holds": {"claude": "a@e.com"},
+        "manual_pick_tier": {"claude": "blocked"},
+    });
+    assert_eq!(
+        State::from_value(&v)
+            .manual_pick_tier
+            .get("claude")
+            .map(String::as_str),
+        Some("blocked")
+    );
+}
+
+#[test]
+fn swap_memory_and_engine_round_trip_through_state_json() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let mut st = State {
+        autoswap_engine: Some("v1".to_string()),
+        ..Default::default()
+    };
+    st.note_active_change(
+        "codex",
+        Some("a@e.com"),
+        "b@e.com",
+        autoswap::memory::ChangeKind::Manual,
+    );
+    st.save().unwrap();
+    let back = State::load().unwrap();
+    assert_eq!(back.autoswap_engine.as_deref(), Some("v1"));
+    let m = &back.swap_memory["codex"];
+    assert!(m.left_at("a@e.com").is_some());
+    assert_eq!(m.last_seen_active.as_deref(), Some("b@e.com"));
+    // A 0.12.1 state.json (no v2 fields) loads with empty memory and v2.
+    let old = State::from_value(&serde_json::json!({"accounts": [], "active": null}));
+    assert!(old.swap_memory.is_empty());
+    assert!(old.autoswap_engine.is_none());
+}
+
+#[test]
+fn engine_selection_prefers_the_setting_over_the_env_var() {
+    let mut st = State::default();
+    crate::env_lock::scoped_env_var(autoswap::shell::ENGINE_ENV_VAR, None, || {
+        assert!(autoswap::shell::engine_v2(&st), "v2 is the default");
+    });
+    crate::env_lock::scoped_env_var(autoswap::shell::ENGINE_ENV_VAR, Some("v1"), || {
+        assert!(!autoswap::shell::engine_v2(&st), "the env var selects v1…");
+        st.autoswap_engine = Some("v2".to_string());
+        assert!(
+            autoswap::shell::engine_v2(&st),
+            "…unless the setting says otherwise"
+        );
+        st.autoswap_engine = None;
+    });
+    st.autoswap_engine = Some("v1".to_string());
+    assert!(!autoswap::shell::engine_v2(&st));
+}
+
+#[test]
+fn manual_switch_records_the_settled_pick_tier_and_the_left_account() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+        seed_codex_pair(
+            dir.path(),
+            "a@example.com",
+            [
+                ("a@example.com", cu(20.0, 20.0, 10)),
+                ("b@example.com", cu(97.0, 97.0, 10)),
+            ],
+        );
+        set_swap_memory("codex", |m| {
+            m.last_seen_active = Some("a@example.com".into())
+        });
+        switch_to_provider_account("codex", "b@example.com", true).unwrap();
+        let st = State::load().unwrap();
+        assert_eq!(
+            st.manual_pick_tier.get("codex").map(String::as_str),
+            Some("draining")
+        );
+        assert_eq!(
+            st.manual_hold("codex"),
+            Some("b@example.com"),
+            "dual-written hold"
+        );
+        let m = &st.swap_memory["codex"];
+        assert!(
+            m.left_at("a@example.com").is_some(),
+            "R2-M2: a manual switch records left_at"
+        );
+        assert!(m.last_switch_at.is_some());
+        assert_eq!(m.last_seen_active.as_deref(), Some("b@example.com"));
+        // §6: manual switches are in the decisions log too.
+        let lines = crate::usage_log::read_decisions();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l["engine"] == "manual" && l["target"] == "b@example.com"),
+            "{lines:?}"
+        );
+        // The next v2 cycle sees no External change.
+        let st = autoswap::shell::begin_cycle("codex", Utc::now()).unwrap();
+        assert_eq!(st.manual_pick("codex"), Some("b@example.com"));
+    });
+}
+
+#[test]
+fn provider_swap_cycle_v2_logs_one_decision_line_per_change() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+        seed_codex_pair(
+            dir.path(),
+            "a@example.com",
+            [
+                ("a@example.com", cu(30.0, 30.0, 10)),
+                ("b@example.com", cu(30.0, 30.0, 10)),
+            ],
+        );
+        let mut guard = SwapGuard::default();
+        for _ in 0..5 {
+            provider_swap_cycle(
+                "codex",
+                &mut codex_rows(),
+                "a@example.com",
+                95.0,
+                95.0,
+                &mut guard,
+            )
+            .unwrap();
+        }
+        let lines = crate::usage_log::read_decisions();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["engine"], "v2");
+        assert_eq!(lines[0]["reason"], "ok");
+        assert_eq!(read_log().matches("action=stayed reason=ok").count(), 1);
+    });
+}
+
+#[test]
+fn replay_rows_carry_the_new_fields_and_old_rows_still_parse() {
+    let mut cache = cu(40.0, 80.0, 30);
+    cache.weekly_reset = Some((Utc::now() + Duration::days(2)).to_rfc3339());
+    let row = replay_row("codex", "x@e.com", &cache, true, "429");
+    assert_eq!(row.active, Some(true));
+    assert_eq!(row.outcome.as_deref(), Some("429"));
+    assert_eq!(row.fetched_at, Some(cache.fetched_at));
+    assert!(row.weekly_reset.is_some());
+    assert!(!row.is_reading(), "a 429 row repeats the cache");
+    let old: usage_log::Snapshot = serde_json::from_str(
+        r#"{"ts":"2026-10-01T00:00:00Z","provider":"claude","account":"a","session_pct":1.0}"#,
+    )
+    .unwrap();
+    assert!(old.is_reading());
+    assert!(old.outcome.is_none() && old.active.is_none());
+}
+
+#[test]
+fn v2_active_fetch_skips_an_lb_blocked_active_until_reset_or_stale() {
+    let now = Utc::now().timestamp();
+    let key = uniq("v2-skip");
+    let mut blocked = cu(100.0, 40.0, 30);
+    blocked.session_reset = Some((Utc::now() + Duration::hours(2)).to_rfc3339());
+    assert_eq!(
+        v2_active_fetch_skip(CLAUDE_SLUG, &key, &blocked, 95.0, now),
+        Some("lb_blocked")
+    );
+    blocked.fetched_at = now - MAX_LOCKED_STALENESS_SECS - 1;
+    assert_eq!(
+        v2_active_fetch_skip(CLAUDE_SLUG, &key, &blocked, 95.0, now),
+        None
+    );
+    // In band: the floor is 60 s, not 30.
+    let fresh = cu(10.0, 92.0, 45);
+    assert_eq!(
+        v2_active_fetch_skip(CLAUDE_SLUG, &key, &fresh, 95.0, now),
+        Some("fresh")
+    );
+    let due = cu(10.0, 92.0, 61);
+    assert_eq!(
+        v2_active_fetch_skip(CLAUDE_SLUG, &key, &due, 95.0, now),
+        None
+    );
+    // A failed attempt within the provider's interval: honour its backoff.
+    record_fetch_attempt_failed(&key, now - 10);
+    assert_eq!(
+        v2_active_fetch_skip(CLAUDE_SLUG, &key, &due, 95.0, now),
+        Some("backoff")
+    );
+    reset_usage_fetch_tracker(&key);
+}
+
+#[test]
+fn v1_prepare_line_is_labelled_prepare_reset() {
+    // R2-m5: v1's Prepare log line said `reason=soonest_reset_in_band`.
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+        seed_codex_pair(
+            dir.path(),
+            "a@example.com",
+            [
+                ("a@example.com", cu(0.0, 100.0, 10)),
+                ("b@example.com", cu(0.0, 100.0, 10)),
+            ],
+        );
+        let mut rows = codex_rows();
+        let now = Utc::now();
+        for r in rows.iter_mut() {
+            r.weekly.resets_at = Some(if r.email == "a@example.com" {
+                now + Duration::days(5)
+            } else {
+                now + Duration::hours(2)
+            });
+        }
+        let (swapped, _) = provider_swap_cycle_v1(
+            "codex",
+            &mut rows,
+            "a@example.com",
+            95.0,
+            95.0,
+            &mut SwapGuard::default(),
+        )
+        .unwrap();
+        assert!(swapped.is_some());
+        let log = read_log();
+        assert!(
+            log.contains("action=switching reason=prepare_reset"),
+            "{log}"
+        );
+        assert!(!log.contains("soonest_reset_in_band"));
+    });
+}
+
+#[test]
+fn v2_switch_writes_the_leave_latch_in_the_switch_commit() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+        seed_codex_pair(
+            dir.path(),
+            "a@example.com",
+            [
+                ("a@example.com", cu(96.0, 40.0, 10)),
+                ("b@example.com", cu(10.0, 10.0, 10)),
+            ],
+        );
+        let latch = autoswap::memory::Latch {
+            window: autoswap::WindowId::Session,
+            resets_at: None,
+            pct: 96.0,
+            at: Utc::now().timestamp(),
+        };
+        let moved = switch_if_still_active_latched(
+            "codex",
+            "b@example.com",
+            "a@example.com",
+            Some((autoswap::memory::LatchKind::Trigger, latch)),
+        )
+        .unwrap();
+        assert_eq!(moved.as_deref(), Some("b@example.com"));
+        let m = swap_memory("codex");
+        assert!(m.trigger_latch("a@example.com").is_some());
+        assert!(m.left_at("a@example.com").is_some());
+    });
 }

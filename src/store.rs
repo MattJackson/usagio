@@ -475,6 +475,21 @@ pub struct State {
     /// switch decided on may be minutes old (see `settle_manual_pick`).
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub manual_pick_at: std::collections::HashMap<String, i64>,
+    /// The settled tier of each provider's manual pick (`"ready"`,
+    /// `"draining"`, `"blocked"`), from the switch-time reading and re-settled
+    /// by the first fresh one (auto-swap v2). A pick holds while its tier is
+    /// Draining or worse. Migrated from `manual_holds` (a held key maps to
+    /// Draining) when absent; `manual_holds` is still written for rollback.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub manual_pick_tier: std::collections::HashMap<String, String>,
+    /// Auto-swap v2's persisted swap memory, keyed by provider slug (left
+    /// times, latches, cooldown, stuck notice). The classic engine ignores it.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub swap_memory: std::collections::HashMap<String, crate::autoswap::SwapMemory>,
+    /// Settings ▸ Auto-swap ▸ Engine. `None` = the default (v2); `"v1"` = the
+    /// classic engine (rollback for one release).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autoswap_engine: Option<String>,
     /// Emails this in-memory state has explicitly requested be dropped via
     /// `remove()`. NOT serialized — transient authorization consumed by
     /// `save_state_safe`, so `save()` can distinguish "the caller meant to
@@ -490,6 +505,32 @@ pub struct State {
     /// authorises `remove`'s.
     #[serde(skip)]
     pub(crate) pending_provider_removals: HashSet<(String, String)>,
+}
+
+/// `manual_pick_tier` from state.json, migrating 0.12.1's `manual_holds`: a
+/// held pick (the held key is still the pick) maps to tier Draining.
+fn migrate_manual_pick_tier(v: &serde_json::Value) -> std::collections::HashMap<String, String> {
+    let mut tiers: std::collections::HashMap<String, String> = v
+        .get("manual_pick_tier")
+        .and_then(|x| serde_json::from_value(x.clone()).ok())
+        .unwrap_or_default();
+    let holds: std::collections::HashMap<String, String> = v
+        .get("manual_holds")
+        .and_then(|x| serde_json::from_value(x.clone()).ok())
+        .unwrap_or_default();
+    let picks: std::collections::HashMap<String, String> = v
+        .get("manual_picks")
+        .and_then(|x| serde_json::from_value(x.clone()).ok())
+        .unwrap_or_default();
+    for (slug, held) in holds {
+        let still_the_pick = picks
+            .get(&slug)
+            .is_none_or(|p| p.eq_ignore_ascii_case(&held));
+        if still_the_pick && !tiers.contains_key(&slug) {
+            tiers.insert(slug, "draining".to_string());
+        }
+    }
+    tiers
 }
 
 /// Per-app config directory. Delegates to the platform Paths backend so the
@@ -775,6 +816,24 @@ impl State {
                 .get("manual_pick_at")
                 .and_then(|x| serde_json::from_value(x.clone()).ok())
                 .unwrap_or_default(),
+            manual_pick_tier: migrate_manual_pick_tier(v),
+            swap_memory: v
+                .get("swap_memory")
+                .and_then(|x| x.as_object())
+                .map(|obj| {
+                    obj.iter()
+                        .filter_map(|(slug, val)| {
+                            serde_json::from_value(val.clone())
+                                .ok()
+                                .map(|m| (slug.clone(), m))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            autoswap_engine: v
+                .get("autoswap_engine")
+                .and_then(|x| x.as_str())
+                .map(String::from),
             pending_removals: HashSet::new(),
             pending_provider_removals: HashSet::new(),
         }
@@ -822,6 +881,36 @@ impl State {
             }
             None => {
                 self.manual_pick_at.remove(slug);
+                self.manual_pick_tier.remove(slug);
+            }
+        }
+    }
+
+    /// Record `slug`'s manual-pick tier (`None` clears it).
+    pub fn set_manual_pick_tier(&mut self, slug: &str, tier: Option<&str>) {
+        set_or_clear(&mut self.manual_pick_tier, slug, tier);
+    }
+
+    /// Record a change of `slug`'s active account in its swap memory (§3.5):
+    /// `left_at[from]`, `last_switch_at`, `last_seen_active`. Only when the key
+    /// actually changed — same-account token adoption is not a change.
+    pub fn note_active_change(
+        &mut self,
+        slug: &str,
+        from: Option<&str>,
+        to: &str,
+        kind: crate::autoswap::memory::ChangeKind,
+    ) {
+        if from.is_some_and(|f| f.eq_ignore_ascii_case(to)) {
+            return;
+        }
+        let m = self.swap_memory.entry(slug.to_string()).or_default();
+        m.note_active_change(from, to, chrono::Utc::now().timestamp(), kind);
+        // An engine switch hands its leave latch over so it lands in the same
+        // locked write as the switch itself (§3.5).
+        if let Some(from) = from {
+            if let Some((k, l)) = crate::autoswap::shell::take_leave_latch(slug, from) {
+                m.apply_latch(from, k, l);
             }
         }
     }

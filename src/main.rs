@@ -9,6 +9,7 @@
 //! service string is intentionally frozen at "claude-usage" to preserve
 //! existing tokens (see `providers/claude/mod.rs`).
 
+mod autoswap;
 mod burn_rate;
 mod context_ledger;
 mod countdown;
@@ -958,6 +959,8 @@ pub(crate) fn resolve_provider_selector(state: &State, selector: &str) -> Option
 /// resolution step the way Claude's identity backfill does). `hold` marks a
 /// manual choice auto-swap must respect; `false` clears any earlier hold.
 pub(crate) fn switch_to_provider_account(slug: &str, key: &str, hold: bool) -> Result<String> {
+    // Every manual switch asks to hold; the auto-swap path passes `false`.
+    let manual = hold;
     let provider = provider_by_slug(slug)?;
     if !provider.capabilities().supports_switching {
         bail!("switching is not supported for {slug}");
@@ -986,8 +989,16 @@ pub(crate) fn switch_to_provider_account(slug: &str, key: &str, hold: bool) -> R
             .active
             .replace(acct.key.clone());
         state.set_manual_pick(slug, hold.then_some(acct.key.as_str()));
-        let hold = hold && pick_holds(&state, slug, &acct.key);
+        let tier = pick_tier(&state, slug, &acct.key);
+        state.set_manual_pick_tier(slug, hold.then_some(tier.as_str()));
+        let hold = hold && tier >= autoswap::Tier::Draining;
         state.set_manual_hold(slug, hold.then_some(acct.key.as_str()));
+        state.note_active_change(
+            slug,
+            prev.as_deref(),
+            &acct.key,
+            autoswap::memory::ChangeKind::Manual,
+        );
         // The vendor credential file is already switched at this point; if
         // recording it in state.json fails, say so explicitly rather than
         // surfacing a bare io error that reads as "the whole switch failed"
@@ -998,6 +1009,9 @@ pub(crate) fn switch_to_provider_account(slug: &str, key: &str, hold: bool) -> R
         )?;
         // Same as Claude's `switch_to_guarded`: the account we left must not
         // re-escalate later on a stale 429 count.
+        if manual {
+            log_manual_switch(slug, prev.as_deref(), &acct.key);
+        }
         if let Some(prev) = prev.filter(|p| !p.eq_ignore_ascii_case(&acct.key)) {
             reset_usage_fetch_tracker(&fetch_tracker_key(slug, &prev));
         }
@@ -1012,7 +1026,7 @@ fn select_email(state: &State, selector: Option<&str>) -> Result<String> {
         None => {
             let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
             let trigger = state.trigger_pct.unwrap_or(TRIGGER_PCT);
-            auto_pick(&rows, trigger, trigger)
+            auto_pick_for(state, &rows, trigger, trigger)
         }
     }
 }
@@ -1052,17 +1066,37 @@ fn provider_rows(state: &State, slug: &str) -> Vec<Row> {
 /// the choice until it's exhausted. Under the trigger it only blocks
 /// proactive flip-back (`State::manual_picks`) and auto-swaps off at the
 /// trigger like any other.
+#[cfg(test)]
 fn pick_holds(state: &State, slug: &str, key: &str) -> bool {
+    pick_tier(state, slug, key) >= autoswap::Tier::Draining
+}
+
+/// The tier a manual pick of `key` settles at from its cached reading: Ready
+/// under the trigger, Draining at/over it, Blocked at the limit. A pick holds
+/// while its tier is Draining or worse (auto-swap v2 `manual_pick_tier`).
+fn pick_tier(state: &State, slug: &str, key: &str) -> autoswap::Tier {
     let trigger = state.trigger_pct.unwrap_or(TRIGGER_PCT);
     provider_rows(state, slug)
         .iter()
         .find(|r| r.email.eq_ignore_ascii_case(key))
-        .is_some_and(|r| r.has_data() && r.max_pct() >= trigger)
+        .filter(|r| r.has_data())
+        .map(|r| tier_for_pct(r.max_pct(), trigger))
+        .unwrap_or(autoswap::Tier::Ready)
+}
+
+fn tier_for_pct(pct: f64, trigger: f64) -> autoswap::Tier {
+    if pct >= autoswap::policy::BLOCKED_PCT {
+        autoswap::Tier::Blocked
+    } else if pct >= trigger {
+        autoswap::Tier::Draining
+    } else {
+        autoswap::Tier::Ready
+    }
 }
 
 /// How long after a manual switch its first reading still settles whether
 /// the pick holds (see `settle_manual_pick`).
-const MANUAL_PICK_SETTLE_SECS: i64 = 300;
+const MANUAL_PICK_SETTLE_SECS: i64 = autoswap::policy::MANUAL_PICK_SETTLE_S;
 
 /// Re-decide `slug`'s manual hold on the first reading of the picked account
 /// taken after the switch. `pick_holds` decided from the cached reading, which
@@ -1090,9 +1124,12 @@ fn settle_manual_pick(state: &mut State, slug: &str, rows: &[Row], trigger: f64)
     }
     let hold = row.max_pct() >= trigger;
     state.set_manual_hold(slug, hold.then_some(key.as_str()));
+    let tier = tier_for_pct(row.max_pct(), trigger);
+    state.set_manual_pick_tier(slug, Some(tier.as_str()));
     logging::log(&format!(
-        "event=manual_pick_settled provider={slug} account={key} pct={:.0} hold={hold}",
-        row.max_pct()
+        "event=manual_pick_settled provider={slug} account={key} pct={:.0} hold={hold} tier={}",
+        row.max_pct(),
+        tier.as_str()
     ));
     true
 }
@@ -1117,6 +1154,7 @@ fn release_reset_hold(state: &mut State, slug: &str, rows: &[Row], trigger: f64)
         return false;
     }
     state.set_manual_hold(slug, None);
+    state.set_manual_pick_tier(slug, Some(autoswap::Tier::Ready.as_str()));
     logging::log(&format!(
         "event=manual_hold_released provider={slug} account={key} pct={:.0} reason=reset",
         row.max_pct()
@@ -1187,6 +1225,19 @@ fn switch_if_still_active(slug: &str, target: &str, expect_active: &str) -> Resu
         }
         switch_to_provider_account(slug, target, false).map(Some)
     })
+}
+
+/// `switch_if_still_active`, writing the engine's leave latch for the account
+/// left in the switch's own locked section (consumed by
+/// `State::note_active_change`).
+fn switch_if_still_active_latched(
+    slug: &str,
+    target: &str,
+    expect_active: &str,
+    latch: Option<(autoswap::memory::LatchKind, autoswap::memory::Latch)>,
+) -> Result<Option<String>> {
+    let _armed = autoswap::shell::arm_leave_latch(slug, expect_active, latch);
+    switch_if_still_active(slug, target, expect_active)
 }
 
 fn provider_supports_swap(slug: &str) -> bool {
@@ -1484,7 +1535,7 @@ fn switch_to_guarded(
                     "swap to {label} skipped: active changed to {:?} since the decision",
                     st.active
                 ));
-                return Ok(false);
+                return Ok(None);
             }
         }
         // Provider-agnostic: absorb any lagging on-disk rotations for the
@@ -1530,17 +1581,32 @@ fn switch_to_guarded(
         }
         st.active = Some(email.to_string());
         st.set_manual_pick(CLAUDE_SLUG, hold.then_some(email));
-        let hold = hold && pick_holds(&st, CLAUDE_SLUG, email);
+        let tier = pick_tier(&st, CLAUDE_SLUG, email);
+        st.set_manual_pick_tier(CLAUDE_SLUG, hold.then_some(tier.as_str()));
+        let hold = hold && tier >= autoswap::Tier::Draining;
         st.set_manual_hold(CLAUDE_SLUG, hold.then_some(email));
+        st.note_active_change(
+            CLAUDE_SLUG,
+            from.as_deref(),
+            email,
+            if expect_active.is_some() {
+                autoswap::memory::ChangeKind::Auto
+            } else {
+                autoswap::memory::ChangeKind::Manual
+            },
+        );
         // The login is already committed to the keychain + ~/.claude.json at this
         // point; if only the state.json bookkeeping write fails, say so clearly.
         if let Err(e) = st.save() {
             return Err(e).context("the login was switched but recording it in state.json failed");
         }
-        Ok(true)
+        Ok(Some((from, expect_active.is_none())))
     })?;
-    if switched {
+    if let Some((from, manual)) = switched {
         logging::log(&format!("switch -> {label}"));
+        if manual {
+            log_manual_switch(CLAUDE_SLUG, from.as_deref(), email);
+        }
         Ok(Some(label))
     } else {
         Ok(None)
@@ -2114,7 +2180,7 @@ pub(crate) fn optimize_now() -> Result<Option<String>> {
     let active = state.active.clone();
     let rows: Vec<Row> = state.accounts.iter().map(row_from_account).collect();
     let trigger = state.trigger_pct.unwrap_or(TRIGGER_PCT);
-    let best = auto_pick(&rows, trigger, trigger)?;
+    let best = auto_pick_for(&state, &rows, trigger, trigger)?;
     if active.as_deref() == Some(best.as_str()) {
         return Ok(None);
     }
@@ -2129,6 +2195,82 @@ pub(crate) fn optimize_now() -> Result<Option<String>> {
 /// account is already past target (it's all that's left) do we fall back to the
 /// least-consumed still-usable one. Operates entirely on cached rows — callers
 /// must not fetch first.
+/// `auto_pick` for the selected engine: v2 ranks with `autoswap`'s
+/// `rank_key` (runway, then use-it-or-lose-it within the rebalance horizon);
+/// the classic engine keeps its soonest-reset order.
+fn auto_pick_for(state: &State, rows: &[Row], ceiling: f64, trigger: f64) -> Result<String> {
+    if autoswap::shell::engine_v2(state) {
+        auto_pick_v2(rows, ceiling, trigger, Utc::now())
+    } else {
+        auto_pick(rows, ceiling, trigger)
+    }
+}
+
+/// Auto-pick by the v2 `rank_key`: the best Ready account by runway (an
+/// account whose weekly reset falls within the rebalance horizon first), then
+/// the Draining one with the most hard runway. Never an account at its limit.
+fn auto_pick_v2(rows: &[Row], ceiling: f64, trigger: f64, now: DateTime<Utc>) -> Result<String> {
+    if !rows.iter().any(|r| r.has_data()) {
+        bail!(
+            "no usage data yet — let the menu-bar app or `usagio watch` \
+             populate it, or pass an explicit account email"
+        );
+    }
+    let policy = autoswap::Policy::new(trigger, ceiling);
+    let memory = autoswap::SwapMemory::default();
+    let ctx = autoswap::assess::Ctx {
+        now,
+        policy: &policy,
+        memory: &memory,
+        sleep: &[],
+    };
+    let mut ranked: Vec<autoswap::assess::Assessed> = rows
+        .iter()
+        .filter(|r| r.has_data() && !r.needs_relogin && !r.no_subscription)
+        .map(|r| {
+            // Default rates: candidates are judged at the floored rate anyway,
+            // and a CLI pick must not depend on reading the usage log.
+            let mut a = autoswap::shell::account_in_from_row(r, Default::default());
+            // A cached reading is all a manual pick has; rank it as if fresh.
+            a.fetched_at = Some(now.timestamp());
+            autoswap::assess::assess(&a, false, &ctx)
+        })
+        .collect();
+    ranked.sort_by(|a, b| autoswap::assess::rank_cmp(a, b, now, None));
+    let Some(pick) = ranked
+        .iter()
+        .find(|a| matches!(a.tier, autoswap::Tier::Ready | autoswap::Tier::Draining))
+    else {
+        let soonest = ranked
+            .iter()
+            .filter_map(|a| a.blocked_until.map(|u| (a, u)))
+            .min_by_key(|(_, u)| *u);
+        match soonest {
+            Some((a, u)) => bail!(
+                "all accounts are maxed out; {} resets soonest, in {}",
+                a.key,
+                humanize_until(u)
+            ),
+            None => bail!("no account currently has room"),
+        }
+    };
+    let runway = if pick.soft_runway.is_finite() {
+        format!(
+            "{:.0} min to the trigger at the floored rate",
+            pick.soft_runway
+        )
+    } else {
+        "no limit in sight".to_string()
+    };
+    let note = if pick.tier == autoswap::Tier::Ready {
+        ""
+    } else {
+        " (all accounts near the trigger — this one lasts longest)"
+    };
+    println!("Auto-picked {} — {runway}.{note}", pick.key);
+    Ok(pick.key.clone())
+}
+
 fn auto_pick(rows: &[Row], ceiling: f64, trigger: f64) -> Result<String> {
     if !rows.iter().any(|r| r.has_data()) {
         bail!(
@@ -2789,8 +2931,12 @@ fn codex_active_refresh(acct: &ProviderAccount) -> ProviderRefreshOutcome {
 
 /// Outcome of a usage refresh.
 struct RefreshOutcome {
-    /// True if any account got HTTP 429 (caller should back off).
+    /// True if the ACTIVE account got HTTP 429 (caller should back off).
     rate_limited: bool,
+    /// The active account's usage was requested this cycle (v2 budget).
+    active_fetched: bool,
+    /// Any account's usage request 429'd this cycle (v2 storm guard).
+    saw_429: bool,
 }
 
 /// The ONE place that calls the usage API. Does all network work (token refresh
@@ -2802,15 +2948,23 @@ struct RefreshOutcome {
 /// anyway, even though `is_locked_until_reset` says to skip. Bounds staleness so
 /// an account that reset or got a temporary limit boost EARLIER than its cached
 /// reset can't stay frozen at a stale "locked" reading until the (wrong) reset.
-const MAX_LOCKED_STALENESS_SECS: i64 = 12 * 3600;
+const MAX_LOCKED_STALENESS_SECS: i64 = autoswap::policy::MAX_LOCKED_STALENESS_S;
 
 fn refresh_usage_cache(force: bool) -> RefreshOutcome {
+    refresh_usage_cache_with(force, false)
+}
+
+/// `refresh_usage_cache`, optionally deferring the ACTIVE account's fetch
+/// (`defer_active`: the v2 per-provider request budget is spent, §5.7).
+fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
     let mut state = match State::load() {
         Ok(s) => s,
         Err(e) => {
             logging::log(&format!("poll: state load failed: {e}"));
             return RefreshOutcome {
                 rate_limited: false,
+                active_fetched: false,
+                saw_429: false,
             };
         }
     };
@@ -2824,6 +2978,8 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
             logging::log(&format!("poll: provider unavailable: {e:#}"));
             return RefreshOutcome {
                 rate_limited: false,
+                active_fetched: false,
+                saw_429: false,
             };
         }
     };
@@ -2834,6 +2990,12 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
     // the user's configured trigger once so we don't reload state per account.
     let trigger_for_floor = state.trigger_pct.unwrap_or(TRIGGER_PCT);
     let now_ts = Utc::now().timestamp();
+    let v2 = autoswap::shell::engine_v2(&state);
+    // Per-account outcome for the replay rows (§6); "skip" unless fetched.
+    let mut outcomes: std::collections::HashMap<String, &'static str> =
+        std::collections::HashMap::new();
+    let mut active_fetched = false;
+    let mut saw_429 = false;
 
     let mut rate_limited = false;
     // (email, refreshed account after ensure_fresh, new cached usage or None,
@@ -3101,61 +3263,48 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
                 }
             }
         }
+        if !force && is_the_active_account && defer_active && v2 {
+            logging::log(&format!(
+                "poll: {email} active fetch deferred (event=budget_defer account={email} \
+                 why=per_minute)"
+            ));
+            continue;
+        }
         if !force && is_the_active_account && !active_just_switched {
             if let Some(cu) = &acct.cached_usage {
-                let age = now_ts - cu.fetched_at;
-                let max_pct = match (cu.session_pct, cu.weekly_pct) {
-                    (Some(s), Some(w)) => Some(s.max(w)),
-                    (Some(s), None) => Some(s),
-                    (None, Some(w)) => Some(w),
-                    (None, None) => None,
-                };
-                // v0.8.0 smart cadence: project each window forward by the
-                // actual horizon (`max(tier_floor, current_loop_interval)` —
-                // under 429 backoff the loop cadence can be 1200s vs a
-                // tier_floor of 30s, and using the tier alone would
-                // under-predict by 40× on the exact storm this feature is
-                // meant to catch, Opus adversarial BLOCKER 1). Per-window
-                // (session/weekly) so a session rollover 99→5 doesn't
-                // produce nonsense `max_pct` slopes (Opus adversarial BAD
-                // 6). If EITHER projection hits trigger, tighten one tier.
-                let tier_floor =
-                    per_account_fetch_floor_secs(max_pct, trigger_for_floor, WATCH_INTERVAL_SECS);
-                let horizon_secs = tier_floor.max(current_loop_interval_secs());
-                let projected_at_horizon = project_active_max_pct_at_horizon(
-                    email,
-                    CLAUDE_SLUG,
-                    cu.session_pct,
-                    cu.weekly_pct,
-                    horizon_secs,
-                    Utc::now(),
-                );
-                let floor = per_account_fetch_floor_secs_with_projection(
-                    max_pct,
-                    trigger_for_floor,
-                    WATCH_INTERVAL_SECS,
-                    projected_at_horizon,
-                ) as i64;
-                if age >= 0 && age < floor && !cache_crossed_reset(cu, Utc::now()) {
-                    let projection_note = projected_at_horizon
-                        .map(|p| format!(" projected_at_{horizon_secs}s={p:.1}%"))
-                        .unwrap_or_default();
-                    logging::log(&format!(
-                        "poll: {email} usage cache still fresh; skipping fetch \
-                         (event=fetch_skip_fresh account={email} age={age}s floor={floor}s{projection_note})"
-                    ));
+                if v2 {
+                    if let Some(why) =
+                        v2_active_fetch_skip(CLAUDE_SLUG, email, cu, trigger_for_floor, now_ts)
+                    {
+                        logging::log(&format!(
+                            "poll: {email} active fetch skipped (event=fetch_skip_active \
+                             account={email} why={why})"
+                        ));
+                        continue;
+                    }
+                } else if v1_active_fetch_skip(email, cu, trigger_for_floor, now_ts) {
                     continue;
                 }
             }
+        }
+        if is_the_active_account {
+            active_fetched = true;
         }
         let cu = match usage::fetch(&acct.access_token) {
             Ok(u) => {
                 record_usage_fetch_success(email);
                 let mut cu = cached_from_usage(&u);
                 attach_prepaid_balance(&mut cu, &acct);
+                if let Some(prev) = &acct.cached_usage {
+                    log_epoch_ends(CLAUDE_SLUG, email, prev, &cu);
+                }
+                outcomes.insert(email.clone(), "ok");
                 Some(cu)
             }
             Err(usage::FetchError::RateLimited) => {
+                saw_429 = true;
+                outcomes.insert(email.clone(), "429");
+                record_fetch_attempt_failed(email, now_ts);
                 // Only the ACTIVE account's 429 slows the global loop. An
                 // inactive account's 429 backs off that account alone —
                 // otherwise one idle (or dead) account pushes the loop to
@@ -3181,6 +3330,8 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
                 None
             }
             Err(usage::FetchError::Forbidden) => {
+                outcomes.insert(email.clone(), "err");
+                record_fetch_attempt_failed(email, now_ts);
                 record_usage_fetch_non_429(email);
                 if !is_the_active_account {
                     record_inactive_fetch_failure(email, now_ts);
@@ -3192,6 +3343,8 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
                 None
             }
             Err(usage::FetchError::Auth) if is_active => {
+                outcomes.insert(email.clone(), "err");
+                record_fetch_attempt_failed(email, now_ts);
                 // The active account's token was invalidated between our CAS
                 // and this fetch (Claude Code rotated again in that narrow
                 // window). Not ours to fix this cycle — skip and let the
@@ -3202,6 +3355,8 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
                 continue;
             }
             Err(e) => {
+                outcomes.insert(email.clone(), "err");
+                record_fetch_attempt_failed(email, now_ts);
                 // Any non-429, non-Auth error (network, DNS, JSON parse, …)
                 // resets the escalation counter — flaky network isn't the
                 // "server is asking us to back off" signal escalation exists
@@ -3225,14 +3380,7 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
         if let Some(cu) = &cu {
             let account_key = usage_log::AccountKey::new(CLAUDE_SLUG, email.clone());
             let prev_snap = usage_log::last_snapshot(&account_key);
-            let curr_snap = usage_log::Snapshot {
-                ts: Utc::now(),
-                provider: CLAUDE_SLUG.to_string(),
-                account: email.clone(),
-                session_pct: cu.session_pct.map(|p| p as f32),
-                weekly_pct: cu.weekly_pct.map(|p| p as f32),
-                active_model: None,
-            };
+            let curr_snap = replay_row(CLAUDE_SLUG, email, cu, is_the_active_account, "ok");
             // One NotifState for the whole tick, carried across both the
             // threshold/pace path (needs a prev snapshot) and the reset-grant
             // path (edge-triggered purely through state, so it runs even on the
@@ -3282,6 +3430,25 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
         updates.push((email.clone(), acct, cu, new_notif_state));
     }
 
+    // One replay row per account per cycle (§6): the 429/err/skip ones repeat
+    // the cached reading with its own `fetched_at`.
+    for email in &emails {
+        let outcome = outcomes.get(email).copied().unwrap_or("skip");
+        if outcome == "ok" {
+            continue;
+        }
+        if let Some(cu) = state.find(email).and_then(|a| a.cached_usage.as_ref()) {
+            let is_active = state.active.as_deref() == Some(email.as_str());
+            if outcome == "skip" && !skip_row_due(CLAUDE_SLUG, email, is_active, now_ts) {
+                continue;
+            }
+            let row = replay_row(CLAUDE_SLUG, email, cu, is_active, outcome);
+            if let Err(e) = usage_log::append(&row) {
+                logging::log(&format!("usage_log: append failed for {email}: {e:#}"));
+            }
+        }
+    }
+
     // Merge under the lock with a fresh reload so we don't clobber a switch.
     let merged = with_state_lock(|| {
         let mut st = State::load()?;
@@ -3313,7 +3480,187 @@ fn refresh_usage_cache(force: bool) -> RefreshOutcome {
         logging::log(&format!("poll: saving refreshed cache failed: {e:#}"));
     }
     logging::log("poll: done");
-    RefreshOutcome { rate_limited }
+    RefreshOutcome {
+        rate_limited,
+        active_fetched,
+        saw_429,
+    }
+}
+
+/// Whether a `skip` replay row (a cycle that didn't fetch the account) is due:
+/// at most one per 60 s for the active account and one per hour for an
+/// inactive one, whose cached reading can't change between its own fetches.
+/// 429/err rows are always written.
+fn skip_row_due(slug: &str, key: &str, active: bool, now_ts: i64) -> bool {
+    type Last = std::collections::HashMap<String, i64>;
+    static LAST: std::sync::Mutex<Option<Last>> = std::sync::Mutex::new(None);
+    let every = if active { 60 } else { 3600 };
+    let mut g = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let map = g.get_or_insert_with(Default::default);
+    let k = format!("{slug}/{key}/{active}");
+    if map.get(&k).is_some_and(|t| now_ts - t < every) {
+        return false;
+    }
+    map.insert(k, now_ts);
+    true
+}
+
+/// A decisions-log line for a manual switch (§6: every switch, including
+/// manual ones).
+fn log_manual_switch(slug: &str, from: Option<&str>, to: &str) {
+    if from.is_some_and(|f| f.eq_ignore_ascii_case(to)) {
+        return;
+    }
+    let v = serde_json::json!({
+        "ts": Utc::now().timestamp(),
+        "provider": slug,
+        "engine": "manual",
+        "action": "switching",
+        "reason": "manual",
+        "from": from,
+        "target": to,
+    });
+    if let Err(e) = usage_log::append_decision(&v) {
+        logging::log(&format!("decisions log append failed: {e:#}"));
+    }
+}
+
+/// One usage-log row for `key` (§6 replay fields).
+fn replay_row(
+    slug: &str,
+    key: &str,
+    cu: &CachedUsage,
+    active: bool,
+    outcome: &str,
+) -> usage_log::Snapshot {
+    let parse = |s: &Option<String>| {
+        s.as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc))
+    };
+    usage_log::Snapshot {
+        ts: Utc::now(),
+        provider: slug.to_string(),
+        account: key.to_string(),
+        session_pct: cu.session_pct.map(|p| p as f32),
+        weekly_pct: cu.weekly_pct.map(|p| p as f32),
+        active_model: None,
+        active: Some(active),
+        session_reset: parse(&cu.session_reset),
+        weekly_reset: parse(&cu.weekly_reset),
+        fetched_at: Some(cu.fetched_at),
+        outcome: Some(outcome.to_string()),
+    }
+}
+
+/// v1's active fetch floor (tier ramp + burn-rate projection), unchanged.
+/// Returns true to skip this cycle's fetch.
+fn v1_active_fetch_skip(email: &str, cu: &CachedUsage, trigger: f64, now_ts: i64) -> bool {
+    let age = now_ts - cu.fetched_at;
+    let max_pct = match (cu.session_pct, cu.weekly_pct) {
+        (Some(s), Some(w)) => Some(s.max(w)),
+        (Some(s), None) => Some(s),
+        (None, Some(w)) => Some(w),
+        (None, None) => None,
+    };
+    // v0.8.0 smart cadence: project each window forward by the actual
+    // horizon (`max(tier_floor, current_loop_interval)` — under 429 backoff
+    // the loop cadence can be 1200s vs a tier_floor of 30s, and using the
+    // tier alone would under-predict by 40× on the exact storm this feature
+    // is meant to catch, Opus adversarial BLOCKER 1). Per-window
+    // (session/weekly) so a session rollover 99→5 doesn't produce nonsense
+    // `max_pct` slopes (Opus adversarial BAD 6). If EITHER projection hits
+    // trigger, tighten one tier.
+    let tier_floor = per_account_fetch_floor_secs(max_pct, trigger, WATCH_INTERVAL_SECS);
+    let horizon_secs = tier_floor.max(current_loop_interval_secs());
+    let projected_at_horizon = project_active_max_pct_at_horizon(
+        email,
+        CLAUDE_SLUG,
+        cu.session_pct,
+        cu.weekly_pct,
+        horizon_secs,
+        Utc::now(),
+    );
+    let floor = per_account_fetch_floor_secs_with_projection(
+        max_pct,
+        trigger,
+        WATCH_INTERVAL_SECS,
+        projected_at_horizon,
+    ) as i64;
+    if age >= 0 && age < floor && !cache_crossed_reset(cu, Utc::now()) {
+        let projection_note = projected_at_horizon
+            .map(|p| format!(" projected_at_{horizon_secs}s={p:.1}%"))
+            .unwrap_or_default();
+        logging::log(&format!(
+            "poll: {email} usage cache still fresh; skipping fetch \
+             (event=fetch_skip_fresh account={email} age={age}s floor={floor}s{projection_note})"
+        ));
+        return true;
+    }
+    false
+}
+
+/// The active account's fetch floor under v2 (§5): the tier ramp with a 60 s
+/// TIGHT floor (no burn-rate projection — the blind projection covers that),
+/// the provider's own backoff after a failed attempt, and never while the
+/// active account is lb-blocked (R3-B2) — it is read again only once that
+/// window is reset-pending, at the 12 h cap, or on a forced refresh. Returns
+/// why it skips, or `None` to fetch.
+fn v2_active_fetch_skip(
+    slug: &str,
+    key: &str,
+    cu: &CachedUsage,
+    trigger: f64,
+    now_ts: i64,
+) -> Option<&'static str> {
+    let now = Utc::now();
+    let age = now_ts - cu.fetched_at;
+    if active_cache_lb_blocked(cu, now) && age < MAX_LOCKED_STALENESS_SECS {
+        return Some("lb_blocked");
+    }
+    if cache_crossed_reset(cu, now) {
+        return None;
+    }
+    let max_pct = match (cu.session_pct, cu.weekly_pct) {
+        (Some(s), Some(w)) => Some(s.max(w)),
+        (s, w) => s.or(w),
+    };
+    let floor = v2_active_floor_secs(max_pct, trigger, WATCH_INTERVAL_SECS) as i64;
+    if age >= 0 && age < floor {
+        return Some("fresh");
+    }
+    if active_fetch_in_backoff(slug, key, now_ts) {
+        return Some("backoff");
+    }
+    None
+}
+
+/// The cached reading has a window at the limit that hasn't reset yet (a
+/// lower bound, valid at any age): an lb-blocked account.
+fn active_cache_lb_blocked(cu: &CachedUsage, now: DateTime<Utc>) -> bool {
+    let parse = |s: &Option<String>| {
+        s.as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc))
+    };
+    [
+        (cu.session_pct, parse(&cu.session_reset)),
+        (cu.weekly_pct, parse(&cu.weekly_reset)),
+    ]
+    .into_iter()
+    .any(|(p, r)| {
+        p.is_some_and(|p| p >= autoswap::policy::BLOCKED_PCT) && r.is_none_or(|r| r > now)
+    })
+}
+
+/// v2's active fetch floor: TIGHT (in band) is 60 s, not 30 s.
+fn v2_active_floor_secs(max_pct: Option<f64>, trigger: f64, base: u64) -> u64 {
+    let Some(pct) = max_pct else { return base };
+    if pct >= trigger - WATCH_TIGHT_BAND {
+        autoswap::policy::ACTIVE_TIGHT_FLOOR_S
+    } else {
+        tier_interval_for_pct(pct, trigger, base)
+    }
 }
 
 /// Map a provider [`UsageSnapshot`] into the stored [`CachedUsage`] shape the
@@ -3371,12 +3718,35 @@ fn cache_crossed_reset(cu: &CachedUsage, now: DateTime<Utc>) -> bool {
 /// `INACTIVE_FETCH_FLOOR_SECS` floor and their own failure backoff (a reset
 /// crossing or `force` bypasses both). Returns the slugs whose ACTIVE account
 /// was rate-limited, for the poll cadence.
-fn refresh_provider_usage_caches(force: bool, trigger: f64) -> std::collections::HashSet<String> {
-    let mut rate_limited_slugs = std::collections::HashSet::new();
+/// What one `refresh_provider_usage_caches` pass saw, per provider slug.
+#[derive(Default)]
+struct ProviderRefresh {
+    /// The ACTIVE account's usage fetch was rate-limited.
+    rate_limited: std::collections::HashSet<String>,
+    /// The active account's usage was requested (v2 budget).
+    active_fetched: std::collections::HashSet<String>,
+    /// Any account's request 429'd (v2 storm guard).
+    saw_429: std::collections::HashSet<String>,
+}
+
+#[cfg(test)]
+fn refresh_provider_usage_caches(force: bool, trigger: f64) -> ProviderRefresh {
+    refresh_provider_usage_caches_with(force, trigger, &std::collections::HashSet::new())
+}
+
+/// `refresh_provider_usage_caches`, deferring the active fetch of the slugs in
+/// `defer_active` (their v2 request budget is spent, §5.7).
+fn refresh_provider_usage_caches_with(
+    force: bool,
+    trigger: f64,
+    defer_active: &std::collections::HashSet<String>,
+) -> ProviderRefresh {
+    let mut out = ProviderRefresh::default();
     let state = match State::load() {
         Ok(s) => s,
-        Err(_) => return rate_limited_slugs,
+        Err(_) => return out,
     };
+    let v2 = autoswap::shell::engine_v2(&state);
     for provider in providers::all() {
         let slug = provider.provider_id();
         if slug == CLAUDE_SLUG {
@@ -3397,7 +3767,9 @@ fn refresh_provider_usage_caches(force: bool, trigger: f64) -> std::collections:
             keys.insert(0, k);
         }
         let mut active_rate_limited = false;
-        for key in keys {
+        let mut outcomes: std::collections::HashMap<String, &'static str> =
+            std::collections::HashMap::new();
+        for key in keys.clone() {
             let Some(acct) = state.find_provider_account(slug, &key).cloned() else {
                 continue;
             };
@@ -3453,17 +3825,27 @@ fn refresh_provider_usage_caches(force: bool, trigger: f64) -> std::collections:
                     }
                 }
             }
+            if !force && is_active && v2 && defer_active.contains(slug) {
+                continue;
+            }
             if !force && is_active {
                 if let Some(cu) = &acct.cached_usage {
-                    let age = now_ts - cu.fetched_at;
-                    let max_pct = match (cu.session_pct, cu.weekly_pct) {
-                        (Some(s), Some(w)) => Some(s.max(w)),
-                        (s, w) => s.or(w),
-                    };
-                    let floor =
-                        per_account_fetch_floor_secs(max_pct, trigger, WATCH_INTERVAL_SECS) as i64;
-                    if age >= 0 && age < floor && !cache_crossed_reset(cu, Utc::now()) {
-                        continue;
+                    if v2 {
+                        if v2_active_fetch_skip(slug, &key, cu, trigger, now_ts).is_some() {
+                            continue;
+                        }
+                    } else {
+                        let age = now_ts - cu.fetched_at;
+                        let max_pct = match (cu.session_pct, cu.weekly_pct) {
+                            (Some(s), Some(w)) => Some(s.max(w)),
+                            (s, w) => s.or(w),
+                        };
+                        let floor =
+                            per_account_fetch_floor_secs(max_pct, trigger, WATCH_INTERVAL_SECS)
+                                as i64;
+                        if age >= 0 && age < floor && !cache_crossed_reset(cu, Utc::now()) {
+                            continue;
+                        }
                     }
                 }
             }
@@ -3500,22 +3882,38 @@ fn refresh_provider_usage_caches(force: bool, trigger: f64) -> std::collections:
                     Recheck::Unknown => {}
                 }
             }
+            if is_active {
+                out.active_fetched.insert(slug.to_string());
+            }
             let cu = match provider.fetch_usage(&access) {
                 Ok(snap) => {
                     record_usage_fetch_success(&tracker_key);
                     if snap.plan.is_some() {
                         plan = snap.plan.clone();
                     }
-                    Some(cached_from_usage_snapshot(&snap))
+                    let cu = cached_from_usage_snapshot(&snap);
+                    if let Some(prev) = &acct.cached_usage {
+                        log_epoch_ends(slug, &key, prev, &cu);
+                    }
+                    outcomes.insert(key.clone(), "ok");
+                    let row = replay_row(slug, &key, &cu, is_active, "ok");
+                    if let Err(e) = usage_log::append(&row) {
+                        logging::log(&format!("usage_log: append failed for {slug}/{key}: {e:#}"));
+                    }
+                    Some(cu)
                 }
                 Err(e) => {
+                    record_fetch_attempt_failed(&tracker_key, now_ts);
                     if matches!(e, ProviderError::RateLimited { .. }) {
+                        outcomes.insert(key.clone(), "429");
+                        out.saw_429.insert(slug.to_string());
                         record_usage_fetch_429(&tracker_key);
                         if is_active {
                             active_rate_limited = true;
-                            rate_limited_slugs.insert(slug.to_string());
+                            out.rate_limited.insert(slug.to_string());
                         }
                     } else {
+                        outcomes.insert(key.clone(), "err");
                         record_usage_fetch_non_429(&tracker_key);
                     }
                     if !is_active {
@@ -3559,8 +3957,31 @@ fn refresh_provider_usage_caches(force: bool, trigger: f64) -> std::collections:
                 ));
             }
         }
+        // One replay row per account per cycle (§6), Codex included.
+        for key in &keys {
+            let outcome = outcomes.get(key).copied().unwrap_or("skip");
+            if outcome == "ok" {
+                continue;
+            }
+            if let Some(cu) = state
+                .find_provider_account(slug, key)
+                .and_then(|a| a.cached_usage.as_ref())
+            {
+                let is_active = active_key
+                    .as_deref()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(key));
+                if outcome == "skip" && !skip_row_due(slug, key, is_active, Utc::now().timestamp())
+                {
+                    continue;
+                }
+                let row = replay_row(slug, key, cu, is_active, outcome);
+                if let Err(e) = usage_log::append(&row) {
+                    logging::log(&format!("usage_log: append failed for {slug}/{key}: {e:#}"));
+                }
+            }
+        }
     }
-    rate_limited_slugs
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -3799,7 +4220,20 @@ impl Cadence {
                     *cur = WATCH_TIGHT_INTERVAL_SECS;
                 }
                 let prev = *cur;
-                *cur = next_interval(*cur, base, p.rate_limited, p.max_pct, trigger, p.actionable);
+                *cur = match p.urgency {
+                    Some(u) => next_interval_v2(
+                        *cur,
+                        base,
+                        p.rate_limited,
+                        u,
+                        p.max_pct,
+                        trigger,
+                        p.actionable,
+                    ),
+                    None => {
+                        next_interval(*cur, base, p.rate_limited, p.max_pct, trigger, p.actionable)
+                    }
+                };
                 if p.rate_limited {
                     logging::log(&format!(
                         "rate limited; backing off to {}s (provider={})",
@@ -3815,9 +4249,55 @@ impl Cadence {
                     ));
                 }
             }
-            next = Some(next.map_or(*cur, |n| n.min(*cur)));
+            let mut wake = *cur;
+            if let Some(at) = p.next_check_at {
+                // Wake at `next_check_at` (a wake with no fetch due still
+                // decides), but never spin faster than the check floor.
+                let secs = (at - Utc::now()).num_seconds().max(0) as u64;
+                wake = wake.min(secs.max(NEXT_CHECK_MIN_SECS));
+            }
+            next = Some(next.map_or(wake, |n| n.min(wake)));
         }
         next.unwrap_or(self.base)
+    }
+}
+
+/// Shortest sleep a v2 `next_check_at` may request.
+const NEXT_CHECK_MIN_SECS: u64 = 15;
+
+/// The v2 cadence (§5): `actionable` and the TIGHT band come from the
+/// decision's urgency. TIGHT is 60 s (with the blind projection), an active
+/// 429 in band or Draining backs off at most to 120 s, and Draining/Blocked
+/// with nothing to catch falls back to BASE.
+fn next_interval_v2(
+    current: u64,
+    base: u64,
+    rate_limited: bool,
+    urgency: autoswap::Urgency,
+    max_pct: Option<f64>,
+    trigger: f64,
+    actionable: bool,
+) -> u64 {
+    use autoswap::policy::{ACTIVE_BAND_429_CAP_S, ACTIVE_TIGHT_FLOOR_S};
+    use autoswap::Urgency;
+    if rate_limited {
+        let doubled = (current.max(ACTIVE_TIGHT_FLOOR_S) * 2).min(WATCH_MAX_INTERVAL_SECS);
+        return if matches!(urgency, Urgency::Band | Urgency::Draining) {
+            doubled.min(ACTIVE_BAND_429_CAP_S)
+        } else {
+            doubled
+        };
+    }
+    match urgency {
+        Urgency::Draining | Urgency::Blocked => {
+            if actionable {
+                ACTIVE_TIGHT_FLOOR_S
+            } else {
+                base
+            }
+        }
+        Urgency::Band => ACTIVE_TIGHT_FLOOR_S,
+        Urgency::Calm => v2_active_floor_secs(max_pct, trigger, base),
     }
 }
 
@@ -3970,6 +4450,11 @@ struct UsageFetchTracker {
     /// Last profile (subscription) check — throttles them to
     /// `SUBSCRIPTION_RECHECK_SECS` per account.
     last_subscription_check_ts: Option<i64>,
+    /// Last usage fetch attempt (unix secs) and whether it failed — so the
+    /// v2 poller honours the active account's own backoff instead of
+    /// re-fetching on every wake (a failure doesn't advance `fetched_at`).
+    last_attempt_ts: Option<i64>,
+    last_attempt_failed: bool,
 }
 
 static USAGE_FETCH_TRACKERS: std::sync::Mutex<
@@ -4011,7 +4496,47 @@ fn record_usage_fetch_success(email: &str) {
         entry.consecutive_429s = 0;
         entry.consecutive_failures = 0;
         entry.backoff_until_ts = None;
+        entry.last_attempt_ts = Some(Utc::now().timestamp());
+        entry.last_attempt_failed = false;
     });
+}
+
+/// Record a failed usage fetch attempt (any error) for the backoff check.
+fn record_fetch_attempt_failed(key: &str, now_ts: i64) {
+    with_fetch_trackers(|t| {
+        let entry = t.entry(key.to_string()).or_default();
+        entry.last_attempt_ts = Some(now_ts);
+        entry.last_attempt_failed = true;
+    });
+}
+
+/// Per-provider poll interval (the cadence's 429-backoff seed), published by
+/// the poll loop so the v2 active fetch honours the provider's own backoff.
+static PROVIDER_INTERVALS: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
+
+fn set_provider_interval_secs(slug: &str, secs: u64) {
+    let mut g = PROVIDER_INTERVALS.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(Default::default)
+        .insert(slug.to_string(), secs);
+}
+
+fn provider_interval_secs(slug: &str) -> u64 {
+    PROVIDER_INTERVALS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(slug).copied())
+        .unwrap_or(autoswap::policy::ACTIVE_BAND_429_CAP_S)
+}
+
+/// The active account's fetch is in backoff (v2): its last attempt failed
+/// within the provider's current interval. No `NeedReading(active)` then.
+fn active_fetch_in_backoff(slug: &str, key: &str, now_ts: i64) -> bool {
+    let t = get_usage_fetch_tracker(&fetch_tracker_key(slug, key));
+    t.last_attempt_failed
+        && t.last_attempt_ts
+            .is_some_and(|a| (0..provider_interval_secs(slug) as i64).contains(&(now_ts - a)))
 }
 
 /// Backoff after `failures` consecutive failed fetches of an inactive
@@ -4251,6 +4776,9 @@ pub(crate) struct SwapGuard {
     // Settings ▸ Auto-swap ▸ "Use credits when every plan is used up".
     // Mirrors `State::use_credits_when_exhausted`, refreshed every cycle.
     use_credits: bool,
+    // Auto-swap v2's in-memory shell state for this provider (request
+    // budget, decision-log dedupe). Its persisted memory is in state.json.
+    pub(crate) v2: autoswap::shell::ShellState,
 }
 
 /// Anti-thrash state for every provider: one independent `SwapGuard` each, so
@@ -4300,6 +4828,12 @@ pub(crate) struct ProviderCycle {
     /// (single-account user, or all others full/needs_relogin) falls back to
     /// BASE instead of hammering the usage endpoint into HTTP 429 (v0.5.17).
     pub actionable: bool,
+    /// Auto-swap v2's urgency for this provider (`None` under the classic
+    /// engine): selects the v2 cadence (60 s TIGHT floor, 120 s band cap).
+    pub urgency: Option<autoswap::Urgency>,
+    /// Auto-swap v2's next check time (estimate crossing, reset, cooldown
+    /// expiry, pre-verify refresh): the loop wakes then even with no fetch due.
+    pub next_check_at: Option<DateTime<Utc>>,
 }
 
 /// Result of one poll: one entry per switchable provider with accounts.
@@ -4819,14 +5353,23 @@ fn stale_swap_candidate(
 /// — the regular refresh owns that (including saving a rotated refresh
 /// token); an expired token just means "unverified".
 fn verify_swap_target(slug: &str, key: &str) -> Option<Row> {
-    let state = State::load().ok()?;
+    verify_swap_target_detailed(slug, key).ok()
+}
+
+/// `verify_swap_target`, telling a 429 (`Err(true)`, which arms the v2 storm
+/// guard) from any other failure (`Err(false)`).
+fn verify_swap_target_detailed(slug: &str, key: &str) -> std::result::Result<Row, bool> {
+    let state = State::load().map_err(|_| false)?;
     let tracker = fetch_tracker_key(slug, key);
     let now_ts = Utc::now().timestamp();
+    let mut rate_limited = false;
+    let previous: Option<CachedUsage>;
     let fetched: std::result::Result<CachedUsage, String> = if slug == CLAUDE_SLUG {
-        let acct = state.find(key)?;
+        let acct = state.find(key).ok_or(false)?;
+        previous = acct.cached_usage.clone();
         // Claude's `expires_at` is epoch millis.
         if acct.needs_relogin || acct.expires_at <= Utc::now().timestamp_millis() {
-            return None;
+            return Err(false);
         }
         match usage::fetch(&acct.access_token) {
             Ok(u) => {
@@ -4836,6 +5379,7 @@ fn verify_swap_target(slug: &str, key: &str) -> Option<Row> {
             }
             Err(e) => {
                 if matches!(e, usage::FetchError::RateLimited) {
+                    rate_limited = true;
                     record_usage_fetch_429(&tracker);
                 } else {
                     record_usage_fetch_non_429(&tracker);
@@ -4844,15 +5388,20 @@ fn verify_swap_target(slug: &str, key: &str) -> Option<Row> {
             }
         }
     } else {
-        let acct = state.find_provider_account(slug, key)?;
+        let acct = state.find_provider_account(slug, key).ok_or(false)?;
+        previous = acct.cached_usage.clone();
         // `ProviderAccount::expires_at` is epoch seconds (0 = unknown).
         if acct.needs_relogin || (acct.expires_at != 0 && acct.expires_at <= now_ts) {
-            return None;
+            return Err(false);
         }
-        match provider_by_slug(slug).ok()?.fetch_usage(&acct.access_token) {
+        match provider_by_slug(slug)
+            .map_err(|_| false)?
+            .fetch_usage(&acct.access_token)
+        {
             Ok(snap) => Ok(cached_from_usage_snapshot(&snap)),
             Err(e) => {
                 if matches!(e, ProviderError::RateLimited { .. }) {
+                    rate_limited = true;
                     record_usage_fetch_429(&tracker);
                 } else {
                     record_usage_fetch_non_429(&tracker);
@@ -4868,10 +5417,13 @@ fn verify_swap_target(slug: &str, key: &str) -> Option<Row> {
             logging::log(&format!(
                 "swap target {slug}/{key}: usage re-check failed: {e}"
             ));
-            return None;
+            return Err(rate_limited);
         }
     };
     record_usage_fetch_success(&tracker);
+    if let Some(prev) = &previous {
+        log_epoch_ends(slug, key, prev, &cu);
+    }
     let saved = with_state_lock(|| {
         let mut st = State::load()?;
         if slug == CLAUDE_SLUG {
@@ -4887,12 +5439,53 @@ fn verify_swap_target(slug: &str, key: &str) -> Option<Row> {
             .find(|r| r.email.eq_ignore_ascii_case(key)))
     });
     match saved {
-        Ok(row) => row,
+        Ok(Some(row)) => Ok(row),
+        Ok(None) => Err(false),
         Err(e) => {
             logging::log(&format!(
                 "swap target {slug}/{key}: saving reading failed: {e:#}"
             ));
-            None
+            Err(false)
+        }
+    }
+}
+
+/// Epoch-end stranding log (§6, B18): when a window's reported reset changes
+/// (it reset), log the last pre-reset pct — how much room expired unused.
+fn log_epoch_ends(slug: &str, key: &str, old: &CachedUsage, new: &CachedUsage) {
+    for (name, old_pct, old_reset, new_reset) in [
+        (
+            "session",
+            old.session_pct,
+            old.session_reset.as_deref(),
+            new.session_reset.as_deref(),
+        ),
+        (
+            "weekly",
+            old.weekly_pct,
+            old.weekly_reset.as_deref(),
+            new.weekly_reset.as_deref(),
+        ),
+    ] {
+        let (Some(pct), Some(o), Some(n)) = (old_pct, old_reset, new_reset) else {
+            continue;
+        };
+        let parse = |s: &str| DateTime::parse_from_rfc3339(s).ok().map(|d| d.timestamp());
+        if parse(o).is_some() && parse(o) != parse(n) {
+            // R2-m4: room left on an account held back by a `trigger_left`
+            // latch is the capacity-ordering cost of the latch.
+            let latched = State::load().ok().is_some_and(|st| {
+                st.swap_memory
+                    .get(slug)
+                    .and_then(|m| m.trigger_latch(key))
+                    .is_some_and(|l| l.window.as_str() == name && l.resets_at == parse(o))
+            });
+            let unused = (100.0 - pct).max(0.0);
+            logging::log(&format!(
+                "event=epoch_end provider={slug} account={key} window={name} last_pct={pct:.0} \
+                 unused_pts={unused:.0} latched_pts={:.0} reset={o}",
+                if latched { unused } else { 0.0 }
+            ));
         }
     }
 }
@@ -4919,7 +5512,22 @@ fn watch_cycle(
     }
     credentials::refresh_inactive_if_stale(State::load().ok().and_then(|s| s.active).as_deref());
 
-    let claude_refresh = refresh_usage_cache(force);
+    // v2 budget (§5.7): an active fetch also respects the per-minute cap.
+    let budget_now = Utc::now().timestamp();
+    let spent: std::collections::HashSet<String> = providers::all()
+        .iter()
+        .map(|p| p.provider_id())
+        .filter(|slug| {
+            guards
+                .for_provider(slug)
+                .v2
+                .budget
+                .allow("", budget_now, true, false, 0)
+                .is_err()
+        })
+        .map(str::to_string)
+        .collect();
+    let claude_refresh = refresh_usage_cache_with(force, spent.contains(CLAUDE_SLUG));
     warn_expiring_logins();
     // Gap-4 (codex-switch-e2e): drive the active-account CAS refresh for
     // every non-Claude provider that has one wired (currently just codex),
@@ -4929,10 +5537,12 @@ fn watch_cycle(
             refresh_provider_active_account(p.provider_id());
         }
     }
-    let provider_rate_limited = refresh_provider_usage_caches(force, trigger);
+    let provider_refresh = refresh_provider_usage_caches_with(force, trigger, &spent);
     settle_manual_picks(trigger);
 
     let state = State::load()?;
+    let v2 = autoswap::shell::engine_v2(&state);
+    let now_ts = Utc::now().timestamp();
     let mut providers_out = Vec::new();
     for p in providers::all() {
         let slug = p.provider_id();
@@ -4947,10 +5557,18 @@ fn watch_cycle(
         if slug == CLAUDE_SLUG {
             append_history(&rows, active.as_deref());
         }
-        let rate_limited = if slug == CLAUDE_SLUG {
-            claude_refresh.rate_limited
+        let (rate_limited, active_fetched, saw_429) = if slug == CLAUDE_SLUG {
+            (
+                claude_refresh.rate_limited,
+                claude_refresh.active_fetched,
+                claude_refresh.saw_429,
+            )
         } else {
-            provider_rate_limited.contains(slug)
+            (
+                provider_refresh.rate_limited.contains(slug),
+                provider_refresh.active_fetched.contains(slug),
+                provider_refresh.saw_429.contains(slug),
+            )
         };
         let max_pct = cadence_max_pct(&rows, active.as_deref());
         let guard = guards.for_provider(slug);
@@ -4961,9 +5579,29 @@ fn watch_cycle(
             .manual_pick(slug)
             .map(|k| (slug.to_string(), k.to_string()));
         guard.use_credits = state.use_credits_when_exhausted;
-        let (swapped, actionable) = match active.as_deref() {
-            Some(a) => provider_swap_cycle(slug, &mut rows, a, trigger, ceiling, guard)?,
-            None => (None, false),
+        if active_fetched {
+            guard.v2.budget.note_request(now_ts);
+        }
+        if saw_429 {
+            guard.v2.budget.note_429(now_ts);
+        }
+        let (swapped, actionable, urgency, next_check_at) = match active.as_deref() {
+            Some(a) if v2 => {
+                let r = autoswap::shell::run_cycle(
+                    slug,
+                    &mut rows,
+                    a,
+                    trigger,
+                    ceiling,
+                    &mut guard.v2,
+                )?;
+                (r.swapped, r.actionable, Some(r.urgency), r.next_check_at)
+            }
+            Some(a) => {
+                let (s, act) = provider_swap_cycle_v1(slug, &mut rows, a, trigger, ceiling, guard)?;
+                (s, act, None, None)
+            }
+            None => (None, false, None, None),
         };
         providers_out.push(ProviderCycle {
             slug: slug.to_string(),
@@ -4972,6 +5610,8 @@ fn watch_cycle(
             rate_limited,
             max_pct,
             actionable,
+            urgency,
+            next_check_at,
         });
     }
     Ok(CycleOutcome {
@@ -4983,7 +5623,28 @@ fn watch_cycle(
 /// the swap made (from, to), if any, and whether a swap is actionable (an
 /// eligible target exists, even if a cooldown currently blocks it) — the
 /// latter drives the cadence backstop (see `next_interval`).
+/// Test entry point (`watch_cycle` dispatches inline so it can carry the v2
+/// urgency to the cadence): v2 delegates to `autoswap::shell::run_cycle`.
+#[cfg(test)]
 fn provider_swap_cycle(
+    slug: &str,
+    rows: &mut [Row],
+    active_email: &str,
+    trigger: f64,
+    ceiling: f64,
+    guard: &mut SwapGuard,
+) -> Result<(Option<(String, String)>, bool)> {
+    if autoswap::shell::engine_v2(&State::load().unwrap_or_default()) {
+        let r =
+            autoswap::shell::run_cycle(slug, rows, active_email, trigger, ceiling, &mut guard.v2)?;
+        return Ok((r.swapped, r.actionable));
+    }
+    provider_swap_cycle_v1(slug, rows, active_email, trigger, ceiling, guard)
+}
+
+/// The classic (v1) engine's cycle, kept for rollback for one release
+/// (Settings ▸ Auto-swap ▸ Engine: Classic, or `USAGIO_AUTOSWAP_ENGINE=v1`).
+fn provider_swap_cycle_v1(
     slug: &str,
     rows: &mut [Row],
     active_email: &str,
@@ -5074,7 +5735,9 @@ fn provider_swap_cycle(
             "event=swap_decision provider={slug} active={active_email} \
              active_pct={active_pct:.0}% target={target} target_pct={:.0}% action=switching{}",
             target_row.max_pct(),
-            if eval.fallback {
+            if eval.preparing {
+                " reason=prepare_reset"
+            } else if eval.fallback {
                 " reason=fallback_most_room"
             } else if eval.credits {
                 " reason=plans_used_up_using_credits"

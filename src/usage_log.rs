@@ -34,7 +34,7 @@ use crate::store;
 /// One tick of cached-usage state for one account, keyed by (provider, account).
 /// The whole point of the history log — every field is here so downstream
 /// analyses (sparkline, pace, burn rate, cost) never have to re-derive them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     pub ts: DateTime<Utc>,
     pub provider: String,
@@ -45,6 +45,29 @@ pub struct Snapshot {
     pub weekly_pct: Option<f32>,
     #[serde(default)]
     pub active_model: Option<String>,
+    /// Whether the account was the provider's active one (0.12.2+; replay).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
+    /// The windows' reported resets (0.12.2+; replay).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_reset: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_reset: Option<DateTime<Utc>>,
+    /// When the reading in this row was fetched (unix secs; 0.12.2+). A
+    /// 429/err/skip row repeats the cached reading, so this is older than `ts`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<i64>,
+    /// `"ok"`, `"429"`, `"err"` or `"skip"` (0.12.2+). Rows without it are
+    /// pre-0.12.2 successful readings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+}
+
+impl Snapshot {
+    /// A successful reading (not a 429/err/skip row repeating the cache).
+    pub fn is_reading(&self) -> bool {
+        self.outcome.as_deref().is_none_or(|o| o == "ok")
+    }
 }
 
 /// Identity of an account within a provider — the row key in the history log.
@@ -162,7 +185,11 @@ pub fn last_n_days(account: &AccountKey, days: u32) -> Vec<Snapshot> {
     };
     let now = Utc::now();
     let from = now - Duration::days(days as i64);
-    read_range_cached(&dir, account, from, now)
+    let mut rows = read_range_cached(&dir, account, from, now);
+    // 429/err/skip rows repeat the cached reading at a later `ts`; every
+    // reader (sparkline, pace, burn rate, rates) wants real readings only.
+    rows.retain(Snapshot::is_reading);
+    rows
 }
 
 // ---------------------------------------------------------------------------
@@ -322,7 +349,7 @@ pub fn last_snapshot(account: &AccountKey) -> Option<Snapshot> {
     // from the notifications eval branch, so an uncached scan of ~35 days
     // of NDJSON per tick is wasteful.
     let snaps = read_range_cached(&dir, account, now - Duration::days(35), now);
-    snaps.into_iter().next_back()
+    snaps.into_iter().rev().find(Snapshot::is_reading)
 }
 
 /// Seven-character sparkline of the last seven local days' peak weekly usage
@@ -341,6 +368,52 @@ pub fn sparkline_7d(account: &AccountKey) -> String {
 pub fn pace(account: &AccountKey) -> Option<PaceEstimate> {
     let snaps = last_n_days(account, 8);
     pace_from_snaps(&snaps)
+}
+
+/// `decisions.YYYY-MM.ndjson` under `dir` for the UTC month of `ts`.
+fn decisions_path(dir: &Path, ts: DateTime<Utc>) -> PathBuf {
+    dir.join(format!(
+        "decisions.{:04}-{:02}.ndjson",
+        ts.year(),
+        ts.month()
+    ))
+}
+
+/// Append one auto-swap decision line to this month's
+/// `decisions.YYYY-MM.ndjson` (same directory, rotation and retention as the
+/// history log). One small `writeln!` with O_APPEND, so concurrent writers
+/// never interleave a line. Rare (one line per decision change), so no
+/// batching.
+pub fn append_decision(v: &serde_json::Value) -> Result<()> {
+    let dir = log_dir()?;
+    std::fs::create_dir_all(&dir).context("creating history dir")?;
+    if !BOOT_ROTATED.swap(true, Ordering::SeqCst) {
+        let _ = rotate_files(&dir, Utc::now());
+    }
+    let path = decisions_path(&dir, Utc::now());
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&path).context("opening decisions log")?;
+    writeln!(f, "{v}").context("writing decisions log")?;
+    Ok(())
+}
+
+/// Every decision line in this month's decisions log (tests and replay).
+#[cfg(test)]
+pub fn read_decisions() -> Vec<serde_json::Value> {
+    let Ok(dir) = log_dir() else {
+        return Vec::new();
+    };
+    std::fs::read_to_string(decisions_path(&dir, Utc::now()))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -421,7 +494,8 @@ fn rotate_files(dir: &Path, now: DateTime<Utc>) -> Result<()> {
     for entry in rd.flatten() {
         let name = entry.file_name();
         let n = name.to_string_lossy();
-        if !(n.starts_with("history.") && n.ends_with(".ndjson")) {
+        let ours = n.starts_with("history.") || n.starts_with("decisions.");
+        if !(ours && n.ends_with(".ndjson")) {
             continue;
         }
         let Ok(md) = entry.metadata() else { continue };
@@ -616,6 +690,7 @@ mod tests {
             session_pct: None,
             weekly_pct: weekly,
             active_model: None,
+            ..Default::default()
         }
     }
 
