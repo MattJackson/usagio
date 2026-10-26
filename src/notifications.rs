@@ -402,6 +402,7 @@ mod tests {
             session_pct: session,
             weekly_pct: weekly,
             active_model: None,
+            ..Default::default()
         }
     }
 
