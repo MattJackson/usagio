@@ -286,6 +286,7 @@ mod tests {
             session_pct: None,
             weekly_pct: Some(weekly),
             active_model: None,
+            ..Default::default()
         }
     }
 
@@ -305,6 +306,7 @@ mod tests {
                     session_pct: None,
                     weekly_pct: Some(pct),
                     active_model: None,
+                    ..Default::default()
                 }
             })
             .collect();
@@ -450,6 +452,7 @@ mod tests {
                 session_pct: session.then_some(*y),
                 weekly_pct: (!session).then_some(*y),
                 active_model: None,
+                ..Default::default()
             })
             .collect()
     }
@@ -555,6 +558,7 @@ mod tests {
                 session_pct: session.then_some(*pct),
                 weekly_pct: (!session).then_some(*pct),
                 active_model: None,
+                ..Default::default()
             };
             let path = dir.join(format!("history.{:04}-{:02}.ndjson", ts.year(), ts.month()));
             let mut f = std::fs::OpenOptions::new()

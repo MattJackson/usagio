@@ -183,6 +183,11 @@ struct AcctView {
     login_expires_at: Option<DateTime<Utc>>,
     /// usagio can run this provider's login itself ("Renew login…").
     renewable: bool,
+    /// The account's own burn rates (auto-swap v2's rate model), for the
+    /// binding-window display. Filled for active accounts only.
+    rate: crate::autoswap::AccountRate,
+    /// The auto-swap trigger: a window at or over it binds the display.
+    trigger: f64,
 }
 
 /// One provider's block in the menu. Rendered only if `accounts` is non-empty
@@ -249,6 +254,8 @@ struct Snapshot {
     /// limit); `Some(slug)` pins the tray to one provider. Drives
     /// `tray_target` / `title_for` / `tray_icon_bytes`.
     tray_icon_mode: Option<String>,
+    /// Settings ▸ Auto-swap ▸ "Classic engine" (rollback to v1).
+    engine_classic: bool,
 }
 
 /// How near a limit a percentage is, for at-a-glance coloring.
@@ -322,6 +329,11 @@ struct RowStyle {
     /// `("noop", _, _)` arm in `handle_click`) since there's nothing to do
     /// when you click "Session resets in 3h".
     disabled_but_white: bool,
+    /// Spans (utf16 offset, length) to embolden within the row: the active
+    /// account's binding window (auto-swap v2 display, §4). Like the other
+    /// styling fields, carried as tested pure output (muri's value spans
+    /// carry color only).
+    bold_spans: Vec<(usize, usize)>,
 }
 
 impl RowStyle {
@@ -339,6 +351,7 @@ impl RowStyle {
             checkmark: false,
             grey_tail_from: None,
             disabled_but_white: false,
+            bold_spans: Vec::new(),
         }
     }
 }
@@ -671,14 +684,23 @@ const ACCOUNT_INDENT: &str = "";
 fn account_header_row(sec: &ProviderSection, a: &AcctView) -> RowStyle {
     let label = format!("{ACCOUNT_INDENT}{}", a.display);
     let base = u16len(&label) + 1; // + '\t'
-    let (trailing, rel_colors) = trailing_for_account(a, sec.severity_bands, now_utc());
+    let now = now_utc();
+    let (trailing, rel_colors) = trailing_for_account(a, sec.severity_bands, now);
     let plain = format!("{label}\t{trailing}");
     let colors = rel_colors
         .into_iter()
         .map(|(off, len, sev)| (base + off, len, sev))
         .collect();
+    let bold_spans = if a.active {
+        binding_span(a, &trailing, now)
+            .map(|(off, len)| vec![(base + off, len)])
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     RowStyle {
         bold: a.active,
+        bold_spans,
         colors,
         tab_x_kind: Some(TabX::MenuRight),
         checkmark: a.active,
@@ -779,15 +801,33 @@ fn tray_target<'a>(
         }
         // Pinned provider absent → fall through to at-risk rather than blank.
     }
-    snap.sections
+    // At risk: the active account that blocks soonest (its binding window's
+    // time to block at its own pace), falling back to the highest pct.
+    let now = now_utc();
+    let actives: Vec<(&ProviderSection, &AcctView)> = snap
+        .sections
         .iter()
         .filter_map(|sec| Some((sec, sec.accounts.iter().find(|a| a.active)?)))
-        .max_by(|(_, a), (_, b)| {
-            acct_max_pct(a)
-                .unwrap_or(-1.0)
-                .partial_cmp(&acct_max_pct(b).unwrap_or(-1.0))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        .collect();
+    let ttb = |a: &AcctView| binding_for(a, now).and_then(|b| b.time_to_block);
+    if actives.iter().any(|(_, a)| ttb(a).is_some()) {
+        return actives.into_iter().min_by(|(_, a), (_, b)| {
+            ttb(a)
+                .unwrap_or(f64::INFINITY)
+                .total_cmp(&ttb(b).unwrap_or(f64::INFINITY))
+                .then(
+                    acct_max_pct(b)
+                        .unwrap_or(-1.0)
+                        .total_cmp(&acct_max_pct(a).unwrap_or(-1.0)),
+                )
+        });
+    }
+    actives.into_iter().max_by(|(_, a), (_, b)| {
+        acct_max_pct(a)
+            .unwrap_or(-1.0)
+            .partial_cmp(&acct_max_pct(b).unwrap_or(-1.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
 }
 
 /// The tray icon bytes for the current [`tray_target`]: the target provider's
@@ -1140,6 +1180,8 @@ fn sleep_bounded_detecting_suspend(total: u64) -> bool {
         }
         let elapsed = before.elapsed().map(|d| d.as_secs()).unwrap_or(chunk);
         if is_suspend_gap(chunk, elapsed) {
+            let to = chrono::Utc::now().timestamp();
+            crate::autoswap::shell::note_sleep(to - elapsed as i64 + chunk as i64, to);
             crate::logging::log(&format!(
                 "poll: wall-clock jumped {elapsed}s over a {chunk}s sleep — system resumed from \
                  suspend; refreshing now (event=poll_wake_from_suspend gap_secs={elapsed})"
@@ -1208,6 +1250,10 @@ fn poll_loop() {
 
 /// The poll + auto-swap loop shared by the menu-bar app and `usagio watch`.
 pub(crate) fn poll_loop_with(opts: &LoopOpts) {
+    // Single engine owner (§3.5): only the process holding engine.lock polls,
+    // decides and switches; a second one (the app plus `usagio watch`) is
+    // display-only and waits for the lock, so request budgets never double.
+    let _engine_lock = acquire_engine_lock();
     let guard = shared_swap_guard();
     let mut cadence = Cadence::new(opts.base);
     let mut wd = crate::watchdog::Watchdog::default();
@@ -1221,6 +1267,12 @@ pub(crate) fn poll_loop_with(opts: &LoopOpts) {
         // v0.8.0: publish current loop cadence so the fetch-floor projection
         // uses the correct horizon under 429 backoff (see main.rs).
         set_current_loop_interval_secs(cadence.current_for(CLAUDE_SLUG));
+        for p in providers::all() {
+            crate::set_provider_interval_secs(
+                p.provider_id(),
+                cadence.current_for(p.provider_id()),
+            );
+        }
         // Self-healing health check (fd-count + keychain-write), throttled to
         // ~once a minute. The menubar poller runs under launchd, so a critical
         // fd leak that a watcher respawn can't clear escalates to a launchd
@@ -1255,6 +1307,47 @@ pub(crate) fn poll_loop_with(opts: &LoopOpts) {
         // is intentionally unused here — the loop head already re-refreshes;
         // early return just gets us there sooner.
         let _resumed = sleep_bounded_detecting_suspend(sleep_secs);
+    }
+}
+
+/// Take the engine lock (`~/.config/usagio/engine.lock`, a non-blocking
+/// flock), waiting while another process holds it. Returns the open file (the
+/// lock lives as long as it does), or `None` if the lock file can't be used at
+/// all — then this process runs the engine anyway rather than never polling.
+fn acquire_engine_lock() -> Option<std::fs::File> {
+    use fs2::FileExt;
+    let mut logged = false;
+    loop {
+        let file = crate::store::config_dir().ok().and_then(|d| {
+            let _ = std::fs::create_dir_all(&d);
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(d.join("engine.lock"))
+                .ok()
+        });
+        let Some(file) = file else {
+            crate::logging::log("event=engine_lock_unavailable ; running the engine unlocked");
+            return None;
+        };
+        if file.try_lock_exclusive().is_ok() {
+            if logged {
+                crate::logging::log("event=engine_lock_acquired");
+            }
+            return Some(file);
+        }
+        if !logged {
+            crate::logging::log(
+                "event=engine_lock_busy ; another usagio process runs auto-swap — display-only",
+            );
+            eprintln!(
+                "usagio: another usagio process (the menu-bar app?) is running auto-swap; \
+                 waiting for it to exit"
+            );
+            logged = true;
+        }
+        let _ = wait_for_poll_request(Duration::from_secs(60));
     }
 }
 
@@ -1701,6 +1794,8 @@ fn acctview_from_row(
         // Filled in by `build_snapshot`, which has the stored credential.
         login_expires_at: None,
         renewable: false,
+        rate: Default::default(),
+        trigger: TRIGGER_PCT,
     }
 }
 
@@ -1764,6 +1859,10 @@ fn build_snapshot() -> Snapshot {
         accounts.sort_by(|a, b| account_priority_cmp(a, b, now));
         let renewable = provider.login_spec().is_some();
         for a in &mut accounts {
+            if a.active && a.has_data {
+                a.rate = cached_rates(slug, &a.key, now);
+            }
+            a.trigger = threshold;
             a.renewable = renewable;
             if slug == CLAUDE_SLUG {
                 a.login_expires_at = st
@@ -1817,6 +1916,7 @@ fn build_snapshot() -> Snapshot {
         use_credits: st.use_credits_when_exhausted,
         notification_config: st.notification_config.clone(),
         tray_icon_mode: st.tray_icon_mode.clone(),
+        engine_classic: !crate::autoswap::shell::engine_v2(&st),
     }
 }
 
@@ -2195,19 +2295,42 @@ fn account_extra_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
             .iter()
             .any(|w| w.id == "weekly" && w.pct.is_some_and(|p| p >= 100.0));
         if !weekly_locked {
-            if let Some(est) = crate::burn_rate::estimate(
-                &account_key,
-                crate::providers::trait_def::Window::Weekly,
-                Utc::now(),
-            ) {
-                if est.confidence >= crate::burn_rate::CONFIDENCE_FLOOR {
-                    rows.push(crate::burn_rate::format_menu_row(&est));
-                }
+            if let Some(row) = empty_in_row(&account_key, a, Utc::now()) {
+                rows.push(row);
             }
         }
         rows.push(format!("updated {}", a.updated));
     }
     rows
+}
+
+/// The weekly "empty in" row from the one rate model (auto-swap v2's
+/// `rates` + `runway::time_to`), at the account's own pace.
+fn empty_in_row(
+    account_key: &crate::usage_log::AccountKey,
+    a: &AcctView,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    use crate::autoswap::{rates::rates_for, runway::time_to, WindowId};
+    let pct = a.windows.iter().find(|w| w.id == "weekly")?.pct?;
+    let rate = rates_for(&account_key.provider, &account_key.account, now).own(WindowId::Weekly)?;
+    let mins = time_to(pct, 100.0, rate);
+    let empty_at = if mins.is_finite() {
+        now + chrono::Duration::seconds((mins * 60.0).min(1.0e8) as i64)
+    } else {
+        now + chrono::Duration::hours(crate::burn_rate::MAX_EMPTY_IN_HOURS)
+    };
+    let reset_at = a.weekly_reset_at;
+    let est = crate::burn_rate::BurnRateEstimate {
+        window: crate::providers::trait_def::Window::Weekly,
+        current_pct: pct as f32,
+        rate_pct_per_hour: (rate * 60.0) as f32,
+        confidence: 1.0,
+        empty_at,
+        reset_at,
+        margin: reset_at.and_then(|r| (r > empty_at).then(|| r - empty_at)),
+    };
+    Some(crate::burn_rate::format_menu_row(&est))
 }
 
 /// Which optional rows `build_account_submenu_item` should append for `sec`'s
@@ -2368,7 +2491,10 @@ fn menu_signature(snap: &Snapshot) -> String {
             reg.provider_id, reg.display_name, reg.installed
         ));
     }
-    s.push_str(&format!("as={} th={:.0}", snap.autoswap, snap.threshold));
+    s.push_str(&format!(
+        "as={} th={:.0} eng={}",
+        snap.autoswap, snap.threshold, snap.engine_classic
+    ));
     s
 }
 
@@ -2473,14 +2599,198 @@ fn recovery_status(
 fn title_for(snap: &Snapshot) -> String {
     match tray_target(snap, snap.tray_icon_mode.as_deref()) {
         Some((sec, a)) => {
-            if let Some((title, _)) = recovery_status(sec, a, now_utc()) {
+            let now = now_utc();
+            if let Some((title, _)) = recovery_status(sec, a, now) {
                 return title;
             }
-            let (session, weekly) = summary_pcts(a);
-            pct(session.or(weekly))
+            binding_title(a, shown_binding(sec, a, now, snap.threshold))
         }
         None => "—".to_string(),
     }
+}
+
+/// The engine's view of an account row (display only).
+fn account_in_for(a: &AcctView) -> crate::autoswap::AccountIn {
+    use crate::autoswap::{AccountIn, WindowIn};
+    let pct_of = |id: &str| a.windows.iter().find(|w| w.id == id).and_then(|w| w.pct);
+    AccountIn {
+        session: pct_of("session").map(|pct| WindowIn {
+            pct,
+            resets_at: a.session_reset_at,
+        }),
+        weekly: pct_of("weekly").map(|pct| WindowIn {
+            pct,
+            resets_at: a.weekly_reset_at,
+        }),
+        fetched_at: a.fetched_at.map(|t| t.timestamp()),
+        rate: a.rate,
+        ..AccountIn::new(&a.key)
+    }
+}
+
+/// The window that blocks first (§4), at the account's own rate.
+fn binding_for(a: &AcctView, now: DateTime<Utc>) -> Option<crate::autoswap::runway::Binding> {
+    if !a.has_data || a.no_subscription {
+        return None;
+    }
+    crate::autoswap::runway::binding_window_at(&account_in_for(a), now, a.trigger)
+}
+
+/// Displayed binding window per (provider, account), with hysteresis. In
+/// memory only (not persisted, R2-M2).
+static BINDING_SHOWN: std::sync::Mutex<
+    Option<std::collections::HashMap<String, crate::autoswap::runway::BindingShown>>,
+> = std::sync::Mutex::new(None);
+
+/// The window to show for `a` now, folding the hysteresis state.
+fn shown_binding(
+    sec: &ProviderSection,
+    a: &AcctView,
+    now: DateTime<Utc>,
+    trigger: f64,
+) -> Option<crate::autoswap::WindowId> {
+    if !a.has_data || a.no_subscription {
+        return None;
+    }
+    // Tests render titles for many fixtures sharing keys in one process; the
+    // hysteresis itself is tested on `BindingShown::update` directly.
+    if cfg!(test) {
+        let _ = trigger;
+        return binding_for(a, now).map(|b| b.window);
+    }
+    let key = format!("{}/{}", sec.provider_id, a.key);
+    let mut g = BINDING_SHOWN.lock().unwrap_or_else(|e| e.into_inner());
+    let map = g.get_or_insert_with(Default::default);
+    let next = crate::autoswap::runway::BindingShown::update(
+        map.get(&key).copied(),
+        &account_in_for(a),
+        now,
+        trigger,
+    );
+    match next {
+        Some(n) => {
+            map.insert(key, n);
+            Some(n.window)
+        }
+        None => {
+            map.remove(&key);
+            None
+        }
+    }
+}
+
+/// Tray title for the displayed binding window: session `47%`, weekly
+/// `96%w`. With no window to show, the session (else weekly) pct.
+fn binding_title(a: &AcctView, shown: Option<crate::autoswap::WindowId>) -> String {
+    let pct_of = |id: &str| a.windows.iter().find(|w| w.id == id).and_then(|w| w.pct);
+    match shown {
+        Some(crate::autoswap::WindowId::Weekly) => match pct_of("weekly") {
+            Some(p) => format!("{p:.0}%w"),
+            None => pct(pct_of("session")),
+        },
+        Some(crate::autoswap::WindowId::Session) => pct(pct_of("session").or(pct_of("weekly"))),
+        None => {
+            let (session, weekly) = summary_pcts(a);
+            pct(session.or(weekly))
+        }
+    }
+}
+
+/// The span (offset, len) of the binding window's segment inside the
+/// trailing `sa / sb` text, for the active row.
+fn binding_span(a: &AcctView, trailing: &str, now: DateTime<Utc>) -> Option<(usize, usize)> {
+    let b = binding_for(a, now)?;
+    let (sa, sb) = trailing.split_once(" / ")?;
+    let first_is_session = a.windows.first().is_some_and(|w| w.id == "session");
+    let in_first = (b.window == crate::autoswap::WindowId::Session) == first_is_session;
+    if in_first {
+        Some((0, u16len(sa)))
+    } else {
+        Some((u16len(sa) + u16len(" / "), u16len(sb)))
+    }
+}
+
+/// `~Nm` / `~Nh Mm` for a minute count.
+fn short_minutes(m: f64) -> String {
+    if !m.is_finite() {
+        return "—".to_string();
+    }
+    let m = m.max(0.0).round() as i64;
+    if m >= 60 {
+        format!("~{}h {}m", m / 60, m % 60)
+    } else {
+        format!("~{m}m")
+    }
+}
+
+/// Tooltip body: `email — session X, weekly Y%w ← binds, blocks in ~Nm at
+/// current pace`, plus the engine's floored-rate verdict when it differs.
+fn binding_tooltip(a: &AcctView, now: DateTime<Utc>, trigger: f64) -> String {
+    use crate::autoswap::runway::time_to;
+    let s = a.windows.first().and_then(|w| w.pct);
+    let w = a.windows.get(1).and_then(|w| w.pct);
+    let ids: Vec<&str> = a.windows.iter().map(|w| w.id.as_str()).collect();
+    let b = binding_for(a, now);
+    let mark = |id: &str| -> String {
+        match b {
+            Some(b) if b.window.as_str() == id => match b.time_to_block {
+                Some(m) => format!(" ← binds, blocks in {} at current pace", short_minutes(m)),
+                None => " ← binds".to_string(),
+            },
+            _ => String::new(),
+        }
+    };
+    let weekly_txt = |p: Option<f64>| match p {
+        Some(v) => format!("{v:.0}%w"),
+        None => pct(None),
+    };
+    let first = ids.first().copied().unwrap_or("session");
+    let second = ids.get(1).copied().unwrap_or("weekly");
+    let render = |id: &str, p: Option<f64>| {
+        if id == "weekly" {
+            weekly_txt(p)
+        } else {
+            pct(p)
+        }
+    };
+    let mut out = format!(
+        "{} — session {}{}, weekly {}{}",
+        a.display,
+        render(first, s),
+        mark(first),
+        render(second, w),
+        mark(second)
+    );
+    // The engine judges with the floored rate; say so when it is stricter
+    // than the account's own pace (R2-m3).
+    if let Some(b) = b {
+        let engine = time_to(b.pct, trigger, a.rate.floored(b.window));
+        let own = b.time_to_block.unwrap_or(f64::INFINITY);
+        if engine < crate::autoswap::policy::MIN_LANDING_MIN
+            && own >= 2.0 * crate::autoswap::policy::MIN_LANDING_MIN
+        {
+            out.push_str(" · auto-swap treats it as near limit");
+        }
+    }
+    out
+}
+
+/// Rates for the binding display, recomputed at most every 30 s per account
+/// (the snapshot is rebuilt every UI tick).
+fn cached_rates(slug: &str, key: &str, now: DateTime<Utc>) -> crate::autoswap::AccountRate {
+    type RateCache = std::collections::HashMap<String, (i64, crate::autoswap::AccountRate)>;
+    static CACHE: std::sync::Mutex<Option<RateCache>> = std::sync::Mutex::new(None);
+    let k = format!("{slug}/{key}");
+    let mut g = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = g.get_or_insert_with(Default::default);
+    if let Some((at, r)) = map.get(&k) {
+        if (now.timestamp() - at).abs() < 30 {
+            return *r;
+        }
+    }
+    let r = crate::autoswap::rates::rates_for(slug, key, now);
+    map.insert(k, (now.timestamp(), r));
+    r
 }
 
 /// Render the current menu (built from the live/fixture `state.json` the
@@ -2517,9 +2827,7 @@ fn tooltip_for(snap: &Snapshot) -> String {
             if let Some((_, detail)) = recovery_status(sec, a, now_utc()) {
                 return detail;
             }
-            let s = a.windows.first().and_then(|w| w.pct);
-            let w = a.windows.get(1).and_then(|w| w.pct);
-            format!("{} — session {}, weekly {}", a.display, pct(s), pct(w))
+            binding_tooltip(a, now_utc(), snap.threshold)
         }
         None => "usagio: no active account".to_string(),
     }
@@ -2562,6 +2870,7 @@ fn handle_click(id: &str) {
         ("noop", _, _) => {}
         ("autoswap", Some("off"), None) => set_autoswap(false),
         ("autoswap", Some("credits"), None) => toggle_use_credits(),
+        ("autoswap", Some("engine"), None) => toggle_engine(),
         ("autoswap", Some("now"), None) => match optimize_now() {
             Ok(Some(email)) => {
                 notify(&format!("Switched to {email}"));
@@ -3138,6 +3447,25 @@ fn toggle_use_credits() {
     }
 }
 
+/// Settings ▸ Auto-swap ▸ "Classic engine": the rollback switch between the
+/// v2 engine (default, `autoswap_engine` unset) and the classic v1 engine
+/// (`"v1"`). Flips the stored value under the lock.
+fn toggle_engine() {
+    let r = with_state_lock(|| {
+        let mut st = State::load()?;
+        let classic = !crate::autoswap::shell::engine_v2(&st);
+        st.autoswap_engine = if classic {
+            None
+        } else {
+            Some("v1".to_string())
+        };
+        st.save()
+    });
+    if let Err(e) = r {
+        notify(&format!("Could not save the engine setting: {e}"));
+    }
+}
+
 /// Settings ▸ Tray Icon selection. `"at-risk"` clears the pin (the default —
 /// tray follows the agent closest to its limit); any other value pins the tray
 /// to that provider slug. Reads-then-writes under the lock so a stale menu
@@ -3506,6 +3834,12 @@ mod cross_platform {
             true,
             snap.use_credits,
         ));
+        autoswap_items.push(checkbox(
+            "autoswap:engine",
+            "Classic engine (before 0.12.2)",
+            true,
+            snap.engine_classic,
+        ));
         autoswap_items.push(PMenuItem::Separator);
         autoswap_items.push(action("autoswap:now", "Switch to best account now", true));
 
@@ -3770,6 +4104,8 @@ mod tests {
             reported: ReportedUsage::default(),
             login_expires_at: None,
             renewable: false,
+            rate: Default::default(),
+            trigger: TRIGGER_PCT,
         }
     }
 
@@ -3798,6 +4134,7 @@ mod tests {
             threshold: 95.0,
             notification_config: crate::notifications::NotificationConfig::default(),
             tray_icon_mode: None,
+            engine_classic: false,
         }
     }
 
@@ -3834,6 +4171,7 @@ mod tests {
             threshold: 95.0,
             notification_config: crate::notifications::NotificationConfig::default(),
             tray_icon_mode,
+            engine_classic: false,
         }
     }
 
@@ -4708,7 +5046,9 @@ mod tests {
         let rows = submenu_info_rows(&sec, &a);
         assert_eq!(rows, ["Session · Not reported", "Weekly renews in 2d"]);
         assert_eq!(summary_pcts(&a), (None, Some(40.0)));
-        assert_eq!(title_for(&one_section_snap(a)), "40%");
+        // Codex has no session window, so the binding window is weekly:
+        // `40%w` (0.12.2 binding-window display, design §4).
+        assert_eq!(title_for(&one_section_snap(a)), "40%w");
     }
 
     #[test]
@@ -4987,6 +5327,7 @@ mod tests {
             threshold: 95.0,
             notification_config: crate::notifications::NotificationConfig::default(),
             tray_icon_mode: None,
+            engine_classic: false,
         };
         let (sec, acc) = active_account(&snap).expect("active row found");
         assert_eq!(sec.provider_id, "codex");
@@ -5602,6 +5943,7 @@ mod tests {
             threshold: 95.0,
             notification_config: crate::notifications::NotificationConfig::default(),
             tray_icon_mode: None,
+            engine_classic: false,
         };
         let groups = provider_grouped_order(&snap);
         assert_eq!(groups.len(), 2, "one entry per provider");
@@ -6282,6 +6624,7 @@ mod tests {
                 session_pct: Some(10.0),
                 weekly_pct: Some(20.0 + i as f32 * 3.0),
                 active_model: None,
+                ..Default::default()
             })
             .unwrap();
         }
@@ -7027,5 +7370,140 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
+    }
+
+    // --- binding-window display (auto-swap v2, design §4) -------------------
+
+    fn rated(mut a: AcctView, rs: Option<f64>, rw: Option<f64>) -> AcctView {
+        a.rate = crate::autoswap::AccountRate {
+            session: rs,
+            weekly: rw,
+            ..Default::default()
+        };
+        a
+    }
+
+    #[test]
+    fn title_shows_the_binding_window_with_a_w_suffix() {
+        // 17:16 dev4 29/96 at 1.8/0.47: weekly blocks first → `96%w`, not `29%`.
+        let a = rated(
+            acct("dev4", Some(29.0), Some(96.0), true),
+            Some(1.8),
+            Some(0.47),
+        );
+        let sec = claude_section();
+        let shown = shown_binding(&sec, &a, test_now(), 95.0);
+        assert_eq!(binding_title(&a, shown), "96%w");
+        // 16:30 dev8 12/83 at 0.71/0.18: 124 vs 94 min → weekly `83%w`.
+        let mut b = rated(
+            acct("dev8-title", Some(12.0), Some(83.0), true),
+            Some(0.71),
+            Some(0.18),
+        );
+        b.key = "dev8-title".into();
+        let shown = shown_binding(&sec, &b, test_now(), 95.0);
+        assert_eq!(binding_title(&b, shown), "83%w");
+        // A session that blocks first shows plain `47%`.
+        let mut c = rated(
+            acct("busy-title", Some(47.0), Some(30.0), true),
+            Some(2.0),
+            Some(0.1),
+        );
+        c.key = "busy-title".into();
+        let shown = shown_binding(&sec, &c, test_now(), 95.0);
+        assert_eq!(binding_title(&c, shown), "47%");
+    }
+
+    #[test]
+    fn tooltip_names_the_binding_window_at_current_pace() {
+        let a = rated(
+            acct("dev4", Some(29.0), Some(96.0), true),
+            Some(1.8),
+            Some(0.47),
+        );
+        let t = binding_tooltip(&a, test_now(), 95.0);
+        assert!(
+            t.starts_with("dev4 — session 29%, weekly 96%w ← binds, blocks in ~9m at current pace"),
+            "{t}"
+        );
+        // The engine's floored verdict, shown when stricter than the pace.
+        let idle = rated(
+            acct("idle", Some(5.0), Some(93.0), true),
+            Some(0.0),
+            Some(0.01),
+        );
+        let t = binding_tooltip(&idle, test_now(), 95.0);
+        assert!(t.ends_with("auto-swap treats it as near limit"), "{t}");
+    }
+
+    #[test]
+    fn tray_target_at_risk_picks_the_soonest_block() {
+        // Claude 80% weekly at a fast pace blocks before Codex at 90% idle-ish.
+        let claude = rated(
+            acct("c@x", Some(10.0), Some(80.0), true),
+            Some(0.5),
+            Some(1.0),
+        );
+        let mut snap = two_section_snap(claude, Some(90.0), None);
+        snap.sections[1].accounts[0].rate = crate::autoswap::AccountRate {
+            session: Some(0.05),
+            weekly: None,
+            ..Default::default()
+        };
+        let (sec, _) = tray_target(&snap, None).unwrap();
+        assert_eq!(sec.provider_id, CLAUDE_SLUG, "20 min vs 200 min to block");
+    }
+
+    #[test]
+    fn active_row_marks_the_binding_segment() {
+        let sec = claude_section();
+        let a = rated(
+            acct("dev4", Some(29.0), Some(96.0), true),
+            Some(1.8),
+            Some(0.47),
+        );
+        let row = account_header_row(&sec, &a);
+        let (label, trailing) = row.plain.split_once('\t').unwrap();
+        let base = u16len(label) + 1;
+        assert_eq!(trailing, "29% / 96%");
+        assert_eq!(
+            row.bold_spans,
+            vec![(base + u16len("29% / "), u16len("96%"))]
+        );
+        // Inactive rows carry no binding mark.
+        let b = rated(
+            acct("x", Some(29.0), Some(96.0), false),
+            Some(1.8),
+            Some(0.47),
+        );
+        assert!(account_header_row(&sec, &b).bold_spans.is_empty());
+    }
+
+    #[test]
+    fn engine_toggle_flips_between_v2_and_classic() {
+        let _g = crate::store::ScopedConfigDir::new();
+        State::default().save().unwrap();
+        let classic = || !crate::autoswap::shell::engine_v2(&State::load().unwrap());
+        crate::env_lock::scoped_env_var(crate::autoswap::shell::ENGINE_ENV_VAR, None, || {
+            assert!(!classic(), "v2 by default");
+            handle_click("autoswap:engine");
+            assert!(classic());
+            assert_eq!(
+                State::load().unwrap().autoswap_engine.as_deref(),
+                Some("v1")
+            );
+            handle_click("autoswap:engine");
+            assert!(!classic());
+            assert_eq!(State::load().unwrap().autoswap_engine, None);
+        });
+        // The checkbox is in Settings ▸ Auto-swap and reflects the snapshot.
+        let mut snap = one_section_snap(acct("a@x", Some(1.0), Some(1.0), true));
+        snap.engine_classic = true;
+        let tree = cross_platform::menu_tree_from_snapshot(&snap);
+        let auto = find_submenu(find_submenu(&tree.items, "Settings"), "Auto-swap");
+        assert!(checked_of(auto, "autoswap:engine"));
+        let mut other = one_section_snap(acct("a@x", Some(1.0), Some(1.0), true));
+        other.engine_classic = false;
+        assert_ne!(menu_signature(&snap), menu_signature(&other));
     }
 }
