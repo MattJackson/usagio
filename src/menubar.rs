@@ -2525,6 +2525,16 @@ fn recovery_status(
         ));
     }
     let state = countdown::compute_display(&account_usage_for(active), now);
+    // Plan used up but credits still pay for requests: the account works, so
+    // the title shows what's left to spend, same as the account row.
+    if matches!(state, DisplayState::Locked { .. }) {
+        if let Some(left) = spendable_credits(active) {
+            return Some((
+                format!("{} credits", left.display_whole()),
+                format!("{} · Plan used up · using credits", active.display),
+            ));
+        }
+    }
     if matches!(state, DisplayState::Usage { .. })
         && !acct_max_pct(active).is_some_and(|p| p >= 99.5)
     {
@@ -6699,6 +6709,33 @@ mod tests {
             let (title, _) = recovery_with(now, alt).expect("recovery info");
             assert_eq!(title, "🔒 1h 0m", "{what} alternative must be skipped");
         }
+    }
+
+    #[test]
+    fn recovery_title_shows_credits_when_the_locked_account_can_spend_them() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let with_credits = |limit_reached: bool| {
+            let mut a = locked_for("active@x.com", now, true);
+            a.reported.credits = Some(Credits {
+                enabled: true,
+                used: usd(37_225),
+                limit: usd(100_000),
+                balance: usd(62_706),
+                limit_reached,
+                ..Credits::default()
+            });
+            a
+        };
+        let title_detail = |limit_reached: bool| {
+            let mut sec = claude_section();
+            sec.accounts = vec![with_credits(limit_reached)];
+            recovery_status(&sec, &with_credits(limit_reached), now).expect("recovery info")
+        };
+        let (title, detail) = title_detail(false);
+        assert_eq!(title, "$627 credits");
+        assert_eq!(detail, "active@x.com · Plan used up · using credits");
+        // Cap reached: back to the lock countdown.
+        assert_eq!(title_detail(true).0, "🔒 1h 0m");
     }
 
     #[test]
