@@ -439,6 +439,34 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn exited_unreaped_daemon_does_not_block_handoff() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let output = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .output()
+            .unwrap();
+        let start = String::from_utf8(output.stdout).unwrap();
+        child.kill().unwrap();
+        // Deliberately do not reap: this reproduces the daemon parent's zombie.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let exited = loop {
+            if !super::daemon_instance_alive(pid, start.trim()).unwrap() {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        child.wait().unwrap();
+        assert!(exited, "unreaped exited daemon blocked handoff");
+    }
+
+    #[test]
     fn daemon_exit_verification_tracks_process_generation() {
         let mut child = std::process::Command::new("sleep")
             .arg("30")
@@ -513,7 +541,7 @@ mod tests {
     }
 }
 
-/// Request Codex's graceful-only Unix drain after checking the PID generation.
+/// Request a bounded Codex restart after checking the PID generation.
 /// Returns false on hosts that use the daemon control endpoint instead.
 pub(crate) fn graceful_drain_is_idempotent() -> bool {
     cfg!(unix)
@@ -525,11 +553,29 @@ pub(crate) fn graceful_daemon_signal(pid: u32, expected_start: &str) -> Result<b
         daemon_instance_alive(pid, expected_start)?,
         "daemon process changed before drain"
     );
-    // SIGHUP is Codex's GracefulOnly signal: repeated delivery never escalates
-    // to force termination (unlike SIGTERM / a second shutdown RPC).
-    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGHUP) };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error().into());
+    // Enter shutdown, then promptly escalate instead of rejecting input for
+    // an unbounded active-turn drain. Recheck generation before each signal.
+    for _ in 0..2 {
+        if !daemon_instance_alive(pid, expected_start)? {
+            return Ok(true);
+        }
+        let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(true);
+            }
+            return Err(error.into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while daemon_instance_alive(pid, expected_start)? {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "Codex restart stop timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
     Ok(true)
 }
@@ -540,7 +586,7 @@ pub(crate) fn daemon_instance_alive(pid: u32, expected_start: &str) -> Result<bo
     anyhow::ensure!(pid > 1 && pid <= i32::MAX as u32, "invalid daemon PID");
     anyhow::ensure!(!expected_start.is_empty(), "missing daemon generation");
     let output = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .args(["-p", &pid.to_string(), "-o", "stat=", "-o", "lstart="])
         .output()?;
     if !output.status.success() {
         anyhow::ensure!(
@@ -550,7 +596,12 @@ pub(crate) fn daemon_instance_alive(pid: u32, expected_start: &str) -> Result<bo
         return Ok(false);
     }
     let actual = String::from_utf8(output.stdout)?;
-    Ok(actual.trim() == expected_start)
+    let actual = actual.trim();
+    let (status, start) = actual
+        .split_once(char::is_whitespace)
+        .ok_or_else(|| anyhow::anyhow!("invalid daemon process status"))?;
+    // Zombies have exited and released descriptors, even before parent reaping.
+    Ok(!status.starts_with('Z') && start.trim() == expected_start)
 }
 
 #[cfg(windows)]

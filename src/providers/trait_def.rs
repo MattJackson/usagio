@@ -753,7 +753,12 @@ pub trait Provider: Send + Sync + 'static {
         Ok(())
     }
 
-    /// Whether repeating a drain request can never force an active turn to stop.
+    /// Whether begin_handoff waits for process exit within a bounded deadline.
+    fn handoff_stops_synchronously(&self) -> bool {
+        false
+    }
+
+    /// Whether retrying the same stop request is supported.
     fn handoff_request_is_idempotent(&self) -> bool {
         false
     }
