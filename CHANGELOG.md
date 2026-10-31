@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-10-31
+
 - Remove the Classic auto-swap engine, its settings toggle and environment override; old saved engine settings are ignored.
 - Exclude locked accounts from the automatic At risk tray ranking. Explicit provider pins retain lock countdowns.
 - Group new-account sign-in under a provider submenu matching Capture current login.
@@ -39,6 +41,175 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Codex switching supports its default file credential store and the shared daemon control protocol tested with Codex 0.166.0. Other configured credential stores are rejected before draining or writing. Sessions owned by a separate embedded app-server cannot be transferred by restarting the shared daemon. Previously overwritten credentials require renewing that account's login; this release prevents further cross-account overwrites but cannot reconstruct lost tokens.
 
+
+## [1.0.1] - 2026-10-31
+
+### Changed
+- **Codex locks come from Codex itself.** usagio used to treat an account as
+  locked once a window reached 99.5%. For Codex it now uses OpenAI's own flag:
+  a limited account reads locked even below 100%, and one Codex still allows
+  isn't treated as locked (it shows 99%), so auto-swap no longer leaves it
+  early. Claude still uses the percentage; its API has no equivalent flag yet.
+
+### Added
+- **Codex limit resets show in the menu.** When Codex banks a rate-limit reset
+  for an account, its submenu shows "🎁 Reset available" (or "banked" until it
+  would apply). Claiming stays in Codex: usagio doesn't know Codex's claim
+  endpoint, so there's no Claim button and no notification yet.
+- **usagio logs API fields that start carrying data.** A few usage fields from
+  Anthropic and OpenAI are always empty today (Claude's `locked_reason` and
+  dollar limits, Codex's `spend_control` and extra rate limits). The first time
+  one comes back with a value, `usagio.log` gets an `api-watch:` line, so we
+  can decide from real data whether to use it.
+
+## [1.0.0] - 2026-10-31
+
+### Added
+- **Your plan shows under Anthropic's own name.** Claude accounts on the new
+  Ultra plan show "Plan · Ultra" instead of "Max 20x". The name comes from
+  Anthropic, so future renames show up without an update.
+
+### Changed
+- **Accounts with only a weekly limit show one number.** Claude Ultra and
+  Codex have no 5-hour session window, so their row shows "66%" instead of
+  "— / 66%". The tooltip and submenu no longer mention the missing session.
+- **Shorter weekly forecast row.** It reads "Weekly · 66% · empty in ~3h" or
+  "Weekly · 66% · lasts to reset", and fits the submenu.
+- **Cleaner credits row.** "Credits · $12.34 / $50 used", and once the cap is
+  hit "Credits · $1,000 limit reached". Codex credit balances show two
+  decimals ("636.49" rather than "636.4935245000").
+
+### Fixed
+- **The weekly forecast no longer calls a window safe when it runs out first.**
+  An account set to run out in under an hour, with its reset days away, read
+  "empty in ~59m · safe for this cycle". It now reads "empty in ~59m".
+
+## [0.12.3] - 2026-10-29
+
+### Fixed
+- **The menu bar shows credits left when the active account runs on
+  credits.** Once an account's plan limit was used up but usage credits were
+  still paying for requests, its row in the menu showed the credits left, but
+  the menu bar still showed a lock and the countdown to the reset. The menu
+  bar now shows the same credits figure (e.g. "$627 credits"), and goes back
+  to the countdown once the credits run out or hit their cap.
+
+## [0.12.2] - 2026-10-26
+
+### Fixed
+- **A "too many requests" reply no longer swaps you off a healthy account.**
+  When usagio's own usage check got a 429 near the trigger, it treated that
+  as "the account is at its limit" and switched — twice in one afternoon,
+  both times on readings that were 31 seconds old and well under the
+  trigger. A 429 now just means "no new reading": usagio keeps the account,
+  and if it stays blind near the trigger for more than two minutes it
+  assumes the worst plausible pace and moves to an account it has just
+  checked, before the limit is reached.
+- **Auto-swap no longer leaves you stuck on an account that's at 100%.** If
+  the account you're on is out of room and another account has room,
+  usagio switches right away — even if it switched recently, even if the
+  other account's last reading is a few minutes old. Before, it could sit on
+  a full account for minutes while a roomy one was available, until you
+  switched by hand.
+- **It picks the account that lasts longest, not the one that resets
+  soonest.** Targets are now judged by how many minutes of use they have
+  left at your pace, across both the 5-hour and the weekly limit. An account
+  3 points from the trigger is no longer chosen over one with room just
+  because its weekly reset is a few hours sooner.
+- **No more ping-pong near the limit.** An account you were moved off is not
+  moved back to in the same limit period, two nearly-full accounts no longer
+  trade places, and the last few points are used in an orderly way: usagio
+  rides the current account to 99%, moves once to an account with real room
+  left, and only then uses up the rest.
+
+### Changed
+- **The menu bar shows the limit that runs out first.** The tray percentage
+  used to be the 5-hour limit even when the weekly limit was about to run
+  out. It now shows whichever limit will block first, with a `w` for weekly:
+  **96%w**. The tooltip says which limit binds and when it would run out at
+  your current pace. Codex, which has no 5-hour limit, shows its weekly one
+  (`1%w`).
+- Near the trigger, usagio checks usage once a minute instead of every 30
+  seconds, and backs off for at most 2 minutes after a 429 there — the
+  30-second checks were what drew the 429s. It never re-checks an account
+  that's at 100% until its limit resets.
+- Manual switches work as before: an account you pick stays until it reaches
+  the trigger (on a real reading), and one you pick at or over the trigger
+  stays until it's used up. A hand-picked account that's used up is still
+  left for one with room, and never swapped away just to wait for a reset.
+- Swap decisions are now written to `decisions.YYYY-MM.ndjson` next to the
+  usage history (and the usage history records every check, including
+  Codex accounts), so a bad switch can be replayed and explained.
+
+### Rollback
+If the new auto-swap misbehaves for you, switch back to the previous one:
+**Settings ▸ Auto-swap ▸ Classic engine (before 0.12.2)**. It takes effect on
+the next check, no restart needed, and your manual picks carry over. For
+`usagio watch` you can also set `USAGIO_AUTOSWAP_ENGINE=v1`. The classic
+engine will be removed in the next release.
+
+## [0.12.1] - 2026-10-25
+
+### Fixed
+- **Auto-swap gets the next account ready again after a manual switch.** If
+  you switched by hand to an account that was already at its limit, usagio
+  kept treating it as "your pick" even after its limit reset and it was used
+  up again. When every account was then out of room, it stayed put instead of
+  moving to the account that resets soonest, so the swap only happened once
+  that account's reset had already passed. The hold on a hand-picked account
+  now ends once its limit resets.
+
+## [0.12.0] - 2026-10-23
+
+### Added
+- **Auto-swap can fall back to usage credits.** New setting: **Settings ▸
+  Auto-swap ▸ Use credits when every plan is used up** (off by default — it
+  spends real money). When it's on and every account's plan usage is used
+  up, usagio switches to the account with the most usage credits left to
+  spend instead of leaving you stuck. Plan usage always comes first: an
+  account with plan room left is picked over any credits, and usagio moves
+  off credits as soon as a plan account frees up.
+- **An account running on credits shows what's left to spend.** A locked
+  account that can still work on usage credits now shows e.g.
+  **$627 credits** in the menu instead of a red unlock countdown, and its
+  submenu reads *Weekly locked · unlocks in 4d 4h · using credits*. "Left to
+  spend" is the smaller of your wallet balance and what's left under your
+  monthly cap.
+
+### Changed
+- While you're working on credits, usagio no longer switches you to another
+  locked account just to be ready for its reset, and no longer sends the
+  "no better target" notification.
+- Money amounts use thousands separators ($1,000.00).
+
+## [0.11.1] - 2026-10-23
+
+### Fixed
+- **Credits now show your real usage-credit balance.** A Claude account with
+  usage credits turned on showed only the monthly spend cap (e.g.
+  *"Credits · $0.00 used of $100.00"*), never the money in the wallet:
+  Anthropic's usage endpoint reports the balance as empty. usagio now reads it
+  from the same place Claude Code does, and the row leads with it:
+  **Credits · $903.35 left · $54.63 used of $100.00**. If a balance read
+  fails, the last known balance stays rather than disappearing.
+- The fallback spend figure (used when the usage response carries no `spend`
+  block) now parses the decimal value Anthropic actually sends.
+
+## [0.11.0] - 2026-10-15
+
+### Added
+- **usagio now shows — and lets you claim — a banked usage-limit reset.**
+  When Anthropic grants your account a one-shot limit reset (the kind handed
+  out with a launch or referral promo), the account's submenu shows a
+  **🎁 Reset available · claim below** row, and a **Claim reset…** action
+  spends it. A reset that's banked for later (usable only once you're actually
+  limited) shows as **🎁 Reset banked · usable once you're limited** with its
+  expiry, and no claim button until it can be spent. Claiming is always
+  manual — usagio never spends a one-shot reset on its own.
+- **A notification the moment a reset lands.** You get a *"🎁 You got a
+  usage-limit reset!"* banner the first time a grant appears, and a separate
+  *"You're out of usage — claim your banked reset now"* alert when you're
+  blocked and a reset is ready to spend. Each fires once per grant.
 
 ## [0.10.5] - 2026-10-14
 
@@ -460,6 +631,42 @@ Codex switching supports its default file credential store and the shared daemon
   website screenshot pipeline now uses it for deterministic, real per-fixture
   captures on all three OSes.
 
+## [0.6.2] - 2026-09-11
+
+The OEM-fidelity release: usagio's tray menu now renders through muri 0.11's **native API** and matches a real NSMenu.
+
+### Look & feel (macOS)
+- **Native OEM menu**, verified against a real Time Machine NSMenu reference: **bold only on the active account row**, the real **SF menu font** with native tracking, native row pitch, and the live popup now shows the **`Material::Menu` vibrancy** instead of a flat gray fill (muri #64).
+- **300pt minimum width** so the dense account / `S% / W%` rows aren't cramped.
+- **Per-window value colors** — session and weekly percentages tint independently: **amber at 80–89%, red at 90%+**.
+
+### Features
+- **Agent-aware tray icon** — show an "at risk" indicator or a specific registered agent (Claude / Codex), selectable in Settings.
+- **Headless screenshot pipeline** — `usagio __render_shot <theme>` rasterizes the menu with no display/tray/accessibility (muri #59); the website's 3-OS screenshots are now deterministic real renders.
+
+### Also in this line (0.6.1)
+- **Codex end-to-end** (capture / list / usage parsing) and the CLI mirrors the menu.
+- **Robust poll loop** — skips refreshing locked-until-reset accounts (fixes a 429 storm that showed stale usage) and is suspend-aware across sleep/battery-out.
+- muri **caret-pin** so a stale lockfile can't hold an old backend.
+
+**Product guarantee unchanged:** usagio never mints a token for the *active* account — account switching always works.
+
+**Full Changelog**: https://github.com/MattJackson/usagio/compare/v0.6.1...v0.6.2
+
+## What's Changed
+* muri 0.11: migrate off frozen muda-compat to native muri API (fixes live bold, agent icon+title) by @MattJackson in https://github.com/MattJackson/usagio/pull/25
+* tray: agent-aware icon/% with 'at risk' default + Settings ▸ Tray Icon picker by @MattJackson in https://github.com/MattJackson/usagio/pull/22
+* screenshots: headless render-to-PNG (muri #59) — fixes blank macOS CI captures, all OEM themes from one host by @MattJackson in https://github.com/MattJackson/usagio/pull/24
+* Per-window value colors (session/weekly independent) + red@90 + muri 0.11.1 by @MattJackson in https://github.com/MattJackson/usagio/pull/26
+* Promote 0.6.2 to qa: muri 0.11.3 native OEM look (bg vibrancy #64), 300pt width, per-window colors by @MattJackson in https://github.com/MattJackson/usagio/pull/27
+* screenshots: headless __render_shot capture (fix Hero-screenshots pipeline) by @MattJackson in https://github.com/MattJackson/usagio/pull/28
+* docs(screenshots): sync headless-pipeline docs into 0.6.2 by @MattJackson in https://github.com/MattJackson/usagio/pull/29
+* changelog: document 0.6.1 and 0.6.2 (final for release) by @MattJackson in https://github.com/MattJackson/usagio/pull/30
+* Release 0.6.2: muri 0.11 native OEM menu (bg vibrancy, per-window colors, 300pt width) + headless screenshots by @MattJackson in https://github.com/MattJackson/usagio/pull/31
+
+
+**Full Changelog**: https://github.com/MattJackson/usagio/compare/v0.6.1...v0.6.2
+
 ## [0.6.1] - 2026-09-11
 
 ### Fixed
@@ -486,6 +693,50 @@ Codex switching supports its default file credential store and the shared daemon
   layout, grouping, icons, and behavior. macOS is unchanged (its NSMenu styler
   still uses muda's `ns_menu()`). Surfaced and got two upstream muri fixes
   (`MenuId::new`, `compat::tray_icon::menu` re-export) landed in muri 0.9.4.
+
+## [0.6.0-rc8] - 2026-09-10
+
+### Changed
+- chore(deps): bump muri 0.10.0 -> 0.10.1 (#15 docs+tests, no runtime change); qa(windows): drop post-open right-click that muri's dismiss closes the menu on
+- chore(deps): bump muri 0.9.7 -> 0.10.0 (adds Icon::Svg rendering; additive, no usagio render change)
+
+## [0.6.0-rc7] - 2026-09-10
+
+### Changed
+- chore(deps): bump muri 0.9.6 -> 0.9.7 (OS accent on Windows/Linux #14; rounds out OEM appearance)
+
+## [0.6.0-rc6] - 2026-09-10
+
+### Changed
+- chore(deps): bump muri 0.9.5 -> 0.9.6 (native OS menu font #10; macOS native dismiss #11)
+
+## [0.6.0-rc5] - 2026-09-10
+
+### Changed
+- menubar: pass \t through to muri (0.9.5 #12 two-column tab-stop) instead of inline ' · '; update strict_cfg lines
+
+## [0.6.0-rc4] - 2026-09-10
+
+### Changed
+- chore(deps): bump muri 0.9.3 -> 0.9.4 (menu provider icons render #9; tray Drop cleanup; audit fixes)
+- menubar(macos): render tray menu through muri, drop tray-icon/muda
+
+## [0.6.0-rc3] - 2026-09-10
+
+### Changed
+- chore(deps): bump muri 0.9.2 -> 0.9.3 (text-title status item — unblocks macOS %; completes muri #8)
+
+## [0.6.0-rc2] - 2026-09-10
+
+### Changed
+- chore(deps): bump muri 0.9.1 -> 0.9.2 (facade now installs a live tray + renders the icon; fixes muri #6/#7)
+
+## [0.6.0-rc1] - 2026-09-10
+
+### Changed
+- chore: bump to 0.6.0 (muri muda-compat backend swap; feature-identical to 0.5.23)
+- chore(deps): bump muri to 0.9.1 and drop muda-compat workarounds
+- feat(win/linux): render tray menu via muri 0.9 muda-compat facade (0.6.0)
 
 ## [0.5.23] - 2026-09-10
 
