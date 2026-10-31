@@ -127,6 +127,7 @@ muri = { version = "0.14.7", features = ["muda-compat"] }
 wry = { version = "0.57", default-features = false, features = ["os-webview"] }
 raw-window-handle = "0.6"
 url = "2"
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 
 # macOS menu bar is driven by a native NSApplication run loop (no tao): tao added
 # its run-loop observer to kCFRunLoopCommonModes, which fires during a status
@@ -253,6 +254,7 @@ windows = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Console", # GetConsoleWindow — hide the menubar daemon's console
+    "Win32_System_Threading", # Verify daemon exit and PID generation during handoff
     # "Renew login…" sign-in window (src/login/window.rs): its own Win32
     # window hosting WebView2, which needs an STA thread.
     "Win32_Graphics_Gdi",

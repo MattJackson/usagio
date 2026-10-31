@@ -3411,9 +3411,13 @@ fn handle_switch(slug: &str, key: &str) {
     };
     match result {
         Ok(label) => {
-            let g = guard.for_provider(slug);
-            g.last_swap = Some(std::time::Instant::now());
-            notify(&format!("Switched to {label}"));
+            if crate::provider_switch_pending(slug, key) {
+                notify(&format!("Switch to {label} queued until idle"));
+            } else {
+                let g = guard.for_provider(slug);
+                g.last_swap = Some(std::time::Instant::now());
+                notify(&format!("Switched to {label}"));
+            }
             request_poll_now();
         }
         Err(e) => notify(&format!("Switch failed: {e}")),

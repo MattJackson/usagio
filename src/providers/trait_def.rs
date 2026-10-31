@@ -445,6 +445,8 @@ pub struct LoginSpec {
     /// Loopback redirect port; `None` = any free port. Some vendors register
     /// one fixed port (Codex: 1455).
     pub redirect_port: Option<u16>,
+    /// Registered loopback host (localhost or the IPv4 loopback literal).
+    pub redirect_host: &'static str,
     /// Loopback redirect path, e.g. `/callback`.
     pub redirect_path: &'static str,
     /// Vendor-specific authorize query params, added verbatim.
@@ -461,6 +463,15 @@ pub enum TokenRequestStyle {
     Json { include_state: bool },
     /// `application/x-www-form-urlencoded` (RFC 6749 §4.1.3).
     Form,
+}
+
+/// Runtime metadata used by the shared handoff policy.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClientStatus {
+    pub running: bool,
+    pub busy: bool,
+    pub account_key: Option<String>,
+    pub handoff_token: Option<String>,
 }
 
 /// How to launch the vendor CLI after a swap. Providers that don't shell out
@@ -670,6 +681,14 @@ pub trait Provider: Send + Sync + 'static {
         Err(ProviderError::Unsupported)
     }
 
+    /// Refresh a saved credential, preserving vendor metadata alongside tokens.
+    /// Ownership, serialization and persistence belong to the lifecycle engine.
+    fn refresh_credential(&self, blob: &str, refresh: &str) -> PResult<(TokenGrant, String)> {
+        let grant = self.refresh_token(refresh)?;
+        let updated = self.patch_stored_blob(blob, &grant)?;
+        Ok((grant, updated))
+    }
+
     /// Whether this provider's refresh grant is fully programmatic (a plain
     /// HTTPS POST `usagio` can issue itself, with no vendor CLI / browser
     /// step required) and therefore safe to drive proactively — including,
@@ -719,6 +738,34 @@ pub trait Provider: Send + Sync + 'static {
     /// Read whatever the vendor CLI currently considers the active identity.
     fn read_active_identity(&self) -> PResult<Option<IdentitySnapshot>> {
         Err(ProviderError::Unsupported)
+    }
+
+    /// Inspect a client that caches credentials. Stateless clients need no handoff.
+    fn client_status(&self) -> PResult<ClientStatus> {
+        Ok(ClientStatus::default())
+    }
+
+    /// Load the newly written credentials and verify the running identity.
+    /// Called only after the shared engine permits the handoff.
+    fn begin_handoff(&self, token: &str) -> PResult<()> {
+        let _ = token;
+        Ok(())
+    }
+
+    /// Whether repeating a drain request can never force an active turn to stop.
+    fn handoff_request_is_idempotent(&self) -> bool {
+        false
+    }
+
+    /// Confirm that the drained instance has fully exited before credentials change.
+    fn verify_handoff_stopped(&self, token: &str) -> PResult<()> {
+        let _ = token;
+        Ok(())
+    }
+
+    fn handoff_client(&self, identity: &IdentitySnapshot, token: Option<&str>) -> PResult<()> {
+        let _ = (identity, token);
+        Ok(())
     }
 
     /// Launch the vendor CLI in the given mode (fresh session vs continue).
