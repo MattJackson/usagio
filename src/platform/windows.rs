@@ -50,6 +50,51 @@ use std::time::Duration;
 // modules.
 use muri::{Icon as MuriIcon, Menu, MenuEvent, Tray, TrayHandle};
 
+pub(super) fn daemon_instance_alive(pid: u32, expected_start: &str) -> Result<bool> {
+    use ::windows::Win32::Foundation::{
+        ERROR_INVALID_PARAMETER, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use ::windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_SYNCHRONIZE,
+    };
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
+    anyhow::ensure!(
+        pid > 1 && !expected_start.is_empty(),
+        "invalid daemon instance"
+    );
+    let handle = match unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        )
+    } {
+        Ok(handle) => unsafe { OwnedHandle::from_raw_handle(handle.0) },
+        Err(error)
+            if error.code() == ::windows::core::HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) =>
+        {
+            return Ok(false)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let raw = HANDLE(handle.as_raw_handle());
+    match unsafe { WaitForSingleObject(raw, 0) } {
+        WAIT_OBJECT_0 => return Ok(false),
+        WAIT_TIMEOUT => {}
+        _ => return Err(std::io::Error::last_os_error().into()),
+    }
+    let mut created = FILETIME::default();
+    let mut exited = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    unsafe { GetProcessTimes(raw, &mut created, &mut exited, &mut kernel, &mut user) }?;
+    // Codex stores the Windows creation FILETIME as a decimal generation token.
+    let generation = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+    Ok(generation.to_string() == expected_start)
+}
+
 pub struct WindowsPlatform {
     menu: WindowsMenu,
     secrets: WindowsSecrets,

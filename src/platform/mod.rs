@@ -439,6 +439,38 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn daemon_exit_verification_tracks_process_generation() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let output = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .output()
+            .unwrap();
+        let start = String::from_utf8(output.stdout).unwrap();
+        let token = serde_json::json!({"pid": pid, "start": start.trim()}).to_string();
+        let alive = super::daemon_instance_alive(pid, start.trim());
+        let pending = crate::providers::Provider::verify_handoff_stopped(
+            &crate::providers::codex::CodexProvider,
+            &token,
+        );
+        let wrong_generation = super::daemon_instance_alive(pid, "different process generation");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(alive.unwrap());
+        assert!(pending.is_err());
+        assert!(!wrong_generation.unwrap());
+        assert!(!super::daemon_instance_alive(pid, start.trim()).unwrap());
+        crate::providers::Provider::verify_handoff_stopped(
+            &crate::providers::codex::CodexProvider,
+            &token,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn secure_permissions_unix_chmods_regular_file_to_0600() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("secret.txt");
@@ -479,4 +511,54 @@ mod tests {
             "error should identify the operation: {msg}"
         );
     }
+}
+
+/// Request Codex's graceful-only Unix drain after checking the PID generation.
+/// Returns false on hosts that use the daemon control endpoint instead.
+pub(crate) fn graceful_drain_is_idempotent() -> bool {
+    cfg!(unix)
+}
+
+#[cfg(unix)]
+pub(crate) fn graceful_daemon_signal(pid: u32, expected_start: &str) -> Result<bool> {
+    anyhow::ensure!(
+        daemon_instance_alive(pid, expected_start)?,
+        "daemon process changed before drain"
+    );
+    // SIGHUP is Codex's GracefulOnly signal: repeated delivery never escalates
+    // to force termination (unlike SIGTERM / a second shutdown RPC).
+    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGHUP) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(true)
+}
+
+/// A missing control socket is not proof that the process released its sessions.
+#[cfg(unix)]
+pub(crate) fn daemon_instance_alive(pid: u32, expected_start: &str) -> Result<bool> {
+    anyhow::ensure!(pid > 1 && pid <= i32::MAX as u32, "invalid daemon PID");
+    anyhow::ensure!(!expected_start.is_empty(), "missing daemon generation");
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output()?;
+    if !output.status.success() {
+        anyhow::ensure!(
+            output.status.code() == Some(1) && output.stdout.is_empty(),
+            "could not inspect daemon process"
+        );
+        return Ok(false);
+    }
+    let actual = String::from_utf8(output.stdout)?;
+    Ok(actual.trim() == expected_start)
+}
+
+#[cfg(windows)]
+pub(crate) fn daemon_instance_alive(pid: u32, expected_start: &str) -> Result<bool> {
+    windows::daemon_instance_alive(pid, expected_start)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn graceful_daemon_signal(_pid: u32, _expected_start: &str) -> Result<bool> {
+    Ok(false)
 }

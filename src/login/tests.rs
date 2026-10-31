@@ -9,6 +9,7 @@ fn spec(token_url: &'static str, style: TokenRequestStyle) -> LoginSpec {
         client_id: "client-123",
         scopes: &["user:profile", "user:inference"],
         redirect_port: None,
+        redirect_host: "localhost",
         redirect_path: "/callback",
         extra_authorize_params: &[("code", "true")],
         login_hint_param: Some("login_hint"),

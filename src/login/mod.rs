@@ -164,7 +164,7 @@ impl Loopback {
         listener.set_nonblocking(true)?;
         Ok(Loopback {
             listener,
-            redirect_uri: format!("http://localhost:{port}{}", spec.redirect_path),
+            redirect_uri: format!("http://{}:{port}{}", spec.redirect_host, spec.redirect_path),
             path: spec.redirect_path,
         })
     }
