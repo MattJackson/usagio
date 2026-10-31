@@ -93,7 +93,7 @@ pub fn estimate(
     })
 }
 
-/// Render a short menu row: "Weekly · 61% · empty in ~40m" when the window
+/// Render a short menu row: "Weekly · 61% · ~40m" when the window
 /// runs out before it resets, "Weekly · 61% · lasts to reset" when it
 /// doesn't (or the pace is flat), "Weekly · 61% · pace flat" with no reset.
 /// The reset time itself is on the "renews in" row, so it isn't repeated.
@@ -106,10 +106,7 @@ pub fn format_menu_row(est: &BurnRateEstimate) -> String {
     let tail = match est.reset_at {
         Some(reset) if flat || est.empty_at >= reset => "lasts to reset".to_string(),
         _ if flat => "pace flat".to_string(),
-        _ => format!(
-            "empty in ~{}",
-            format_short_duration(est.empty_at - Utc::now())
-        ),
+        _ => format!("~{}", format_short_duration(est.empty_at - Utc::now())),
     };
     format!("{name} · {:.0}% · {tail}", est.current_pct)
 }
@@ -322,10 +319,10 @@ mod tests {
             Duration::minutes(59) + Duration::seconds(30),
             Some(Duration::days(6)),
         );
-        assert_eq!(format_menu_row(&e), "Weekly · 61% · empty in ~59m");
+        assert_eq!(format_menu_row(&e), "Weekly · 61% · ~59m");
         // Mid-minute, so a slow runner can't tick it over a boundary.
         let e = est(15.0, Duration::minutes(119) + Duration::seconds(50), None);
-        assert_eq!(format_menu_row(&e), "Weekly · 61% · empty in ~1h 59m");
+        assert_eq!(format_menu_row(&e), "Weekly · 61% · ~1h 59m");
     }
 
     #[test]

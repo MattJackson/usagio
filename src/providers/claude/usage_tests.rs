@@ -279,12 +279,12 @@ fn parse(v: serde_json::Value) -> Usage {
 }
 
 #[test]
-fn live_shape_parses_with_no_credits_and_raw_extras() {
+fn live_shape_preserves_disabled_credits_and_raw_extras() {
     let u = parse(live_usage_json());
     assert_eq!(u.seven_day.as_ref().unwrap().utilization, Some(73.0));
     let r = reported_usage(&u);
-    // Extra usage off and $0.00 spent → nothing worth showing.
-    assert!(r.credits.is_none());
+    // Preserve the explicit off state so the menu can show Credits · 0.
+    assert!(!r.credits.as_ref().unwrap().enabled);
     // The breakdown is carried as reported (the menu decides it's noise).
     assert_eq!(r.breakdown.len(), 4);
     assert_eq!(r.breakdown[0].label, "Claude Code");
@@ -390,7 +390,10 @@ fn all_null_extras_report_nothing() {
     v["spend"]["used"] = serde_json::Value::Null;
     v["seven_day_breakdown"]["rows"] = serde_json::json!([]);
     v["limits"] = serde_json::json!([]);
-    assert!(reported_usage(&parse(v)).is_empty());
+    let r = reported_usage(&parse(v));
+    assert!(!r.credits.as_ref().unwrap().enabled);
+    assert!(r.breakdown.is_empty());
+    assert!(r.scoped_limits.is_empty());
 }
 
 #[test]
