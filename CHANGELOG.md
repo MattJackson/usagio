@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-10-31
+
 - Remove the Classic auto-swap engine, its settings toggle and environment override; old saved engine settings are ignored.
 - Exclude locked accounts from the automatic At risk tray ranking. Explicit provider pins retain lock countdowns.
 - Group new-account sign-in under a provider submenu matching Capture current login.
