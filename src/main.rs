@@ -1977,7 +1977,7 @@ impl Cell {
     }
 }
 
-/// Short plan label from the captured `oauthAccount` ("Max 20x", "Pro", …).
+/// Short plan label from the captured `oauthAccount` ("Ultra", "Max 20x", "Pro", …).
 /// A lapsed subscription is always "Free", whatever was captured.
 fn claude_plan_label(a: &Account) -> Option<String> {
     if a.no_subscription {
@@ -1988,7 +1988,11 @@ fn claude_plan_label(a: &Account) -> Option<String> {
     }
     let o = a.oauth_account.as_ref()?;
     let get = |k: &str| o.get(k).and_then(|v| v.as_str());
-    usage::plan_label(get("organizationType"), get("organizationRateLimitTier"))
+    usage::plan_label(
+        get("planDisplayName"),
+        get("organizationType"),
+        get("organizationRateLimitTier"),
+    )
 }
 
 /// Build a display row from an account's cached usage (never fetches).

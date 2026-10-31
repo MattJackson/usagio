@@ -157,7 +157,7 @@ active account's **session %** at a glance. Click it for a dropdown:
   - a stats block — `Session X% · resets in …`, `Weekly X% · resets in …`, Opus if
     present, and `updated Xm ago`
   - anything extra the provider itself reports, only when there's something to
-    show: credits / extra-usage spend (`Credits · $12.34 used of $50.00`,
+    show: credits / extra-usage spend (`Credits · $12.34 / $50 used`,
     `Credits · 120 left`), where this week's usage went
     (`This week · Claude Code 82% · Chats 18%`), and per-model weekly limits in
     use (`Fable 7d · 42% · resets in 2d 3h`). Never estimated.
