@@ -507,13 +507,9 @@ pub struct State {
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub manual_pick_tier: std::collections::HashMap<String, String>,
     /// Auto-swap v2's persisted swap memory, keyed by provider slug (left
-    /// times, latches, cooldown, stuck notice). The classic engine ignores it.
+    /// times, latches, cooldown, stuck notice).
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub swap_memory: std::collections::HashMap<String, crate::autoswap::SwapMemory>,
-    /// Settings ▸ Auto-swap ▸ Engine. `None` = the default (v2); `"v1"` = the
-    /// classic engine (rollback for one release).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub autoswap_engine: Option<String>,
     /// Emails this in-memory state has explicitly requested be dropped via
     /// `remove()`. NOT serialized — transient authorization consumed by
     /// `save_state_safe`, so `save()` can distinguish "the caller meant to
@@ -854,10 +850,6 @@ impl State {
                         .collect()
                 })
                 .unwrap_or_default(),
-            autoswap_engine: v
-                .get("autoswap_engine")
-                .and_then(|x| x.as_str())
-                .map(String::from),
             pending_removals: HashSet::new(),
             pending_provider_removals: HashSet::new(),
         }
