@@ -331,12 +331,9 @@ mod tests {
             Some(Duration::days(6)),
         );
         assert_eq!(format_menu_row(&e), "Weekly · 61% · empty in ~59m");
-        let e = est(15.0, Duration::hours(2), None);
-        assert!(
-            format_menu_row(&e).ends_with("· empty in ~1h 59m"),
-            "{}",
-            format_menu_row(&e)
-        );
+        // Mid-minute, so a slow runner can't tick it over a boundary.
+        let e = est(15.0, Duration::minutes(119) + Duration::seconds(50), None);
+        assert_eq!(format_menu_row(&e), "Weekly · 61% · empty in ~1h 59m");
     }
 
     #[test]
