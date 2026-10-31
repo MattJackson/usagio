@@ -1,4 +1,4 @@
-# usagio 1.1.0
+# usagio 1.0.1
 
 ### Changed
 - **Codex locks come from Codex itself.** usagio used to treat an account as
