@@ -45,6 +45,12 @@ pub enum RefreshError {
     Transient(String),
 }
 
+impl From<anyhow::Error> for RefreshError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Transient(format!("cannot serialize credential refresh: {error}"))
+    }
+}
+
 impl std::fmt::Display for RefreshError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -109,11 +115,10 @@ pub fn ensure_fresh(acct: &mut Account, skew_secs: i64) -> Result<bool, RefreshE
     crate::lifecycle::ensure_claude_fresh(acct, skew_secs)
 }
 
-/// Exclusive `refresh.lock` in the config dir, held until dropped. Best
-/// effort: if it can't be taken we refresh unserialized, as before. Always
+/// Exclusive `refresh.lock` in the config dir, held until dropped. Always
 /// taken BEFORE the state lock (a switch's commit takes it too, so it sees a
 /// rotation that was in flight).
-pub(crate) fn refresh_lock() -> Option<std::fs::File> {
+pub(crate) fn refresh_lock() -> anyhow::Result<std::fs::File> {
     crate::lifecycle::refresh_lock()
 }
 

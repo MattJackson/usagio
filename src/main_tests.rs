@@ -1736,6 +1736,7 @@ fn run_dispatch_prefers_an_explicit_arg_over_bundle_detection() {
 /// Every method besides `read_active_slot` / `mirror_rotated_token` is an
 /// inert default — `active_refresh_cas` never calls them.
 struct MockActiveSlotProvider {
+    client_running: bool,
     writes: std::sync::atomic::AtomicUsize,
     fail_handoff: std::sync::atomic::AtomicBool,
     fail_drain: std::sync::atomic::AtomicBool,
@@ -1749,6 +1750,7 @@ struct MockActiveSlotProvider {
 impl MockActiveSlotProvider {
     fn new(initial: &str) -> Self {
         Self {
+            client_running: false,
             writes: std::sync::atomic::AtomicUsize::new(0),
             fail_handoff: std::sync::atomic::AtomicBool::new(false),
             fail_drain: std::sync::atomic::AtomicBool::new(false),
@@ -1815,6 +1817,14 @@ impl crate::providers::Provider for MockActiveSlotProvider {
     }
     fn handoff_request_is_idempotent(&self) -> bool {
         self.retry_drain
+    }
+    fn client_status(&self) -> providers::PResult<providers::ClientStatus> {
+        Ok(providers::ClientStatus {
+            running: self.client_running,
+            busy: self.client_running,
+            account_key: Some(self.email.clone()),
+            handoff_token: self.client_running.then(|| "renewal-instance".into()),
+        })
     }
     fn write_active_account(
         &self,
@@ -8227,6 +8237,7 @@ fn handoff_verification_retry_does_not_drain_replacement_or_overwrite_rotation()
         from: Some("old@example.com".into()),
         drain_token: Some("old-instance".into()),
         credentials_written: false,
+        renewed_account: None,
         leave_latch: None,
     });
     state.save().unwrap();
@@ -8341,4 +8352,167 @@ fn queued_auto_handoff_preserves_no_bounce_latch_across_restart() {
         saved.swap_memory[slug].trigger_left.get("old@example.com"),
         Some(&latch)
     );
+}
+
+#[test]
+fn delayed_usage_cannot_replace_new_login_or_newer_observation() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let mut original = codex_account("account@example.com", None);
+    original.identity_email = Some(original.key.clone());
+    original.secret_blob = "original-generation".into();
+    let stale_usage = CachedUsage {
+        session_pct: Some(90.0),
+        fetched_at: 10,
+        ..Default::default()
+    };
+    let stale_plan = PlanStatus {
+        label: Some("old-plan".into()),
+        active: false,
+    };
+    for change in ["login", "cache", "plan"] {
+        let mut newer = original.clone();
+        match change {
+            "login" => {
+                newer.secret_blob = "renewed-generation".into();
+                newer.access_token = "renewed-access".into();
+            }
+            "cache" => {
+                newer.cached_usage = Some(CachedUsage {
+                    session_pct: Some(5.0),
+                    fetched_at: 20,
+                    ..Default::default()
+                })
+            }
+            "plan" => newer.plan = Some("new-plan".into()),
+            _ => unreachable!(),
+        }
+        let mut state = State::load().unwrap_or_default();
+        state.upsert_provider_account("codex", newer.clone());
+        state.save().unwrap();
+        assert!(
+            !persist_provider_observation(
+                "codex",
+                &original,
+                Some(&stale_usage),
+                Some(&stale_plan)
+            )
+            .unwrap(),
+            "stale {change} result was accepted"
+        );
+        let saved = State::load().unwrap();
+        let current = saved.find_provider_account("codex", &original.key).unwrap();
+        assert_eq!(current.secret_blob, newer.secret_blob);
+        assert_eq!(current.cached_usage, newer.cached_usage);
+        assert_eq!(current.plan, newer.plan);
+        assert!(!current.no_subscription);
+    }
+    // The result can still update its own unchanged account while another
+    // account is selected; switching accounts must not throw away useful usage.
+    let mut state = State::load().unwrap();
+    state.upsert_provider_account("codex", original.clone());
+    state.provider_accounts_mut("codex").active = Some("other@example.com".into());
+    state.save().unwrap();
+    assert!(persist_provider_observation("codex", &original, Some(&stale_usage), None).unwrap());
+    assert_eq!(
+        State::load()
+            .unwrap()
+            .find_provider_account("codex", &original.key)
+            .unwrap()
+            .cached_usage
+            .as_ref(),
+        Some(&stale_usage)
+    );
+}
+
+#[test]
+fn active_login_renewal_waits_for_drain_and_survives_old_token_rotation() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let mut provider = MockActiveSlotProvider::new("old-live-login");
+    provider.client_running = true;
+    let slug = provider.provider_id();
+    let key = "active@example.com";
+    let mut old = codex_account(key, None);
+    old.identity_email = Some(key.into());
+    old.secret_blob = "old-live-login".into();
+    let mut state = State::default();
+    state.upsert_provider_account(slug, old);
+    state.provider_accounts_mut(slug).active = Some(key.into());
+    state.save().unwrap();
+    let captured = providers::codex::CodexProvider
+        .complete_login(&codex_login_response(key, "account-a"))
+        .unwrap();
+    let renewed_blob = captured.secret_blob.clone();
+    let result = persist_login(&provider, captured, None).unwrap();
+    assert!(!result.made_live);
+    assert_eq!(provider.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        provider.slot.lock().unwrap().as_deref(),
+        Some("old-live-login")
+    );
+    let mut reloaded = State::load().unwrap();
+    assert_eq!(
+        reloaded
+            .find_provider_account(slug, key)
+            .unwrap()
+            .secret_blob,
+        "old-live-login"
+    );
+    assert_eq!(
+        reloaded
+            .provider_accounts(slug)
+            .unwrap()
+            .pending_switch
+            .as_ref()
+            .unwrap()
+            .renewed_account
+            .as_ref()
+            .unwrap()
+            .secret_blob,
+        renewed_blob
+    );
+    // The running client still owns the old grant. Its rotation may be adopted
+    // while draining, but it cannot replace the staged browser login.
+    reloaded
+        .find_provider_account_mut(slug, key)
+        .unwrap()
+        .secret_blob = "old-grant-rotated".into();
+    reloaded.save().unwrap();
+    assert!(lifecycle::prepare_handoff(
+        &provider,
+        &providers::ClientStatus::default(),
+        &mut reloaded,
+        key,
+        true
+    )
+    .unwrap());
+    commit_provider_switch(&provider, slug, key, true, true).unwrap();
+    assert_eq!(
+        provider.slot.lock().unwrap().as_deref(),
+        Some(renewed_blob.as_str())
+    );
+    let saved = State::load().unwrap();
+    assert_eq!(
+        saved.find_provider_account(slug, key).unwrap().secret_blob,
+        renewed_blob
+    );
+    assert!(saved
+        .provider_accounts(slug)
+        .unwrap()
+        .pending_switch
+        .is_none());
+}
+
+#[test]
+fn failed_refresh_lock_never_sends_a_single_use_refresh_grant() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    std::fs::create_dir_all(store::config_dir().unwrap().join("refresh.lock")).unwrap();
+    let (url, hits) = spawn_mock_usage_server(500, "{}".into());
+    oauth::set_token_url_override(Some(&url));
+    let mut account =
+        Account::from_keychain_blob(&mock_claude_blob("expired", "single-use", 1)).unwrap();
+    let result = lifecycle::ensure_claude_fresh(&mut account, 60);
+    oauth::set_token_url_override(None);
+    assert!(matches!(result, Err(oauth::RefreshError::Transient(_))));
+    assert_eq!(hit_count(&hits), 0);
+    assert_eq!(account.refresh_token, "single-use");
 }

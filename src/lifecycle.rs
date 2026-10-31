@@ -8,19 +8,18 @@ use chrono::Utc;
 
 /// Serialize refresh and switch preparation across usagio processes. Always
 /// acquire this before the state lock, including on the legacy Claude path.
-pub fn refresh_lock() -> Option<std::fs::File> {
+pub fn refresh_lock() -> Result<std::fs::File> {
     use fs2::FileExt;
-    let dir = crate::store::config_dir().ok()?;
-    std::fs::create_dir_all(&dir).ok()?;
+    let dir = crate::store::config_dir()?;
+    std::fs::create_dir_all(&dir)?;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(dir.join("refresh.lock"))
-        .ok()?;
-    file.lock_exclusive().ok()?;
-    Some(file)
+        .open(dir.join("refresh.lock"))?;
+    file.lock_exclusive()?;
+    Ok(file)
 }
 
 /// One transaction policy for both account stores: serialize, reload ownership,
@@ -32,13 +31,13 @@ struct PreparedRefresh<T> {
     expires_at_ms: i64,
 }
 
-fn refresh_transaction<T, E>(
+fn refresh_transaction<T, E: From<anyhow::Error>>(
     skew_secs: i64,
     prepare: impl FnOnce() -> std::result::Result<PreparedRefresh<T>, E>,
     request: impl FnOnce(&T) -> std::result::Result<T, E>,
     commit: impl FnOnce(&T, std::result::Result<T, E>) -> std::result::Result<T, E>,
 ) -> std::result::Result<T, E> {
-    let _ownership = refresh_lock();
+    let _ownership = refresh_lock().map_err(E::from)?;
     let prepared = prepare()?;
     if prepared.owned
         || !needs_refresh(
@@ -431,7 +430,7 @@ pub(crate) fn ensure_claude_fresh(
         return Ok(false);
     }
     let initial = acct.clone();
-    let refreshed = refresh_transaction(
+    let refreshed = refresh_transaction::<_, RefreshError>(
         skew_secs,
         || {
             let mut current = initial.clone();
@@ -511,6 +510,16 @@ pub(crate) fn prepare_handoff(
     manual: bool,
 ) -> Result<bool> {
     let slug = provider.provider_id();
+    let renewed_account = state
+        .provider_accounts(slug)
+        .and_then(|accounts| accounts.pending_switch.as_ref())
+        .and_then(|pending| pending.renewed_account.clone());
+    if let Some(renewed) = &renewed_account {
+        anyhow::ensure!(
+            renewed.key == key,
+            "a renewed login is still completing its handoff"
+        );
+    }
     if let Some(pending) = state
         .provider_accounts(slug)
         .and_then(|accounts| accounts.pending_switch.as_ref())
@@ -567,6 +576,7 @@ pub(crate) fn prepare_handoff(
         drain_token: Some(token.to_owned()),
         credentials_written: false,
         leave_latch,
+        renewed_account,
     });
     state.save()?;
     if !already_requested || provider.handoff_request_is_idempotent() {

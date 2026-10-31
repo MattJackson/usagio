@@ -54,7 +54,7 @@ pub(crate) fn set_home_override(p: Option<PathBuf>) {
 /// The last usage snapshot fetched for an account. Written only by the
 /// scheduler's poll; read (never fetched) by `list`, `switch`, and the menu bar
 /// so ad-hoc commands never hit the usage API (and never trigger HTTP 429).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CachedUsage {
     #[serde(default)]
     pub session_pct: Option<f64>,
@@ -311,7 +311,7 @@ impl Account {
 /// login would have produced. `access_token`/`refresh_token`/`expires_at`
 /// mirror the blob's tokens for refresh math, exactly like `Account` does for
 /// Claude.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderAccount {
     /// The provider's own identifier for this account (email, or a UUID/hash
     /// fallback — see `Provider::account_identifier`).
@@ -373,6 +373,9 @@ pub struct PendingSwitch {
     /// not drain the replacement instance or overwrite a rotated credential.
     #[serde(default)]
     pub credentials_written: bool,
+    /// A renewed active login waits here until the old client has drained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewed_account: Option<ProviderAccount>,
     #[serde(default)]
     pub leave_latch: Option<(
         crate::autoswap::memory::LatchKind,
