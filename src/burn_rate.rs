@@ -6,7 +6,7 @@
 // slope <= FLAT_SLOPE_THRESHOLD is treated as "rate flat" (below noise floor).
 //
 // Wire into menu redesign as a DetailRow beneath the corresponding Session/Weekly row
-// when confidence > CONFIDENCE_FLOOR (default 0.5).  See README-DRAFT.md.
+// for the report and menu displays.
 
 use chrono::{DateTime, Duration, Utc};
 
@@ -23,18 +23,12 @@ pub const FLAT_SLOPE_THRESHOLD_PCT_PER_HOUR: f32 = 0.5;
 /// nonsense like "empty in ~470h."  Chosen so the menu row stays under one screen line.
 pub const MAX_EMPTY_IN_HOURS: i64 = 999;
 
-/// Fits below this R² are still reported but a caller can gate rendering on it
-/// (menu redesign uses this).
-pub const CONFIDENCE_FLOOR: f32 = 0.5;
-
 #[derive(Clone, Debug)]
 pub struct BurnRateEstimate {
     pub window: Window,
     pub current_pct: f32,
     /// Slope of the linear fit, in "percent points per hour."  May be zero.
     pub rate_pct_per_hour: f32,
-    /// R² of the fit, clamped to [0, 1].
-    pub confidence: f32,
     /// Projected time to hit 100%.  If `rate_pct_per_hour <= FLAT_SLOPE_THRESHOLD`
     /// this is `now + MAX_EMPTY_IN_HOURS`; callers should render via
     /// `format_menu_row` which handles the flat case in text.
@@ -75,7 +69,7 @@ pub fn estimate(
     let current_pct = pct_for(samples.last().unwrap(), window).unwrap();
     let reset_at = reset_for(samples.last().unwrap(), window);
 
-    let (slope_per_hour, intercept, r2) = weighted_linear_fit(&samples, window, now)?;
+    let (slope_per_hour, intercept, _r2) = weighted_linear_fit(&samples, window, now)?;
 
     // Empty-at projection: solve intercept + slope*t = 100 (t is hours from `now`).
     let empty_at = if slope_per_hour <= FLAT_SLOPE_THRESHOLD_PCT_PER_HOUR {
@@ -94,7 +88,6 @@ pub fn estimate(
         window,
         current_pct,
         rate_pct_per_hour: slope_per_hour,
-        confidence: r2.clamp(0.0, 1.0),
         empty_at,
         reset_at,
     })
@@ -307,7 +300,6 @@ mod tests {
             window: Window::Weekly,
             current_pct: 61.0,
             rate_pct_per_hour: rate,
-            confidence: 0.9,
             empty_at: now + empty_in,
             reset_at: reset_in.map(|r| now + r),
         }
@@ -532,7 +524,6 @@ mod tests {
             "{}",
             est.rate_pct_per_hour
         );
-        assert!(est.confidence > 0.99);
         assert_eq!(est.empty_at - now, Duration::hours(6));
         assert!(est.reset_at.is_none());
     }
