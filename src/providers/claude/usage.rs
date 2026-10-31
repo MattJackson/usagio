@@ -104,7 +104,8 @@ fn flag(o: Option<&serde_json::Value>, k: &str) -> bool {
 
 /// Credits from `spend` (preferred — it carries exact money) and
 /// `extra_usage` (flags, plus `used_credits` when it's an integer count of
-/// minor units alongside `decimal_places`). `None` unless meaningful.
+/// minor units alongside `decimal_places`). Preserve explicit disabled flags
+/// so every account with a reported credit state can show "Credits · 0".
 fn credits(u: &Usage) -> Option<Credits> {
     let spend = u.spend.as_ref().filter(|v| v.is_object());
     let extra = u.extra_usage.as_ref().filter(|v| v.is_object());
@@ -127,7 +128,9 @@ fn credits(u: &Usage) -> Option<Credits> {
         limit: money(get(spend, "limit")).or_else(|| money(get(spend, "cap"))),
         balance: money(get(spend, "balance")),
     };
-    c.is_meaningful().then_some(c)
+    let explicitly_reported = get(spend, "enabled").is_some_and(serde_json::Value::is_boolean)
+        || get(extra, "is_enabled").is_some_and(serde_json::Value::is_boolean);
+    (explicitly_reported || c.is_meaningful()).then_some(c)
 }
 
 fn breakdown(u: &Usage) -> Vec<UsageShare> {
