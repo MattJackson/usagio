@@ -2164,12 +2164,20 @@ fn scoped_limit_row(w: &UsageWindow) -> Option<String> {
 /// grant still has a reset left (`is_available`); `usable_now` picks the verb.
 /// A banked-but-not-yet-usable grant says so (and names when it expires) so the
 /// absent "claim" row doesn't read as a bug.
-fn reset_grant_row(g: &ResetGrant) -> Option<String> {
+/// Whether usagio can claim this provider's reset grants itself. Claude only:
+/// Codex reports banked resets but has no known claim endpoint.
+fn claims_resets(provider_id: &str) -> bool {
+    provider_id == "claude"
+}
+
+fn reset_grant_row(g: &ResetGrant, claimable: bool) -> Option<String> {
     if !g.is_available() {
         return None;
     }
-    let mut row = if g.usable_now {
+    let mut row = if g.usable_now && claimable {
         "🎁 Reset available · claim below".to_string()
+    } else if g.usable_now {
+        "🎁 Reset available".to_string()
     } else {
         "🎁 Reset banked · usable once you're limited".to_string()
     };
@@ -2182,8 +2190,12 @@ fn reset_grant_row(g: &ResetGrant) -> Option<String> {
 /// Every provider-reported row for an account, in render order: reset grants
 /// (good news up top), scoped limits, where the week went, then credits. Pure;
 /// provider-agnostic.
-fn reported_rows(r: &ReportedUsage) -> Vec<String> {
-    let mut rows: Vec<String> = r.reset_grants.iter().filter_map(reset_grant_row).collect();
+fn reported_rows(r: &ReportedUsage, claimable: bool) -> Vec<String> {
+    let mut rows: Vec<String> = r
+        .reset_grants
+        .iter()
+        .filter_map(|g| reset_grant_row(g, claimable))
+        .collect();
     rows.extend(r.scoped_limits.iter().filter_map(scoped_limit_row));
     rows.extend(breakdown_row(&r.breakdown));
     rows.extend(r.credits.as_ref().and_then(credits_row));
@@ -2286,7 +2298,11 @@ fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)
             }
             // What the provider itself reported beyond the windows (credits,
             // where the week went, per-model limits) — never estimates.
-            rows.extend(reported_rows(&a.reported).into_iter().map(|r| (r, false)));
+            rows.extend(
+                reported_rows(&a.reported, claims_resets(a.provider_id))
+                    .into_iter()
+                    .map(|r| (r, false)),
+            );
             if !rows.iter().any(|(r, _)| !r.starts_with("Plan · ")) {
                 rows.push(("no data yet".to_string(), false));
             }
@@ -2386,11 +2402,11 @@ fn account_submenu_rows(sec: &ProviderSection, a: &AcctView) -> AccountSubmenuRo
         remove_row: sec.supports_remove,
         // Only offer the claim when a grant can actually be spent now — a
         // banked-but-not-usable grant would just return `not_limited`.
-        claim_reset_row: a
-            .reported
-            .reset_grants
-            .iter()
-            .any(|g| g.is_available() && g.usable_now),
+        claim_reset_row: claims_resets(sec.provider_id)
+            && a.reported
+                .reset_grants
+                .iter()
+                .any(|g| g.is_available() && g.usable_now),
     }
 }
 
@@ -2485,7 +2501,7 @@ fn menu_signature(snap: &Snapshot) -> String {
             }
             // Provider-reported rows exactly as rendered, so a credits /
             // breakdown / scoped-limit change redraws an open menu.
-            for row in reported_rows(&a.reported) {
+            for row in reported_rows(&a.reported, claims_resets(a.provider_id)) {
                 s.push_str(&format!("rep={row}|"));
             }
             // Deliberately EXCLUDE `a.updated` from the signature. It's the
@@ -4722,7 +4738,7 @@ mod tests {
 
     #[test]
     fn no_reported_rows_when_nothing_reported() {
-        assert!(reported_rows(&ReportedUsage::default()).is_empty());
+        assert!(reported_rows(&ReportedUsage::default(), true).is_empty());
         let rows = with_reported(ReportedUsage::default());
         assert!(
             !rows
@@ -4862,38 +4878,46 @@ mod tests {
             expires_at: None,
         };
         // Spent → no row.
-        assert_eq!(reset_grant_row(&mk(0, true)), None);
+        assert_eq!(reset_grant_row(&mk(0, true), true), None);
         // Usable now → the claim invitation.
         assert_eq!(
-            reset_grant_row(&mk(1, true)).as_deref(),
+            reset_grant_row(&mk(1, true), true).as_deref(),
             Some("🎁 Reset available · claim below")
         );
         // Banked but not usable → say so, don't invite a claim.
         assert_eq!(
-            reset_grant_row(&mk(1, false)).as_deref(),
+            reset_grant_row(&mk(1, false), true).as_deref(),
             Some("🎁 Reset banked · usable once you're limited")
         );
         // Expiry is appended when known.
         let mut g = mk(1, true);
         g.expires_at = Some(Utc::now() + chrono::Duration::days(3));
-        assert!(reset_grant_row(&g)
+        assert!(reset_grant_row(&g, true)
             .unwrap()
             .starts_with("🎁 Reset available · claim below · expires in "));
+        // A provider usagio can't claim for (Codex): no "claim below".
+        assert_eq!(
+            reset_grant_row(&mk(1, true), false).as_deref(),
+            Some("🎁 Reset available")
+        );
     }
 
     #[test]
     fn reset_grant_rows_lead_reported_rows() {
-        let rows = reported_rows(&ReportedUsage {
-            scoped_limits: vec![scoped("Fable", Some(42.0))],
-            reset_grants: vec![ResetGrant {
-                id: "g1".into(),
-                label: "Opus launch".into(),
-                resets_left: 1,
-                usable_now: true,
-                expires_at: None,
-            }],
-            ..ReportedUsage::default()
-        });
+        let rows = reported_rows(
+            &ReportedUsage {
+                scoped_limits: vec![scoped("Fable", Some(42.0))],
+                reset_grants: vec![ResetGrant {
+                    id: "g1".into(),
+                    label: "Opus launch".into(),
+                    resets_left: 1,
+                    usable_now: true,
+                    expires_at: None,
+                }],
+                ..ReportedUsage::default()
+            },
+            true,
+        );
         assert_eq!(rows[0], "🎁 Reset available · claim below", "{rows:?}");
     }
 
