@@ -53,8 +53,8 @@ use std::time::Duration;
 
 use crate::providers::trait_def::{
     AccountKey, Capabilities, CaptureMode, CapturedAccount, CredentialFreshness, Credits,
-    IdentitySnapshot, Money, PResult, Provider, ProviderError, ReportedUsage, SecretBackend,
-    TokenGrant, UsageSnapshot, UsageWindow,
+    IdentitySnapshot, Money, PResult, Provider, ProviderError, ReportedUsage, ResetGrant,
+    SecretBackend, TokenGrant, UsageSnapshot, UsageWindow,
 };
 
 /// Read/write timeout applied to every outbound HTTP call this provider
@@ -163,9 +163,17 @@ fn parse_usage_windows(body: &serde_json::Value) -> Vec<UsageWindow> {
     else {
         return windows;
     };
-    for (keys, id, label) in [
-        (["primary_window", "primary"], "session", "5h"),
-        (["secondary_window", "secondary"], "weekly", "7d"),
+    // Which response slot each pushed window came from ("primary"/"secondary"),
+    // so the provider's own lock flag can name it.
+    let mut slots: Vec<&str> = Vec::new();
+    for (keys, id, label, slot) in [
+        (["primary_window", "primary"], "session", "5h", "primary"),
+        (
+            ["secondary_window", "secondary"],
+            "weekly",
+            "7d",
+            "secondary",
+        ),
     ] {
         let Some(w) = keys
             .iter()
@@ -212,9 +220,98 @@ fn parse_usage_windows(body: &serde_json::Value) -> Vec<UsageWindow> {
             utilization,
             resets_at,
         });
+        slots.push(slot);
     }
+    apply_reported_lock(rl, &slots, &mut windows);
     windows
 }
+
+/// Codex says outright whether the account is limited (`limit_reached`, or
+/// `allowed: false`), so that replaces usagio's own "≥99.5% means locked"
+/// guess. Locked: the window it names in `rate_limit_reached_type` (else the
+/// fullest one) reads 100%. Not locked: no window reads as locked, even at
+/// 99.5–100% (it shows 99%). Neither field present: the percentages stand.
+fn apply_reported_lock(
+    rl: &serde_json::Map<String, Value>,
+    slots: &[&str],
+    windows: &mut [UsageWindow],
+) {
+    let reached = rl.get("limit_reached").and_then(Value::as_bool);
+    let allowed = rl.get("allowed").and_then(Value::as_bool);
+    let locked = match (reached, allowed) {
+        (None, None) => return,
+        (r, a) => r == Some(true) || a == Some(false),
+    };
+    if !locked {
+        for w in windows.iter_mut() {
+            if let Some(p) = w.utilization.filter(|p| *p >= 99.5) {
+                w.utilization = Some(p.min(99.0));
+            }
+        }
+        return;
+    }
+    let named = rl
+        .get("rate_limit_reached_type")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    let by_name = named.as_deref().and_then(|t| {
+        slots.iter().position(|slot| t.contains(slot)).or_else(|| {
+            windows.iter().position(|w| {
+                (t.contains("week") && w.id == "weekly")
+                    || ((t.contains("session") || t.contains("5h")) && w.id == "session")
+            })
+        })
+    });
+    let fullest = || {
+        (0..windows.len()).max_by(|&a, &b| {
+            let p = |i: usize| windows[i].utilization.unwrap_or(0.0);
+            p(a).total_cmp(&p(b))
+        })
+    };
+    if let Some(i) = by_name.or_else(fullest) {
+        windows[i].utilization = Some(100.0);
+    }
+}
+
+/// Codex's banked rate-limit resets (`rate_limit_reset_credits`) as a reset
+/// grant, so the menu shows one is available. `usable_now` follows
+/// `applicable_available_count` (a reset that would apply right now). The id
+/// carries the count so a newly banked reset announces itself again.
+pub(crate) fn parse_reset_credits(body: &Value) -> Vec<ResetGrant> {
+    let Some(c) = body
+        .get("rate_limit_reset_credits")
+        .and_then(Value::as_object)
+    else {
+        return Vec::new();
+    };
+    let count = |k: &str| {
+        c.get(k)
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(0)
+    };
+    let available = count("available_count");
+    if available == 0 {
+        return Vec::new();
+    }
+    vec![ResetGrant {
+        id: format!("codex-reset-credits-{available}"),
+        label: "Codex rate-limit reset".to_string(),
+        resets_left: available,
+        usable_now: count("applicable_available_count") > 0,
+        expires_at: None,
+    }]
+}
+
+/// Usage fields usagio doesn't read yet, logged when they start carrying data
+/// (see `providers::log_watched_fields`).
+const WATCHED_FIELDS: &[&str] = &[
+    "rate_limit_reached_type",
+    "spend_control",
+    "additional_rate_limits",
+    "code_review_rate_limit",
+    "promo",
+];
 
 impl Provider for CodexProvider {
     fn provider_id(&self) -> &'static str {
@@ -419,12 +516,14 @@ impl Provider for CodexProvider {
             Err(e) => return Err(ProviderError::Transient(e.to_string())),
         };
 
+        crate::providers::log_watched_fields("codex", &body, WATCHED_FIELDS);
         Ok(UsageSnapshot {
             windows: parse_usage_windows(&body),
             fetched_at: Utc::now(),
             plan: parse_plan(&body),
             reported: ReportedUsage {
                 credits: parse_credits(&body),
+                reset_grants: parse_reset_credits(&body),
                 ..ReportedUsage::default()
             },
         })
@@ -815,6 +914,90 @@ mod tests {
         assert!(parse_credits(&serde_json::json!({})).is_none());
         assert!(parse_credits(&serde_json::json!({ "credits": null })).is_none());
         assert!(parse_credits(&serde_json::json!({ "credits": "lots" })).is_none());
+    }
+
+    /// The live weekly-only Pro shape, with the lock flags set as given.
+    fn weekly_body(pct: f64, rl_extra: Value) -> Value {
+        let mut rl = serde_json::json!({
+            "primary_window": {
+                "used_percent": pct, "limit_window_seconds": 604800,
+                "reset_after_seconds": 600000
+            },
+            "secondary_window": null
+        });
+        rl.as_object_mut()
+            .unwrap()
+            .extend(rl_extra.as_object().unwrap().clone());
+        serde_json::json!({ "rate_limit": rl })
+    }
+
+    fn pcts(body: &Value) -> Vec<(String, Option<f64>)> {
+        parse_usage_windows(body)
+            .into_iter()
+            .map(|w| (w.id, w.utilization))
+            .collect()
+    }
+
+    #[test]
+    fn provider_lock_flag_replaces_the_pct_guess() {
+        // Codex says limited at 97%: the window reads locked.
+        let b = weekly_body(97.0, serde_json::json!({ "limit_reached": true }));
+        assert_eq!(pcts(&b), [("weekly".to_string(), Some(100.0))]);
+        let b = weekly_body(97.0, serde_json::json!({ "allowed": false }));
+        assert_eq!(pcts(&b), [("weekly".to_string(), Some(100.0))]);
+        // Codex says NOT limited at 100%: it doesn't read as locked.
+        let b = weekly_body(
+            100.0,
+            serde_json::json!({ "limit_reached": false, "allowed": true }),
+        );
+        assert_eq!(pcts(&b), [("weekly".to_string(), Some(99.0))]);
+        // Below the line, an unlocked reading is untouched.
+        let b = weekly_body(42.0, serde_json::json!({ "limit_reached": false }));
+        assert_eq!(pcts(&b), [("weekly".to_string(), Some(42.0))]);
+        // No flags at all (older shape): the percentages stand.
+        let b = weekly_body(100.0, serde_json::json!({}));
+        assert_eq!(pcts(&b), [("weekly".to_string(), Some(100.0))]);
+    }
+
+    #[test]
+    fn provider_lock_lands_on_the_named_else_fullest_window() {
+        let body = |kind: Value| {
+            serde_json::json!({ "rate_limit": {
+                "limit_reached": true,
+                "rate_limit_reached_type": kind,
+                "primary_window": { "used_percent": 80, "limit_window_seconds": 18000 },
+                "secondary_window": { "used_percent": 60, "limit_window_seconds": 604800 }
+            }})
+        };
+        let s = |p: f64| ("session".to_string(), Some(p));
+        let w = |p: f64| ("weekly".to_string(), Some(p));
+        assert_eq!(pcts(&body("secondary".into())), [s(80.0), w(100.0)]);
+        assert_eq!(pcts(&body("weekly_limit".into())), [s(80.0), w(100.0)]);
+        assert_eq!(pcts(&body("primary".into())), [s(100.0), w(60.0)]);
+        // Unnamed or unrecognised: the fullest window is the one that hit.
+        assert_eq!(pcts(&body(Value::Null)), [s(100.0), w(60.0)]);
+        assert_eq!(pcts(&body("mystery".into())), [s(100.0), w(60.0)]);
+    }
+
+    #[test]
+    fn reset_credits_become_a_reset_grant() {
+        // The live shape with none banked: nothing to show.
+        let none = serde_json::json!({ "rate_limit_reset_credits": {
+            "available_count": 0, "applicable_available_count": 0
+        }});
+        assert!(parse_reset_credits(&none).is_empty());
+        assert!(parse_reset_credits(&serde_json::json!({})).is_empty());
+        let banked = serde_json::json!({ "rate_limit_reset_credits": {
+            "available_count": 2, "applicable_available_count": 0
+        }});
+        let g = &parse_reset_credits(&banked)[0];
+        assert_eq!(g.resets_left, 2);
+        assert!(g.is_available() && !g.usable_now);
+        assert_eq!(g.id, "codex-reset-credits-2");
+        let usable = serde_json::json!({ "rate_limit_reset_credits": {
+            "available_count": 1, "applicable_available_count": 1
+        }});
+        assert!(parse_reset_credits(&usable)[0].usable_now);
     }
 
     #[test]
