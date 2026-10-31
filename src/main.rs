@@ -439,8 +439,8 @@ pub(crate) fn capture_current() -> Result<(String, bool)> {
         .map(String::from);
 
     let (at_prefix, rt_prefix, expires_at) = (
-        logging::tok_prefix(&acct.access_token),
-        logging::tok_prefix(&acct.refresh_token),
+        logging::token_fingerprint(&acct.access_token),
+        logging::token_fingerprint(&acct.refresh_token),
         acct.expires_at,
     );
     let existed = with_state_lock(|| {
@@ -1081,32 +1081,13 @@ fn complete_pending_switches() {
             continue;
         };
         if accounts.find(&pending.key).is_none() || accounts.active != pending.from {
-            let _ = with_state_lock(|| {
-                let mut latest = State::load()?;
-                let accounts = latest.provider_accounts_mut(slug);
-                if accounts.pending_switch.as_ref() != Some(pending) {
-                    return Ok(());
+            if let Ok(provider) = provider_by_slug(slug) {
+                if let Err(error) = recover_obsolete_pending_switch(provider, pending) {
+                    logging::log(&format!(
+                        "event=handoff_recovery_pending provider={slug} reason={error}"
+                    ));
                 }
-                // A drain already sent must still be completed. If the user
-                // removed the target or changed accounts, resume their current
-                // selection rather than abandoning the stopped daemon.
-                if let Some(active) = accounts
-                    .active
-                    .clone()
-                    .filter(|key| accounts.find(key).is_some())
-                {
-                    if let Some(pending) = accounts.pending_switch.as_mut() {
-                        pending.key = active.clone();
-                        pending.from = Some(active);
-                        pending.manual = false;
-                        pending.credentials_written = false;
-                        pending.leave_latch = None;
-                    }
-                } else if pending.drain_token.is_none() {
-                    accounts.pending_switch = None;
-                }
-                latest.save()
-            });
+            }
             continue;
         }
         if let Err(error) = switch_provider_with_intent(slug, &pending.key, pending.manual) {
@@ -1115,6 +1096,72 @@ fn complete_pending_switches() {
             ));
         }
     }
+}
+
+/// A removal cancels the account choice, not the responsibility to restart a
+/// daemon already told to drain. Never recreate a removed saved account.
+fn recover_obsolete_pending_switch(
+    provider: &dyn Provider,
+    expected: &store::PendingSwitch,
+) -> Result<()> {
+    let slug = provider.provider_id();
+    let restart = with_state_lock(|| {
+        let mut state = State::load()?;
+        let accounts = state.provider_accounts_mut(slug);
+        if accounts.pending_switch.as_ref() != Some(expected) {
+            return Ok(None);
+        }
+        if let Some(active) = accounts
+            .active
+            .clone()
+            .filter(|key| accounts.find(key).is_some())
+        {
+            if let Some(renewed) = &expected.renewed_account {
+                if renewed.key != active {
+                    if let Some(saved) = accounts
+                        .accounts
+                        .iter_mut()
+                        .find(|account| account.key == renewed.key)
+                    {
+                        *saved = renewed.clone();
+                    }
+                }
+            }
+            let pending = accounts.pending_switch.as_mut().unwrap();
+            pending.key = active.clone();
+            pending.from = Some(active);
+            pending.manual = false;
+            pending.credentials_written = false;
+            pending.leave_latch = None;
+            pending.renewed_account = None;
+            state.save()?;
+            return Ok(None);
+        }
+        if let Some(token) = &expected.drain_token {
+            return Ok(Some(token.clone()));
+        }
+        accounts.pending_switch = None;
+        state.save()?;
+        Ok(None)
+    })?;
+    if let Some(token) = restart {
+        let _refresh = lifecycle::refresh_lock()?;
+        provider.verify_handoff_stopped(&token)?;
+        let identity = provider
+            .read_active_identity()?
+            .context("cannot restore the drained client's live login")?;
+        provider.handoff_client(&identity, Some(&token))?;
+        with_state_lock(|| {
+            let mut state = State::load()?;
+            let accounts = state.provider_accounts_mut(slug);
+            if accounts.pending_switch.as_ref() == Some(expected) {
+                accounts.pending_switch = None;
+                state.save()?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
 }
 
 fn commit_provider_switch(
@@ -2078,8 +2125,8 @@ fn sync_active_from_keychain(provider: &'static dyn Provider, state: &mut State)
     logging::log(&format!(
         "event=sync_active_from_keychain account={active} outcome=adopted \
          at_prefix={} rt_prefix={}",
-        logging::tok_prefix(&fresh.access_token),
-        logging::tok_prefix(&fresh.refresh_token),
+        logging::token_fingerprint(&fresh.access_token),
+        logging::token_fingerprint(&fresh.refresh_token),
     ));
     acct.access_token = fresh.access_token;
     acct.refresh_token = fresh.refresh_token;
@@ -3115,7 +3162,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
         } else {
             match oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
                 Ok(true) => {
-                    let old_prefix = logging::tok_prefix(&acct.access_token);
+                    let old_prefix = logging::token_fingerprint(&acct.access_token);
                     // mirror_back is `skip` (not `ok`/`err`) when the vendor
                     // CLI's own active identity doesn't match this account —
                     // Claude Code's keychain/credentials-file slot is a
@@ -3129,7 +3176,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
                     logging::log(&format!(
                         "event=inactive_refresh account={email} at_prefix={old_prefix}.. -> \
                          {}.. mirror_back={}",
-                        logging::tok_prefix(&acct.access_token),
+                        logging::token_fingerprint(&acct.access_token),
                         match &mirror_back {
                             Some(Ok(())) => "ok",
                             Some(Err(_)) => "err",

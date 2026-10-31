@@ -315,7 +315,7 @@ pub(crate) fn active_refresh_cas(
     };
 
     let drifted = cc_acct.access_token != acct.access_token;
-    let cc_prefix = logging::tok_prefix(&cc_acct.access_token);
+    let cc_prefix = logging::token_fingerprint(&cc_acct.access_token);
     acct.set_tokens(
         cc_acct.access_token,
         cc_acct.refresh_token,

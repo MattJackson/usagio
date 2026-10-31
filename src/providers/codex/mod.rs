@@ -440,6 +440,7 @@ impl Provider for CodexProvider {
         let Some(path) = auth_json_path() else {
             return Ok(None);
         };
+        ensure_file_backend(&path)?;
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -597,6 +598,9 @@ impl Provider for CodexProvider {
     }
 
     fn client_status(&self) -> PResult<crate::providers::ClientStatus> {
+        if let Some(path) = auth_json_path() {
+            ensure_file_backend(&path)?;
+        }
         client::probe()
             .map(|state| match state {
                 Some(state) => crate::providers::ClientStatus {
@@ -647,6 +651,7 @@ impl Provider for CodexProvider {
         let Some(path) = auth_json_path() else {
             return Ok(None);
         };
+        ensure_file_backend(&path)?;
         match std::fs::read_to_string(path) {
             Ok(blob) => Ok(Some(blob)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -726,6 +731,7 @@ impl Provider for CodexProvider {
         let path = auth_json_path().ok_or_else(|| {
             ProviderError::Other("could not resolve $CODEX_HOME / $HOME for auth.json".into())
         })?;
+        ensure_file_backend(&path)?;
         write_auth_json_atomically(&path, blob)?;
         Ok(())
     }
@@ -753,7 +759,8 @@ impl Provider for CodexProvider {
 
     fn credential_paths(&self) -> Vec<PathBuf> {
         match auth_json_path() {
-            Some(p) => vec![p],
+            Some(p) if ensure_file_backend(&p).is_ok() => vec![p],
+            Some(_) => Vec::new(),
             None => Vec::new(),
         }
     }
@@ -898,6 +905,26 @@ pub(super) fn parse_codex_blob(blob: &str) -> PResult<AuthDotJson> {
 /// Resolve the Codex auth file path, honoring `$CODEX_HOME`. `pub(super)`
 /// so `oauth.rs`'s CAS refresh resolves the same path this module uses for
 /// capture/switching — a single source of truth for "where is auth.json".
+/// Refuse to treat a fallback auth.json as the live login when Codex uses
+/// another credential backend. The upstream default is file; explicit auto
+/// can prefer keyring and therefore cannot safely be inferred from file presence.
+fn ensure_file_backend(auth_path: &std::path::Path) -> PResult<()> {
+    let config = auth_path.with_file_name("config.toml");
+    let text = match std::fs::read_to_string(config) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(ProviderError::Io(error)),
+    };
+    let config: toml::Value = toml::from_str(&text).map_err(|_| {
+        ProviderError::Other("cannot read Codex credential backend from invalid config.toml".into())
+    })?;
+    match config.get("cli_auth_credentials_store") {
+        None => Ok(()),
+        Some(mode) if mode.as_str() == Some("file") => Ok(()),
+        _ => Err(ProviderError::Other("Codex uses a credential backend other than file; this account adapter cannot safely switch it".into())),
+    }
+}
+
 pub(super) fn auth_json_path() -> Option<PathBuf> {
     if let Some(h) = std::env::var_os("CODEX_HOME") {
         return Some(PathBuf::from(h).join("auth.json"));

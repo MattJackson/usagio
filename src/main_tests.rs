@@ -8561,3 +8561,131 @@ fn qualified_codex_selector_does_not_switch_same_email_claude_account() {
         assert_eq!(resolve_provider_selector(&saved, "unknown:shared"), None);
     });
 }
+
+#[test]
+fn removing_pending_target_restores_client_without_recreating_account() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let provider = MockActiveSlotProvider::new("still-valid-vendor-login");
+    let pending = store::PendingSwitch {
+        key: "removed@example.com".into(),
+        manual: true,
+        from: Some("removed@example.com".into()),
+        drain_token: Some("drained-instance".into()),
+        credentials_written: false,
+        renewed_account: None,
+        leave_latch: None,
+    };
+    let mut state = State::default();
+    state
+        .provider_accounts_mut(provider.provider_id())
+        .pending_switch = Some(pending.clone());
+    state.save().unwrap();
+    provider
+        .process_alive
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(recover_obsolete_pending_switch(&provider, &pending).is_err());
+    assert!(State::load()
+        .unwrap()
+        .provider_accounts(provider.provider_id())
+        .unwrap()
+        .pending_switch
+        .is_some());
+    provider
+        .process_alive
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    recover_obsolete_pending_switch(&provider, &pending).unwrap();
+    let state = State::load().unwrap();
+    let accounts = state.provider_accounts(provider.provider_id()).unwrap();
+    assert!(accounts.pending_switch.is_none());
+    assert!(accounts.accounts.is_empty());
+    assert_eq!(provider.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn changed_selection_preserves_staged_renewal_as_inactive_credentials() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let provider = MockActiveSlotProvider::new("current");
+    let mut renewed = codex_account("a", None);
+    renewed.secret_blob = "renewed-a".into();
+    let pending = store::PendingSwitch {
+        key: "a".into(),
+        manual: true,
+        from: Some("a".into()),
+        drain_token: Some("instance".into()),
+        credentials_written: false,
+        renewed_account: Some(renewed),
+        leave_latch: None,
+    };
+    let mut state = State::default();
+    state.upsert_provider_account(provider.provider_id(), codex_account("a", None));
+    state.upsert_provider_account(provider.provider_id(), codex_account("b", None));
+    let accounts = state.provider_accounts_mut(provider.provider_id());
+    accounts.active = Some("b".into());
+    accounts.pending_switch = Some(pending.clone());
+    state.save().unwrap();
+    recover_obsolete_pending_switch(&provider, &pending).unwrap();
+    let state = State::load().unwrap();
+    assert_eq!(
+        state
+            .find_provider_account(provider.provider_id(), "a")
+            .unwrap()
+            .secret_blob,
+        "renewed-a"
+    );
+    let next = state
+        .provider_accounts(provider.provider_id())
+        .unwrap()
+        .pending_switch
+        .as_ref()
+        .unwrap();
+    assert_eq!(next.key, "b");
+    assert!(next.renewed_account.is_none());
+    assert_eq!(next.drain_token, pending.drain_token);
+}
+
+#[test]
+fn codex_non_file_backend_is_rejected_before_drain_or_write() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+        let provider = providers::codex::CodexProvider;
+        let captured = provider
+            .complete_login(&codex_login_response("a@example.com", "a"))
+            .unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, "stale-fallback").unwrap();
+        for mode in ["keyring", "auto", "ephemeral"] {
+            std::fs::write(
+                dir.path().join("config.toml"),
+                format!("cli_auth_credentials_store = \"{mode}\"\n"),
+            )
+            .unwrap();
+            assert!(provider.client_status().is_err());
+            assert!(provider.capture_current_login().is_err());
+            assert!(provider.read_active_slot().is_err());
+            assert!(provider.credential_paths().is_empty());
+            assert!(provider
+                .write_active_account(&captured.secret_blob, &captured.identity)
+                .is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "stale-fallback");
+        }
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "cli_auth_credentials_store = \"file\"\n",
+        )
+        .unwrap();
+        provider
+            .write_active_account(&captured.secret_blob, &captured.identity)
+            .unwrap();
+        assert_eq!(
+            provider
+                .capture_current_login()
+                .unwrap()
+                .unwrap()
+                .identity
+                .email
+                .as_deref(),
+            Some("a@example.com")
+        );
+    });
+}
