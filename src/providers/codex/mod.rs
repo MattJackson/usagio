@@ -626,6 +626,10 @@ impl Provider for CodexProvider {
         launch_command(mode).status().map_err(ProviderError::Io)
     }
 
+    fn handoff_stops_synchronously(&self) -> bool {
+        cfg!(unix)
+    }
+
     fn handoff_request_is_idempotent(&self) -> bool {
         crate::platform::graceful_drain_is_idempotent()
     }

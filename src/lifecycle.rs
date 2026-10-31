@@ -615,5 +615,11 @@ pub(crate) fn prepare_handoff(
             "event=client_drain_requested provider={slug} account={key}"
         ));
     }
+    // A bounded provider stop can finish synchronously. Publish/restart in
+    // this transaction instead of leaving clients disconnected until polling.
+    if provider.handoff_stops_synchronously() && !provider.client_status()?.running {
+        provider.verify_handoff_stopped(token)?;
+        return Ok(true);
+    }
     Ok(false)
 }
