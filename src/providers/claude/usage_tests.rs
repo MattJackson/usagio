@@ -128,37 +128,68 @@ fn subscription_unknown_without_organization() {
 #[test]
 fn plan_label_maps_org_type_and_tier() {
     assert_eq!(
-        plan_label(Some("claude_max"), Some("default_claude_max_20x")).as_deref(),
+        plan_label(None, Some("claude_max"), Some("default_claude_max_20x")).as_deref(),
         Some("Max 20x")
     );
     assert_eq!(
-        plan_label(Some("claude_max"), Some("default_claude_max_5x")).as_deref(),
+        plan_label(None, Some("claude_max"), Some("default_claude_max_5x")).as_deref(),
         Some("Max 5x")
     );
-    assert_eq!(plan_label(Some("claude_pro"), None).as_deref(), Some("Pro"));
     assert_eq!(
-        plan_label(Some("claude_free"), None).as_deref(),
+        plan_label(None, Some("claude_pro"), None).as_deref(),
+        Some("Pro")
+    );
+    assert_eq!(
+        plan_label(None, Some("claude_free"), None).as_deref(),
         Some("Free")
     );
-    assert_eq!(plan_label(Some("something_new"), None), None);
-    assert_eq!(plan_label(None, None), None);
+    assert_eq!(plan_label(None, Some("something_new"), None), None);
+    assert_eq!(plan_label(None, None, None), None);
 }
 
 #[test]
 fn plan_label_maps_every_org_type_and_tier() {
     assert_eq!(
-        plan_label(Some("claude_team"), None).as_deref(),
+        plan_label(None, Some("claude_team"), None).as_deref(),
         Some("Team")
     );
     assert_eq!(
-        plan_label(Some("claude_enterprise"), None).as_deref(),
+        plan_label(None, Some("claude_enterprise"), None).as_deref(),
         Some("Enterprise")
     );
     // A Max org with no / unrecognised tier is plain "Max", not a multiplier.
-    assert_eq!(plan_label(Some("claude_max"), None).as_deref(), Some("Max"));
     assert_eq!(
-        plan_label(Some("claude_max"), Some("default_claude_max")).as_deref(),
+        plan_label(None, Some("claude_max"), None).as_deref(),
         Some("Max")
+    );
+    assert_eq!(
+        plan_label(None, Some("claude_max"), Some("default_claude_max")).as_deref(),
+        Some("Max")
+    );
+}
+
+#[test]
+fn plan_label_prefers_anthropics_display_name() {
+    // Ultra keeps the Max 20x org type / tier; only the display name changed.
+    assert_eq!(
+        plan_label(
+            Some("Ultra"),
+            Some("claude_max"),
+            Some("default_claude_max_20x")
+        )
+        .as_deref(),
+        Some("Ultra")
+    );
+    // Blank display name falls back to the mapping.
+    assert_eq!(
+        plan_label(Some(" "), Some("claude_pro"), None).as_deref(),
+        Some("Pro")
+    );
+    let mut p = sample_profile();
+    p["organization"]["plan_display_name"] = "Ultra".into();
+    assert_eq!(
+        plan_status_from_profile(&p).unwrap().label.as_deref(),
+        Some("Ultra")
     );
 }
 

@@ -40,9 +40,6 @@ pub struct BurnRateEstimate {
     /// `format_menu_row` which handles the flat case in text.
     pub empty_at: DateTime<Utc>,
     pub reset_at: Option<DateTime<Utc>>,
-    /// `reset_at - empty_at`.  `None` when there's no reset time, when `empty_at`
-    /// is after `reset_at` (we're safe for this cycle), or when the rate is flat.
-    pub margin: Option<Duration>,
 }
 
 pub fn estimate(
@@ -81,21 +78,13 @@ pub fn estimate(
     let (slope_per_hour, intercept, r2) = weighted_linear_fit(&samples, window, now)?;
 
     // Empty-at projection: solve intercept + slope*t = 100 (t is hours from `now`).
-    let (empty_at, margin) = if slope_per_hour <= FLAT_SLOPE_THRESHOLD_PCT_PER_HOUR {
-        // Flat: cap far in the future, no margin.
-        (now + Duration::hours(MAX_EMPTY_IN_HOURS), None)
+    let empty_at = if slope_per_hour <= FLAT_SLOPE_THRESHOLD_PCT_PER_HOUR {
+        // Flat: cap far in the future.
+        now + Duration::hours(MAX_EMPTY_IN_HOURS)
     } else {
         // hours_from_now = (100 - current_pct) / slope
         let hours_to_empty = ((100.0 - current_pct) / slope_per_hour).max(0.0) as i64;
-        let empty_at = now + Duration::hours(hours_to_empty.min(MAX_EMPTY_IN_HOURS));
-        let margin = reset_at.and_then(|r| {
-            if r > empty_at {
-                Some(r - empty_at)
-            } else {
-                None
-            }
-        });
-        (empty_at, margin)
+        now + Duration::hours(hours_to_empty.min(MAX_EMPTY_IN_HOURS))
     };
 
     // Silence unused-var lint on intercept — kept for debug/logging clarity.
@@ -108,51 +97,28 @@ pub fn estimate(
         confidence: r2.clamp(0.0, 1.0),
         empty_at,
         reset_at,
-        margin,
     })
 }
 
-/// Render a menu row like "Weekly · 61% · empty in ~40m · 6m before reset"
-/// or "Weekly · 61% · empty in ~2h 15m · safe for this cycle"
-/// or "Weekly · 61% · rate flat".
+/// Render a short menu row: "Weekly · 61% · empty in ~40m" when the window
+/// runs out before it resets, "Weekly · 61% · lasts to reset" when it
+/// doesn't (or the pace is flat), "Weekly · 61% · pace flat" with no reset.
+/// The reset time itself is on the "renews in" row, so it isn't repeated.
 pub fn format_menu_row(est: &BurnRateEstimate) -> String {
     let name = match est.window {
         Window::Session => "Session",
         Window::Weekly => "Weekly",
     };
-    if est.rate_pct_per_hour <= FLAT_SLOPE_THRESHOLD_PCT_PER_HOUR {
-        return format!("{name} · {:.0}% · rate flat", est.current_pct);
-    }
-    let remaining = est.empty_at - Utc::now();
-    let empty_str = format_short_duration(remaining);
-    match est.margin {
-        Some(m) if m > Duration::zero() => {
-            format!(
-                "{name} · {:.0}% · empty in ~{empty_str} · safe for this cycle ({} to spare)",
-                est.current_pct,
-                format_short_duration(m)
-            )
-        }
-        // Not safe this cycle: either the renderer supplied a non-positive
-        // margin (empty falls at/before the reset) or it supplied none. Both
-        // render the same "how long before reset" tail when a reset is known,
-        // else the plain empty line. Folding the non-positive-margin case in
-        // here (rather than a separate `unreachable!()`) means a caller that
-        // populates `margin` with a non-positive Duration renders correctly
-        // instead of panicking on the main-thread render tick.
-        _ => {
-            if let Some(reset) = est.reset_at {
-                let before = reset - est.empty_at;
-                format!(
-                    "{name} · {:.0}% · empty in ~{empty_str} · {} before reset",
-                    est.current_pct,
-                    format_short_duration(before)
-                )
-            } else {
-                format!("{name} · {:.0}% · empty in ~{empty_str}", est.current_pct)
-            }
-        }
-    }
+    let flat = est.rate_pct_per_hour <= FLAT_SLOPE_THRESHOLD_PCT_PER_HOUR;
+    let tail = match est.reset_at {
+        Some(reset) if flat || est.empty_at >= reset => "lasts to reset".to_string(),
+        _ if flat => "pace flat".to_string(),
+        _ => format!(
+            "empty in ~{}",
+            format_short_duration(est.empty_at - Utc::now())
+        ),
+    };
+    format!("{name} · {:.0}% · {tail}", est.current_pct)
 }
 
 fn pct_for(s: &Snapshot, w: Window) -> Option<f32> {
@@ -335,83 +301,56 @@ mod tests {
         assert!(weighted_linear_fit(&samples, Window::Weekly, now).is_none());
     }
 
+    fn est(rate: f32, empty_in: Duration, reset_in: Option<Duration>) -> BurnRateEstimate {
+        let now = Utc::now();
+        BurnRateEstimate {
+            window: Window::Weekly,
+            current_pct: 61.0,
+            rate_pct_per_hour: rate,
+            confidence: 0.9,
+            empty_at: now + empty_in,
+            reset_at: reset_in.map(|r| now + r),
+        }
+    }
+
     #[test]
     fn format_menu_row_flat() {
-        let est = BurnRateEstimate {
-            window: Window::Weekly,
-            current_pct: 42.0,
-            rate_pct_per_hour: 0.1,
-            confidence: 0.9,
-            empty_at: Utc::now() + Duration::hours(500),
-            reset_at: None,
-            margin: None,
-        };
-        assert_eq!(format_menu_row(&est), "Weekly · 42% · rate flat");
+        let e = est(0.1, Duration::hours(500), None);
+        assert_eq!(format_menu_row(&e), "Weekly · 61% · pace flat");
+        let e = est(0.1, Duration::hours(500), Some(Duration::hours(10)));
+        assert_eq!(format_menu_row(&e), "Weekly · 61% · lasts to reset");
     }
 
+    /// Regression: empty in ~59m with the reset 6d away used to read
+    /// "empty in ~59m · safe for this cycle (6d 17h to spare)".
     #[test]
-    fn format_menu_row_safe_for_cycle() {
-        let est = BurnRateEstimate {
-            window: Window::Weekly,
-            current_pct: 61.0,
-            rate_pct_per_hour: 15.0,
-            confidence: 0.9,
-            empty_at: Utc::now() + Duration::hours(2) + Duration::minutes(15),
-            reset_at: Some(Utc::now() + Duration::hours(10)),
-            margin: Some(Duration::hours(7) + Duration::minutes(45)),
-        };
-        let s = format_menu_row(&est);
+    fn format_menu_row_empties_before_reset() {
+        let e = est(
+            35.0,
+            Duration::minutes(59) + Duration::seconds(30),
+            Some(Duration::days(6)),
+        );
+        assert_eq!(format_menu_row(&e), "Weekly · 61% · empty in ~59m");
+        let e = est(15.0, Duration::hours(2), None);
         assert!(
-            s.contains("empty in ~2h") && s.contains("safe for this cycle"),
-            "{s}"
+            format_menu_row(&e).ends_with("· empty in ~1h 59m"),
+            "{}",
+            format_menu_row(&e)
         );
     }
 
     #[test]
-    fn format_menu_row_at_risk() {
-        let est = BurnRateEstimate {
-            window: Window::Weekly,
-            current_pct: 61.0,
-            rate_pct_per_hour: 40.0,
-            confidence: 0.9,
-            empty_at: Utc::now() + Duration::minutes(40),
-            reset_at: Some(Utc::now() + Duration::minutes(46)),
-            margin: None,
-        };
-        let s = format_menu_row(&est);
-        assert!(
-            s.contains("empty in ~40m") && s.contains("before reset"),
-            "{s}"
-        );
-    }
-
-    /// Regression: a caller that populates `margin` with a NON-positive
-    /// Duration (empty falls exactly at, or past, the reset) must render the
-    /// before-reset tail rather than panicking. Previously this hit an
-    /// `unreachable!()` on the main-thread render tick.
-    #[test]
-    fn format_menu_row_non_positive_margin_does_not_panic() {
+    fn format_menu_row_lasts_past_reset() {
+        let e = est(1.0, Duration::hours(40), Some(Duration::hours(10)));
+        assert_eq!(format_menu_row(&e), "Weekly · 61% · lasts to reset");
+        // Exact tie: it never sits empty, so it lasts.
         let now = Utc::now();
-        // Exact tie: empty_at == reset_at → margin == 0 (not > zero).
-        let est = BurnRateEstimate {
-            window: Window::Weekly,
-            current_pct: 80.0,
-            rate_pct_per_hour: 20.0,
-            confidence: 0.9,
+        let tie = BurnRateEstimate {
             empty_at: now + Duration::hours(3),
             reset_at: Some(now + Duration::hours(3)),
-            margin: Some(Duration::zero()),
+            ..est(20.0, Duration::zero(), None)
         };
-        let s = format_menu_row(&est);
-        assert!(s.contains("before reset"), "{s}");
-
-        // Negative margin: empty projected past the reset.
-        let est_neg = BurnRateEstimate {
-            margin: Some(Duration::minutes(-30)),
-            ..est
-        };
-        let s2 = format_menu_row(&est_neg);
-        assert!(s2.contains("before reset"), "{s2}");
+        assert_eq!(format_menu_row(&tie), "Weekly · 61% · lasts to reset");
     }
 
     #[test]
@@ -599,7 +538,6 @@ mod tests {
         assert!(est.confidence > 0.99);
         assert_eq!(est.empty_at - now, Duration::hours(6));
         assert!(est.reset_at.is_none());
-        assert!(est.margin.is_none());
     }
 
     #[test]
@@ -636,7 +574,6 @@ mod tests {
         let est = estimate(&key, Window::Session, now).expect("enough samples");
         assert!(est.rate_pct_per_hour <= FLAT_SLOPE_THRESHOLD_PCT_PER_HOUR);
         assert_eq!(est.empty_at - now, Duration::hours(MAX_EMPTY_IN_HOURS));
-        assert!(est.margin.is_none());
     }
 
     // Ignored by default — this hits the live usage_log crate function, which panics

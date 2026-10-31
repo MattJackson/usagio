@@ -511,8 +511,16 @@ pub fn org_uuid_from_profile(profile: &serde_json::Value) -> Option<String> {
         .map(String::from)
 }
 
-/// Map Anthropic's org type / rate-limit tier to what the user bought.
-pub fn plan_label(org_type: Option<&str>, tier: Option<&str>) -> Option<String> {
+/// What the user bought: Anthropic's own plan name ("Ultra") when the profile
+/// carries one, else mapped from the org type / rate-limit tier.
+pub fn plan_label(
+    display_name: Option<&str>,
+    org_type: Option<&str>,
+    tier: Option<&str>,
+) -> Option<String> {
+    if let Some(name) = display_name.map(str::trim).filter(|n| !n.is_empty()) {
+        return Some(name.to_string());
+    }
     let label = match org_type? {
         "claude_max" => match tier.unwrap_or("") {
             t if t.ends_with("_20x") => "Max 20x",
@@ -536,7 +544,11 @@ pub fn plan_status_from_profile(
     let org = profile.get("organization");
     let get = |k: &str| org.and_then(|o| o.get(k)).and_then(|v| v.as_str());
     let label = if active {
-        plan_label(get("organization_type"), get("rate_limit_tier"))
+        plan_label(
+            get("plan_display_name"),
+            get("organization_type"),
+            get("rate_limit_tier"),
+        )
     } else {
         Some("Free".to_string())
     };
@@ -565,6 +577,7 @@ pub fn oauth_account_from_profile(profile: &serde_json::Value) -> Option<serde_j
         "organizationName": get(org, "name"),
         "organizationType": get(org, "organization_type"),
         "organizationRateLimitTier": get(org, "rate_limit_tier"),
+        "planDisplayName": get(org, "plan_display_name"),
         "billingType": get(org, "billing_type"),
         "hasExtraUsageEnabled": get(org, "has_extra_usage_enabled"),
         "subscriptionCreatedAt": get(org, "subscription_created_at"),

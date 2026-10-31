@@ -6151,6 +6151,8 @@ fn claude_plan_label_prefers_lapse_then_stored_plan_then_the_captured_org() {
         "organizationRateLimitTier": "default_claude_max_20x",
     }));
     assert_eq!(claude_plan_label(&a).as_deref(), Some("Max 20x"));
+    a.oauth_account.as_mut().unwrap()["planDisplayName"] = "Ultra".into();
+    assert_eq!(claude_plan_label(&a).as_deref(), Some("Ultra"));
     a.plan = Some("Pro".to_string());
     assert_eq!(claude_plan_label(&a).as_deref(), Some("Pro"));
     a.no_subscription = true;
