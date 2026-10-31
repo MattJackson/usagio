@@ -243,8 +243,8 @@ pub(crate) fn verify_stopped(token: &str) -> Result<()> {
     Ok(())
 }
 
-/// Persist the instance before requesting drain. Unix SIGHUP never forces;
-/// on Windows a repeated shutdown RPC can force termination.
+/// Stop the recorded instance. Unix uses a bounded restart; Windows retains
+/// its once-only graceful shutdown RPC.
 pub(crate) fn begin_drain(token: &str) -> Result<()> {
     let instance: Value = serde_json::from_str(token).context("invalid Codex daemon instance")?;
     let pid = instance["pid"]
@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires installed Codex; starts only an isolated test daemon"]
-    fn isolated_daemon_drains_and_loads_the_selected_account() {
+    fn isolated_daemon_restarts_and_loads_the_selected_account() {
         use crate::providers::Provider;
         let _cfg = crate::store::ScopedConfigDir::new();
         let dir = tempfile::Builder::new()
@@ -494,41 +494,6 @@ stream_max_retries = 0
             let unchanged = probe().unwrap().unwrap();
             assert!(unchanged.busy);
             assert_eq!(unchanged.instance_token, before.instance_token);
-            let attached_session = session.clone();
-            let (attached, attachment_ready) = std::sync::mpsc::channel();
-            let observer = std::thread::spawn(move || {
-                with_control_timeout("ws://localhost/", Duration::from_secs(25), move |socket| {
-                    inspect(socket)?;
-                    call(
-                        socket,
-                        1000,
-                        "thread/resume",
-                        json!({"threadId":attached_session}),
-                    )?;
-                    attached.send(()).unwrap();
-                    loop {
-                        match socket.read() {
-                            Ok(Message::Text(body)) => {
-                                let message: Value = serde_json::from_str(&body)?;
-                                if message["method"] == "turn/completed"
-                                    && message["params"]["threadId"] == attached_session
-                                {
-                                    // The stdio proxy keeps stdout open until
-                                    // stdin closes, even after server EOF. The
-                                    // completion event is the observable client
-                                    // contract; process exit is checked separately.
-                                    return Ok(message["params"]["turn"]["status"] == "completed");
-                                }
-                            }
-                            Ok(Message::Close(_)) | Err(_) => return Ok(false),
-                            _ => {}
-                        }
-                    }
-                })
-            });
-            attachment_ready
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap();
             let second = provider
                 .complete_login(&crate::tests::codex_login_response(
                     "b@example.com",
@@ -537,44 +502,9 @@ stream_max_retries = 0
                 .unwrap();
             crate::persist_login(&provider, second, None).unwrap();
             crate::switch_to_provider_account("codex", "b@example.com", true).unwrap();
-            assert!(crate::provider_switch_pending("codex", "b@example.com"));
-            std::thread::sleep(Duration::from_millis(500));
-            assert!(
-                verify_stopped(before.instance_token.as_deref().unwrap()).is_err(),
-                "active turn was terminated by graceful drain"
-            );
-            assert_eq!(
-                std::fs::read_to_string(home.join("auth.json")).unwrap(),
-                first.secret_blob
-            );
-            release.send(()).unwrap();
-            let deadline = std::time::Instant::now() + Duration::from_secs(15);
-            loop {
-                match probe() {
-                    Ok(None)
-                        if verify_stopped(before.instance_token.as_deref().unwrap()).is_ok() =>
-                    {
-                        break
-                    }
-                    Ok(None) if std::time::Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(100))
-                    }
-                    Ok(Some(_)) | Err(_) if std::time::Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(100))
-                    }
-                    other => panic!("isolated daemon did not drain: {other:?}"),
-                }
-            }
-            assert_eq!(
-                std::fs::read_to_string(home.join("auth.json")).unwrap(),
-                first.secret_blob
-            );
-            assert!(
-                observer.join().unwrap().unwrap(),
-                "attached client did not receive turn completion before disconnect"
-            );
-            crate::complete_pending_switches();
             assert!(!crate::provider_switch_pending("codex", "b@example.com"));
+            verify_stopped(before.instance_token.as_deref().unwrap()).unwrap();
+            let _ = release.send(());
             assert_eq!(
                 crate::store::State::load()
                     .unwrap()
@@ -609,8 +539,8 @@ stream_max_retries = 0
                         .last()
                         .and_then(|turn| turn.get("status"))
                         .and_then(Value::as_str)
-                        == Some("completed"),
-                    "in-flight turn did not finish before handoff"
+                        == Some("interrupted"),
+                    "forced restart must preserve the interrupted turn in history"
                 );
                 Ok(())
             })

@@ -218,8 +218,10 @@ usagio continue codex:dev  # codex resume --last
 priority; `codex:` auto-picks within Codex. With only Codex accounts saved,
 commands without a selector auto-pick within Codex.
 
-Codex switches wait for its shared daemon to finish running turns, then publish
-the selected credentials, restart the daemon, and verify its loaded account.
+On macOS and Linux, Codex switches promptly stop its shared daemon, publish
+the selected credentials, restart it, and verify its loaded account. Existing
+clients can reconnect; in-flight turns may be interrupted. Windows retains
+the graceful handoff that waits for running turns.
 The pending switch survives a usagio restart. Active-account renewal uses the
 same handoff; selecting an already-loaded account leaves its work running.
 This adapter supports Codex's default `file` credential store. Explicit

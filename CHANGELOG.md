@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-10-31
+
+- Replace prolonged Codex draining on Unix with a bounded restart completed in the same switch operation.
+- Recognize exited, unreaped daemon processes so they cannot block credential handoff.
+- Add zombie-process regression coverage and verify active-turn restart, selected identity, and session resume with an isolated Codex daemon.
+
 ## [1.0.2] - 2026-10-31
 
 ### Fixed
