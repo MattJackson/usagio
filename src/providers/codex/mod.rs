@@ -49,6 +49,14 @@ use crate::providers::trait_def::{
     SecretBackend, TokenGrant, UsageSnapshot, UsageWindow,
 };
 
+fn launch_command(mode: crate::providers::trait_def::LaunchMode) -> std::process::Command {
+    let mut command = std::process::Command::new("codex");
+    if matches!(mode, crate::providers::trait_def::LaunchMode::Continue) {
+        command.args(["resume", "--last"]);
+    }
+    command
+}
+
 /// Read/write timeout applied to every outbound HTTP call this provider
 /// makes. The default `ureq::Agent` only bounds the TCP *connect* (30s); a
 /// server or proxy that accepts the connection but then stalls mid-response
@@ -404,7 +412,7 @@ impl Provider for CodexProvider {
             // the live app, so the "Switch to this account" row is safe to
             // show (H3, v0.5.0 codeaudit — closed).
             supports_switching: true,
-            supports_launch: false,
+            supports_launch: true,
             supports_remove: true,
             supports_email_capture: true,
             secret_backend: SecretBackend::File,
@@ -604,6 +612,13 @@ impl Provider for CodexProvider {
 
     fn begin_handoff(&self, token: &str) -> PResult<()> {
         client::begin_drain(token).map_err(|error| ProviderError::Other(error.to_string()))
+    }
+
+    fn launch_client(
+        &self,
+        mode: crate::providers::trait_def::LaunchMode,
+    ) -> PResult<std::process::ExitStatus> {
+        launch_command(mode).status().map_err(ProviderError::Io)
     }
 
     fn handoff_request_is_idempotent(&self) -> bool {
@@ -1318,7 +1333,7 @@ mod tests {
         // gives Codex a place to store a second account to switch to, wired
         // through `main.rs`/`menubar.rs` — see the module doc RESOLVED note.
         assert!(caps.supports_switching);
-        assert!(!caps.supports_launch);
+        assert!(caps.supports_launch);
         assert!(caps.supports_remove);
         assert!(caps.supports_email_capture);
         assert_eq!(caps.secret_backend, SecretBackend::File);
@@ -1327,14 +1342,16 @@ mod tests {
     }
 
     #[test]
-    fn launch_client_is_still_unsupported() {
-        // No wired-up client launch yet; only `write_active_account` (the
-        // auth.json rewrite) implements switching so far.
-        let p = CodexProvider;
-        assert!(matches!(
-            p.launch_client(crate::providers::trait_def::LaunchMode::Fresh),
-            Err(ProviderError::Unsupported)
-        ));
+    fn launch_modes_use_codex_native_resume() {
+        use crate::providers::trait_def::LaunchMode;
+        let fresh = launch_command(LaunchMode::Fresh);
+        assert_eq!(fresh.get_program(), "codex");
+        assert_eq!(fresh.get_args().count(), 0);
+        let resume = launch_command(LaunchMode::Continue);
+        assert_eq!(
+            resume.get_args().collect::<Vec<_>>(),
+            vec!["resume", "--last"]
+        );
     }
 
     #[test]

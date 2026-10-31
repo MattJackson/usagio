@@ -107,9 +107,6 @@ impl Provider for ClaudeProvider {
         Capabilities {
             supports_usage: true,
             supports_switching: true,
-            // The only provider whose `launch_client` is actually wired to
-            // spawn the vendor CLI (see below) — every other provider keeps
-            // this `false` until it has one too (H3, v0.5.0 codeaudit).
             supports_launch: true,
             supports_remove: true,
             supports_email_capture: true,

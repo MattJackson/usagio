@@ -320,16 +320,16 @@ fn run() -> Result<()> {
 
 fn print_help() {
     println!(
-        "usagio — usage & instant account switching for Claude\n\n\
+        "usagio — usage & automatic account switching for Claude and Codex\n\n\
          Accounts are identified by their email; commands accept a full email or a\n\
-         unique prefix (e.g. `dev` for dev@example.com).\n\n\
+         unique prefix (e.g. `dev` for dev@example.com). Use `codex:email` or `claude:email` to select a provider.\n\n\
          USAGE:\n  \
          usagio                   Show cached usage for every account (default)\n  \
          usagio list --refresh    Fetch usage now, then show it\n  \
          usagio capture [prov]    Save the account you're logged into (default claude; e.g. `capture codex`)\n  \
          usagio switch [email]    Make <email> the active login (no launch)\n  \
-         usagio start [email]     Switch, then launch a fresh `claude`\n  \
-         usagio continue [email]  Switch, then launch `claude --continue`\n  \
+         usagio start [email]     Switch, then launch the selected provider CLI\n  \
+         usagio continue [email]  Switch, then resume the selected provider session\n  \
          usagio token [email]     Print a fresh access token\n  \
          usagio watch             Auto-swap at 95%, keep working (foreground)\n  \
          usagio menubar           Run the macOS menu-bar app (usage + auto-swap)\n  \
@@ -888,24 +888,29 @@ fn cmd_switch(selector: Option<&str>, launch: Option<Launch>) -> Result<()> {
     // proactive flip-back), then auto-swaps as usual. A pick already at/over
     // the trigger holds until it's exhausted (see `State::manual_holds`).
     if let Some(sel) = selector {
+        if let Some((slug, account)) = sel.split_once(':') {
+            let slug = slug.to_ascii_lowercase();
+            provider_by_slug(&slug)?;
+            if slug == CLAUDE_SLUG {
+                let email = select_email(&state, (!account.is_empty()).then_some(account))?;
+                return finish_claude_switch(&email, launch, !account.is_empty());
+            }
+            let key = if account.is_empty() {
+                let trigger = state.trigger_pct.unwrap_or(TRIGGER_PCT);
+                auto_pick_for(&state, &provider_rows(&state, &slug), trigger, trigger)?
+            } else {
+                resolve_provider_selector(&state, sel)
+                    .map(|(_, key)| key)
+                    .ok_or_else(|| anyhow!("no unique {slug} account matches '{account}'"))?
+            };
+            return finish_provider_switch(&slug, &key, launch, !account.is_empty());
+        }
         let claude = (!state.accounts.is_empty()).then(|| state.resolve(sel));
         if let Some(Ok(email)) = &claude {
             return finish_claude_switch(email, launch, true);
         }
         if let Some((slug, key)) = resolve_provider_selector(&state, sel) {
-            let label = switch_to_provider_account(&slug, &key, true)?;
-            if provider_switch_pending(&slug, &key) {
-                println!("Switch to {label} ({slug}) is queued until the client is idle.");
-            } else {
-                println!("Active login is now {label} ({slug}).");
-            }
-            if launch.is_some() {
-                println!(
-                    "\nNote: `usagio start`/`continue` only launches the `claude` CLI; \
-                     launch `{slug}` yourself to pick up this switch."
-                );
-            }
-            return Ok(());
+            return finish_provider_switch(&slug, &key, launch, true);
         }
         // Surface Claude's own error ("'dev' is ambiguous — matches: …")
         // rather than a bare miss.
@@ -917,10 +922,58 @@ fn cmd_switch(selector: Option<&str>, launch: Option<Launch>) -> Result<()> {
 
     // No selector: unchanged v1 auto-pick behavior, Claude-only.
     if state.accounts.is_empty() {
-        bail!("no accounts yet; capture one with: usagio capture");
+        let available: Vec<_> = state
+            .providers
+            .iter()
+            .filter(|(slug, accounts)| {
+                !accounts.accounts.is_empty() && provider_supports_swap(slug)
+            })
+            .collect();
+        if let [(slug, _)] = available.as_slice() {
+            let trigger = state.trigger_pct.unwrap_or(TRIGGER_PCT);
+            let key = auto_pick_for(&state, &provider_rows(&state, slug), trigger, trigger)?;
+            return finish_provider_switch(slug, &key, launch, false);
+        }
+        bail!("choose a provider account, for example codex:email@example.com");
     }
     let email = select_email(&state, None)?;
     finish_claude_switch(&email, launch, false)
+}
+
+fn finish_provider_switch(slug: &str, key: &str, launch: Option<Launch>, hold: bool) -> Result<()> {
+    let provider = provider_by_slug(slug)?;
+    if launch.is_some() && !provider.capabilities().supports_launch {
+        bail!("launching {} is not supported", provider.display_name());
+    }
+    let label = switch_to_provider_account(slug, key, hold)?;
+    if provider_switch_pending(slug, key) {
+        println!("Switch to {label} ({slug}) is queued until the client finishes its work.");
+        if launch.is_none() {
+            return Ok(());
+        }
+        while provider_switch_pending(slug, key) {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            switch_provider_with_intent(slug, key, hold)?;
+        }
+    }
+    println!("Active login is now {label} ({slug}).");
+    launch_selected_client(provider, launch)
+}
+
+fn launch_selected_client(provider: &dyn Provider, launch: Option<Launch>) -> Result<()> {
+    let Some(launch) = launch else {
+        return Ok(());
+    };
+    println!("\nLaunching {}…\n", provider.display_name());
+    let mode = match launch {
+        Launch::Fresh => providers::trait_def::LaunchMode::Fresh,
+        Launch::Continue => providers::trait_def::LaunchMode::Continue,
+    };
+    let status = provider.launch_client(mode)?;
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
 }
 
 /// Shared tail of `cmd_switch` for a resolved Claude email: perform the
@@ -932,24 +985,7 @@ fn finish_claude_switch(email: &str, launch: Option<Launch>, hold: bool) -> Resu
     println!("New `claude` sessions will use it. Already-running sessions keep their");
     println!("current account until they're restarted.");
 
-    match launch {
-        None => Ok(()),
-        Some(kind) => {
-            println!("\nLaunching claude…\n");
-            let mut cmd = std::process::Command::new("claude");
-            match kind {
-                Launch::Continue => {
-                    cmd.arg("--continue");
-                }
-                Launch::Fresh => {}
-            }
-            match cmd.status() {
-                Ok(s) if s.success() => Ok(()),
-                Ok(s) => std::process::exit(s.code().unwrap_or(1)),
-                Err(e) => bail!("could not launch `claude`: {e}"),
-            }
-        }
-    }
+    launch_selected_client(provider_by_slug(CLAUDE_SLUG)?, launch)
 }
 
 /// Resolve `selector` (a full account key, or a unique case-insensitive
@@ -959,7 +995,10 @@ fn finish_claude_switch(email: &str, launch: Option<Launch>, hold: bool) -> Resu
 /// slots instead of one flat list, since account keys are only unique within
 /// a single provider (a Codex and a future provider could share an email).
 pub(crate) fn resolve_provider_selector(state: &State, selector: &str) -> Option<(String, String)> {
-    let sel = selector.trim();
+    let (scope, sel) = selector
+        .trim()
+        .split_once(':')
+        .map_or((None, selector.trim()), |(slug, key)| (Some(slug), key));
     if sel.is_empty() {
         return None;
     }
@@ -967,6 +1006,9 @@ pub(crate) fn resolve_provider_selector(state: &State, selector: &str) -> Option
     let mut exact: Vec<(String, String)> = Vec::new();
     let mut prefix: Vec<(String, String)> = Vec::new();
     for (slug, pa) in &state.providers {
+        if scope.is_some_and(|scope| !scope.eq_ignore_ascii_case(slug)) {
+            continue;
+        }
         for a in &pa.accounts {
             let key_lc = a.key.to_lowercase();
             if key_lc == sel_lc {

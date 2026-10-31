@@ -8516,3 +8516,42 @@ fn failed_refresh_lock_never_sends_a_single_use_refresh_grant() {
     assert_eq!(hit_count(&hits), 0);
     assert_eq!(account.refresh_token, "single-use");
 }
+
+#[test]
+fn qualified_codex_selector_does_not_switch_same_email_claude_account() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+        let codex = codex_auth_json("shared@example.com", 4_000_000_000, "codex-at", "codex-rt");
+        std::fs::write(dir.path().join("auth.json"), &codex).unwrap();
+        capture_current_generic("codex").unwrap();
+        let mut state = State::load().unwrap();
+        let mut claude = Account::from_keychain_blob(&mock_claude_blob(
+            "claude-at",
+            "claude-rt",
+            4_000_000_000_000,
+        ))
+        .unwrap();
+        claude.email = Some("shared@example.com".into());
+        state.accounts.push(claude);
+        state.active = Some("shared@example.com".into());
+        state.save().unwrap();
+        cmd_switch(Some("codex:shared"), None).unwrap();
+        let saved = State::load().unwrap();
+        assert_eq!(saved.accounts[0].access_token, "claude-at");
+        assert_eq!(saved.active.as_deref(), Some("shared@example.com"));
+        assert_eq!(
+            saved.provider_accounts("codex").unwrap().active.as_deref(),
+            Some("shared@example.com")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("auth.json")).unwrap(),
+            codex
+        );
+        assert_eq!(
+            resolve_provider_selector(&saved, "CODEX:shared"),
+            Some(("codex".into(), "shared@example.com".into()))
+        );
+        assert_eq!(resolve_provider_selector(&saved, "unknown:shared"), None);
+    });
+}
