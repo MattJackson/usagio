@@ -209,8 +209,8 @@ pub(crate) fn parse_plan(
 
 /// Credits from the usage response's `credits` object (`has_credits`,
 /// `unlimited`, `overage_limit_reached`, `balance` as a decimal string in
-/// Codex credits — not a currency). `None` unless something meaningful is
-/// reported: an account without credits and a "0" balance is noise.
+/// Codex credits — not a currency). Preserve an explicit zero balance so
+/// accounts without credits still show the same menu row.
 pub(crate) fn parse_credits(body: &serde_json::Value) -> Option<Credits> {
     let c = body.get("credits")?.as_object()?;
     let flag = |k: &str| c.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
@@ -232,7 +232,9 @@ pub(crate) fn parse_credits(body: &serde_json::Value) -> Option<Credits> {
         limit: None,
         balance,
     };
-    credits.is_meaningful().then_some(credits)
+    let explicitly_reported =
+        c.get("has_credits").is_some_and(Value::is_boolean) || credits.balance.is_some();
+    (explicitly_reported || credits.is_meaningful()).then_some(credits)
 }
 
 fn parse_usage_windows(body: &serde_json::Value) -> Vec<UsageWindow> {
@@ -1088,13 +1090,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_credits_none_when_nothing_is_reported() {
-        // The live shape for an account without credits: nothing to show.
+    fn parse_credits_preserves_explicit_zero_and_omits_unknown() {
+        // A zero balance still needs a Credits · 0 row in the menu.
         let body = serde_json::json!({ "credits": {
             "has_credits": false, "unlimited": false, "overage_limit_reached": false,
             "balance": "0", "approx_local_messages": [0, 0], "approx_cloud_messages": [0, 0]
         }});
-        assert!(parse_credits(&body).is_none());
+        let credits = parse_credits(&body).unwrap();
+        assert!(!credits.enabled);
+        assert!(credits.balance.as_ref().unwrap().is_zero());
         assert!(parse_credits(&serde_json::json!({})).is_none());
         assert!(parse_credits(&serde_json::json!({ "credits": null })).is_none());
         assert!(parse_credits(&serde_json::json!({ "credits": "lots" })).is_none());

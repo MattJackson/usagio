@@ -570,6 +570,22 @@ fn trailing_for_account(
     bands: SeverityBands,
     now: DateTime<Utc>,
 ) -> (String, Vec<(usize, usize, Severity)>) {
+    let (mut text, colors) = trailing_usage_for_account(a, bands, now);
+    if has_reset(a) {
+        text.push_str(" 🎁");
+    }
+    (text, colors)
+}
+
+fn has_reset(a: &AcctView) -> bool {
+    a.reported.reset_grants.iter().any(ResetGrant::is_available)
+}
+
+fn trailing_usage_for_account(
+    a: &AcctView,
+    bands: SeverityBands,
+    now: DateTime<Utc>,
+) -> (String, Vec<(usize, usize, Severity)>) {
     // No plan, no usage: a countdown to a reset that frees nothing would lie.
     // Outranks auth trouble too — a Free account is unusable whether or not
     // its login is healthy, so the plan is the headline, not "re-login".
@@ -2083,43 +2099,20 @@ fn window_status_row(w: &WindowView) -> Option<(String, bool)> {
     }
 }
 
-/// "Credits · $903.35 left · $3.10 / $50 used" — `None` unless the provider
-/// reported credits switched on or a non-zero figure. The wallet balance leads:
-/// it's the money actually available; used / cap is the monthly spend. Once
-/// the cap is hit, "$1,000 limit reached" replaces the (over-cap) used figure.
-/// Only ever the provider's own numbers; nothing here is estimated.
+/// Show only what can be used now, never historical spending or a spend cap.
 fn credits_row(c: &Credits) -> Option<String> {
-    if !c.is_meaningful() {
-        return None;
-    }
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(balance) = &c.balance {
-        parts.push(format!("{} left", balance.display()));
-    }
-    if c.limit_reached {
-        parts.push(match &c.limit {
-            Some(limit) => format!("{} limit reached", limit.display_whole()),
-            None => "limit reached".to_string(),
-        });
+    let status = if !c.enabled && !c.unlimited || c.limit_reached {
+        "0".to_string()
+    } else if c.unlimited {
+        "unlimited".to_string()
+    } else if let Some(left) = c.spendable() {
+        left.display()
+    } else if c.balance.is_some() || c.limit.is_some() {
+        "0".to_string()
     } else {
-        match (&c.used, &c.limit) {
-            (Some(used), Some(limit)) => parts.push(format!(
-                "{} / {} used",
-                used.display(),
-                limit.display_whole()
-            )),
-            (Some(used), None) => parts.push(format!("{} used", used.display())),
-            (None, Some(limit)) => parts.push(format!("{} limit", limit.display_whole())),
-            (None, None) => {}
-        }
-    }
-    if c.unlimited {
-        parts.push("unlimited".to_string());
-    }
-    if parts.is_empty() {
-        parts.push("enabled".to_string());
-    }
-    Some(format!("Credits · {}", parts.join(" · ")))
+        "—".to_string()
+    };
+    Some(format!("Credits · {status}"))
 }
 
 /// "This week · Claude Code 82% · Chats 18%" — only when at least two
@@ -2157,28 +2150,23 @@ fn scoped_limit_row(w: &UsageWindow) -> Option<String> {
     Some(row)
 }
 
-/// "🎁 Reset available · claim below" / "🎁 Reset banked · usable when limited"
-/// — a one-shot usage-limit reset the provider is offering. Shown only when the
-/// grant still has a reset left (`is_available`); `usable_now` picks the verb.
-/// A banked-but-not-yet-usable grant says so (and names when it expires) so the
-/// absent "claim" row doesn't read as a bug.
-/// Whether usagio can claim this provider's reset grants itself. Claude only:
-/// Codex reports banked resets but has no known claim endpoint.
+/// Whether usagio can claim this provider's reset grants itself.
+/// Codex redemption is not integrated; only Claude has a claim action.
 fn claims_resets(provider_id: &str) -> bool {
     provider_id == "claude"
 }
 
-fn reset_grant_row(g: &ResetGrant, claimable: bool) -> Option<String> {
+fn reset_grant_row(g: &ResetGrant) -> Option<String> {
     if !g.is_available() {
         return None;
     }
-    let mut row = if g.usable_now && claimable {
-        "🎁 Reset available · claim below".to_string()
-    } else if g.usable_now {
-        "🎁 Reset available".to_string()
+    let noun = if g.resets_left == 1 {
+        "reset"
     } else {
-        "🎁 Reset banked · usable once you're limited".to_string()
+        "resets"
     };
+    let state = if g.usable_now { "ready" } else { "banked" };
+    let mut row = format!("🎁 {} {noun} {state}", g.resets_left);
     if let Some(exp) = g.expires_at {
         row.push_str(&format!(" · expires in {}", crate::humanize_until(exp)));
     }
@@ -2188,12 +2176,8 @@ fn reset_grant_row(g: &ResetGrant, claimable: bool) -> Option<String> {
 /// Every provider-reported row for an account, in render order: reset grants
 /// (good news up top), scoped limits, where the week went, then credits. Pure;
 /// provider-agnostic.
-fn reported_rows(r: &ReportedUsage, claimable: bool) -> Vec<String> {
-    let mut rows: Vec<String> = r
-        .reset_grants
-        .iter()
-        .filter_map(|g| reset_grant_row(g, claimable))
-        .collect();
+fn reported_rows(r: &ReportedUsage) -> Vec<String> {
+    let mut rows: Vec<String> = r.reset_grants.iter().filter_map(reset_grant_row).collect();
     rows.extend(r.scoped_limits.iter().filter_map(scoped_limit_row));
     rows.extend(breakdown_row(&r.breakdown));
     rows.extend(r.credits.as_ref().and_then(credits_row));
@@ -2296,11 +2280,7 @@ fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)
             }
             // What the provider itself reported beyond the windows (credits,
             // where the week went, per-model limits) — never estimates.
-            rows.extend(
-                reported_rows(&a.reported, claims_resets(a.provider_id))
-                    .into_iter()
-                    .map(|r| (r, false)),
-            );
+            rows.extend(reported_rows(&a.reported).into_iter().map(|r| (r, false)));
             if !rows.iter().any(|(r, _)| !r.starts_with("Plan · ")) {
                 rows.push(("no data yet".to_string(), false));
             }
@@ -2325,8 +2305,8 @@ fn account_extra_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
         let account_key =
             crate::usage_log::AccountKey::new(sec.provider_id.to_string(), a.key.clone());
         // The burn-rate row forecasts when the WEEKLY window empties ("Weekly ·
-        // N% · empty in ~X"). Once the weekly window is already locked (100%),
-        // that reads as a redundant "· 100% · empty in ~0m" — skip it; the
+        // N% · ~X"). Once the weekly window is already locked (100%),
+        // that reads as a redundant "· 100% · ~0m" — skip it; the
         // "Weekly limit reached" status row already conveys the lock.
         let weekly_locked = a
             .windows
@@ -2342,7 +2322,7 @@ fn account_extra_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
     rows
 }
 
-/// The weekly "empty in" row from the one rate model (auto-swap v2's
+/// The compact weekly forecast row from the one rate model (auto-swap v2's
 /// `rates` + `runway::time_to`), at the account's own pace.
 fn empty_in_row(
     account_key: &crate::usage_log::AccountKey,
@@ -2351,7 +2331,11 @@ fn empty_in_row(
 ) -> Option<String> {
     use crate::autoswap::{rates::rates_for, runway::time_to, WindowId};
     let pct = a.windows.iter().find(|w| w.id == "weekly")?.pct?;
-    let rate = rates_for(&account_key.provider, &account_key.account, now).own(WindowId::Weekly)?;
+    let Some(rate) =
+        rates_for(&account_key.provider, &account_key.account, now).own(WindowId::Weekly)
+    else {
+        return Some(format!("Weekly · {} · —", self::pct(Some(pct))));
+    };
     let mins = time_to(pct, 100.0, rate);
     let empty_at = if mins.is_finite() {
         now + chrono::Duration::seconds((mins * 60.0).min(1.0e8) as i64)
@@ -2378,23 +2362,18 @@ fn empty_in_row(
 /// gate at all.
 #[derive(Debug, PartialEq, Eq)]
 struct AccountSubmenuRows {
-    /// `Some(true)` → render "✓ Active" (this account is the active one).
-    /// `Some(false)` → render a clickable "Switch to this account" row.
-    /// `None` → the provider doesn't support switching; render neither.
-    switch_row: Option<bool>,
+    /// Offer switching only for an inactive account with a subscription.
+    switch_row: bool,
     /// "Renew login…" — usagio can run this provider's login itself.
     renew_row: bool,
     remove_row: bool,
-    /// "Claim reset…" — a banked usage-limit reset is usable right now.
+    /// The ready reset label is actionable for this account.
     claim_reset_row: bool,
 }
 
 fn account_submenu_rows(sec: &ProviderSection, a: &AcctView) -> AccountSubmenuRows {
     AccountSubmenuRows {
-        // A lapsed plan can't serve requests: no Switch/Launch into it (the
-        // active one still shows "✓ Active" so it's clear where you are).
-        switch_row: (sec.supports_switching && (a.active || !a.no_subscription))
-            .then_some(a.active),
+        switch_row: sec.supports_switching && !a.active && !a.no_subscription,
         renew_row: a.renewable,
         remove_row: sec.supports_remove,
         // Only offer the claim when a grant can actually be spent now — a
@@ -2498,7 +2477,7 @@ fn menu_signature(snap: &Snapshot) -> String {
             }
             // Provider-reported rows exactly as rendered, so a credits /
             // breakdown / scoped-limit change redraws an open menu.
-            for row in reported_rows(&a.reported, claims_resets(a.provider_id)) {
+            for row in reported_rows(&a.reported) {
                 s.push_str(&format!("rep={row}|"));
             }
             // Deliberately EXCLUDE `a.updated` from the signature. It's the
@@ -2639,6 +2618,18 @@ fn recovery_status(
 }
 
 fn title_for(snap: &Snapshot) -> String {
+    let mut title = usage_title_for(snap);
+    if snap
+        .sections
+        .iter()
+        .any(|sec| sec.accounts.iter().any(has_reset))
+    {
+        title.push_str(" 🎁");
+    }
+    title
+}
+
+fn usage_title_for(snap: &Snapshot) -> String {
     match tray_target(snap, snap.tray_icon_mode.as_deref()) {
         Some((sec, a)) => {
             let now = now_utc();
@@ -2742,7 +2733,7 @@ fn binding_title(a: &AcctView, shown: Option<crate::autoswap::WindowId>) -> Stri
 /// trailing `sa / sb` text, for the active row.
 fn binding_span(a: &AcctView, trailing: &str, now: DateTime<Utc>) -> Option<(usize, usize)> {
     let b = binding_for(a, now)?;
-    let (sa, sb) = trailing.split_once(" / ")?;
+    let (sa, sb) = trailing.trim_end_matches(" 🎁").split_once(" / ")?;
     let first_is_session = a.windows.first().is_some_and(|w| w.id == "session");
     let in_first = (b.window == crate::autoswap::WindowId::Session) == first_is_session;
     if in_first {
@@ -3282,17 +3273,38 @@ fn handle_renew(slug: &str, key: &str) {
     }
 }
 
-/// "Claim reset…": spend a banked usage-limit reset for this account. Claude
-/// only (the single provider with a known claim endpoint); a click id for any
-/// other slug is ignored. Runs off the UI thread — the claim does a token
+/// Clicking a ready reset asks for confirmation before spending it. Claude
+/// only; a click id for any other slug is ignored. Runs off the UI thread — the claim does a token
 /// refresh, a profile fetch and a POST — and refreshes usage on success so the
 /// cleared windows show up right away. This SPENDS a one-shot reset, so it only
 /// ever runs from this explicit click, never automatically.
 fn handle_claim(slug: &str, key: &str) {
-    if slug != CLAUDE_SLUG {
-        return;
+    handle_claim_with(
+        slug,
+        key,
+        |question| confirm_with_button(question, "Claim reset"),
+        |key| {
+            spawn_claim(key);
+        },
+    );
+}
+
+fn handle_claim_with(
+    slug: &str,
+    key: &str,
+    ask: impl FnOnce(&str) -> bool,
+    claim: impl FnOnce(String),
+) {
+    if slug == CLAUDE_SLUG
+        && ask(&format!(
+            "Claim this reset for {key}?\n\nThis uses one banked reset."
+        ))
+    {
+        claim(key.to_string());
     }
-    let key = key.to_string();
+}
+
+fn spawn_claim(key: String) {
     std::thread::spawn(move || match crate::claim_claude_reset(&key) {
         Ok(crate::providers::claude::usage::ClaimOutcome::Reset) => {
             notify(&format!("Reset claimed for {key} — limits cleared"));
@@ -3564,16 +3576,20 @@ fn set_autoswap_threshold(v: f64) {
 /// the dialog fails closed to `Cancel`, so a missing binary can't accidentally
 /// confirm a destructive action).
 fn confirm(question: &str) -> bool {
+    confirm_with_button(question, "Remove")
+}
+
+fn confirm_with_button(question: &str, button: &str) -> bool {
     let result = rfd::MessageDialog::new()
         .set_title("usagio")
         .set_description(question)
         .set_level(rfd::MessageLevel::Warning)
         .set_buttons(rfd::MessageButtons::OkCancelCustom(
-            "Remove".to_string(),
+            button.to_string(),
             "Cancel".to_string(),
         ))
         .show();
-    matches!(result, rfd::MessageDialogResult::Custom(label) if label == "Remove")
+    matches!(result, rfd::MessageDialogResult::Custom(label) if label == button)
 }
 
 // ---------------------------------------------------------------------------
@@ -3699,28 +3715,33 @@ mod cross_platform {
     /// provider group holds one such submenu per account.
     fn build_account_submenu_item(sec: &ProviderSection, a: &AcctView) -> PMenuItem {
         let mut items = Vec::new();
+        let rows = account_submenu_rows(sec, a);
         for (row, locked) in submenu_info_items(sec, a) {
-            items.push(info_row(row, locked.then_some(ValueColor::Red)));
+            let ready_reset = rows.claim_reset_row
+                && a.reported.reset_grants.iter().any(|g| {
+                    g.is_available()
+                        && g.usable_now
+                        && reset_grant_row(g).as_deref() == Some(row.as_str())
+                });
+            if ready_reset {
+                items.push(action(
+                    format!("claim:{}:{}", sec.provider_id, a.key),
+                    row,
+                    true,
+                ));
+            } else {
+                items.push(info_row(row, locked.then_some(ValueColor::Red)));
+            }
         }
         for row in account_extra_info_rows(sec, a) {
             items.push(info_row(row, None));
         }
-        // Action rows: Switch/Active, Launch, Remove.
-        let rows = account_submenu_rows(sec, a);
+        // Account actions.
         items.push(PMenuItem::Separator);
-        match rows.switch_row {
-            Some(true) => items.push(action("noop", "✓ Active", false)),
-            Some(false) => items.push(action(
+        if rows.switch_row {
+            items.push(action(
                 format!("switch:{}:{}", sec.provider_id, a.key),
                 "Switch to this account",
-                true,
-            )),
-            None => {}
-        }
-        if rows.claim_reset_row {
-            items.push(action(
-                format!("claim:{}:{}", sec.provider_id, a.key),
-                "Claim reset…",
                 true,
             ));
         }
@@ -4719,7 +4740,7 @@ mod tests {
 
     #[test]
     fn no_reported_rows_when_nothing_reported() {
-        assert!(reported_rows(&ReportedUsage::default(), true).is_empty());
+        assert!(reported_rows(&ReportedUsage::default()).is_empty());
         let rows = with_reported(ReportedUsage::default());
         assert!(
             !rows
@@ -4730,89 +4751,68 @@ mod tests {
     }
 
     #[test]
-    fn credits_row_formats_what_the_provider_reported() {
-        let row = |c: Credits| credits_row(&c);
-        assert_eq!(
-            row(Credits {
-                enabled: true,
-                used: usd(1234),
-                limit: usd(5000),
-                ..Credits::default()
-            })
-            .as_deref(),
-            Some("Credits · $12.34 / $50 used")
-        );
-        assert_eq!(
-            row(Credits {
-                used: usd(310),
-                ..Credits::default()
-            })
-            .as_deref(),
-            Some("Credits · $3.10 used")
-        );
-        assert_eq!(
-            row(Credits {
-                enabled: true,
-                balance: Money::new(120, 0, Money::CREDITS),
-                ..Credits::default()
-            })
-            .as_deref(),
-            Some("Credits · 120 left")
-        );
-        // Claude: wallet balance from `prepaid/credits` leads the monthly cap.
-        assert_eq!(
-            row(Credits {
-                enabled: true,
-                used: usd(5463),
-                limit: usd(10000),
-                balance: usd(90335),
-                ..Credits::default()
-            })
-            .as_deref(),
-            Some("Credits · $903.35 left · $54.63 / $100 used")
-        );
-        assert_eq!(
-            row(Credits {
-                enabled: true,
-                limit_reached: true,
-                ..Credits::default()
-            })
-            .as_deref(),
-            Some("Credits · limit reached")
-        );
-        // The cap is hit: the over-cap used figure is noise.
-        assert_eq!(
-            row(Credits {
-                enabled: true,
-                limit_reached: true,
-                used: usd(100162),
-                limit: usd(100000),
-                ..Credits::default()
-            })
-            .as_deref(),
-            Some("Credits · $1,000 limit reached")
-        );
-        assert_eq!(
-            row(Credits {
-                enabled: true,
-                ..Credits::default()
-            })
-            .as_deref(),
-            Some("Credits · enabled")
-        );
+    fn credits_row_shows_available_amount_under_the_spending_cap() {
+        let mut c = Credits {
+            enabled: true,
+            used: usd(5463),
+            limit: usd(10000),
+            balance: usd(90335),
+            ..Credits::default()
+        };
+        assert_eq!(credits_row(&c).as_deref(), Some("Credits · $45.37"));
+        c.balance = usd(1200);
+        assert_eq!(credits_row(&c).as_deref(), Some("Credits · $12.00"));
+        c.used = usd(10000);
+        assert_eq!(credits_row(&c).as_deref(), Some("Credits · 0"));
+        c.balance = Money::new(63649, 2, Money::CREDITS);
+        c.limit = None;
+        c.used = None;
+        assert_eq!(credits_row(&c).as_deref(), Some("Credits · 636.49"));
     }
 
     #[test]
-    fn credits_row_suppressed_when_off_and_zero() {
-        // Claude's live shape with extra usage off: $0.00 used, not enabled.
+    fn credits_row_reports_none_for_disabled_empty_or_capped_accounts() {
+        for c in [
+            Credits::default(),
+            Credits {
+                used: usd(100286),
+                limit: usd(0),
+                ..Credits::default()
+            },
+            Credits {
+                enabled: true,
+                limit_reached: true,
+                balance: usd(90335),
+                ..Credits::default()
+            },
+            Credits {
+                enabled: true,
+                balance: usd(0),
+                ..Credits::default()
+            },
+        ] {
+            assert_eq!(credits_row(&c).as_deref(), Some("Credits · 0"));
+        }
+    }
+
+    #[test]
+    fn credits_row_does_not_invent_an_unknown_balance() {
         assert_eq!(
             credits_row(&Credits {
-                used: usd(0),
+                enabled: true,
                 ..Credits::default()
-            }),
-            None
+            })
+            .as_deref(),
+            Some("Credits · —")
         );
-        assert_eq!(credits_row(&Credits::default()), None);
+        assert_eq!(
+            credits_row(&Credits {
+                unlimited: true,
+                ..Credits::default()
+            })
+            .as_deref(),
+            Some("Credits · unlimited")
+        );
     }
 
     #[test]
@@ -4849,6 +4849,114 @@ mod tests {
         assert!(row.starts_with("Fable 7d · 42% · resets in "), "{row}");
     }
 
+    fn reset_fixture(usable_now: bool) -> ResetGrant {
+        ResetGrant {
+            id: "gift".into(),
+            resets_left: 1,
+            usable_now,
+            ..ResetGrant::default()
+        }
+    }
+
+    #[test]
+    fn reset_gift_tracks_inactive_accounts_across_providers() {
+        let now = Utc::now();
+        let mut snap = two_section_snap(
+            acct("claude@example.com", Some(10.0), Some(20.0), true),
+            Some(43.0),
+            Some("claude".into()),
+        );
+        let base = title_for(&snap);
+        snap.sections[1].accounts[0].active = false;
+        snap.sections[1].accounts[0].reported.reset_grants = vec![reset_fixture(false)];
+        assert_eq!(title_for(&snap), format!("{base} 🎁"));
+        let a = &snap.sections[1].accounts[0];
+        assert!(account_header_row(&snap.sections[1], a)
+            .plain
+            .ends_with(" 🎁"));
+        let (text, colors) = trailing_for_account(a, bands(), now);
+        let (base_text, base_colors) = trailing_usage_for_account(a, bands(), now);
+        assert_eq!(text, format!("{base_text} 🎁"));
+        assert_eq!(colors, base_colors);
+        assert_eq!(
+            binding_span(a, &text, now),
+            binding_span(a, &base_text, now)
+        );
+        snap.sections[1].accounts[0].reported.reset_grants[0].resets_left = 0;
+        assert_eq!(title_for(&snap), base);
+        assert!(
+            !account_header_row(&snap.sections[1], &snap.sections[1].accounts[0])
+                .plain
+                .contains('🎁')
+        );
+    }
+
+    #[test]
+    fn reset_ready_row_is_clickable_only_for_claude() {
+        let _g = crate::store::ScopedConfigDir::new();
+        use crate::platform::MenuItem;
+        for provider in ["claude", "codex"] {
+            for ready in [false, true] {
+                let mut a = acct("gift@example.com", Some(10.0), Some(20.0), true);
+                a.provider_id = provider;
+                a.reported.reset_grants = vec![reset_fixture(ready)];
+                let mut snap = one_section_snap(a);
+                snap.sections[0].provider_id = provider;
+                let tree = cross_platform::menu_tree_from_snapshot(&snap);
+                let MenuItem::Submenu { items, .. } = &tree.items[1] else {
+                    panic!("account submenu missing")
+                };
+                let claim_rows: Vec<_> = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        MenuItem::Action {
+                            id, label, enabled, ..
+                        } if id.starts_with("claim:") => Some((id, label, enabled)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(claim_rows.len(), usize::from(provider == "claude" && ready));
+                if let Some((id, label, enabled)) = claim_rows.first() {
+                    assert_eq!(id.as_str(), "claim:claude:gift@example.com");
+                    assert_eq!(label.as_str(), "🎁 1 reset ready");
+                    assert!(**enabled);
+                }
+                assert!(!items.iter().any(
+                    |item| matches!(item, MenuItem::Action { label, .. } if label == "Claim reset…" || label == "✓ Active")
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn reset_claim_requires_confirmation_and_never_claims_codex() {
+        use std::cell::Cell;
+        for (provider, approved, expected) in [
+            ("claude", false, false),
+            ("claude", true, true),
+            ("codex", true, false),
+        ] {
+            let asked = Cell::new(false);
+            let claimed = Cell::new(false);
+            handle_claim_with(
+                provider,
+                "gift@example.com",
+                |question| {
+                    asked.set(true);
+                    assert!(question.contains("gift@example.com"));
+                    assert!(question.contains("one banked reset"));
+                    approved
+                },
+                |key| {
+                    assert_eq!(key, "gift@example.com");
+                    claimed.set(true);
+                },
+            );
+            assert_eq!(asked.get(), provider == "claude");
+            assert_eq!(claimed.get(), expected);
+        }
+    }
+
     #[test]
     fn reset_grant_row_text_by_state() {
         let mk = |resets_left: u32, usable_now: bool| ResetGrant {
@@ -4859,47 +4967,49 @@ mod tests {
             expires_at: None,
         };
         // Spent → no row.
-        assert_eq!(reset_grant_row(&mk(0, true), true), None);
-        // Usable now → the claim invitation.
+        assert_eq!(reset_grant_row(&mk(0, true)), None);
+        // Usable now → ready.
         assert_eq!(
-            reset_grant_row(&mk(1, true), true).as_deref(),
-            Some("🎁 Reset available · claim below")
+            reset_grant_row(&mk(1, true)).as_deref(),
+            Some("🎁 1 reset ready")
         );
-        // Banked but not usable → say so, don't invite a claim.
+        // Banked but not usable → banked.
         assert_eq!(
-            reset_grant_row(&mk(1, false), true).as_deref(),
-            Some("🎁 Reset banked · usable once you're limited")
+            reset_grant_row(&mk(1, false)).as_deref(),
+            Some("🎁 1 reset banked")
         );
         // Expiry is appended when known.
         let mut g = mk(1, true);
         g.expires_at = Some(Utc::now() + chrono::Duration::days(3));
-        assert!(reset_grant_row(&g, true)
+        assert!(reset_grant_row(&g)
             .unwrap()
-            .starts_with("🎁 Reset available · claim below · expires in "));
-        // A provider usagio can't claim for (Codex): no "claim below".
+            .starts_with("🎁 1 reset ready · expires in "));
+        let mut multiple = mk(2, false);
         assert_eq!(
-            reset_grant_row(&mk(1, true), false).as_deref(),
-            Some("🎁 Reset available")
+            reset_grant_row(&multiple).as_deref(),
+            Some("🎁 2 resets banked")
+        );
+        multiple.usable_now = true;
+        assert_eq!(
+            reset_grant_row(&multiple).as_deref(),
+            Some("🎁 2 resets ready")
         );
     }
 
     #[test]
     fn reset_grant_rows_lead_reported_rows() {
-        let rows = reported_rows(
-            &ReportedUsage {
-                scoped_limits: vec![scoped("Fable", Some(42.0))],
-                reset_grants: vec![ResetGrant {
-                    id: "g1".into(),
-                    label: "Opus launch".into(),
-                    resets_left: 1,
-                    usable_now: true,
-                    expires_at: None,
-                }],
-                ..ReportedUsage::default()
-            },
-            true,
-        );
-        assert_eq!(rows[0], "🎁 Reset available · claim below", "{rows:?}");
+        let rows = reported_rows(&ReportedUsage {
+            scoped_limits: vec![scoped("Fable", Some(42.0))],
+            reset_grants: vec![ResetGrant {
+                id: "g1".into(),
+                label: "Opus launch".into(),
+                resets_left: 1,
+                usable_now: true,
+                expires_at: None,
+            }],
+            ..ReportedUsage::default()
+        });
+        assert_eq!(rows[0], "🎁 1 reset ready", "{rows:?}");
     }
 
     #[test]
@@ -4907,7 +5017,7 @@ mod tests {
         let rows = with_reported(ReportedUsage {
             credits: Some(Credits {
                 enabled: true,
-                used: usd(310),
+                balance: usd(310),
                 ..Credits::default()
             }),
             breakdown: vec![share("Claude Code", 82.0), share("Chats", 18.0)],
@@ -4926,7 +5036,7 @@ mod tests {
             [
                 "Fable 7d · 42%",
                 "This week · Claude Code 82% · Chats 18%",
-                "Credits · $3.10 used",
+                "Credits · $3.10",
             ],
             "{rows:?}"
         );
@@ -4964,14 +5074,14 @@ mod tests {
         let mut changed = base;
         changed.sections[0].accounts[0].reported.credits = Some(Credits {
             enabled: true,
-            used: usd(310),
+            balance: usd(310),
             ..Credits::default()
         });
         let sig2 = menu_signature(&changed);
         assert_ne!(sig1, sig2);
         changed.sections[0].accounts[0].reported.credits = Some(Credits {
             enabled: true,
-            used: usd(311),
+            balance: usd(311),
             ..Credits::default()
         });
         assert_ne!(sig2, menu_signature(&changed));
@@ -4984,10 +5094,10 @@ mod tests {
         let mut a = acct("lapsed@x.com", Some(0.0), Some(0.0), false);
         a.no_subscription = true;
         let rows = account_submenu_rows(&sec, &a);
-        assert_eq!(rows.switch_row, None);
-        // Still active → keep the "✓ Active" marker.
+        assert!(!rows.switch_row);
+        // An active account also has no redundant status or switch row.
         a.active = true;
-        assert_eq!(account_submenu_rows(&sec, &a).switch_row, Some(true));
+        assert!(!account_submenu_rows(&sec, &a).switch_row);
     }
 
     #[test]
@@ -6051,18 +6161,18 @@ mod tests {
 
     #[test]
     fn submenu_rows_omit_switch_when_unsupported() {
-        // Codex today: supports_switching == false — no Switch row.
+        // A provider without switching support has no Switch row.
         let sec = section_with_caps(false, true);
         let a = acct("user@example.com", Some(10.0), Some(20.0), false);
         let rows = account_submenu_rows(&sec, &a);
-        assert_eq!(rows.switch_row, None, "no switch row: {rows:?}");
+        assert!(!rows.switch_row, "no switch row: {rows:?}");
     }
 
     #[test]
-    fn submenu_rows_marks_active_account_instead_of_a_clickable_switch_row() {
+    fn submenu_rows_omit_switch_for_active_accounts() {
         let sec = section_with_caps(true, true);
         let a = acct("user@example.com", Some(10.0), Some(20.0), true);
-        assert_eq!(account_submenu_rows(&sec, &a).switch_row, Some(true));
+        assert!(!account_submenu_rows(&sec, &a).switch_row);
     }
 
     #[test]
@@ -6199,7 +6309,7 @@ mod tests {
             Some(now + chrono::Duration::days(2)),
         );
         let rows = account_submenu_rows(&claude_section(), &a);
-        assert_eq!(rows.switch_row, Some(false));
+        assert!(rows.switch_row);
     }
 
     #[test]
@@ -6664,8 +6774,17 @@ mod tests {
         };
         let a = mk();
 
-        // No history yet → just the freshness footer.
-        assert_eq!(account_extra_info_rows(&sec, &a), ["updated 1m ago"]);
+        // Keep the same layout without inventing a pace when history is absent.
+        assert_eq!(
+            account_extra_info_rows(&sec, &a),
+            ["Weekly · 60% · —", "updated 1m ago"]
+        );
+        let mut inactive = mk();
+        inactive.active = false;
+        assert_eq!(
+            account_extra_info_rows(&sec, &inactive),
+            account_extra_info_rows(&sec, &a)
+        );
 
         // A steady climb over the last hour → a confident burn-rate row first.
         let now = Utc::now();
