@@ -399,6 +399,12 @@ fn summary_pcts(a: &AcctView) -> (Option<f64>, Option<f64>) {
     (a0, a1)
 }
 
+/// The account reports a weekly window but no session window (Claude Ultra,
+/// Codex), so the weekly pct is its only number.
+fn weekly_only(a: &AcctView) -> bool {
+    matches!(summary_pcts(a), (None, Some(_)))
+}
+
 /// Fold an `AcctView` into the shape `countdown::compute_display` expects —
 /// pcts from the first two windows plus the raw reset instants we captured off
 /// the row. Shared by account-row and provider recovery countdowns.
@@ -634,7 +640,20 @@ fn trailing_for_account(
             }
             (trailing, colors)
         }
+        DisplayState::StaleAfterReset { .. } if weekly_only(a) => ("-%".to_string(), Vec::new()),
         DisplayState::StaleAfterReset { .. } => ("-% / -%".to_string(), Vec::new()),
+        // No session window at all (Claude Ultra, Codex): the weekly pct is
+        // the only number, so show it alone rather than `— / 66%`.
+        DisplayState::Usage {
+            session_pct: None,
+            weekly_pct: Some(wp),
+        } => {
+            let t = pct(Some(wp));
+            let colors = severity_with(Some(wp), bands)
+                .map(|sev| vec![(0, u16len(&t), sev)])
+                .unwrap_or_default();
+            (t, colors)
+        }
         DisplayState::Usage {
             session_pct,
             weekly_pct,
@@ -2066,9 +2085,10 @@ fn window_status_row(w: &WindowView) -> Option<(String, bool)> {
     }
 }
 
-/// "Credits · $903.35 left · $3.10 used of $50.00" — `None` unless the provider
+/// "Credits · $903.35 left · $3.10 / $50 used" — `None` unless the provider
 /// reported credits switched on or a non-zero figure. The wallet balance leads:
-/// it's the money actually available; used-of-limit is the monthly spend cap.
+/// it's the money actually available; used / cap is the monthly spend. Once
+/// the cap is hit, "$1,000 limit reached" replaces the (over-cap) used figure.
 /// Only ever the provider's own numbers; nothing here is estimated.
 fn credits_row(c: &Credits) -> Option<String> {
     if !c.is_meaningful() {
@@ -2078,19 +2098,25 @@ fn credits_row(c: &Credits) -> Option<String> {
     if let Some(balance) = &c.balance {
         parts.push(format!("{} left", balance.display()));
     }
-    match (&c.used, &c.limit) {
-        (Some(used), Some(limit)) => {
-            parts.push(format!("{} used of {}", used.display(), limit.display()))
+    if c.limit_reached {
+        parts.push(match &c.limit {
+            Some(limit) => format!("{} limit reached", limit.display_whole()),
+            None => "limit reached".to_string(),
+        });
+    } else {
+        match (&c.used, &c.limit) {
+            (Some(used), Some(limit)) => parts.push(format!(
+                "{} / {} used",
+                used.display(),
+                limit.display_whole()
+            )),
+            (Some(used), None) => parts.push(format!("{} used", used.display())),
+            (None, Some(limit)) => parts.push(format!("{} limit", limit.display_whole())),
+            (None, None) => {}
         }
-        (Some(used), None) => parts.push(format!("{} used", used.display())),
-        (None, Some(limit)) => parts.push(format!("limit {}", limit.display())),
-        (None, None) => {}
     }
     if c.unlimited {
         parts.push("unlimited".to_string());
-    }
-    if c.limit_reached {
-        parts.push("limit reached".to_string());
     }
     if parts.is_empty() {
         parts.push("enabled".to_string());
@@ -2256,8 +2282,6 @@ fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)
                         text.push_str(" · using credits");
                     }
                     rows.push((text, locked)); // (text, locked)
-                } else if sec.provider_id == "codex" && w.pct.is_none() {
-                    rows.push((format!("{} · Not reported", stat_display_label(w)), false));
                 }
             }
             // What the provider itself reported beyond the windows (credits,
@@ -2320,15 +2344,13 @@ fn empty_in_row(
     } else {
         now + chrono::Duration::hours(crate::burn_rate::MAX_EMPTY_IN_HOURS)
     };
-    let reset_at = a.weekly_reset_at;
     let est = crate::burn_rate::BurnRateEstimate {
         window: crate::providers::trait_def::Window::Weekly,
         current_pct: pct as f32,
         rate_pct_per_hour: (rate * 60.0) as f32,
         confidence: 1.0,
         empty_at,
-        reset_at,
-        margin: reset_at.and_then(|r| (r > empty_at).then(|| r - empty_at)),
+        reset_at: a.weekly_reset_at,
     };
     Some(crate::burn_rate::format_menu_row(&est))
 }
@@ -2763,14 +2785,23 @@ fn binding_tooltip(a: &AcctView, now: DateTime<Utc>, trigger: f64) -> String {
             pct(p)
         }
     };
-    let mut out = format!(
-        "{} — session {}{}, weekly {}{}",
-        a.display,
-        render(first, s),
-        mark(first),
-        render(second, w),
-        mark(second)
-    );
+    let mut out = if weekly_only(a) {
+        format!(
+            "{} — weekly {}{}",
+            a.display,
+            render(second, w),
+            mark(second)
+        )
+    } else {
+        format!(
+            "{} — session {}{}, weekly {}{}",
+            a.display,
+            render(first, s),
+            mark(first),
+            render(second, w),
+            mark(second)
+        )
+    };
     // The engine judges with the floored rate; say so when it is stricter
     // than the account's own pace (R2-m3).
     if let Some(b) = b {
@@ -4712,7 +4743,7 @@ mod tests {
                 ..Credits::default()
             })
             .as_deref(),
-            Some("Credits · $12.34 used of $50.00")
+            Some("Credits · $12.34 / $50 used")
         );
         assert_eq!(
             row(Credits {
@@ -4741,7 +4772,7 @@ mod tests {
                 ..Credits::default()
             })
             .as_deref(),
-            Some("Credits · $903.35 left · $54.63 used of $100.00")
+            Some("Credits · $903.35 left · $54.63 / $100 used")
         );
         assert_eq!(
             row(Credits {
@@ -4751,6 +4782,18 @@ mod tests {
             })
             .as_deref(),
             Some("Credits · limit reached")
+        );
+        // The cap is hit: the over-cap used figure is noise.
+        assert_eq!(
+            row(Credits {
+                enabled: true,
+                limit_reached: true,
+                used: usd(100162),
+                limit: usd(100000),
+                ..Credits::default()
+            })
+            .as_deref(),
+            Some("Credits · $1,000 limit reached")
         );
         assert_eq!(
             row(Credits {
@@ -5054,7 +5097,8 @@ mod tests {
         let mut sec = claude_section();
         sec.provider_id = "codex";
         let rows = submenu_info_rows(&sec, &a);
-        assert_eq!(rows, ["Session · Not reported", "Weekly renews in 2d"]);
+        // No session window: nothing to say about it, not "Not reported".
+        assert_eq!(rows, ["Weekly renews in 2d"]);
         assert_eq!(summary_pcts(&a), (None, Some(40.0)));
         // Codex has no session window, so the binding window is weekly:
         // `40%w` (0.12.2 binding-window display, design §4).
