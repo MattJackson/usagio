@@ -133,9 +133,14 @@ pub(crate) fn parse_plan(
 pub(crate) fn parse_credits(body: &serde_json::Value) -> Option<Credits> {
     let c = body.get("credits")?.as_object()?;
     let flag = |k: &str| c.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
+    // The backend sends ten decimal places ("636.4935245000"); two read fine.
+    let cents = |s: &str| match s.split_once('.') {
+        Some((whole, frac)) => format!("{whole}.{}", &frac[..frac.len().min(2)]),
+        None => s.to_string(),
+    };
     let balance = c.get("balance").and_then(|b| match b {
-        Value::String(s) => Money::from_decimal_str(s, Money::CREDITS),
-        Value::Number(n) => Money::from_decimal_str(&n.to_string(), Money::CREDITS),
+        Value::String(s) => Money::from_decimal_str(&cents(s), Money::CREDITS),
+        Value::Number(n) => Money::from_decimal_str(&cents(&n.to_string()), Money::CREDITS),
         _ => None,
     });
     let credits = Credits {
@@ -828,6 +833,13 @@ mod tests {
         assert_eq!(
             parse_credits(&body).unwrap().balance.unwrap().display(),
             "12.50"
+        );
+        // The live backend's ten decimal places are cut to two.
+        let body =
+            serde_json::json!({ "credits": { "has_credits": true, "balance": "636.4935245000" } });
+        assert_eq!(
+            parse_credits(&body).unwrap().balance.unwrap().display(),
+            "636.49"
         );
     }
 
