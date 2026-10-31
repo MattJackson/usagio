@@ -292,6 +292,18 @@ fn usage_url() -> String {
     config::USAGE_URL.to_string()
 }
 
+/// Usage fields usagio doesn't read yet, all `null` so far; logged when they
+/// start carrying data (see `providers::log_watched_fields`).
+const WATCHED_FIELDS: &[&str] = &[
+    "five_hour.locked_reason",
+    "seven_day.locked_reason",
+    "seven_day.limit_dollars",
+    "seven_day.used_dollars",
+    "seven_day.remaining_dollars",
+    "pace",
+    "seven_day_cowork",
+];
+
 pub fn fetch(access_token: &str) -> std::result::Result<Usage, FetchError> {
     let resp = super::http_agent()
         .get(&usage_url())
@@ -305,9 +317,14 @@ pub fn fetch(access_token: &str) -> std::result::Result<Usage, FetchError> {
         .set("Content-Type", "application/json")
         .call();
     match resp {
-        Ok(r) => r
-            .into_json::<Usage>()
-            .map_err(|e| FetchError::Other(format!("parsing usage response: {e}"))),
+        Ok(r) => {
+            let body: serde_json::Value = r
+                .into_json()
+                .map_err(|e| FetchError::Other(format!("parsing usage response: {e}")))?;
+            crate::providers::log_watched_fields("claude", &body, WATCHED_FIELDS);
+            serde_json::from_value::<Usage>(body)
+                .map_err(|e| FetchError::Other(format!("parsing usage response: {e}")))
+        }
         Err(ureq::Error::Status(429, _)) => Err(FetchError::RateLimited),
         Err(ureq::Error::Status(401, _)) => Err(FetchError::Auth),
         Err(ureq::Error::Status(403, _)) => Err(FetchError::Forbidden),
