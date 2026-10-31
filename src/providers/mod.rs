@@ -137,3 +137,94 @@ fn build() -> Vec<Box<dyn Provider>> {
 
     v
 }
+
+/// The non-null values among `paths` (dotted, e.g. `seven_day.locked_reason`)
+/// in a provider response, as `path=json`. `false` and `0` count as empty: the
+/// point is to catch a field that starts carrying real data.
+pub(crate) fn watched_values(body: &serde_json::Value, paths: &[&str]) -> Vec<String> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            let v = path.split('.').try_fold(body, |v, k| v.get(k))?;
+            if is_blank(v) {
+                return None;
+            }
+            let mut json = v.to_string();
+            if json.chars().count() > 300 {
+                json = json.chars().take(300).chain(['…']).collect();
+            }
+            Some(format!("{path}={json}"))
+        })
+        .collect()
+}
+
+/// Null, `false`, `0`, `[]`, or an object of nothing but those.
+fn is_blank(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Null | serde_json::Value::Bool(false) => true,
+        serde_json::Value::Number(n) => n.as_f64() == Some(0.0),
+        serde_json::Value::Array(a) => a.is_empty(),
+        serde_json::Value::Object(o) => o.values().all(is_blank),
+        _ => false,
+    }
+}
+
+/// Log the first appearance of each value of fields usagio doesn't use yet
+/// (`api-watch: claude seven_day.locked_reason="…"`), so whether they're worth
+/// using can be decided from real data. Each distinct value is logged once per
+/// process, not every poll.
+pub(crate) fn log_watched_fields(provider: &str, body: &serde_json::Value, paths: &[&str]) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let found = watched_values(body, paths);
+    if found.is_empty() {
+        return;
+    }
+    let Ok(mut seen) = SEEN.lock() else {
+        return;
+    };
+    let seen = seen.get_or_insert_with(HashSet::new);
+    for f in found {
+        let key = format!("{provider} {f}");
+        if seen.len() < 1000 && seen.insert(key.clone()) {
+            crate::logging::log(&format!("api-watch: {key}"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::watched_values;
+
+    #[test]
+    fn watched_values_reports_only_real_data() {
+        let body = serde_json::json!({
+            "seven_day": { "locked_reason": "weekly_cap", "limit_dollars": null },
+            "pace": null,
+            "spend_control": { "reached": false, "individual_limit": null },
+            "additional_rate_limits": [],
+            "code_review_rate_limit": { "used_percent": 12 },
+        });
+        let got = watched_values(
+            &body,
+            &[
+                "seven_day.locked_reason",
+                "seven_day.limit_dollars",
+                "pace",
+                "spend_control",
+                "spend_control.reached",
+                "additional_rate_limits",
+                "code_review_rate_limit",
+                "missing.path",
+            ],
+        );
+        assert_eq!(
+            got,
+            [
+                "seven_day.locked_reason=\"weekly_cap\"",
+                "code_review_rate_limit={\"used_percent\":12}",
+            ]
+        );
+    }
+}
