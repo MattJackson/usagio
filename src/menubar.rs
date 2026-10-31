@@ -254,8 +254,6 @@ struct Snapshot {
     /// limit); `Some(slug)` pins the tray to one provider. Drives
     /// `tray_target` / `title_for` / `tray_icon_bytes`.
     tray_icon_mode: Option<String>,
-    /// Settings ▸ Auto-swap ▸ "Classic engine" (rollback to v1).
-    engine_classic: bool,
 }
 
 /// How near a limit a percentage is, for at-a-glance coloring.
@@ -827,6 +825,7 @@ fn tray_target<'a>(
         .sections
         .iter()
         .filter_map(|sec| Some((sec, sec.accounts.iter().find(|a| a.active)?)))
+        .filter(|(_, a)| locked_countdown_for(a, now).is_none())
         .collect();
     let ttb = |a: &AcctView| binding_for(a, now).and_then(|b| b.time_to_block);
     if actives.iter().any(|(_, a)| ttb(a).is_some()) {
@@ -1935,7 +1934,6 @@ fn build_snapshot() -> Snapshot {
         use_credits: st.use_credits_when_exhausted,
         notification_config: st.notification_config.clone(),
         tray_icon_mode: st.tray_icon_mode.clone(),
-        engine_classic: !crate::autoswap::shell::engine_v2(&st),
     }
 }
 
@@ -2364,7 +2362,6 @@ fn empty_in_row(
         window: crate::providers::trait_def::Window::Weekly,
         current_pct: pct as f32,
         rate_pct_per_hour: (rate * 60.0) as f32,
-        confidence: 1.0,
         empty_at,
         reset_at: a.weekly_reset_at,
     };
@@ -2529,10 +2526,7 @@ fn menu_signature(snap: &Snapshot) -> String {
             reg.provider_id, reg.display_name, reg.installed
         ));
     }
-    s.push_str(&format!(
-        "as={} th={:.0} eng={}",
-        snap.autoswap, snap.threshold, snap.engine_classic
-    ));
+    s.push_str(&format!("as={} th={:.0}", snap.autoswap, snap.threshold));
     s
 }
 
@@ -2927,7 +2921,6 @@ fn handle_click(id: &str) {
         ("noop", _, _) => {}
         ("autoswap", Some("off"), None) => set_autoswap(false),
         ("autoswap", Some("credits"), None) => toggle_use_credits(),
-        ("autoswap", Some("engine"), None) => toggle_engine(),
         ("autoswap", Some("now"), None) => match optimize_now() {
             Ok(Some(email)) => {
                 notify(&format!("Switched to {email}"));
@@ -3508,25 +3501,6 @@ fn toggle_use_credits() {
     }
 }
 
-/// Settings ▸ Auto-swap ▸ "Classic engine": the rollback switch between the
-/// v2 engine (default, `autoswap_engine` unset) and the classic v1 engine
-/// (`"v1"`). Flips the stored value under the lock.
-fn toggle_engine() {
-    let r = with_state_lock(|| {
-        let mut st = State::load()?;
-        let classic = !crate::autoswap::shell::engine_v2(&st);
-        st.autoswap_engine = if classic {
-            None
-        } else {
-            Some("v1".to_string())
-        };
-        st.save()
-    });
-    if let Err(e) = r {
-        notify(&format!("Could not save the engine setting: {e}"));
-    }
-}
-
 /// Settings ▸ Tray Icon selection. `"at-risk"` clears the pin (the default —
 /// tray follows the agent closest to its limit); any other value pins the tray
 /// to that provider slug. Reads-then-writes under the lock so a stale menu
@@ -3840,13 +3814,15 @@ mod cross_platform {
             }
         }
         // Sign in to a new account — every provider usagio can log in itself.
+        let mut signin_items = Vec::new();
         for p in providers::all().iter().filter(|p| p.login_spec().is_some()) {
-            items.push(action(
+            signin_items.push(action(
                 format!("signin:{}", p.provider_id()),
-                format!("Sign in to a new {} account…", p.display_name()),
+                p.display_name(),
                 true,
             ));
         }
+        items.push(plain_submenu("Sign in to a new account", signin_items));
         items.push(plain_submenu("Capture current login", capture_items));
 
         // Settings ▸: Refresh usage now, then a separator, then everything
@@ -3894,12 +3870,6 @@ mod cross_platform {
             "Use credits when every plan is used up",
             true,
             snap.use_credits,
-        ));
-        autoswap_items.push(checkbox(
-            "autoswap:engine",
-            "Classic engine (before 0.12.2)",
-            true,
-            snap.engine_classic,
         ));
         autoswap_items.push(PMenuItem::Separator);
         autoswap_items.push(action("autoswap:now", "Switch to best account now", true));
@@ -4195,7 +4165,6 @@ mod tests {
             threshold: 95.0,
             notification_config: crate::notifications::NotificationConfig::default(),
             tray_icon_mode: None,
-            engine_classic: false,
         }
     }
 
@@ -4232,7 +4201,6 @@ mod tests {
             threshold: 95.0,
             notification_config: crate::notifications::NotificationConfig::default(),
             tray_icon_mode,
-            engine_classic: false,
         }
     }
 
@@ -4246,6 +4214,15 @@ mod tests {
         let snap = two_section_snap(acct("c@x", Some(99.0), Some(20.0), true), Some(10.0), None);
         let (sec, _) = tray_target(&snap, None).expect("a target");
         assert_eq!(sec.provider_id, CLAUDE_SLUG);
+    }
+
+    #[test]
+    fn at_risk_excludes_locked_claude_and_keeps_usable_codex() {
+        let mut claude = acct("c@x", Some(100.0), Some(100.0), true);
+        claude.session_reset_at = Some(now_utc() + chrono::Duration::hours(2));
+        claude.weekly_reset_at = claude.session_reset_at;
+        let snap = two_section_snap(claude, Some(16.0), None);
+        assert_eq!(tray_target(&snap, None).unwrap().0.provider_id, "codex");
     }
 
     #[test]
@@ -4342,13 +4319,13 @@ mod tests {
             // Tolerate poison, like every production caller: the refresh-thread
             // test deliberately panics a `run_cycle` while holding this guard.
             let mut g = a.lock().unwrap_or_else(|e| e.into_inner());
-            g.for_provider(CLAUDE_SLUG).stuck_notified = true;
+            g.for_provider(CLAUDE_SLUG).use_credits = true;
         }
         assert!(
             b.lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .for_provider(CLAUDE_SLUG)
-                .stuck_notified,
+                .use_credits,
             "mutation through one handle must be visible through the other"
         );
     }
@@ -5069,6 +5046,7 @@ mod tests {
         next.fetched_at = Some(now);
         let mut snap = one_section_snap(active);
         snap.sections[0].accounts.push(next);
+        snap.tray_icon_mode = Some("claude".into());
         with_now(now, || {
             assert_eq!(title_for(&snap), "🔒 2h 0m");
             assert!(tooltip_for(&snap).contains("next@x.com"));
@@ -5097,7 +5075,9 @@ mod tests {
         let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
         let mut a = acct("blocked@x.com", Some(100.0), Some(100.0), true);
         a.weekly_reset_at = Some(now + chrono::Duration::hours(2));
-        with_now(now, || assert_eq!(title_for(&one_section_snap(a)), "🔒"));
+        let mut snap = one_section_snap(a);
+        snap.tray_icon_mode = Some("claude".into());
+        with_now(now, || assert_eq!(title_for(&snap), "🔒"));
     }
 
     #[test]
@@ -5409,7 +5389,6 @@ mod tests {
             threshold: 95.0,
             notification_config: crate::notifications::NotificationConfig::default(),
             tray_icon_mode: None,
-            engine_classic: false,
         };
         let (sec, acc) = active_account(&snap).expect("active row found");
         assert_eq!(sec.provider_id, "codex");
@@ -6025,7 +6004,6 @@ mod tests {
             threshold: 95.0,
             notification_config: crate::notifications::NotificationConfig::default(),
             tray_icon_mode: None,
-            engine_classic: false,
         };
         let groups = provider_grouped_order(&snap);
         assert_eq!(groups.len(), 2, "one entry per provider");
@@ -6943,6 +6921,19 @@ mod tests {
     }
 
     #[test]
+    fn signin_is_one_provider_submenu_and_classic_is_absent() {
+        let _cfg = crate::store::ScopedConfigDir::new();
+        let snap = one_section_snap(acct("a@x", Some(10.0), Some(10.0), true));
+        let tree = cross_platform::menu_tree_from_snapshot(&snap);
+        let signin = find_submenu(&tree.items, "Sign in to a new account");
+        for provider in providers::all().iter().filter(|p| p.login_spec().is_some()) {
+            assert!(signin.iter().any(|item| matches!(item, crate::platform::MenuItem::Action { id, label, .. } if id == &format!("signin:{}", provider.provider_id()) && label == provider.display_name())));
+        }
+        let auto = find_submenu(find_submenu(&tree.items, "Settings"), "Auto-swap");
+        assert!(!auto.iter().any(|item| matches!(item, crate::platform::MenuItem::Action { id, .. } if id == "autoswap:engine")));
+    }
+
+    #[test]
     fn menu_tree_capture_submenu_lists_providers_when_either_bucket_has_one() {
         // The menu builder reads the usage log for burn-rate rows.
         let _g = crate::store::ScopedConfigDir::new();
@@ -7579,33 +7570,5 @@ mod tests {
             Some(0.47),
         );
         assert!(account_header_row(&sec, &b).bold_spans.is_empty());
-    }
-
-    #[test]
-    fn engine_toggle_flips_between_v2_and_classic() {
-        let _g = crate::store::ScopedConfigDir::new();
-        State::default().save().unwrap();
-        let classic = || !crate::autoswap::shell::engine_v2(&State::load().unwrap());
-        crate::env_lock::scoped_env_var(crate::autoswap::shell::ENGINE_ENV_VAR, None, || {
-            assert!(!classic(), "v2 by default");
-            handle_click("autoswap:engine");
-            assert!(classic());
-            assert_eq!(
-                State::load().unwrap().autoswap_engine.as_deref(),
-                Some("v1")
-            );
-            handle_click("autoswap:engine");
-            assert!(!classic());
-            assert_eq!(State::load().unwrap().autoswap_engine, None);
-        });
-        // The checkbox is in Settings ▸ Auto-swap and reflects the snapshot.
-        let mut snap = one_section_snap(acct("a@x", Some(1.0), Some(1.0), true));
-        snap.engine_classic = true;
-        let tree = cross_platform::menu_tree_from_snapshot(&snap);
-        let auto = find_submenu(find_submenu(&tree.items, "Settings"), "Auto-swap");
-        assert!(checked_of(auto, "autoswap:engine"));
-        let mut other = one_section_snap(acct("a@x", Some(1.0), Some(1.0), true));
-        other.engine_classic = false;
-        assert_ne!(menu_signature(&snap), menu_signature(&other));
     }
 }
