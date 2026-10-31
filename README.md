@@ -182,8 +182,8 @@ prefix** (an ambiguous prefix lists the matches).
 usagio                     Show usage for every account (default)
 usagio capture             Capture the account you're currently logged into
 usagio switch [acct]       Make <acct> the active login (no launch)
-usagio start [acct]        Switch, then launch a fresh `claude`
-usagio continue [acct]     Switch, then launch `claude --continue`
+usagio start [acct]        Switch, then launch the selected provider CLI
+usagio continue [acct]     Switch, then resume the selected provider session
 usagio token <acct>        Print a fresh access token (for scripting)
 usagio login               Sign in to a new account in your browser (adds it)
 usagio renew <acct>        Sign <acct> in again in your browser (fresh login)
@@ -204,6 +204,28 @@ usagio start               # auto-pick the best account and open claude
 usagio continue dev        # prefix-match dev@…, switch, resume last conversation
 TOKEN=$(usagio token dev)  # a fresh access token for scripts
 ```
+
+For Codex, use an explicit provider when accounts share an email:
+
+```sh
+usagio capture codex
+usagio switch codex:dev@example.com
+usagio start codex:dev
+usagio continue codex:dev  # codex resume --last
+```
+
+`claude:email` also works. Unqualified selectors retain Claude's existing
+priority; `codex:` auto-picks within Codex. With only Codex accounts saved,
+commands without a selector auto-pick within Codex.
+
+Codex switches wait for its shared daemon to finish running turns, then publish
+the selected credentials, restart the daemon, and verify its loaded account.
+The pending switch survives a usagio restart. Active-account renewal uses the
+same handoff; selecting an already-loaded account leaves its work running.
+This adapter supports Codex's default `file` credential store. Explicit
+`keyring`, `auto`, and `ephemeral` stores are rejected before a switch begins.
+Sessions owned by a separate embedded app-server remain owned by that process;
+changing the shared daemon does not transfer their ownership.
 
 ## Auto-swap
 

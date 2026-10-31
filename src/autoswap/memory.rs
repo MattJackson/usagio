@@ -30,7 +30,7 @@ pub struct Latch {
 }
 
 /// Which latch a leave sets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LatchKind {
     /// Left by Trigger: not a Trigger/Rebalance target again this epoch.
     Trigger,

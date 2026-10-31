@@ -104,13 +104,25 @@ fn help_lists_subcommands() {
 #[test]
 fn help_subcommand_matches_flag() {
     let home = TempDir::new().unwrap();
-    bin(&home)
+    let help = bin(&home)
         .arg("help")
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "usage & instant account switching",
-        ));
+            "usage & automatic account switching",
+        ))
+        .stdout(predicate::str::contains("codex:email"))
+        .get_output()
+        .stdout
+        .clone();
+    let flag = bin(&home)
+        .arg("--help")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(help, flag);
 }
 
 #[test]

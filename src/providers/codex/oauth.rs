@@ -143,6 +143,7 @@ impl std::error::Error for RefreshError {}
 /// needs.
 #[derive(Debug, Clone)]
 pub struct CodexRefreshGrant {
+    pub id_token: Option<String>,
     pub access_token: String,
     pub refresh_token: String,
     pub expires_in_secs: i64,
@@ -214,6 +215,7 @@ pub fn refresh_token_grant(refresh_token: &str) -> Result<CodexRefreshGrant, Ref
         .map(|exp| exp.saturating_sub(chrono::Utc::now().timestamp()))
         .unwrap_or(0);
     Ok(CodexRefreshGrant {
+        id_token: parsed.id_token,
         access_token,
         refresh_token: refresh_token_out,
         expires_in_secs,
