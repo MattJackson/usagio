@@ -19,26 +19,18 @@
 //! The `id_token` JWT payload carries `email` plus the ChatGPT plan/account
 //! identifiers — no network call is needed to attach an email to the account.
 //!
-//! Unlike Claude, Codex doesn't use the macOS keychain at all — the `codex`
-//! CLI itself signs in by writing this file directly. Switching therefore has
-//! no keychain half: `write_active_account` rewrites `auth.json` atomically
-//! (tmp file + rename) with parent-dir/file permissions matching what the
-//! vendor CLI itself would produce (`0700`/`0600`). There is no separate
-//! identity file to touch (unlike `~/.claude.json`), so the auth.json write
-//! *is* the entire switch. `launch_client` remains unimplemented
-//! (`ProviderError::Unsupported`) — a future phase may shell out to `codex`.
+//! This adapter currently reads Codex's file credential backend. Credential
+//! writes are atomic and owner-only. Codex also has keyring-backed storage;
+//! file publication alone does not establish that a client loaded the account.
 //!
-//! RESOLVED (v0.5.0, state v2): `write_active_account` above is the
-//! auth.json-rewrite half of switching; `capabilities().supports_switching`
-//! is now `true` because `crate::store::State::providers` gives Codex a real
-//! multi-account slot (`ProviderAccount`/`ProviderAccounts`) to persist a
-//! *second* captured account into, and `main.rs::switch_to_provider_account` /
-//! `menubar.rs::handle_switch` dispatch a switch by provider slug instead of
-//! assuming Claude (see the H3 finding this closes, formerly recorded here as
-//! a TODO).
+//! The shared lifecycle owns refresh serialization, identity-safe adoption,
+//! durable switch intent and retries. The client adapter handles daemon drain,
+//! process-exit verification, startup and cached-account verification. Session
+//! ownership belongs to Codex and is distinct from credential identity.
 
 #![allow(dead_code)]
 
+mod client;
 pub mod oauth;
 
 use std::path::PathBuf;
@@ -56,6 +48,14 @@ use crate::providers::trait_def::{
     IdentitySnapshot, Money, PResult, Provider, ProviderError, ReportedUsage, ResetGrant,
     SecretBackend, TokenGrant, UsageSnapshot, UsageWindow,
 };
+
+fn launch_command(mode: crate::providers::trait_def::LaunchMode) -> std::process::Command {
+    let mut command = std::process::Command::new("codex");
+    if matches!(mode, crate::providers::trait_def::LaunchMode::Continue) {
+        command.args(["resume", "--last"]);
+    }
+    command
+}
 
 /// Read/write timeout applied to every outbound HTTP call this provider
 /// makes. The default `ureq::Agent` only bounds the TCP *connect* (30s); a
@@ -79,6 +79,69 @@ pub(crate) fn http_agent() -> &'static ureq::Agent {
     })
 }
 
+/// Decode both captured and newly authorized credentials without changing the
+/// vendor's active login. The shared login engine chooses where to save them.
+fn capture_blob(blob: String) -> PResult<CapturedAccount> {
+    let parsed = parse_codex_blob(&blob)?;
+
+    // The id_token JWT carries email + ChatGPT identifiers. Parsing is
+    // pure-local: no network call.
+    let id_claims = parsed
+        .tokens
+        .id_token
+        .as_deref()
+        .and_then(jwt_payload_claims)
+        .unwrap_or_default();
+
+    let email = id_claims
+        .get("email")
+        .and_then(|x| x.as_str())
+        .map(String::from)
+        .or_else(|| {
+            id_claims
+                .get("https://api.openai.com/profile")
+                .and_then(|p| p.get("email"))
+                .and_then(|x| x.as_str())
+                .map(String::from)
+        });
+    let uuid = parsed.tokens.account_id.clone().or_else(|| {
+        id_claims
+            .get("https://api.openai.com/auth")
+            .and_then(|p| p.get("chatgpt_account_id"))
+            .and_then(|x| x.as_str())
+            .map(String::from)
+    });
+
+    let native_blob = serde_json::json!({
+        "account_id": parsed.tokens.account_id,
+        "id_token_claims": id_claims,
+    });
+
+    let identity = IdentitySnapshot {
+        email,
+        uuid,
+        display_name: None,
+        native_blob,
+    };
+    let tokens = TokenGrant {
+        access: parsed.tokens.access_token.clone(),
+        refresh: parsed.tokens.refresh_token.clone(),
+        // The vendor blob doesn't record `expires_in` directly; use the
+        // JWT's `exp` claim minus `now` when present, else default to
+        // "expired" so callers refresh eagerly.
+        expires_in_secs: id_claims
+            .get("exp")
+            .and_then(|x| x.as_i64())
+            .map(|exp| exp.saturating_sub(Utc::now().timestamp()))
+            .unwrap_or(0),
+    };
+    Ok(CapturedAccount {
+        identity,
+        secret_blob: blob,
+        tokens,
+    })
+}
+
 /// Constructor called from `providers::build()` behind the `codex` feature.
 pub fn new() -> Box<dyn Provider> {
     Box::new(CodexProvider)
@@ -89,6 +152,24 @@ pub struct CodexProvider;
 /// Codex rate-limit / usage endpoint. The ChatGPT backend variant works for
 /// tokens issued by the standard ChatGPT-plan OAuth flow the CLI uses.
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+
+#[cfg(test)]
+thread_local! {
+    static USAGE_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_usage_url_override(url: Option<String>) {
+    USAGE_OVERRIDE.with(|value| *value.borrow_mut() = url);
+}
+
+fn usage_url() -> String {
+    #[cfg(test)]
+    if let Some(url) = USAGE_OVERRIDE.with(|value| value.borrow().clone()) {
+        return url;
+    }
+    USAGE_URL.to_string()
+}
 
 /// Parse the ChatGPT usage endpoint body into rate-limit windows. Pure (no
 /// network / clock beyond `Utc::now` for the reset offset) so both JSON shapes
@@ -331,7 +412,7 @@ impl Provider for CodexProvider {
             // the live app, so the "Switch to this account" row is safe to
             // show (H3, v0.5.0 codeaudit — closed).
             supports_switching: true,
-            supports_launch: false,
+            supports_launch: true,
             supports_remove: true,
             supports_email_capture: true,
             secret_backend: SecretBackend::File,
@@ -359,6 +440,7 @@ impl Provider for CodexProvider {
         let Some(path) = auth_json_path() else {
             return Ok(None);
         };
+        ensure_file_backend(&path)?;
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -366,67 +448,74 @@ impl Provider for CodexProvider {
         };
         let blob = String::from_utf8(bytes)
             .map_err(|e| ProviderError::Other(format!("auth.json is not UTF-8: {e}")))?;
-        let parsed = parse_codex_blob(&blob)?;
-
-        // The id_token JWT carries email + ChatGPT identifiers. Parsing is
-        // pure-local: no network call.
-        let id_claims = parsed
-            .tokens
-            .id_token
-            .as_deref()
-            .and_then(jwt_payload_claims)
-            .unwrap_or_default();
-
-        let email = id_claims
-            .get("email")
-            .and_then(|x| x.as_str())
-            .map(String::from)
-            .or_else(|| {
-                id_claims
-                    .get("https://api.openai.com/profile")
-                    .and_then(|p| p.get("email"))
-                    .and_then(|x| x.as_str())
-                    .map(String::from)
-            });
-        let uuid = parsed.tokens.account_id.clone().or_else(|| {
-            id_claims
-                .get("https://api.openai.com/auth")
-                .and_then(|p| p.get("chatgpt_account_id"))
-                .and_then(|x| x.as_str())
-                .map(String::from)
-        });
-
-        let native_blob = serde_json::json!({
-            "account_id": parsed.tokens.account_id,
-            "id_token_claims": id_claims,
-        });
-
-        let identity = IdentitySnapshot {
-            email,
-            uuid,
-            display_name: None,
-            native_blob,
-        };
-        let tokens = TokenGrant {
-            access: parsed.tokens.access_token.clone(),
-            refresh: parsed.tokens.refresh_token.clone(),
-            // The vendor blob doesn't record `expires_in` directly; use the
-            // JWT's `exp` claim minus `now` when present, else default to
-            // "expired" so callers refresh eagerly.
-            expires_in_secs: id_claims
-                .get("exp")
-                .and_then(|x| x.as_i64())
-                .map(|exp| exp.saturating_sub(Utc::now().timestamp()))
-                .unwrap_or(0),
-        };
-        Ok(Some(CapturedAccount {
-            identity,
-            secret_blob: blob,
-            tokens,
-        }))
+        Ok(Some(capture_blob(blob)?))
     }
 
-    // --- Token lifecycle ---------------------------------------------------
+    fn login_spec(&self) -> Option<crate::providers::trait_def::LoginSpec> {
+        use crate::providers::trait_def::{LoginSpec, TokenRequestStyle};
+        Some(LoginSpec {
+            authorize_url: "https://auth.openai.com/oauth/authorize",
+            token_url: oauth::TOKEN_URL,
+            client_id: oauth::CLIENT_ID,
+            scopes: &[
+                "openid",
+                "profile",
+                "email",
+                "offline_access",
+                "api.connectors.read",
+                "api.connectors.invoke",
+            ],
+            redirect_port: Some(1455),
+            redirect_host: "127.0.0.1",
+            redirect_path: "/auth/callback",
+            extra_authorize_params: &[
+                ("id_token_add_organizations", "true"),
+                ("codex_cli_simplified_flow", "true"),
+                ("originator", "codex_cli_rs"),
+            ],
+            login_hint_param: Some("login_hint"),
+            token_request: TokenRequestStyle::Form,
+        })
+    }
+
+    fn complete_login(&self, response: &Value) -> PResult<CapturedAccount> {
+        for field in ["access_token", "refresh_token", "id_token"] {
+            if response
+                .get(field)
+                .and_then(Value::as_str)
+                .is_none_or(|s| s.trim().is_empty())
+            {
+                return Err(ProviderError::Other(format!(
+                    "Codex sign-in returned no {field}"
+                )));
+            }
+        }
+        let claims =
+            jwt_payload_claims(response["id_token"].as_str().unwrap()).ok_or_else(|| {
+                ProviderError::Other("Codex sign-in returned an invalid identity token".into())
+            })?;
+        let account_id = claims
+            .get("https://api.openai.com/auth")
+            .and_then(|auth| auth.get("chatgpt_account_id"))
+            .and_then(Value::as_str);
+        let blob = serde_json::json!({
+            "auth_mode": "chatgpt", "OPENAI_API_KEY": null,
+            "tokens": {
+                "access_token": response["access_token"], "refresh_token": response["refresh_token"],
+                "id_token": response["id_token"], "account_id": account_id,
+                "oauth_provenance": { "issuer": "https://auth.openai.com", "client_id": oauth::CLIENT_ID },
+                "login_owner_id": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>()),
+            },
+            "last_refresh": Utc::now().to_rfc3339(),
+        });
+        let captured = capture_blob(blob.to_string())?;
+        if captured.identity.email.is_none() || captured.identity.uuid.is_none() {
+            return Err(ProviderError::Other(
+                "Codex sign-in did not identify the account".into(),
+            ));
+        }
+        Ok(captured)
+    }
 
     fn parse_stored_blob(&self, blob: &str) -> PResult<TokenGrant> {
         let parsed = parse_codex_blob(blob)?;
@@ -490,11 +579,94 @@ impl Provider for CodexProvider {
             })
     }
 
+    fn refresh_credential(&self, blob: &str, refresh: &str) -> PResult<(TokenGrant, String)> {
+        let refreshed = oauth::refresh_token_grant(refresh).map_err(|e| match e {
+            oauth::RefreshError::InvalidGrant => ProviderError::Auth,
+            oauth::RefreshError::RateLimited => ProviderError::RateLimited {
+                retry_after_secs: None,
+            },
+            oauth::RefreshError::Transient(s) => ProviderError::Transient(s),
+        })?;
+        let id_token = refreshed.id_token.clone();
+        let grant = refreshed.into();
+        let mut updated: Value = serde_json::from_str(&self.patch_stored_blob(blob, &grant)?)
+            .map_err(|e| ProviderError::Other(e.to_string()))?;
+        if let Some(id_token) = id_token {
+            updated["tokens"]["id_token"] = Value::String(id_token);
+        }
+        Ok((grant, updated.to_string()))
+    }
+
+    fn client_status(&self) -> PResult<crate::providers::ClientStatus> {
+        if let Some(path) = auth_json_path() {
+            ensure_file_backend(&path)?;
+        }
+        client::probe()
+            .map(|state| match state {
+                Some(state) => crate::providers::ClientStatus {
+                    running: true,
+                    busy: state.busy,
+                    account_key: state.email,
+                    account_id: state.account_id,
+                    handoff_token: state.instance_token,
+                },
+                None => crate::providers::ClientStatus::default(),
+            })
+            .map_err(|error| ProviderError::Other(error.to_string()))
+    }
+
+    fn begin_handoff(&self, token: &str) -> PResult<()> {
+        client::begin_drain(token).map_err(|error| ProviderError::Other(error.to_string()))
+    }
+
+    fn launch_client(
+        &self,
+        mode: crate::providers::trait_def::LaunchMode,
+    ) -> PResult<std::process::ExitStatus> {
+        launch_command(mode).status().map_err(ProviderError::Io)
+    }
+
+    fn handoff_request_is_idempotent(&self) -> bool {
+        crate::platform::graceful_drain_is_idempotent()
+    }
+
+    fn verify_handoff_stopped(&self, token: &str) -> PResult<()> {
+        client::verify_stopped(token).map_err(|error| ProviderError::Other(error.to_string()))
+    }
+
+    fn handoff_client(&self, identity: &IdentitySnapshot, token: Option<&str>) -> PResult<()> {
+        if token.is_none() {
+            return Ok(());
+        }
+        client::start_and_verify(identity).map_err(|error| ProviderError::Other(error.to_string()))
+    }
+
+    fn read_active_identity(&self) -> PResult<Option<IdentitySnapshot>> {
+        Ok(self
+            .capture_current_login()?
+            .map(|captured| captured.identity))
+    }
+
+    fn read_active_slot(&self) -> PResult<Option<String>> {
+        let Some(path) = auth_json_path() else {
+            return Ok(None);
+        };
+        ensure_file_backend(&path)?;
+        match std::fs::read_to_string(path) {
+            Ok(blob) => Ok(Some(blob)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(ProviderError::Other(format!(
+                "reading Codex credentials: {error}"
+            ))),
+        }
+    }
+
     // --- Usage -------------------------------------------------------------
 
     fn fetch_usage(&self, access_token: &str) -> PResult<UsageSnapshot> {
+        let url = usage_url();
         let resp = http_agent()
-            .get(USAGE_URL)
+            .get(&url)
             .set("Authorization", &format!("Bearer {access_token}"))
             .set("Content-Type", "application/json")
             .call();
@@ -559,53 +731,36 @@ impl Provider for CodexProvider {
         let path = auth_json_path().ok_or_else(|| {
             ProviderError::Other("could not resolve $CODEX_HOME / $HOME for auth.json".into())
         })?;
+        ensure_file_backend(&path)?;
         write_auth_json_atomically(&path, blob)?;
         Ok(())
     }
 
-    // `read_active_identity` and `launch_client` inherit the trait defaults,
-    // which return `ProviderError::Unsupported`. Codex has no separate
-    // "currently active identity" file to read independently of auth.json
-    // (capture_current_login already covers that), and no wired-up client
-    // launch yet.
-
-    /// Overridden rather than inherited: the trait default routes through
-    /// `read_active_identity()?`, which is the `Unsupported` trait default
-    /// here (see above) and would make every mirror attempt fail. Codex has
-    /// exactly one `auth.json` per machine with no separate identity file to
-    /// gate on — `write_active_account` already ignores its `identity`
-    /// argument entirely — so mirror unconditionally with a placeholder.
+    /// An inactive rotation must never overwrite a different live login.
     fn mirror_rotated_token(&self, blob: &str) -> PResult<()> {
-        let placeholder = IdentitySnapshot {
-            email: None,
-            uuid: None,
-            display_name: None,
-            native_blob: serde_json::Value::Null,
-        };
-        let result = self.write_active_account(blob, &placeholder);
-        let account = self
+        let incoming = self
             .identify_credential(blob)
-            .map(|k| k.key)
-            .unwrap_or_else(|| "<unknown>".to_string());
-        let to = auth_json_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<unresolved auth.json>".to_string());
-        crate::logging::log(&format!(
-            "event=mirror provider={} account={account} to={to} result={}",
-            self.provider_id(),
-            match &result {
-                Ok(()) => "ok".to_string(),
-                Err(e) => format!("err:{e}"),
-            }
-        ));
-        result
+            .ok_or(ProviderError::NotLoggedIn)?;
+        let current = self
+            .capture_current_login()?
+            .ok_or(ProviderError::NotLoggedIn)?;
+        if !self
+            .account_identifier(&current.identity)
+            .eq_ignore_ascii_case(&incoming.key)
+        {
+            return Err(ProviderError::Other(
+                "active Codex identity changed; rotation was not mirrored".into(),
+            ));
+        }
+        self.write_active_account(blob, &current.identity)
     }
 
     // --- Credential sync ---------------------------------------------------
 
     fn credential_paths(&self) -> Vec<PathBuf> {
         match auth_json_path() {
-            Some(p) => vec![p],
+            Some(p) if ensure_file_backend(&p).is_ok() => vec![p],
+            Some(_) => Vec::new(),
             None => Vec::new(),
         }
     }
@@ -668,6 +823,11 @@ impl Provider for CodexProvider {
     fn absorb_credential(&self, account: &AccountKey, blob: &str) -> PResult<()> {
         if account.provider != self.provider_id() {
             return Ok(()); // not ours
+        }
+        if self.identify_credential(blob).as_ref() != Some(account) {
+            return Err(ProviderError::Other(
+                "credential identity does not match the destination account".into(),
+            ));
         }
         let parsed = match parse_codex_blob(blob) {
             Ok(p) => p,
@@ -745,6 +905,26 @@ pub(super) fn parse_codex_blob(blob: &str) -> PResult<AuthDotJson> {
 /// Resolve the Codex auth file path, honoring `$CODEX_HOME`. `pub(super)`
 /// so `oauth.rs`'s CAS refresh resolves the same path this module uses for
 /// capture/switching — a single source of truth for "where is auth.json".
+/// Refuse to treat a fallback auth.json as the live login when Codex uses
+/// another credential backend. The upstream default is file; explicit auto
+/// can prefer keyring and therefore cannot safely be inferred from file presence.
+fn ensure_file_backend(auth_path: &std::path::Path) -> PResult<()> {
+    let config = auth_path.with_file_name("config.toml");
+    let text = match std::fs::read_to_string(config) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(ProviderError::Io(error)),
+    };
+    let config: toml::Value = toml::from_str(&text).map_err(|_| {
+        ProviderError::Other("cannot read Codex credential backend from invalid config.toml".into())
+    })?;
+    match config.get("cli_auth_credentials_store") {
+        None => Ok(()),
+        Some(mode) if mode.as_str() == Some("file") => Ok(()),
+        _ => Err(ProviderError::Other("Codex uses a credential backend other than file; this account adapter cannot safely switch it".into())),
+    }
+}
+
 pub(super) fn auth_json_path() -> Option<PathBuf> {
     if let Some(h) = std::env::var_os("CODEX_HOME") {
         return Some(PathBuf::from(h).join("auth.json"));
@@ -1181,7 +1361,7 @@ mod tests {
         // gives Codex a place to store a second account to switch to, wired
         // through `main.rs`/`menubar.rs` — see the module doc RESOLVED note.
         assert!(caps.supports_switching);
-        assert!(!caps.supports_launch);
+        assert!(caps.supports_launch);
         assert!(caps.supports_remove);
         assert!(caps.supports_email_capture);
         assert_eq!(caps.secret_backend, SecretBackend::File);
@@ -1190,14 +1370,16 @@ mod tests {
     }
 
     #[test]
-    fn launch_client_is_still_unsupported() {
-        // No wired-up client launch yet; only `write_active_account` (the
-        // auth.json rewrite) implements switching so far.
-        let p = CodexProvider;
-        assert!(matches!(
-            p.launch_client(crate::providers::trait_def::LaunchMode::Fresh),
-            Err(ProviderError::Unsupported)
-        ));
+    fn launch_modes_use_codex_native_resume() {
+        use crate::providers::trait_def::LaunchMode;
+        let fresh = launch_command(LaunchMode::Fresh);
+        assert_eq!(fresh.get_program(), "codex");
+        assert_eq!(fresh.get_args().count(), 0);
+        let resume = launch_command(LaunchMode::Continue);
+        assert_eq!(
+            resume.get_args().collect::<Vec<_>>(),
+            vec!["resume", "--last"]
+        );
     }
 
     #[test]
@@ -1220,6 +1402,28 @@ mod tests {
     }
 
     #[test]
+    fn wrong_account_rotation_cannot_replace_live_or_saved_credentials() {
+        let _cfg = crate::store::ScopedConfigDir::new();
+        let dir = tempfile::tempdir().unwrap();
+        crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+            let a = make_blob("a@example.com", 4_000_000_000);
+            let b = make_blob("b@example.com", 4_000_000_001);
+            let captured = capture_blob(a.clone()).unwrap();
+            CodexProvider
+                .write_active_account(&a, &captured.identity)
+                .unwrap();
+            assert!(CodexProvider.mirror_rotated_token(&b).is_err());
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("auth.json")).unwrap(),
+                a
+            );
+            assert!(CodexProvider
+                .absorb_credential(&AccountKey::new("codex", "a@example.com"), &b)
+                .is_err());
+        });
+    }
+
+    #[test]
     fn mirror_rotated_token_writes_the_blob_where_the_vendor_reads_it() {
         // `mirror_rotated_token` logs via `logging::log`, which resolves
         // `store::config_dir()` — that panics in tests without a
@@ -1231,6 +1435,8 @@ mod tests {
         let codex_home = dir.path().join("codex-home");
         crate::env_lock::scoped_env_var("CODEX_HOME", Some(codex_home.to_str().unwrap()), || {
             let blob = make_blob("rotated@example.com", Utc::now().timestamp() + 3600);
+            let captured = capture_blob(blob.clone()).unwrap();
+            p.write_active_account(&blob, &captured.identity).unwrap();
             p.mirror_rotated_token(&blob).unwrap();
             let auth_path = codex_home.join("auth.json");
             let on_disk = std::fs::read_to_string(&auth_path).unwrap();

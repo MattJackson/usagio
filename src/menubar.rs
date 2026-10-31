@@ -3411,9 +3411,13 @@ fn handle_switch(slug: &str, key: &str) {
     };
     match result {
         Ok(label) => {
-            let g = guard.for_provider(slug);
-            g.last_swap = Some(std::time::Instant::now());
-            notify(&format!("Switched to {label}"));
+            if crate::provider_switch_pending(slug, key) {
+                notify(&format!("Switch to {label} queued until idle"));
+            } else {
+                let g = guard.for_provider(slug);
+                g.last_swap = Some(std::time::Instant::now());
+                notify(&format!("Switched to {label}"));
+            }
             request_poll_now();
         }
         Err(e) => notify(&format!("Switch failed: {e}")),
@@ -6098,22 +6102,15 @@ mod tests {
     }
 
     #[test]
-    fn codex_capabilities_advertise_switching_but_not_launch() {
-        // State v2 (`State::providers`)
-        // gives Codex somewhere to persist a second account, and
-        // `main.rs`/`menubar.rs` dispatch a switch by provider slug, so
-        // `write_active_account` is reachable from the live app —
-        // `supports_switching` is `true`. `launch_client` is still
-        // unimplemented for Codex, so `supports_launch` stays `false`.
+    fn codex_capabilities_advertise_switching_and_launch() {
         let caps = crate::providers::codex::CodexProvider.capabilities();
         assert!(caps.supports_switching);
-        assert!(!caps.supports_launch);
+        assert!(caps.supports_launch);
         assert!(caps.supports_remove);
     }
 
     #[test]
     fn claude_capabilities_advertise_launch_support() {
-        // Claude is the only provider with a wired `launch_client`.
         let caps = crate::providers::claude::ClaudeProvider.capabilities();
         assert!(caps.supports_switching);
         assert!(caps.supports_launch);

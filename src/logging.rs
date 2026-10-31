@@ -23,7 +23,7 @@ const ROTATE_UNIQUIFY_ATTEMPTS: u32 = 20;
 /// start (no umask window) — mirrors `store::write_private`'s posture for
 /// every other token-adjacent file. `usagio.log` itself never contains raw
 /// secrets (see the module doc), but it does contain account emails, error
-/// text, and enough token-lifecycle metadata (`tok_prefix` 20-char prefixes)
+/// text, and enough token-lifecycle metadata (one-way token fingerprints)
 /// that it shouldn't be left world-readable under a default umask (security-02,
 /// v0.5.2 audit). No-op mode difference on Windows: NTFS ACLs already
 /// restrict the per-user profile directory this lands under.
@@ -111,19 +111,15 @@ pub fn rotate_if_large(path: &std::path::Path, max_bytes: u64) {
     }
 }
 
-/// Redact a token to its first 20 chars + `..` so structured token-lifecycle
-/// log lines (`event=...`) can show enough of a token to correlate across
-/// lines (e.g. "did the CAS-lost adopted prefix match the next cycle's
-/// before-blob prefix?") without ever writing a usable secret to disk.
-/// Tokens shorter than 20 chars (should never happen for a real OAuth access
-/// token, but keeps this total for stray test/fixture strings) are redacted
-/// in full rather than panicking on the slice.
-pub fn tok_prefix(t: &str) -> String {
-    if t.len() >= 20 {
-        format!("{}..", &t[..20])
-    } else {
-        format!("{t}..")
+/// Correlate credential lifecycle events without exposing token bytes.
+/// The truncated SHA-256 digest is diagnostic only, never an identity check.
+pub fn token_fingerprint(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    if token.is_empty() {
+        return "none".into();
     }
+    let digest = Sha256::digest(token.as_bytes());
+    format!("sha256:{:x}", digest)[..19].to_string()
 }
 
 /// Append a timestamped line to the debug log. Best-effort: any failure is
@@ -222,17 +218,13 @@ mod tests {
     }
 
     #[test]
-    fn tok_prefix_keeps_first_20_chars_of_long_tokens() {
-        let tok = "abcdefghijklmnopqrstuvwxyz";
-        assert_eq!(tok_prefix(tok), "abcdefghijklmnopqrst..");
-        // Exactly 20 chars is the boundary: still sliced (no extra chars).
-        assert_eq!(tok_prefix("01234567890123456789"), "01234567890123456789..");
-    }
-
-    #[test]
-    fn tok_prefix_redacts_short_tokens_in_full() {
-        assert_eq!(tok_prefix("short"), "short..");
-        assert_eq!(tok_prefix("0123456789012345678"), "0123456789012345678..");
-        assert_eq!(tok_prefix(""), "..");
+    fn token_fingerprints_never_expose_short_long_or_unicode_tokens() {
+        assert_eq!(token_fingerprint("abc"), "sha256:ba7816bf8f01");
+        assert_eq!(token_fingerprint(""), "none");
+        for token in ["short", "abcdefghijklmnopqrstuvwxyz", "秘密トークン"] {
+            let fingerprint = token_fingerprint(token);
+            assert!(!fingerprint.contains(token));
+            assert_eq!(fingerprint.len(), 19);
+        }
     }
 }

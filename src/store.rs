@@ -54,7 +54,7 @@ pub(crate) fn set_home_override(p: Option<PathBuf>) {
 /// The last usage snapshot fetched for an account. Written only by the
 /// scheduler's poll; read (never fetched) by `list`, `switch`, and the menu bar
 /// so ad-hoc commands never hit the usage API (and never trigger HTTP 429).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CachedUsage {
     #[serde(default)]
     pub session_pct: Option<f64>,
@@ -311,7 +311,7 @@ impl Account {
 /// login would have produced. `access_token`/`refresh_token`/`expires_at`
 /// mirror the blob's tokens for refresh math, exactly like `Account` does for
 /// Claude.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderAccount {
     /// The provider's own identifier for this account (email, or a UUID/hash
     /// fallback — see `Provider::account_identifier`).
@@ -362,6 +362,27 @@ impl ProviderAccount {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingSwitch {
+    pub key: String,
+    pub manual: bool,
+    pub from: Option<String>,
+    #[serde(default)]
+    pub drain_token: Option<String>,
+    /// Credential publication completed; retries must verify/start the client,
+    /// not drain the replacement instance or overwrite a rotated credential.
+    #[serde(default)]
+    pub credentials_written: bool,
+    /// A renewed active login waits here until the old client has drained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewed_account: Option<ProviderAccount>,
+    #[serde(default)]
+    pub leave_latch: Option<(
+        crate::autoswap::memory::LatchKind,
+        crate::autoswap::memory::Latch,
+    )>,
+}
+
 /// One non-Claude provider's multi-account slot: every captured account plus
 /// which one is currently written to the provider's on-disk credential file.
 /// This is state v2's answer to the gap documented in `providers::codex::mod`'s
@@ -369,6 +390,9 @@ impl ProviderAccount {
 /// persist a *second* Codex account to switch to.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ProviderAccounts {
+    /// Explicit selection waiting for a safe client handoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_switch: Option<PendingSwitch>,
     #[serde(default)]
     pub accounts: Vec<ProviderAccount>,
     /// Key of the account currently written to this provider's active
