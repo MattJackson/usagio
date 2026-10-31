@@ -94,31 +94,6 @@ const INACTIVE_FETCH_MAX_BACKOFF_SECS: u64 = 3600;
 pub(crate) const SUBSCRIPTION_RECHECK_SECS: u64 = 1800;
 /// Swap away from the active account when it reaches this utilization.
 const TRIGGER_PCT: f64 = 95.0;
-/// Minimum gap between swaps. Applies only to OPTIONAL swaps (proactive
-/// flip-back, all-blocked preparation): moving off an account that has hit the
-/// trigger, 429'd near it, or lapsed is never delayed — a 5-minute hold there
-/// let a just-landed account run from 94% to ~98% before we could move again.
-const SWAP_COOLDOWN_SECS: u64 = 300;
-/// A swap target's reading must be at most this old when we swap to it;
-/// older, and we re-fetch it right before swapping (an inactive account's
-/// cache can be up to `INACTIVE_FETCH_FLOOR_SECS` old, and it may have been
-/// used elsewhere since).
-const TARGET_VERIFY_MAX_AGE_SECS: i64 = 120;
-/// When a target's pre-swap re-fetch fails, an urgent swap may still use it
-/// only if its last good reading left at least this many points under the
-/// trigger — a stale 24% can't plausibly be at the limit; a stale 93% can.
-const UNVERIFIED_TARGET_MIN_HEADROOM_PTS: f64 = 10.0;
-/// When every account is past the trigger, the active one is only swapped
-/// for one with at least this many more points of room.
-const FALLBACK_MIN_GAIN_PTS: f64 = 5.0;
-/// Don't return to an account we just left for this long.
-const NO_RETURN_SECS: u64 = 1200;
-/// Proactive flip-back: when the active account is healthy (below trigger), only
-/// swap to a better one if that better account's weekly window resets sooner, or
-/// — on an equal reset — it has at least this many more points of headroom. The
-/// weekly-reset primary key is stable; the headroom tiebreak fluctuates as you
-/// work, so this margin keeps two near-equal accounts from ping-ponging.
-const PROACTIVE_HEADROOM_MARGIN: f64 = 10.0;
 /// Reverse-DNS label for the OS's autostart registration (runs the menu-bar
 /// app at login). Reused across install / uninstall on every platform: it's
 /// the launchd Label on macOS, the .desktop filename on Linux, and the
@@ -2410,18 +2385,6 @@ fn attach_prepaid_balance(cu: &mut CachedUsage, acct: &Account) {
     });
 }
 
-/// Compare two candidate rows for auto-pick / auto-swap: soonest weekly reset
-/// first, then MORE headroom (lower usage) first.
-fn candidate_order(a: &Row, b: &Row) -> std::cmp::Ordering {
-    let ka = a.weekly.resets_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
-    let kb = b.weekly.resets_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
-    ka.cmp(&kb).then(
-        b.headroom()
-            .partial_cmp(&a.headroom())
-            .unwrap_or(std::cmp::Ordering::Equal),
-    )
-}
-
 /// Order accounts for `usagio list` exactly like the menu bar's
 /// `account_priority_cmp`, so the two surfaces always agree:
 ///   1. Locked-and-not-active sinks to the bottom (an active locked account
@@ -2496,15 +2459,9 @@ pub(crate) fn optimize_now() -> Result<Option<String>> {
 /// account is already past target (it's all that's left) do we fall back to the
 /// least-consumed still-usable one. Operates entirely on cached rows — callers
 /// must not fetch first.
-/// `auto_pick` for the selected engine: v2 ranks with `autoswap`'s
-/// `rank_key` (runway, then use-it-or-lose-it within the rebalance horizon);
-/// the classic engine keeps its soonest-reset order.
-fn auto_pick_for(state: &State, rows: &[Row], ceiling: f64, trigger: f64) -> Result<String> {
-    if autoswap::shell::engine_v2(state) {
-        auto_pick_v2(rows, ceiling, trigger, Utc::now())
-    } else {
-        auto_pick(rows, ceiling, trigger)
-    }
+/// Rank accounts by runway and reset horizon.
+fn auto_pick_for(_state: &State, rows: &[Row], ceiling: f64, trigger: f64) -> Result<String> {
+    auto_pick_v2(rows, ceiling, trigger, Utc::now())
 }
 
 /// Auto-pick by the v2 `rank_key`: the best Ready account by runway (an
@@ -2572,120 +2529,16 @@ fn auto_pick_v2(rows: &[Row], ceiling: f64, trigger: f64, now: DateTime<Utc>) ->
     Ok(pick.key.clone())
 }
 
-fn auto_pick(rows: &[Row], ceiling: f64, trigger: f64) -> Result<String> {
-    if !rows.iter().any(|r| r.has_data()) {
-        bail!(
-            "no usage data yet — let the menu-bar app or `usagio watch` \
-             populate it, or pass an explicit account email"
-        );
-    }
-    fn sorted(mut c: Vec<&Row>) -> Vec<&Row> {
-        c.sort_by(|a, b| candidate_order(a, b));
-        c
-    }
-    // Tier 1: accounts still under the swap target — the genuinely good places
-    // to land. Tier 2 ("all that's left"): anything with a shred of room left
-    // (weekly < 100%), used only when Tier 1 is empty so a `switch` never dead-
-    // ends when every account is past target but one still has a sliver.
-    let under_target = sorted(
-        rows.iter()
-            .filter(|r| r.has_data() && r.eligible_target(ceiling, trigger))
-            .collect(),
-    );
-    let fallback = under_target.is_empty();
-    let candidates = if fallback {
-        sorted(
-            rows.iter()
-                .filter(|r| r.has_data() && r.available())
-                .collect(),
-        )
-    } else {
-        under_target
-    };
-    if candidates.is_empty() {
-        let soonest = rows
-            .iter()
-            .filter(|r| r.has_data())
-            .filter_map(|r| r.weekly.resets_at.map(|dt| (r, dt)))
-            .min_by_key(|(_, dt)| *dt);
-        match soonest {
-            Some((r, dt)) => bail!(
-                "all accounts are maxed out; {} resets soonest, in {}",
-                r.email,
-                humanize_until(dt)
-            ),
-            None => bail!("no account currently has room"),
-        }
-    }
-    let pick = candidates[0];
-    // In the fallback tier every option is already past target, so flag that the
-    // pick is a nearly-full last resort rather than a healthy landing spot.
-    let note = if fallback {
-        " (all accounts past target — this is the least-full)"
-    } else {
-        ""
-    };
-    println!(
-        "Auto-picked {} — weekly resets in {}, {:.0}% headroom.{note}",
-        pick.email,
-        pick.weekly.resets_in(),
-        pick.headroom()
-    );
-    Ok(pick.email.clone())
-}
-
 impl Row {
     /// True once we have a cached usage sample to reason about.
     fn has_data(&self) -> bool {
         self.error.is_none() && self.fetched_at.is_some()
     }
 
-    /// Not blocked and both session and weekly have headroom.
-    fn available(&self) -> bool {
-        let ok = |c: &Cell| c.pct.map(|p| p < 100.0).unwrap_or(true);
-        ok(&self.session) && ok(&self.weekly)
-    }
-
-    /// Eligible as a swap / return target: both the **session** and the
-    /// **weekly** are below the trigger by more than `ESCALATION_MIN_BAND`.
-    /// Inside that band a single 429 counts as reaching the trigger
-    /// (`effective_active_max_pct_for_swap_fire`), so landing there meant
-    /// leaving again on the next 429 — with the proactive flip-back walking
-    /// back to it 20 minutes later (the v0.8.7 dev@ thrash: ~30 swaps in 3h
-    /// around an 82–85% account). The active account still rides up to the
-    /// trigger; only moving *into* the band is refused. The session ceiling
-    /// defaults to the trigger (`usagio watch --ceiling` can lower it).
-    fn eligible_target(&self, session_ceiling: f64, trigger: f64) -> bool {
-        let limit = trigger - ESCALATION_MIN_BAND;
-        let session = self.session.pct.unwrap_or(0.0);
-        session <= session_ceiling && session < limit && self.weekly.pct.unwrap_or(0.0) < limit
-    }
-
-    /// Eligible as a target only when the active account must be left: both
-    /// windows under the trigger, even inside the band `eligible_target`
-    /// refuses. Ranked like any candidate, so a banded account wins only when
-    /// it resets soonest — its last points would otherwise expire unused.
-    /// Never a proactive flip-back target, so the v0.8.7 walk-back can't recur.
-    fn forced_target(&self, session_ceiling: f64, trigger: f64) -> bool {
-        let session = self.session.pct.unwrap_or(0.0);
-        session <= session_ceiling && session < trigger && self.weekly.pct.unwrap_or(0.0) < trigger
-    }
-
-    /// Plan usage is used up: a window at the limit, so only credits (if
-    /// any) let the account keep working.
-    fn plan_exhausted(&self) -> bool {
-        self.max_pct() >= 99.5
-    }
-
     /// Money the account can still spend on usage credits — see
     /// `Credits::spendable`. `None` means it can't run on credits.
     fn spendable_credits(&self) -> Option<providers::trait_def::Money> {
         self.reported.credits.as_ref()?.spendable()
-    }
-
-    /// Can keep serving requests on credits once its plan is used up.
-    fn runs_on_credits(&self) -> bool {
-        self.spendable_credits().is_some()
     }
 
     /// Remaining percent on the tightest of session/weekly.
@@ -3007,7 +2860,6 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
     // the user's configured trigger once so we don't reload state per account.
     let trigger_for_floor = state.trigger_pct.unwrap_or(TRIGGER_PCT);
     let now_ts = Utc::now().timestamp();
-    let v2 = autoswap::shell::engine_v2(&state);
     // Per-account outcome for the replay rows (§6); "skip" unless fetched.
     let mut outcomes: std::collections::HashMap<String, &'static str> =
         std::collections::HashMap::new();
@@ -3280,7 +3132,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
                 }
             }
         }
-        if !force && is_the_active_account && defer_active && v2 {
+        if !force && is_the_active_account && defer_active {
             logging::log(&format!(
                 "poll: {email} active fetch deferred (event=budget_defer account={email} \
                  why=per_minute)"
@@ -3289,7 +3141,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
         }
         if !force && is_the_active_account && !active_just_switched {
             if let Some(cu) = &acct.cached_usage {
-                if v2 {
+                {
                     if let Some(why) =
                         v2_active_fetch_skip(CLAUDE_SLUG, email, cu, trigger_for_floor, now_ts)
                     {
@@ -3299,8 +3151,6 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
                         ));
                         continue;
                     }
-                } else if v1_active_fetch_skip(email, cu, trigger_for_floor, now_ts) {
-                    continue;
                 }
             }
         }
@@ -3570,53 +3420,6 @@ fn replay_row(
     }
 }
 
-/// v1's active fetch floor (tier ramp + burn-rate projection), unchanged.
-/// Returns true to skip this cycle's fetch.
-fn v1_active_fetch_skip(email: &str, cu: &CachedUsage, trigger: f64, now_ts: i64) -> bool {
-    let age = now_ts - cu.fetched_at;
-    let max_pct = match (cu.session_pct, cu.weekly_pct) {
-        (Some(s), Some(w)) => Some(s.max(w)),
-        (Some(s), None) => Some(s),
-        (None, Some(w)) => Some(w),
-        (None, None) => None,
-    };
-    // v0.8.0 smart cadence: project each window forward by the actual
-    // horizon (`max(tier_floor, current_loop_interval)` — under 429 backoff
-    // the loop cadence can be 1200s vs a tier_floor of 30s, and using the
-    // tier alone would under-predict by 40× on the exact storm this feature
-    // is meant to catch, Opus adversarial BLOCKER 1). Per-window
-    // (session/weekly) so a session rollover 99→5 doesn't produce nonsense
-    // `max_pct` slopes (Opus adversarial BAD 6). If EITHER projection hits
-    // trigger, tighten one tier.
-    let tier_floor = per_account_fetch_floor_secs(max_pct, trigger, WATCH_INTERVAL_SECS);
-    let horizon_secs = tier_floor.max(current_loop_interval_secs());
-    let projected_at_horizon = project_active_max_pct_at_horizon(
-        email,
-        CLAUDE_SLUG,
-        cu.session_pct,
-        cu.weekly_pct,
-        horizon_secs,
-        Utc::now(),
-    );
-    let floor = per_account_fetch_floor_secs_with_projection(
-        max_pct,
-        trigger,
-        WATCH_INTERVAL_SECS,
-        projected_at_horizon,
-    ) as i64;
-    if age >= 0 && age < floor && !cache_crossed_reset(cu, Utc::now()) {
-        let projection_note = projected_at_horizon
-            .map(|p| format!(" projected_at_{horizon_secs}s={p:.1}%"))
-            .unwrap_or_default();
-        logging::log(&format!(
-            "poll: {email} usage cache still fresh; skipping fetch \
-             (event=fetch_skip_fresh account={email} age={age}s floor={floor}s{projection_note})"
-        ));
-        return true;
-    }
-    false
-}
-
 /// The active account's fetch floor under v2 (§5): the tier ramp with a 60 s
 /// TIGHT floor (no burn-rate projection — the blind projection covers that),
 /// the provider's own backoff after a failed attempt, and never while the
@@ -3763,7 +3566,6 @@ fn refresh_provider_usage_caches_with(
         Ok(s) => s,
         Err(_) => return out,
     };
-    let v2 = autoswap::shell::engine_v2(&state);
     for provider in providers::all() {
         let slug = provider.provider_id();
         if slug == CLAUDE_SLUG {
@@ -3858,25 +3660,13 @@ fn refresh_provider_usage_caches_with(
                     }
                 }
             }
-            if !force && is_active && v2 && defer_active.contains(slug) {
+            if !force && is_active && defer_active.contains(slug) {
                 continue;
             }
             if !force && is_active {
                 if let Some(cu) = &acct.cached_usage {
-                    if v2 {
+                    {
                         if v2_active_fetch_skip(slug, &key, cu, trigger, now_ts).is_some() {
-                            continue;
-                        }
-                    } else {
-                        let age = now_ts - cu.fetched_at;
-                        let max_pct = match (cu.session_pct, cu.weekly_pct) {
-                            (Some(s), Some(w)) => Some(s.max(w)),
-                            (s, w) => s.or(w),
-                        };
-                        let floor =
-                            per_account_fetch_floor_secs(max_pct, trigger, WATCH_INTERVAL_SECS)
-                                as i64;
-                        if age >= 0 && age < floor && !cache_crossed_reset(cu, Utc::now()) {
                             continue;
                         }
                     }
@@ -4367,119 +4157,9 @@ fn tier_interval_for_pct(pct: f64, trigger: f64, base: u64) -> u64 {
     }
 }
 
-/// Per-account minimum interval between `usage::fetch` calls, in seconds.
-/// Prevents any single account from being pinged faster than its own tier
-/// allows, even when the global loop cadence is tighter (because a *different*
-/// account is deeper in the ramp). Without this, a single at-trigger account
-/// would drag every other account down to the 30s TIGHT cadence and re-open
-/// the 429 loop this ramp was built to close.
-///
-/// Returns `base` (BASE cadence) for an account with no cached usage yet — we
-/// need at least one successful fetch before we know its tier.
-fn per_account_fetch_floor_secs(max_pct: Option<f64>, trigger: f64, base: u64) -> u64 {
-    let Some(pct) = max_pct else { return base };
-    tier_interval_for_pct(pct, trigger, base)
-}
-
-/// Tighten a static-tier interval by exactly one step, capped at TIGHT (never
-/// faster than 30s). Used by `per_account_fetch_floor_secs_with_projection`
-/// so a burn-rate projection can only ever pull cadence UP, never push it out
-/// beyond what the static tier alone would pick. See v0.8.0 "smart cadence".
-fn tighten_tier_once(current_secs: u64, base: u64) -> u64 {
-    if current_secs >= base {
-        WATCH_RELAXED_INTERVAL_SECS
-    } else if current_secs == WATCH_RELAXED_INTERVAL_SECS {
-        WATCH_MIDDLE_INTERVAL_SECS
-    } else if current_secs == WATCH_MIDDLE_INTERVAL_SECS {
-        WATCH_TIGHT_INTERVAL_SECS
-    } else {
-        // TIGHT or BACKSTOP — already at the floor, nothing to tighten.
-        current_secs
-    }
-}
-
-/// Per-account fetch floor, tier-based, with an optional burn-rate projection.
-/// When `projected_max_pct_at_horizon` (usually `now + max(tier_floor,
-/// current_loop_interval)`) is at or above `trigger`, tighten one tier so we
-/// see the crossing before it happens. Projection can only tighten — the
-/// caller has no way to make the raw tier slower, and the whole point of
-/// projection is to catch fast burns the static ramp would miss.
-///
-/// Rationale (v0.8.0, Opus adversarial BLOCKER 1): projecting on the tier
-/// floor alone under-predicts by up to 40× when `next_interval` doubles the
-/// loop cadence during a 429 backoff (tier_floor=30s but loop=1200s). Callers
-/// therefore feed `dt = max(tier_floor, current_loop_interval)` — the actual
-/// horizon before the next fetch is even attempted, not just the wish.
-fn per_account_fetch_floor_secs_with_projection(
-    max_pct: Option<f64>,
-    trigger: f64,
-    base: u64,
-    projected_max_pct_at_horizon: Option<f64>,
-) -> u64 {
-    let static_tier = per_account_fetch_floor_secs(max_pct, trigger, base);
-    match projected_max_pct_at_horizon {
-        Some(p) if p >= trigger => tighten_tier_once(static_tier, base),
-        _ => static_tier,
-    }
-}
-
-/// Project each usage window (`session_pct`, `weekly_pct`) forward by
-/// `horizon_secs` using `burn_rate::estimate`'s weighted-regression slope,
-/// and return the max of the two projections. Windows are projected
-/// separately because a session rollover (99→5) can produce a positive
-/// `max_pct` slope that has nothing to do with real weekly burn (Opus
-/// adversarial BAD 6). Returns `None` when neither window has a confident,
-/// non-flat estimate — the caller then falls back to the static tier.
-fn project_active_max_pct_at_horizon(
-    email: &str,
-    provider_id: &str,
-    session_pct: Option<f64>,
-    weekly_pct: Option<f64>,
-    horizon_secs: u64,
-    now: DateTime<Utc>,
-) -> Option<f64> {
-    let account_key = usage_log::AccountKey::new(provider_id, email);
-    let hours = horizon_secs as f64 / 3600.0;
-    let project = |window: providers::trait_def::Window, curr: Option<f64>| -> Option<f64> {
-        let curr = curr?;
-        let est = burn_rate::estimate(&account_key, window, now)?;
-        if (est.confidence as f64) < burn_rate::CONFIDENCE_FLOOR as f64 {
-            return None;
-        }
-        if est.rate_pct_per_hour <= burn_rate::FLAT_SLOPE_THRESHOLD_PCT_PER_HOUR {
-            return None;
-        }
-        Some((curr + (est.rate_pct_per_hour as f64) * hours).min(100.0))
-    };
-    let s = project(providers::trait_def::Window::Session, session_pct);
-    let w = project(providers::trait_def::Window::Weekly, weekly_pct);
-    match (s, w) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // v0.8.0 auto-swap escalation on repeated `/oauth/usage` 429s
 // ---------------------------------------------------------------------------
-
-/// Consecutive 429s on the ACTIVE account's usage endpoint before we treat its
-/// cached max_pct as "at the trigger" for auto-swap. v0.8.7: one. v0.8.0
-/// required two, but each 429 also backs the poll off, so the second strike
-/// arrived minutes later — dev@ ran from 93% to its limit waiting for it.
-/// Swapping on a false alarm costs only the last few points of that session:
-/// the account comes back once a fresh reading shows it under the trigger.
-const ESCALATION_MIN_CONSECUTIVE_429S: u32 = 1;
-
-/// Cached max_pct must be within this many percentage points of `trigger`
-/// (i.e. in the TIGHT band) for a 429 to count as escalation signal.
-/// Wider bands (e.g. RELAXED at trigger−20 = 75%) would fire on tenant-wide
-/// 429 noise unrelated to THIS account's real usage — Opus adversarial
-/// review BAD 3. Kept identical to `WATCH_TIGHT_BAND` on purpose so the
-/// escalation gate never fires outside the tightest static tier.
-const ESCALATION_MIN_BAND: f64 = WATCH_TIGHT_BAND;
 
 /// Ephemeral per-account usage-endpoint tracker for the v0.8.0 escalation
 /// path. In-memory only, no `State` field — persisting a counter reintroduced
@@ -4520,10 +4200,6 @@ static CURRENT_LOOP_INTERVAL_SECS: std::sync::atomic::AtomicU64 =
 
 fn set_current_loop_interval_secs(secs: u64) {
     CURRENT_LOOP_INTERVAL_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn current_loop_interval_secs() -> u64 {
-    CURRENT_LOOP_INTERVAL_SECS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn with_fetch_trackers<T>(
@@ -4774,41 +4450,10 @@ fn get_usage_fetch_tracker(email: &str) -> UsageFetchTracker {
     with_fetch_trackers(|t| t.get(email).copied().unwrap_or_default())
 }
 
-/// Compute the "effective" max_pct of the ACTIVE account for the AUTO-SWAP
-/// FIRE DECISION ONLY. Returns the raw cached max_pct in the common case;
-/// when the active account's last usage fetch was a 429 while its cached pct
-/// was already in the TIGHT band, returns at least `trigger` so
-/// `evaluate_swap` fires now even though the endpoint won't tell us the real
-/// number. Near the trigger, not knowing is treated as being there: the
-/// alternative is polling blind while the account runs out.
-///
-/// The tracker is reset on any successful fetch, on any non-429 error, and on
-/// switching away from the account, so a stale 429 never re-fires later.
-///
-/// SCOPE: never used for candidate ranking or target eligibility. Using an
-/// escalated source value while comparing against other accounts' raw cached
-/// values would make a marginal source look artificially worse than a
-/// genuinely-96% one, corrupting target order (Sonnet adversarial review
-/// BAD 3). `evaluate_swap` reads raw values everywhere except the boolean
-/// "should we swap away right now" check.
-fn effective_active_max_pct_for_swap_fire(row: &Row, trigger: f64) -> f64 {
-    let raw = row.max_pct();
-    let tracker = get_usage_fetch_tracker(&fetch_tracker_key(&row.provider_id, &row.email));
-    if tracker.consecutive_429s < ESCALATION_MIN_CONSECUTIVE_429S {
-        return raw;
-    }
-    if raw < trigger - ESCALATION_MIN_BAND {
-        return raw;
-    }
-    raw.max(trigger)
-}
-
 /// Anti-thrash state carried across watch cycles.
 #[derive(Default)]
 pub(crate) struct SwapGuard {
     last_swap: Option<std::time::Instant>,
-    left_at: std::collections::HashMap<String, std::time::Instant>,
-    stuck_notified: bool,
     // The account the user switched to by hand, as `(slug, key)`. Mirrors
     // `State::manual_hold`, refreshed every cycle. Auto-swap stays on it
     // until it is exhausted or lapses, and never prepares a switch away from
@@ -4837,19 +4482,6 @@ impl SwapGuards {
     pub(crate) fn for_provider(&mut self, slug: &str) -> &mut SwapGuard {
         self.by_provider.entry(slug.to_string()).or_default()
     }
-}
-
-/// How long a `left_at` entry is kept. Longer than `NO_RETURN_SECS` because
-/// the entry also gates `fresh_since_left` (no return before a post-leave
-/// reading), which must outlive the no-return window.
-const LEFT_AT_RETENTION_SECS: u64 = 24 * 3600;
-
-/// Drop stale `left_at` entries so the map can't grow without bound over a
-/// daemon running for weeks (e.g. accounts later `rm`'d).
-fn prune_swap_guard(guard: &mut SwapGuard) {
-    guard
-        .left_at
-        .retain(|_, t| t.elapsed().as_secs() < LEFT_AT_RETENTION_SECS);
 }
 
 /// One switchable provider's result for a poll cycle.
@@ -4884,521 +4516,6 @@ pub(crate) struct ProviderCycle {
 /// Result of one poll: one entry per switchable provider with accounts.
 pub(crate) struct CycleOutcome {
     pub providers: Vec<ProviderCycle>,
-}
-
-/// True if `cand` is a strictly better place to be than the healthy `act`:
-/// a sooner weekly reset (use-it-or-lose-it), or — on an equal reset — a
-/// meaningful headroom lead. Used only on the proactive (active-not-in-trouble)
-/// path; the reactive path moves regardless of how the active account ranks.
-fn worth_returning_to(cand: &Row, act: &Row) -> bool {
-    // If the ACTIVE account's weekly reset is unknown, there is no
-    // use-it-or-lose-it basis to leave a healthy active account. Require a real
-    // headroom lead instead of the old behavior, which defaulted the unknown
-    // reset to MAX_UTC and so ranked ANY candidate with a known reset as
-    // "sooner" — forcing a needless proactive swap off a working account
-    // (v0.5.17). Only the active-unknown case changes; every act-known path
-    // (including a candidate whose own reset is unknown → treated as furthest)
-    // keeps its prior behavior.
-    let Some(ka) = act.weekly.resets_at else {
-        return cand.headroom() - act.headroom() >= PROACTIVE_HEADROOM_MARGIN;
-    };
-    let kc = cand.weekly.resets_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
-    match kc.cmp(&ka) {
-        std::cmp::Ordering::Less => true,
-        std::cmp::Ordering::Greater => false,
-        std::cmp::Ordering::Equal => cand.headroom() - act.headroom() >= PROACTIVE_HEADROOM_MARGIN,
-    }
-}
-
-/// A pure auto-swap decision over cached rows. Returns the email to swap to, or
-/// None (with `guard` consulted for cooldown / no-return). Extracted for tests.
-///
-/// Two paths: **reactive** — the active account has reached `trigger`, so move to
-/// the best healthy candidate; and **proactive** — the active account is still
-/// healthy, but a better account has since freed up (e.g. its 5h session reset),
-/// so flip back to it. The proactive path additionally requires the candidate to
-/// be `worth_returning_to` the active account, so we don't swap sideways.
-///
-/// `watch_cycle` itself calls `evaluate_swap` directly (v0.5.2 item 6 needs
-/// the extra cooldown/no-eligible-target detail for its structured decision
-/// logging); this thin `.target`-only wrapper survives purely because the
-/// existing test suite calls it by this name — `#[cfg(test)]` rather than
-/// deleting it keeps that coverage without carrying dead code into release
-/// builds.
-#[cfg(test)]
-fn choose_swap_target(
-    rows: &[Row],
-    active: &str,
-    trigger: f64,
-    ceiling: f64,
-    guard: &SwapGuard,
-) -> Option<String> {
-    evaluate_swap(rows, active, trigger, ceiling, guard).target
-}
-
-/// Extended swap-target inspection shared by `choose_swap_target` (the actual
-/// decision consulted for swapping) and `watch_cycle`'s structured
-/// `event=swap_decision` logging (v0.5.2 item 6) — the two must agree on what
-/// "would swap if not for cooldown" means, so a "blocked" log line names the
-/// SAME target `choose_swap_target` would have picked once the cooldown
-/// clears.
-struct SwapEval {
-    preparing: bool,
-    /// The active account must be left now: it is at/over the trigger (or
-    /// 429'd near it — see `effective_active_max_pct_for_swap_fire`) or its
-    /// subscription lapsed. Urgent swaps skip the cooldown and may use a
-    /// target whose pre-swap re-check failed if its last reading had ample
-    /// room (`UNVERIFIED_TARGET_MIN_HEADROOM_PTS`).
-    urgent: bool,
-    /// No account is under the trigger, so the target is simply the one with
-    /// the most room (at least `FALLBACK_MIN_GAIN_PTS` more than the active).
-    fallback: bool,
-    /// Every plan is used up and the target is an account with usage
-    /// credits to spend (`State::use_credits_when_exhausted`).
-    credits: bool,
-    /// The account to switch to right now, if any (cooldown/no-return/
-    /// eligibility have all already been consulted).
-    target: Option<String>,
-    /// True if an active cooldown window is the ONLY reason `target` is
-    /// `None` — i.e. ignoring cooldown, there IS an eligible + genuinely
-    /// better candidate (`target_ignoring_cooldown`).
-    blocked_by_cooldown: bool,
-    /// The best eligible candidate ignoring the cooldown gate, whether or not
-    /// cooldown ends up blocking it. `None` when there's no eligible
-    /// candidate at all (or the active account isn't in trouble and no
-    /// candidate is `worth_returning_to` it).
-    target_ignoring_cooldown: Option<String>,
-}
-
-/// True unless `r` is an account we auto-swapped away from and its cached
-/// reading predates leaving it. `left_at` is a monotonic `Instant`; map it
-/// onto the wall clock via its elapsed time.
-fn fresh_since_left(r: &Row, guard: &SwapGuard) -> bool {
-    let Some(left) = guard.left_at.get(&r.email) else {
-        return true;
-    };
-    let left_ts = Utc::now().timestamp() - left.elapsed().as_secs() as i64;
-    r.fetched_at.is_some_and(|f| f > left_ts)
-}
-
-/// True if `act` is the account the user manually switched to at/over the
-/// trigger.
-fn held_on(guard: &SwapGuard, act: &Row) -> bool {
-    is_choice(guard.manual_locked_choice.as_ref(), act)
-}
-
-/// The active account's usage as the "must we leave it now" check sees it.
-/// A manual pick is only left on a real reading at the trigger: a usage 429
-/// near it doesn't count (0.10.3 miss: a pick at 93% flipped on one 429).
-fn swap_fire_pct(act: &Row, trigger: f64, guard: &SwapGuard) -> f64 {
-    if picked_on(guard, act) {
-        act.max_pct()
-    } else {
-        effective_active_max_pct_for_swap_fire(act, trigger)
-    }
-}
-
-/// True if `act` is the account the user manually switched to.
-fn picked_on(guard: &SwapGuard, act: &Row) -> bool {
-    is_choice(guard.manual_pick.as_ref(), act)
-}
-
-fn is_choice(choice: Option<&(String, String)>, act: &Row) -> bool {
-    choice.is_some_and(|(provider, key)| {
-        provider == &act.provider_id && key.eq_ignore_ascii_case(&act.email)
-    })
-}
-
-/// A manual pick stays put past the trigger (and through any proactive
-/// flip-back) until it can't serve requests: exhausted or lapsed.
-fn hold_applies(guard: &SwapGuard, act: &Row) -> bool {
-    held_on(guard, act) && !act.no_subscription && act.max_pct() < 99.5
-}
-
-/// Choose a login to prepare while every valid account is quota-blocked.
-/// Unknown usage/reset data is not proof of an all-blocked state. An account
-/// with two exhausted windows becomes usable only at the later reset.
-fn earliest_blocked_target<'a>(
-    rows: &'a [Row],
-    act: &Row,
-    guard: &SwapGuard,
-    now: DateTime<Utc>,
-) -> Option<&'a Row> {
-    if held_on(guard, act) {
-        return None;
-    }
-    let mut earliest: Option<(&Row, DateTime<Utc>)> = None;
-    for row in rows
-        .iter()
-        .filter(|r| r.provider_id == act.provider_id && !r.needs_relogin && !r.no_subscription)
-    {
-        if !row.has_data() {
-            return None;
-        }
-        let mut until = None;
-        for cell in [&row.session, &row.weekly] {
-            if cell.pct.is_some_and(|p| p >= 99.5) {
-                let reset = cell.resets_at.filter(|r| *r > now)?;
-                until = Some(until.map_or(reset, |t: DateTime<Utc>| t.max(reset)));
-            }
-        }
-        let until = until?;
-        if earliest.is_none_or(|(_, previous)| until < previous) {
-            earliest = Some((row, until));
-        }
-    }
-    let (best, until) = earliest?;
-    // Stay on an equally early active account rather than churn on ties.
-    let active_until = [&act.session, &act.weekly]
-        .into_iter()
-        .filter(|c| c.pct.is_some_and(|p| p >= 99.5))
-        .filter_map(|c| c.resets_at)
-        .max()?;
-    if until >= active_until || !provider_supports_swap(&best.provider_id) {
-        return None;
-    }
-    if guard
-        .left_at
-        .get(&best.email)
-        .is_some_and(|t| t.elapsed().as_secs() < NO_RETURN_SECS)
-    {
-        return None;
-    }
-    Some(best)
-}
-
-fn evaluate_swap(
-    rows: &[Row],
-    active: &str,
-    trigger: f64,
-    ceiling: f64,
-    guard: &SwapGuard,
-) -> SwapEval {
-    let none = SwapEval {
-        preparing: false,
-        urgent: false,
-        fallback: false,
-        credits: false,
-        target: None,
-        blocked_by_cooldown: false,
-        target_ignoring_cooldown: None,
-    };
-    let Some(act) = rows.iter().find(|r| r.email == active) else {
-        return none;
-    };
-    // An active account whose subscription lapsed can't serve requests at
-    // all — move off it regardless of its (frozen) cached usage.
-    let act_lapsed = act.no_subscription;
-    if (!act.has_data() && !act_lapsed) || trigger > 100.0 {
-        return none;
-    }
-    // If the active account's provider has its env-override active, the CLI
-    // ignores whatever token we install into the keychain — swapping is a
-    // no-op. Bail before we churn the state file.
-    if env_override_active(&act.provider_id) {
-        return none;
-    }
-    let switchable: Vec<&Row> = rows
-        .iter()
-        // A row is only a valid swap candidate if its owning provider has both
-        // a usage signal (so we can compare its cached utilization to the
-        // ceiling) and a way to actually switch to it. This is the sole
-        // capability gate for auto-swap: reporting-only or stub providers
-        // never surface here, even if their rows carry a stale utilization.
-        .filter(|r| r.provider_id == act.provider_id && provider_supports_swap(&r.provider_id))
-        // Skip candidates the token endpoint has permanently rejected —
-        // swapping to a needs-relogin account would just re-write the same
-        // dead credentials into the keychain.
-        .filter(|r| !r.needs_relogin)
-        // A lapsed subscription has no capacity at all, whatever its stale
-        // cache says.
-        .filter(|r| !r.no_subscription)
-        // Skip candidates whose provider has its env-override active — a
-        // switch to them would be silently ignored by the vendor CLI.
-        .filter(|r| !env_override_active(&r.provider_id))
-        .filter(|r| r.has_data() && r.email != active)
-        .collect();
-    let usable: Vec<&Row> = switchable
-        .iter()
-        .copied()
-        // Never infer renewed capacity from a reset clock alone. A successful
-        // post-reset fetch must precede a switch to this account.
-        .filter(|r| {
-            ![r.session.resets_at, r.weekly.resets_at]
-                .into_iter()
-                .flatten()
-                .any(|reset| {
-                    reset <= Utc::now()
-                        && r.fetched_at
-                            .is_none_or(|fetched| fetched < reset.timestamp())
-                })
-        })
-        .filter(|r| {
-            guard
-                .left_at
-                .get(&r.email)
-                .map(|t| t.elapsed().as_secs() >= NO_RETURN_SECS)
-                .unwrap_or(true)
-        })
-        // An account we left is only a target again once a reading taken
-        // AFTER we left it says so — the cached number from just before
-        // leaving (e.g. 93% frozen by a 429) may be well past the trigger.
-        .filter(|r| fresh_since_left(r, guard))
-        .collect();
-    let in_trouble = act_lapsed || swap_fire_pct(act, trigger, guard) >= trigger;
-    let mut candidates: Vec<&Row> = usable
-        .iter()
-        .copied()
-        .filter(|r| {
-            r.eligible_target(ceiling, trigger) || (in_trouble && r.forced_target(ceiling, trigger))
-        })
-        .collect();
-    // A manual pick is only left once it must be: optional moves (flip-back,
-    // all-blocked preparation) never override the user's choice.
-    if hold_applies(guard, act) || (picked_on(guard, act) && !in_trouble) {
-        return none;
-    }
-    // Every other account is past the trigger too, but the active one must be
-    // left: move to whichever has the most room rather than staying put on a
-    // full account. Requires a real gain so two near-full accounts don't trade
-    // places for a point.
-    let mut fallback = false;
-    if candidates.is_empty() && in_trouble {
-        let act_headroom = if act_lapsed { 0.0 } else { act.headroom() };
-        if let Some(most_room) = usable
-            .iter()
-            .copied()
-            .filter(|r| r.available() && r.headroom() >= act_headroom + FALLBACK_MIN_GAIN_PTS)
-            .max_by(|a, b| {
-                a.headroom()
-                    .partial_cmp(&b.headroom())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-        {
-            candidates.push(most_room);
-            fallback = true;
-        }
-    }
-    // Every plan is used up and the active account can't run on credits:
-    // move to the account with the most credits left to spend, when the user
-    // allowed it. Last resort only — any plan headroom above won first. Not
-    // gated on the no-return window or a post-leave reading: a locked inactive
-    // account isn't re-polled, and returning to credits only happens once the
-    // plan account we moved to is used up too, so it can't thrash.
-    let mut credits = false;
-    if candidates.is_empty()
-        && guard.use_credits
-        && (act_lapsed || act.plan_exhausted())
-        && !act.runs_on_credits()
-    {
-        if let Some(most_credits) = switchable
-            .iter()
-            .copied()
-            .filter(|r| r.runs_on_credits())
-            .max_by_key(|r| r.spendable_credits().map_or(0, |m| m.amount_minor))
-        {
-            candidates.push(most_credits);
-            credits = true;
-        }
-    }
-    // An active account still working on credits is never swapped onto a
-    // blocked one just to be ready for its reset — that would stop work.
-    if candidates.is_empty() && !act_lapsed && act.runs_on_credits() {
-        return none;
-    }
-    let preparing = candidates.is_empty();
-    if preparing {
-        let Some(target) = earliest_blocked_target(rows, act, guard, Utc::now()) else {
-            return none;
-        };
-        candidates.push(target);
-    }
-    candidates.sort_by(|a, b| candidate_order(a, b));
-    let best = candidates[0];
-    // Active in trouble → move to the best candidate. Active still healthy →
-    // only move if the best candidate is genuinely a better place to be.
-    //
-    // v0.8.0 escalation: `effective_active_max_pct_for_swap_fire` returns
-    // the raw cached max_pct in the common case, but escalates to ≥ trigger
-    // when the ACTIVE account's `/oauth/usage` has 429'd repeatedly while
-    // the cache was already in the TIGHT band (below trigger by ≤ 5pt) and
-    // the last success was recent. This closes the gap where a cache
-    // pinned at 94% by 429s silences auto-swap while real usage climbs to
-    // 98% (v0.7.3 postmortem). Scoped to the boolean fire ONLY — candidate
-    // ranking above still reads raw `max_pct` so a marginal source can't
-    // pretend to be worse than a genuinely-96% one and corrupt target order.
-    if !(in_trouble || worth_returning_to(best, act)) {
-        return none;
-    }
-    // Leaving an account that is out of room is never delayed; the cooldown
-    // only rate-limits optional moves (proactive flip-back, all-blocked
-    // preparation). Thrash stays bounded without it: a target must be under
-    // the trigger, and the account we left can't be re-picked for
-    // NO_RETURN_SECS nor before a fresh reading.
-    let urgent = in_trouble && !preparing;
-    let cooldown_active = !urgent
-        && guard
-            .last_swap
-            .map(|t| t.elapsed().as_secs() < SWAP_COOLDOWN_SECS)
-            .unwrap_or(false);
-    if cooldown_active {
-        SwapEval {
-            preparing,
-            urgent,
-            fallback,
-            credits,
-            target: None,
-            blocked_by_cooldown: true,
-            target_ignoring_cooldown: Some(best.email.clone()),
-        }
-    } else {
-        SwapEval {
-            preparing,
-            urgent,
-            fallback,
-            credits,
-            target: Some(best.email.clone()),
-            blocked_by_cooldown: false,
-            target_ignoring_cooldown: Some(best.email.clone()),
-        }
-    }
-}
-
-/// `evaluate_swap`, but only ever returning a target whose reading is
-/// current. A target last read more than `TARGET_VERIFY_MAX_AGE_SECS` ago is
-/// re-fetched first (one request, only when a swap is about to happen); the
-/// fresh reading replaces its row and the decision is re-run, so a target
-/// that turns out to be at the trigger is dropped for the next-best one. If
-/// the re-fetch fails, an urgent swap may still use the target when its last
-/// reading had `UNVERIFIED_TARGET_MIN_HEADROOM_PTS` of room — anything
-/// closer to the trigger is excluded rather than trusted. Each pass either
-/// stops or freshens/excludes one row, so the loop is bounded by `rows`.
-fn evaluate_swap_verified(
-    rows: &mut [Row],
-    active: &str,
-    trigger: f64,
-    ceiling: f64,
-    guard: &SwapGuard,
-) -> SwapEval {
-    // Stale-only rescues per cycle (see below) — bounds the extra requests.
-    const MAX_STALE_RESCUES: usize = 2;
-    let mut rescues = 0;
-    let mut tried: Vec<String> = Vec::new();
-    let Some(provider_id) = rows
-        .iter()
-        .find(|r| r.email == active)
-        .map(|r| r.provider_id.clone())
-    else {
-        return evaluate_swap(rows, active, trigger, ceiling, guard);
-    };
-    loop {
-        let eval = evaluate_swap(rows, active, trigger, ceiling, guard);
-        let Some(target) = eval.target.clone() else {
-            // The active account must be left but nothing qualifies. Candidates
-            // excluded only for staleness (a reset crossed since their last
-            // reading, no reading since we left them) never refresh during an
-            // active 429 — the poll skips inactive fetches that cycle — so
-            // re-check the best stale one directly instead of waiting blind.
-            if rescues >= MAX_STALE_RESCUES || !active_in_trouble(rows, active, trigger, guard) {
-                return eval;
-            }
-            let Some(stale) = stale_swap_candidate(rows, active, guard, &tried) else {
-                return eval;
-            };
-            rescues += 1;
-            tried.push(stale.clone());
-            if let Some(fresh) = verify_swap_target(&provider_id, &stale) {
-                if let Some(row) = rows.iter_mut().find(|r| r.email == stale) {
-                    *row = fresh;
-                }
-            }
-            continue;
-        };
-        // Preparing an all-blocked account isn't a bet on its capacity.
-        if eval.preparing {
-            return eval;
-        }
-        let Some(row) = rows.iter_mut().find(|r| r.email == target) else {
-            return eval;
-        };
-        let age = row.fetched_at.map(|f| Utc::now().timestamp() - f);
-        if age.is_some_and(|a| (0..=TARGET_VERIFY_MAX_AGE_SECS).contains(&a)) {
-            return eval;
-        }
-        match verify_swap_target(&provider_id, &target) {
-            Some(fresh) => {
-                *row = fresh;
-                logging::log(&format!(
-                    "event=swap_target_verified account={target} pct={:.0}",
-                    row.max_pct()
-                ));
-            }
-            None if eval.urgent
-                && row.max_pct() <= trigger - UNVERIFIED_TARGET_MIN_HEADROOM_PTS =>
-            {
-                logging::log(&format!(
-                    "event=swap_target_unverified account={target} cached_pct={:.0} action=use",
-                    row.max_pct()
-                ));
-                return eval;
-            }
-            None => {
-                logging::log(&format!(
-                    "event=swap_target_unverified account={target} cached_pct={:.0} action=skip",
-                    row.max_pct()
-                ));
-                row.error = Some("swap target could not be re-checked".to_string());
-            }
-        }
-    }
-}
-
-/// Whether the active account must be left now — the same test
-/// `evaluate_swap` uses for an urgent swap.
-fn active_in_trouble(rows: &[Row], active: &str, trigger: f64, guard: &SwapGuard) -> bool {
-    rows.iter().find(|r| r.email == active).is_some_and(|a| {
-        a.no_subscription || (a.has_data() && swap_fire_pct(a, trigger, guard) >= trigger)
-    })
-}
-
-/// The best-ranked account that could be a swap target if its reading were
-/// current: usable, past the no-return window, and either read before we left
-/// it or with a reading older than `TARGET_VERIFY_MAX_AGE_SECS`.
-fn stale_swap_candidate(
-    rows: &[Row],
-    active: &str,
-    guard: &SwapGuard,
-    tried: &[String],
-) -> Option<String> {
-    let now_ts = Utc::now().timestamp();
-    let act_provider = &rows.iter().find(|r| r.email == active)?.provider_id;
-    let mut stale: Vec<&Row> = rows
-        .iter()
-        .filter(|r| r.email != active && &r.provider_id == act_provider)
-        .filter(|r| !r.needs_relogin && !r.no_subscription && r.has_data())
-        .filter(|r| !tried.contains(&r.email))
-        .filter(|r| {
-            guard
-                .left_at
-                .get(&r.email)
-                .is_none_or(|t| t.elapsed().as_secs() >= NO_RETURN_SECS)
-        })
-        .filter(|r| {
-            !fresh_since_left(r, guard)
-                || r.fetched_at
-                    .is_none_or(|f| now_ts - f > TARGET_VERIFY_MAX_AGE_SECS)
-        })
-        .collect();
-    stale.sort_by(|a, b| candidate_order(a, b));
-    stale.first().map(|r| r.email.clone())
-}
-
-/// Fetch a prospective swap target's usage right now and persist it. Returns
-/// its refreshed row, or `None` if it couldn't be read. Never rotates tokens
-/// — the regular refresh owns that (including saving a rotated refresh
-/// token); an expired token just means "unverified".
-fn verify_swap_target(slug: &str, key: &str) -> Option<Row> {
-    verify_swap_target_detailed(slug, key).ok()
 }
 
 /// `verify_swap_target`, telling a 429 (`Err(true)`, which arms the v2 storm
@@ -5587,7 +4704,6 @@ fn watch_cycle(
     settle_manual_picks(trigger);
 
     let state = State::load()?;
-    let v2 = autoswap::shell::engine_v2(&state);
     let now_ts = Utc::now().timestamp();
     let mut providers_out = Vec::new();
     for p in providers::all() {
@@ -5632,7 +4748,7 @@ fn watch_cycle(
             guard.v2.budget.note_429(now_ts);
         }
         let (swapped, actionable, urgency, next_check_at) = match active.as_deref() {
-            Some(a) if v2 => {
+            Some(a) => {
                 let r = autoswap::shell::run_cycle(
                     slug,
                     &mut rows,
@@ -5642,10 +4758,6 @@ fn watch_cycle(
                     &mut guard.v2,
                 )?;
                 (r.swapped, r.actionable, Some(r.urgency), r.next_check_at)
-            }
-            Some(a) => {
-                let (s, act) = provider_swap_cycle_v1(slug, &mut rows, a, trigger, ceiling, guard)?;
-                (s, act, None, None)
             }
             None => (None, false, None, None),
         };
@@ -5693,164 +4805,11 @@ fn provider_swap_cycle(
     ceiling: f64,
     guard: &mut SwapGuard,
 ) -> Result<(Option<(String, String)>, bool)> {
-    if autoswap::shell::engine_v2(&State::load().unwrap_or_default()) {
+    {
         let r =
             autoswap::shell::run_cycle(slug, rows, active_email, trigger, ceiling, &mut guard.v2)?;
-        return Ok((r.swapped, r.actionable));
+        Ok((r.swapped, r.actionable))
     }
-    provider_swap_cycle_v1(slug, rows, active_email, trigger, ceiling, guard)
-}
-
-/// The classic (v1) engine's cycle, kept for rollback for one release
-/// (Settings ▸ Auto-swap ▸ Engine: Classic, or `USAGIO_AUTOSWAP_ENGINE=v1`).
-fn provider_swap_cycle_v1(
-    slug: &str,
-    rows: &mut [Row],
-    active_email: &str,
-    trigger: f64,
-    ceiling: f64,
-    guard: &mut SwapGuard,
-) -> Result<(Option<(String, String)>, bool)> {
-    let active_email = active_email.to_string();
-    let eval = evaluate_swap_verified(rows, &active_email, trigger, ceiling, guard);
-    // A target that's merely cooldown-blocked still counts as actionable:
-    // we want the fast backstop so we swap the instant the cooldown clears.
-    let actionable = eval.target_ignoring_cooldown.is_some();
-    // v0.5.2 item 6: structured decision logging (+ a "stayed" notification)
-    // fires every cycle the active account is at/above trigger, regardless
-    // of what happens next — a swap, a cooldown-blocked would-be swap, or
-    // genuinely nothing eligible.
-    let act_row = rows.iter().find(|r| r.email == active_email);
-    let act_over = act_row
-        .map(|r| r.has_data() && r.max_pct() >= trigger)
-        .unwrap_or(false);
-    let active_pct = act_row.map(|r| r.max_pct()).unwrap_or(0.0);
-    let held = act_row.is_some_and(|r| hold_applies(guard, r));
-
-    let Some(target) = eval.target.clone() else {
-        if held && act_over {
-            logging::log(&format!(
-                "event=swap_decision provider={slug} active={active_email} \
-                 active_pct={active_pct:.0}% action=stayed reason=manual_hold"
-            ));
-        } else if act_over || eval.urgent {
-            if eval.blocked_by_cooldown {
-                if let Some(target) = &eval.target_ignoring_cooldown {
-                    logging::log(&format!(
-                        "event=swap_decision provider={slug} active={active_email} \
-                         active_pct={active_pct:.0}% target={target} action=blocked \
-                         reason=cooldown"
-                    ));
-                }
-            } else if act_row.is_some_and(|r| r.plan_exhausted() && r.runs_on_credits()) {
-                logging::log(&format!(
-                    "event=swap_decision provider={slug} active={active_email} action=stayed \
-                     reason=on_credits"
-                ));
-            } else {
-                logging::log(&format!(
-                    "event=swap_decision provider={slug} active={active_email} action=stayed \
-                     reason=no_eligible_target"
-                ));
-                if !guard.stuck_notified {
-                    // Pick the soonest reset by TIMESTAMP, then humanize —
-                    // taking min() of humanized strings sorts
-                    // lexicographically ("3d 12h" < "3d 9h"), which is not
-                    // chronological.
-                    let soonest = rows
-                        .iter()
-                        .filter(|r| r.has_data())
-                        .filter_map(|r| r.weekly.resets_at)
-                        .min()
-                        .map(humanize_until)
-                        .unwrap_or_else(|| "unknown".to_string());
-                    notify(&format!(
-                        "staying on {active_email} — no better target available \
-                         (soonest reset in {soonest})"
-                    ));
-                    guard.stuck_notified = true;
-                }
-            }
-        } else {
-            guard.stuck_notified = false;
-        }
-        return Ok((None, actionable));
-    };
-
-    let target_row = rows
-        .iter()
-        .find(|r| r.email == target)
-        .expect("evaluate_swap returned an email absent from `rows`");
-    let (pick_s, pick_w) = (
-        target_row.session.pct.unwrap_or(0.0),
-        target_row.weekly.pct.unwrap_or(0.0),
-    );
-    // Proactive flip-back if the account we're leaving wasn't itself over the
-    // trigger — a better account simply freed up. A 429 near the trigger
-    // counts as over it (`eval.urgent`).
-    let proactive = !(act_over || eval.urgent);
-    if !proactive {
-        logging::log(&format!(
-            "event=swap_decision provider={slug} active={active_email} \
-             active_pct={active_pct:.0}% target={target} target_pct={:.0}% action=switching{}",
-            target_row.max_pct(),
-            if eval.preparing {
-                " reason=prepare_reset"
-            } else if eval.fallback {
-                " reason=fallback_most_room"
-            } else if eval.credits {
-                " reason=plans_used_up_using_credits"
-            } else if !target_row.eligible_target(ceiling, trigger) {
-                " reason=soonest_reset_in_band"
-            } else {
-                ""
-            }
-        ));
-    }
-    // Compare-and-set on the active account: if a manual switch landed since
-    // evaluate_swap read the snapshot, skip this swap. A failure or a lost CAS
-    // keeps `actionable` so the retry is prompt.
-    let switched = match switch_if_still_active(slug, &target, &active_email) {
-        Ok(s) => s,
-        Err(e) => {
-            logging::log(&format!("swap to {slug}/{target} failed: {e:#}"));
-            return Ok((None, true));
-        }
-    };
-    let Some(label) = switched else {
-        return Ok((None, true));
-    };
-    guard
-        .left_at
-        .insert(active_email.clone(), std::time::Instant::now());
-    guard.last_swap = Some(std::time::Instant::now());
-    guard.stuck_notified = false;
-    guard.manual_locked_choice = None;
-    guard.manual_pick = None;
-    prune_swap_guard(guard);
-    log_event(&serde_json::json!({
-        "ts": Utc::now().timestamp(),
-        "event": "swap",
-        "provider": slug,
-        "reason": if eval.preparing { "prepare_reset" } else if proactive { "proactive" } else if eval.fallback { "fallback" } else { "trigger" },
-        "from": active_email,
-        "to": target,
-        "session": pick_s,
-        "weekly": pick_w,
-    }));
-    let verb = if proactive {
-        "Flipped back to"
-    } else {
-        "Switched to"
-    };
-    if eval.preparing {
-        notify(&format!(
-            "Prepared {label} for its next reset — usage is still blocked."
-        ));
-    } else {
-        notify(&format!("{verb} {label} — {pick_s:.0}% / {pick_w:.0}%"));
-    }
-    Ok((Some((active_email, target)), actionable))
 }
 
 /// Fire a native "usagio: {msg}" notification (best effort, cross-platform).

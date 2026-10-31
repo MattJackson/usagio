@@ -311,26 +311,6 @@ pub struct ShellState {
 // Engine selection and process-wide facts
 // ---------------------------------------------------------------------------
 
-/// The env var that selects the classic engine (`v1`) for `usagio watch` and
-/// the CLI. Secondary to the Settings toggle.
-pub const ENGINE_ENV_VAR: &str = "USAGIO_AUTOSWAP_ENGINE";
-
-/// Whether the v2 engine is selected: `State.autoswap_engine` (Settings ▸
-/// Auto-swap ▸ Engine) wins; unset, `USAGIO_AUTOSWAP_ENGINE=v1` selects the
-/// classic engine; otherwise v2 (the default).
-pub fn engine_v2(state: &State) -> bool {
-    match state.autoswap_engine.as_deref() {
-        Some(e) => !is_classic(e),
-        None => std::env::var(ENGINE_ENV_VAR)
-            .ok()
-            .is_none_or(|v| !is_classic(v.trim())),
-    }
-}
-
-fn is_classic(e: &str) -> bool {
-    e.eq_ignore_ascii_case("v1") || e.eq_ignore_ascii_case("classic")
-}
-
 static SLEEP_GAPS: std::sync::Mutex<Vec<(i64, i64)>> = std::sync::Mutex::new(Vec::new());
 
 /// Record a detected system sleep `(from, to)` (unix secs); the blind
