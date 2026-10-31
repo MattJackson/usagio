@@ -187,6 +187,14 @@ fn with_control<T: Send + 'static>(
     url: &'static str,
     action: impl FnOnce(&mut WebSocket<Proxy>) -> Result<T> + Send + 'static,
 ) -> Result<T> {
+    with_control_timeout(url, Duration::from_secs(5), action)
+}
+
+fn with_control_timeout<T: Send + 'static>(
+    url: &'static str,
+    timeout: Duration,
+    action: impl FnOnce(&mut WebSocket<Proxy>) -> Result<T> + Send + 'static,
+) -> Result<T> {
     let home = super::auth_json_path()
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .context("cannot resolve Codex home")?;
@@ -213,7 +221,7 @@ fn with_control<T: Send + 'static>(
         let _ = send.send(result);
     });
     let result = receive
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(timeout)
         .map_err(|_| anyhow!("Codex control request timed out"));
     let _ = child.kill();
     let _ = child.wait();
@@ -319,6 +327,82 @@ pub(crate) fn start_and_verify(expected: &crate::providers::IdentitySnapshot) ->
 mod tests {
     use super::*;
 
+    /// Hold a synthetic Responses stream open until the test releases it.
+    /// No credentials or prompts are recorded or sent beyond loopback.
+    fn held_response() -> (
+        String,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        use std::io::BufRead;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (started, started_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(_) if std::time::Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(20))
+                        }
+                        Err(_) => return,
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut request = String::new();
+                if reader.read_line(&mut request).unwrap_or(0) == 0 {
+                    return;
+                }
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                if length > 4 * 1024 * 1024 {
+                    return;
+                }
+                let mut body = vec![0; length];
+                if reader.read_exact(&mut body).is_err() {
+                    return;
+                }
+                drop(reader);
+                if !request.starts_with("POST /v1/responses ") {
+                    let body = "{\"models\":[]}";
+                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = stream.flush();
+                    continue;
+                }
+                let opened =
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"mock-response\"}}\n\n";
+                let completed = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"mock-response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n";
+                if write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{opened}", opened.len() + completed.len()).is_err() { return; }
+                let _ = stream.flush();
+                let _ = started.send(());
+                if release_rx.recv_timeout(Duration::from_secs(25)).is_ok() {
+                    let _ = stream.write_all(completed.as_bytes());
+                    let _ = stream.flush();
+                }
+                break;
+            }
+        });
+        (format!("http://{address}/v1"), started_rx, release)
+    }
+
     #[test]
     #[ignore = "requires installed Codex; starts only an isolated test daemon"]
     fn isolated_daemon_drains_and_loads_the_selected_account() {
@@ -330,6 +414,26 @@ mod tests {
             .unwrap();
         crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
             let home = dir.path();
+            let (base_url, started, release) = held_response();
+            std::fs::write(
+                home.join("config.toml"),
+                format!(
+                    r#"
+model = "gpt-5.4"
+model_provider = "mock"
+approval_policy = "never"
+sandbox_mode = "read-only"
+[model_providers.mock]
+name = "Local handoff test"
+base_url = "{base_url}"
+wire_api = "responses"
+requires_openai_auth = false
+request_max_retries = 0
+stream_max_retries = 0
+"#
+                ),
+            )
+            .unwrap();
             std::fs::create_dir_all(home.join("app-server-daemon")).unwrap();
             std::fs::write(
                 home.join("app-server-daemon/settings.json"),
@@ -357,6 +461,7 @@ mod tests {
             provider
                 .write_active_account(&first.secret_blob, &first.identity)
                 .unwrap();
+            crate::capture_current_generic("codex").unwrap();
             start_and_verify(&first.identity).unwrap();
             let session = with_control("ws://localhost/", |socket| {
                 inspect(socket)?;
@@ -373,9 +478,76 @@ mod tests {
                     .context("missing isolated thread ID")
             })
             .unwrap();
+            let turn_session = session.clone();
+            with_control("ws://localhost/", move |socket| {
+                inspect(socket)?;
+                call(socket, 1000, "turn/start", json!({"threadId":turn_session,"input":[{"type":"text","text":"Reply briefly.","text_elements":[]}]}))?;
+                Ok(())
+            }).unwrap();
+            started
+                .recv_timeout(Duration::from_secs(10))
+                .expect("Codex did not reach the local response server");
             let before = probe().unwrap().unwrap();
-            assert!(!before.busy);
-            begin_drain(before.instance_token.as_deref().unwrap()).unwrap();
+            assert!(before.busy);
+            crate::switch_to_provider_account("codex", "a@example.com", true).unwrap();
+            assert!(!crate::provider_switch_pending("codex", "a@example.com"));
+            let unchanged = probe().unwrap().unwrap();
+            assert!(unchanged.busy);
+            assert_eq!(unchanged.instance_token, before.instance_token);
+            let attached_session = session.clone();
+            let (attached, attachment_ready) = std::sync::mpsc::channel();
+            let observer = std::thread::spawn(move || {
+                with_control_timeout("ws://localhost/", Duration::from_secs(25), move |socket| {
+                    inspect(socket)?;
+                    call(
+                        socket,
+                        1000,
+                        "thread/resume",
+                        json!({"threadId":attached_session}),
+                    )?;
+                    attached.send(()).unwrap();
+                    loop {
+                        match socket.read() {
+                            Ok(Message::Text(body)) => {
+                                let message: Value = serde_json::from_str(&body)?;
+                                if message["method"] == "turn/completed"
+                                    && message["params"]["threadId"] == attached_session
+                                {
+                                    // The stdio proxy keeps stdout open until
+                                    // stdin closes, even after server EOF. The
+                                    // completion event is the observable client
+                                    // contract; process exit is checked separately.
+                                    return Ok(message["params"]["turn"]["status"] == "completed");
+                                }
+                            }
+                            Ok(Message::Close(_)) | Err(_) => return Ok(false),
+                            _ => {}
+                        }
+                    }
+                })
+            });
+            attachment_ready
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            let second = provider
+                .complete_login(&crate::tests::codex_login_response(
+                    "b@example.com",
+                    "account-b",
+                ))
+                .unwrap();
+            crate::persist_login(&provider, second, None).unwrap();
+            crate::switch_to_provider_account("codex", "b@example.com", true).unwrap();
+            assert!(crate::provider_switch_pending("codex", "b@example.com"));
+            std::thread::sleep(Duration::from_millis(500));
+            assert!(
+                verify_stopped(before.instance_token.as_deref().unwrap()).is_err(),
+                "active turn was terminated by graceful drain"
+            );
+            assert_eq!(
+                std::fs::read_to_string(home.join("auth.json")).unwrap(),
+                first.secret_blob
+            );
+            release.send(()).unwrap();
             let deadline = std::time::Instant::now() + Duration::from_secs(15);
             loop {
                 match probe() {
@@ -397,16 +569,21 @@ mod tests {
                 std::fs::read_to_string(home.join("auth.json")).unwrap(),
                 first.secret_blob
             );
-            let second = provider
-                .complete_login(&crate::tests::codex_login_response(
-                    "b@example.com",
-                    "account-b",
-                ))
-                .unwrap();
-            provider
-                .write_active_account(&second.secret_blob, &second.identity)
-                .unwrap();
-            start_and_verify(&second.identity).unwrap();
+            assert!(
+                observer.join().unwrap().unwrap(),
+                "attached client did not receive turn completion before disconnect"
+            );
+            crate::complete_pending_switches();
+            assert!(!crate::provider_switch_pending("codex", "b@example.com"));
+            assert_eq!(
+                crate::store::State::load()
+                    .unwrap()
+                    .provider_accounts("codex")
+                    .unwrap()
+                    .active
+                    .as_deref(),
+                Some("b@example.com")
+            );
             let after = probe().unwrap().unwrap();
             assert_eq!(after.email.as_deref(), Some("b@example.com"));
             assert_ne!(after.instance_token, before.instance_token);
@@ -416,6 +593,24 @@ mod tests {
                 anyhow::ensure!(
                     resumed.pointer("/thread/id").and_then(Value::as_str) == Some(session.as_str()),
                     "session was not resumed after handoff"
+                );
+                let history = call(
+                    socket,
+                    1001,
+                    "thread/read",
+                    json!({"threadId":session,"includeTurns":true}),
+                )?;
+                let turns = history
+                    .pointer("/thread/turns")
+                    .and_then(Value::as_array)
+                    .context("missing resumed turn history")?;
+                anyhow::ensure!(
+                    turns
+                        .last()
+                        .and_then(|turn| turn.get("status"))
+                        .and_then(Value::as_str)
+                        == Some("completed"),
+                    "in-flight turn did not finish before handoff"
                 );
                 Ok(())
             })

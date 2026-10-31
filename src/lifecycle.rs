@@ -520,6 +520,36 @@ pub(crate) fn prepare_handoff(
             "a renewed login is still completing its handoff"
         );
     }
+    if status.running
+        && state
+            .provider_accounts(slug)
+            .is_none_or(|accounts| accounts.pending_switch.is_none())
+    {
+        if let Some(account) = state.find_provider_account(slug, key) {
+            if status
+                .account_key
+                .as_deref()
+                .is_some_and(|current| current.eq_ignore_ascii_case(key))
+                && status.account_id == account.identity_uuid
+                && matching_active_blob(provider, &account.identity_snapshot())?.is_some()
+            {
+                let accounts = state.provider_accounts_mut(slug);
+                // Already live in both storage and the daemon: reconcile
+                // selection without rewriting tokens or interrupting work.
+                accounts.pending_switch = Some(crate::store::PendingSwitch {
+                    key: key.to_owned(),
+                    manual,
+                    from: accounts.active.clone(),
+                    drain_token: None,
+                    credentials_written: true,
+                    renewed_account: None,
+                    leave_latch: None,
+                });
+                state.save()?;
+                return Ok(true);
+            }
+        }
+    }
     if let Some(pending) = state
         .provider_accounts(slug)
         .and_then(|accounts| accounts.pending_switch.as_ref())

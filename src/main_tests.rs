@@ -1823,6 +1823,7 @@ impl crate::providers::Provider for MockActiveSlotProvider {
             running: self.client_running,
             busy: self.client_running,
             account_key: Some(self.email.clone()),
+            account_id: None,
             handoff_token: self.client_running.then(|| "renewal-instance".into()),
         })
     }
@@ -8132,6 +8133,7 @@ fn graceful_handoff_drains_once_and_preserves_credentials_until_exit() {
         running: true,
         busy: true,
         account_key: Some("a@example.com".into()),
+        account_id: None,
         handoff_token: Some("instance-1".into()),
     };
     assert!(
@@ -8202,6 +8204,7 @@ fn changing_a_pending_target_does_not_force_the_draining_daemon() {
         running: true,
         busy: true,
         account_key: None,
+        account_id: None,
         handoff_token: Some("same-instance".into()),
     };
     lifecycle::prepare_handoff(&provider, &status, &mut state, "b@example.com", false).unwrap();
@@ -8258,6 +8261,7 @@ fn handoff_verification_retry_does_not_drain_replacement_or_overwrite_rotation()
         running: true,
         busy: false,
         account_key: Some(key.into()),
+        account_id: None,
         handoff_token: Some("replacement-instance".into()),
     };
     assert!(lifecycle::prepare_handoff(&provider, &status, &mut state, key, true).unwrap());
@@ -8293,6 +8297,7 @@ fn idempotent_drain_retries_failed_delivery_without_losing_intent() {
         running: true,
         busy: true,
         account_key: None,
+        account_id: None,
         handoff_token: Some("instance".into()),
     };
     assert!(lifecycle::prepare_handoff(&provider, &status, &mut state, "target", false).is_err());
@@ -8331,6 +8336,7 @@ fn queued_auto_handoff_preserves_no_bounce_latch_across_restart() {
             running: true,
             busy: true,
             account_key: None,
+            account_id: None,
             handoff_token: Some("instance".into()),
         };
         assert!(

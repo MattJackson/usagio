@@ -603,6 +603,7 @@ impl Provider for CodexProvider {
                     running: true,
                     busy: state.busy,
                     account_key: state.email,
+                    account_id: state.account_id,
                     handoff_token: state.instance_token,
                 },
                 None => crate::providers::ClientStatus::default(),

@@ -471,6 +471,7 @@ pub struct ClientStatus {
     pub running: bool,
     pub busy: bool,
     pub account_key: Option<String>,
+    pub account_id: Option<String>,
     pub handoff_token: Option<String>,
 }
 
