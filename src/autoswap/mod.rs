@@ -544,7 +544,9 @@ impl<'a> Decider<'a> {
     fn prepare(&self) -> Option<Out> {
         let act = &self.act;
         let act_until = act.blocked_until?;
-        if act.lapsed || self.pick.is_some() || act.tier == Tier::Credits {
+        // A confirmed block ends manual protection: prepare an earlier unlock
+        // even after a manual pick, while retaining cooldown and evidence gates.
+        if act.lapsed || act.tier == Tier::Credits {
             return None;
         }
         if self.cands.iter().any(|c| !c.has_reading) {

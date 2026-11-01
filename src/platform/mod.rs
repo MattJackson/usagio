@@ -39,6 +39,38 @@ pub trait Platform: Send + Sync + 'static {
     /// user's NTFS ACL, so this is a documented no-op on that backend rather
     /// than a scattered `#[cfg(unix)]` at every call site. `path` must exist.
     fn secure_permissions(&self, path: &Path) -> Result<()>;
+
+    /// Start a separate application without making usagio responsible for its
+    /// later privacy requests. macOS must launch through launchd: daemonizing
+    /// or reparenting an ordinary child does not break TCC responsibility.
+    /// Failure must propagate; falling back to a direct spawn defeats isolation.
+    fn run_independent(
+        &self,
+        program: &Path,
+        args: &[&str],
+        environment: &[(&str, &std::ffi::OsStr)],
+        timeout: std::time::Duration,
+    ) -> Result<std::process::ExitStatus> {
+        let mut child = std::process::Command::new(program)
+            .args(args)
+            .envs(environment.iter().copied())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("independent process start timed out");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
     /// Native save/open panels for the "Advanced ▸ Backups ▸ Save…/Restore…"
     /// menu flow. Default-implemented against `rfd` (Win32
     /// IFileOpenDialog/IFileSaveDialog on Windows, NSOpenPanel/NSSavePanel on

@@ -301,16 +301,16 @@ fn menu_order_sorts_locked_accounts_by_unlock_time() {
 }
 
 #[test]
-fn menu_order_keeps_active_locked_account_in_rotation() {
+fn menu_order_sinks_active_locked_account() {
     let now = Utc::now();
-    // Active and locked: not sunk, so its sooner weekly reset puts it first.
+    // Active status must not lift a locked account above a usable one.
     let mut locked = row_full("active@e.com", 100.0, 40.0, now + Duration::hours(6));
     locked.session.resets_at = Some(now + Duration::hours(1));
     let free = row_full("free@e.com", 30.0, 30.0, now + Duration::hours(24));
     let mut rows = [free, locked];
     rows.sort_by(|a, b| menu_order(a, b, Some("active@e.com"), now));
-    assert_eq!(rows[0].email, "active@e.com");
-    assert_eq!(rows[1].email, "free@e.com");
+    assert_eq!(rows[0].email, "free@e.com");
+    assert_eq!(rows[1].email, "active@e.com");
 }
 
 #[test]
@@ -6325,4 +6325,16 @@ fn older_cli_profile_does_not_undo_a_background_profile_refresh() {
         sync_active_claude_identity(&mut state);
         assert_eq!(state.accounts[0].plan.as_deref(), Some("New plan"));
     });
+}
+
+#[test]
+fn menu_order_active_locked_account_uses_unlock_time() {
+    let now = Utc::now();
+    let mut active = row_full("dev8", 100.0, 27.0, now + Duration::days(6));
+    active.session.resets_at = Some(now + Duration::hours(4));
+    let mut earlier = row_full("dev4", 100.0, 54.0, now + Duration::days(7));
+    earlier.session.resets_at = Some(now + Duration::hours(2));
+    for selected in [Some("dev8"), Some("dev4"), None] {
+        assert!(menu_order(&earlier, &active, selected, now).is_lt());
+    }
 }

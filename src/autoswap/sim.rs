@@ -1225,12 +1225,10 @@ fn s8b_overnight_with_a_manual_pick_on_dev8() {
         .first()
         .map(|s| s.t)
         .unwrap_or(ymd(10, 27, 0, 0, 0));
-    assert!(
-        !tr.switches
-            .iter()
-            .any(|s| s.kind == Kind::Prepare && s.t < pick_end),
-        "no Prepare while the pick is active"
-    );
+    let first = tr.switches.first().expect("prepares the earliest reset");
+    assert_eq!(first.kind, Kind::Prepare);
+    assert_eq!(first.from, "dev8");
+    assert_eq!(first.to, "dev6");
     let dev8_fetches = tr
         .fetches
         .iter()
@@ -1315,7 +1313,7 @@ fn s10_manual_picks_at_79_96_100() {
         .find(|s| s.from == "pick")
         .expect("leaves");
     assert_eq!(out.kind, Kind::Serve, "held until lb-blocked");
-    // 100: leaves for a verified server, never prepared away.
+    // 100: prefers a verified server over preparing a blocked account.
     let tr = manual_pick_at(100.0);
     let out = tr
         .switches
