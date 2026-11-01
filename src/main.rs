@@ -11,6 +11,7 @@
 
 mod autoswap;
 mod burn_rate;
+mod claude_profiles;
 mod context_ledger;
 mod countdown;
 mod credentials;
@@ -608,8 +609,8 @@ fn persist_claude_login(
         match state.find_mut(&email) {
             Some(a) => {
                 a.adopt_login(&fresh);
-                if a.oauth_account.is_none() {
-                    a.oauth_account = native.get("oauthAccount").cloned().filter(|v| !v.is_null());
+                if let Some(identity) = native.get("oauthAccount").filter(|v| v.is_object()) {
+                    update_claude_identity(a, identity);
                 }
             }
             None => {
@@ -791,6 +792,7 @@ fn cmd_list(args: &[String]) -> Result<()> {
     // By default read the cache (no network); --refresh does exactly one fetch.
     if refresh {
         refresh_usage_cache(true);
+        claude_profiles::refresh(usize::MAX, true);
     }
     providers::init();
     let state = State::load()?;
@@ -2053,6 +2055,85 @@ fn mirror_inactive_rotation(
     outcome.unwrap_or_default()
 }
 
+/// Refresh metadata independently of token rotation. Called again under the
+/// state lock at poll commit so skipped usage fetches still persist the name.
+fn sync_active_claude_identity(state: &mut State) {
+    let (Some(active), (Some(identity), _)) = (state.active.clone(), read_claude_identity()) else {
+        return;
+    };
+    let Some(account) = state.find_mut(&active) else {
+        return;
+    };
+    let saved_at = account
+        .oauth_account
+        .as_ref()
+        .and_then(|o| o.get("profileFetchedAt"))
+        .and_then(|v| v.as_i64());
+    let incoming_at = identity.get("profileFetchedAt").and_then(|v| v.as_i64());
+    // The CLI's older on-disk profile must not undo a newer background fetch.
+    if saved_at.is_some_and(|saved| incoming_at.is_none_or(|incoming| incoming < saved)) {
+        return;
+    }
+    if identity_matches(
+        account.identity_uuid().as_deref(),
+        account.email.as_deref(),
+        identity.get("accountUuid").and_then(|v| v.as_str()),
+        identity.get("emailAddress").and_then(|v| v.as_str()),
+    ) {
+        update_claude_identity(account, &identity);
+    }
+}
+
+/// Merge fresh vendor metadata without dropping fields absent in older clients.
+fn update_claude_identity(account: &mut Account, identity: &serde_json::Value) {
+    let Some(fields) = identity.as_object() else {
+        return;
+    };
+    let saved = account
+        .oauth_account
+        .get_or_insert_with(|| serde_json::json!({}));
+    if !saved.is_object() {
+        *saved = serde_json::json!({});
+    }
+    let tier_changed = ["organizationType", "organizationRateLimitTier"]
+        .iter()
+        .any(|key| {
+            identity
+                .get(*key)
+                .is_some_and(|value| !value.is_null() && saved.get(*key) != Some(value))
+        });
+    if tier_changed
+        && identity
+            .get("planDisplayName")
+            .and_then(|v| v.as_str())
+            .is_none_or(|name| name.trim().is_empty())
+    {
+        saved.as_object_mut().unwrap().remove("planDisplayName");
+    }
+    for (key, value) in fields {
+        if !value.is_null() {
+            saved[key] = value.clone();
+        }
+    }
+    if !account.no_subscription {
+        if let Some(name) = identity
+            .get("planDisplayName")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            account.plan = Some(name.to_string());
+        } else if tier_changed {
+            let get = |key: &str| account.oauth_account.as_ref()?.get(key)?.as_str();
+            account.plan = usage::plan_label(
+                None,
+                get("organizationType"),
+                get("organizationRateLimitTier"),
+            );
+        }
+    }
+}
+
 /// If the account currently in the keychain is genuinely our active account,
 /// adopt any token rotation a live `claude` session performed. Verified by
 /// identity: `/login` into a *different* account rewrites ~/.claude.json's
@@ -2060,6 +2141,7 @@ fn mirror_inactive_rotation(
 /// we must NOT overwrite its stored tokens. In-place rotation keeps the same
 /// account uuid/email, so legitimate rotation is still captured.
 fn sync_active_from_keychain(provider: &'static dyn Provider, state: &mut State) {
+    sync_active_claude_identity(state);
     let _ = provider;
     let Some(active) = state.active.clone() else {
         return;
@@ -2107,12 +2189,6 @@ fn sync_active_from_keychain(provider: &'static dyn Provider, state: &mut State)
     acct.refresh_token = fresh.refresh_token;
     acct.expires_at = fresh.expires_at;
     acct.keychain_blob = fresh.keychain_blob;
-    // Self-heal: if we had no identity but .claude.json has one, record it.
-    if acct.oauth_account.is_none() {
-        if let Some(o) = json_oauth {
-            acct.oauth_account = Some(o);
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2255,11 +2331,17 @@ fn claude_plan_label(a: &Account) -> Option<String> {
     if a.no_subscription {
         return Some(a.plan.clone().unwrap_or_else(|| "Free".to_string()));
     }
-    if a.plan.is_some() {
+    let get = |k: &str| a.oauth_account.as_ref()?.get(k)?.as_str();
+    let inferred = usage::plan_label(
+        None,
+        get("organizationType"),
+        get("organizationRateLimitTier"),
+    );
+    // A profile response without a display name only repeats the old tier
+    // mapping. It must not mask the vendor's explicit name saved by Claude.
+    if a.plan.is_some() && a.plan != inferred {
         return a.plan.clone();
     }
-    let o = a.oauth_account.as_ref()?;
-    let get = |k: &str| o.get(k).and_then(|v| v.as_str());
     usage::plan_label(
         get("planDisplayName"),
         get("organizationType"),
@@ -3319,6 +3401,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
     // Merge under the lock with a fresh reload so we don't clobber a switch.
     let merged = with_state_lock(|| {
         let mut st = State::load()?;
+        sync_active_claude_identity(&mut st);
         for (email, acct, cu, ns) in &updates {
             if let Some(a) = st.find_mut(email) {
                 // Tokens are already saved: rotations by `oauth::ensure_fresh`,
@@ -4387,22 +4470,22 @@ fn persist_plan(
         Ok(changed)
     });
     match res {
-        Ok(true) => {
-            logging::log(&format!(
-                "event=subscription_{} provider={slug} account={key}",
-                if lapsed { "lapsed" } else { "restored" }
-            ));
-            notify(&if lapsed {
-                format!(
-                    "{key} ({slug}) has no subscription — usage checks paused until it's renewed"
-                )
-            } else {
-                format!("{key} ({slug}) subscription is back")
-            });
-        }
+        Ok(true) => notify_subscription_change(slug, key, lapsed),
         Ok(false) => {}
         Err(e) => logging::log(&format!("persist_plan({slug}/{key}): save failed: {e:#}")),
     }
+}
+
+fn notify_subscription_change(slug: &str, key: &str, lapsed: bool) {
+    logging::log(&format!(
+        "event=subscription_{} provider={slug} account={key}",
+        if lapsed { "lapsed" } else { "restored" }
+    ));
+    notify(&if lapsed {
+        format!("{key} ({slug}) has no subscription — usage checks paused until it's renewed")
+    } else {
+        format!("{key} ({slug}) subscription is back")
+    });
 }
 
 /// The active account as of the last `refresh_usage_cache`. Lets the poller
@@ -4785,6 +4868,14 @@ fn watch_cycle(
             next_check_at,
         });
     }
+    claude_profiles::refresh(
+        if force {
+            usize::MAX
+        } else {
+            claude_profiles::BATCH_SIZE
+        },
+        force,
+    );
     Ok(CycleOutcome {
         providers: providers_out,
     })

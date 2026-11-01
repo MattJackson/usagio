@@ -717,10 +717,12 @@ mod tests {
         );
     }
 
-    /// Not launchd-managed under `cargo test`, so no restart is issued.
+    /// Explicitly unmanaged, even if cargo inherited a launchd environment.
     #[test]
     fn real_effects_self_restart_not_issued_when_unmanaged() {
         let _cfg = crate::store::ScopedConfigDir::new();
-        assert!(!RealEffects.self_restart());
+        crate::env_lock::scoped_env_var("XPC_SERVICE_NAME", None, || {
+            assert!(!RealEffects.self_restart());
+        });
     }
 }

@@ -26,6 +26,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+mod independent;
+
 pub struct MacOsPlatform {
     // Reachable through the `MenuBackend` trait method below; the compiler's
     // dead-code analysis doesn't see the vtable dispatch. The concrete impl
@@ -67,6 +69,15 @@ impl Platform for MacOsPlatform {
     }
     fn secure_permissions(&self, path: &Path) -> Result<()> {
         super::secure_permissions_unix(path)
+    }
+    fn run_independent(
+        &self,
+        program: &Path,
+        args: &[&str],
+        environment: &[(&str, &std::ffi::OsStr)],
+        timeout: Duration,
+    ) -> Result<ExitStatus> {
+        independent::run(program, args, environment, timeout)
     }
     fn register_notification_app(&self) {
         // Tell mac-notification-sys our real bundle id so it doesn't fall back

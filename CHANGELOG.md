@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.7] - 2026-10-31
+
+### Fixed
+
+- Start the shared Codex daemon through a one-shot macOS launchd job during account handoff. Directly starting it from Usagio could attribute Codex tools' privacy requests to Usagio, including protected-folder access. The job preserves the selected Codex home, reports launcher failures, times out, and unloads after use. Existing processes need a restart through the fixed launch path; upgrading Usagio alone does not change their privacy attribution.
+
+## [1.0.6] - 2026-10-31
+
+### Fixed
+
+- Refresh Claude plan names for all saved accounts, including inactive accounts and accounts with locked usage. Two profiles refresh after each normal polling cycle; manual Refresh checks every eligible profile. Successful checks repeat after 30 minutes; failed requests retry after five minutes, with the schedule preserved across restarts.
+- Prefer Anthropic’s explicit plan name, such as “Ultra,” over cached tier labels such as “Max 20x.” Polling, capture, and login renewal preserve fresh identity metadata.
+- Reject stale or mismatched profile responses without changing credentials, cached usage, or the active login. A plan downgrade clears a display name that belongs to the old tier.
+
 ## [1.0.5] - 2026-10-31
 
 - Show 🎁 in the menu bar when any account has a reset and beside each account with one.
