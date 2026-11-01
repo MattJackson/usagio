@@ -91,7 +91,7 @@ The same runway function drives the new tray/menu feature: show the **binding wi
 | **I3 Leave at trigger** | If the active account's binding window reaches the trigger (Real reading, estimate within the 10 min cap, or blind projection §3.3), and a verified `Ready` candidate exists, switch now (Trigger). No cooldown applies. Not for a manual pick unless the reading is Real (I6). |
 | **I4 Bounded churn** | Per reset epoch, an account is left by Trigger at most once and by Drain/Serve at most once (latches §3.5). Optional moves (Rebalance, Prepare) are ≥ `SWAP_COOLDOWN` apart. Proptest with per-account 429 masks (§8.3). |
 | **I5 Evidence** | A target is *verified* when its reading was taken ≥ 60 s after we last left it, its windows are not reset-pending (§3.3), and the reading is ≤ 120 s old or was refreshed by `NeedReading` this cycle. For accounts we left, drift is carried forward to `left_at`. Unverified targets: §3.4 post-pass. |
-| **I6 Manual** | Optional moves (Rebalance, Prepare) are off while a pick is active. A pick leaves at the trigger only on a `Real` reading (0.10.4), never on an estimate or projection. Its tier is settled from the switch-time reading, then re-settled by the first fresh one (0.8.8, 0.10.4). A pick settled at Draining or worse holds until it is lb-blocked (0.8.9). An lb-blocked pick leaves for any servable account (Serve) but is never prepared away from. The hold ends when the pick's tier improves (0.12.1) or on any change of active account. |
+| **I6 Manual** | Rebalance is off while a pick is active. Prepare is allowed once the pick is lb-blocked. A pick leaves at the trigger only on a `Real` reading (0.10.4), never on an estimate or projection. Its tier is settled from the switch-time reading, then re-settled by the first fresh one (0.8.8, 0.10.4). A pick settled at Draining or worse holds until it is lb-blocked (0.8.9). An lb-blocked pick leaves for any servable account (Serve) or prepares the earliest known unlock when all accounts are blocked. The hold ends when the pick's tier improves (0.12.1) or on any change of active account. |
 | **I7 Credits last** | Credits are used only when the setting is on, the active account is lb-blocked, no account is servable, and every reset-pending plan account has been read (or its read failed) this cycle. Leave credits for a verified plan account with ≥ `MIN_LANDING`. Never prepare away from credits. |
 | **I8 No info is no info** | A 429, error or skip changes only reading age. An lb-blocked active is not re-fetched (§5.7). A blind-in-band active gets the projection (§3.3). Any other Stale active gets `NeedReading(active)`, not a guess. |
 
@@ -353,7 +353,7 @@ be a Trigger or Rebalance target. Its room is logged as `latched_pts` in the str
 |---|---|
 | **Cooldown** | `SWAP_COOLDOWN = 300 s` since `last_switch_at`. Applies only to Rebalance and Prepare. A cooldown-blocked move is logged as `action=blocked reason=cooldown` (as today). |
 | **Rebalance** (use-it-or-lose-it) | Active is Ready and unpicked. The candidate is verified Ready, not latched, and its weekly reset is `< now + REBALANCE_HORIZON` (6 h) and earlier than the active account's weekly reset. Not announced as a decision (keeps 5749). **Why 6 h:** the only value of a flip is room that would otherwise expire. Beyond ~6 h (one 5-hour session window plus margin) the active account will normally exit on its own (trigger, or a session block) before the candidate's reset, and drain mode uses the room then. Inside 6 h, the next natural exit may come after the reset. 24 h (v1) flipped on resets almost a day out and was a hard step (B17). The comparison is strict `<` with `now` injected. |
-| **Prepare** (all blocked) | All must hold (B12, v1 parity): the active account is lb-blocked with a known `blocked_until`; every switchable row has data; no reset-pending row is still unattempted this cycle; the target is lb-blocked with `blocked_until` strictly earlier than the active account's; cooldown has elapsed; no pick is active; the active account is not on credits. |
+| **Prepare** (all blocked) | All must hold (B12, v1 parity): the active account is lb-blocked with a known `blocked_until`; every switchable row has data; no reset-pending row is still unattempted this cycle; the target is lb-blocked with `blocked_until` strictly earlier than the active account's; cooldown has elapsed; the active account is not on credits. A manual pick does not prevent Prepare once lb-blocked. |
 | **Credits** | §2 I7. |
 | **Stuck notice** | Fires once on entering `Stay(all_blocked)`, or `Stay(draining)` with no drain target. Re-arms only on a switch, or on a *Real-reading* tier change of the active account. It is cleared when the active account is Ready or held (keeps 5843 semantics, B8). Never fires for `on_credits` or `manual_hold`. |
 | **Decision log** | One `event=swap_decision v=2 …` line per *change* of (action, reason, target), and every switch. This removes the per-cycle Codex `on_credits` spam. |
@@ -663,7 +663,7 @@ Blocker scenarios from the review:
 | S6 | B2 15:36–16:23 streak (8× 429 15:38–15:58) | 0 switches |
 | S7 | B1 two accounts at 99, 30 s and 60 s polls | ≤ 1 switch before both are blocked |
 | S8 | all blocked, overnight resets (dev6 04:59:59, dev7 07:59:59) with an active 429 streak | on dev6 by 05:05 |
-| S8b | S8 with an overnight manual pick on dev8 and every dev8 fetch 429ing | on dev6 by 05:05; no Prepare while the pick is active; 0 dev8 fetches while it is lb-blocked |
+| S8b | S8 with an overnight manual pick on dev8 and every dev8 fetch 429ing | on dev6 by 05:05; Prepare to the earliest unlock once lb-blocked; 0 dev8 fetches while it is lb-blocked |
 | S9 | credits: plan exhausted → credits → a plan account resets | leaves credits ≤ 2 cycles after the reset is verified |
 | S10 | manual picks at 79 / 96 / 100 with 429s | 79: leaves at Real 95. 96: holds to Real 99.5. 100: leaves for a verified server; never prepared away |
 | S11 | idle overnight, then resume | no switch while idle; no flip into the band |
@@ -683,7 +683,7 @@ Blocker scenarios from the review:
 | T33 | `r2m2_memory_merge_keeps_cli_write` | daemon writes after a CLI wrote `left_at[X]` meanwhile | both entries survive |
 | T34 | `r2m2_dual_write_manual_holds` | pick settled Draining | `manual_holds[slug]` written; v1 holds after a toggle |
 | T35 | `r2m4_budget_storm_guard` | 429 on any token within 60 s | 0 verification reads except reset-pending ones; ≤ 3 per 60 s total |
-| T36 | `r2b2_dev8_1752_skip_to_100_with_pick` | dev8 = manual pick (17:30:55, settled Ready at 90); Real 70/98 at 17:52:43, then 429; all else lb 100 | 17:52 Stay(draining) (pick, no Ready target); 17:55:46 Real 100 → arm 1: nothing servable, **no Prepare (pick)**, Stay(all_blocked); 0 dev8 fetches afterwards |
+| T36 | `r2b2_dev8_1752_skip_to_100_with_pick` | dev8 = manual pick (17:30:55, settled Ready at 90); Real 70/98 at 17:52:43, then 429; all else lb 100 | 17:52 Stay(draining) (pick, no Ready target); 17:55:46 Real 100 → arm 1: nothing servable, **Prepare to dev6**, subject to cooldown; 0 dev8 fetches afterwards |
 
 **[v3.1] Round-3 table tests:**
 
@@ -829,7 +829,7 @@ accounts lb 100). v3 cadence: 60 s in Draining.
 |---|---|
 | 17:52:43 | Real 98 ≥ trigger → Draining. No verified Ready or drain target: dev4 lb 100 at 17:28:31 is still Blocked at any age (R2-B1/B3). **Stay(draining)**, 0 verification reads (T36). |
 | 17:53:43, 17:54:43 | dev8 is the manual pick, so neither an estimate nor the projection moves it (I6); there is also no Ready target. Stay(draining). (v3.1: the projection can never drain, R3-M1.) |
-| 17:55:46 | Real 100 → lb-blocked → arm 1. Nothing servable (dev4 lb 100 since 17:28:31; the rest lb 100). No pending reset reads. No Credits. **No Prepare: dev8 is a manual pick** (I6; v1 prepared to dev6 here because its rule only covered held picks). Stay(all_blocked), stuck notice once. dev8 is no longer fetched (R3-B2). |
+| 17:55:46 | Real 100 → lb-blocked → arm 1. Nothing servable (dev4 lb 100 since 17:28:31; the rest lb 100). No pending reset reads. No Credits. **Prepare to dev6**, the earliest known unlock, subject to cooldown. A confirmed lock ends the pick’s protection against Prepare. dev8 is no longer fetched (R3-B2). |
 | 10-26 04:59:59 → 05:00:05 | dev6's window turns reset-pending. NeedReading(dev6), exempt from the storm guard and run before any active fetch. It reads 0/0 reporting the next reset (11-02 05:00), so it is post-reset and servable → **Serve → dev6** (the pick on dev8 doesn't hold, I6). This is T38 / S8b. |
 
 **v0.8.7 blind run** (dev@ Real session 93, trigger 95, a 25-minute 429 streak). The last Real reading is in
@@ -888,7 +888,7 @@ is no 10-minute cutoff. This is T27 / S14.
 | Note 1 | The tier table, §0 and Prepare now say lb-blocked (any age), not "Real". |
 | Note 2 | The post-pass is one rule by kind: Serve uses `servable` (R2-M1, no runway minimum); 2×MIN_LANDING applies only to unverified Trigger targets. |
 | Note 3 | T26 expects no Prepare (dev6 is the earliest) and 0 reads. |
-| Note 4 | T36 and the §11.1 17:55:46 / 05:00 rows account for the dev8 manual pick: no Prepare, then Serve to dev6 via the reset read. |
+| Note 4 | T36 and the §11.1 17:55:46 / 05:00 rows account for the dev8 manual pick: Prepare to dev6 once blocked, then verify the reset reading. |
 | Note 5 | v1's Prepare log label is fixed (§6). |
 
 **Consistency pass (v3.1).** Each rule is stated once in §2–§8; §9 and §11 are marked as history:
