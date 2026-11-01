@@ -472,6 +472,7 @@ fn refresh_inactive_if_stale_skips_currently_active_account() {
                 needs_relogin: false,
                 no_subscription: false,
                 plan: None,
+                profile_refresh_after: None,
                 login_store: None,
             };
             st.accounts.push(a);
@@ -515,6 +516,7 @@ fn far_future_account(email: &str) -> crate::store::Account {
         needs_relogin: false,
         no_subscription: false,
         plan: None,
+        profile_refresh_after: None,
         login_store: None,
     }
 }

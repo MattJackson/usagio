@@ -269,6 +269,13 @@ swap — it notifies you of the soonest reset. It runs inside the menu-bar app (
 menu bar; both run the same loop and use the threshold and auto-swap setting from
 the menu (`usagio watch --trigger` overrides the threshold).
 
+Claude plan names also refresh for inactive accounts and accounts whose usage is
+locked. The app checks two profiles after each normal polling cycle, repeats
+successful checks after 30 minutes, and retries failed requests after five
+minutes. Manual Refresh (or `usagio list --refresh`) checks every eligible
+profile immediately. Accounts needing sign-in retain their status; expired
+access tokens wait for the existing credential lifecycle to refresh them.
+
 **Your own picks stick.** When you switch yourself — from the menu or with
 `usagio switch <acct>` / `start <acct>` / `continue <acct>` — to an account already
 at or over your threshold, auto-swap leaves it alone and won't flip back off it

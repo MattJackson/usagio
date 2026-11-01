@@ -2203,7 +2203,7 @@ fn fetch_tracker_keys_are_namespaced_per_provider() {
 
 /// Mock usage endpoint: answers every request with `status` and `body`,
 /// counting hits.
-fn spawn_mock_usage_server(
+pub(super) fn spawn_mock_usage_server(
     status: u16,
     body: String,
 ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
@@ -3992,7 +3992,7 @@ fn cell_resets_in_is_blank_without_a_reset_time() {
 }
 
 #[test]
-fn claude_plan_label_prefers_lapse_then_stored_plan_then_the_captured_org() {
+fn claude_plan_label_prefers_lapse_and_explicit_name_over_tier_fallback() {
     let mut a = claude_account("p@e.com", 3_600_000);
     assert_eq!(claude_plan_label(&a), None);
     a.oauth_account = Some(serde_json::json!({
@@ -4001,6 +4001,8 @@ fn claude_plan_label_prefers_lapse_then_stored_plan_then_the_captured_org() {
     }));
     assert_eq!(claude_plan_label(&a).as_deref(), Some("Max 20x"));
     a.oauth_account.as_mut().unwrap()["planDisplayName"] = "Ultra".into();
+    assert_eq!(claude_plan_label(&a).as_deref(), Some("Ultra"));
+    a.plan = Some("Max 20x".to_string());
     assert_eq!(claude_plan_label(&a).as_deref(), Some("Ultra"));
     a.plan = Some("Pro".to_string());
     assert_eq!(claude_plan_label(&a).as_deref(), Some("Pro"));
@@ -5113,12 +5115,9 @@ fn persist_login_renews_an_existing_claude_account_without_switching() {
     st.save().unwrap();
 
     let provider = providers::claude::new();
-    let r = persist_login(
-        provider.as_ref(),
-        renewed_capture("dev@example.com", "new-at", 77),
-        None,
-    )
-    .unwrap();
+    let mut captured = renewed_capture("dev@example.com", "new-at", 77);
+    captured.identity.native_blob["oauthAccount"]["planDisplayName"] = "Ultra".into();
+    let r = persist_login(provider.as_ref(), captured, None).unwrap();
 
     assert_eq!(r.key, "dev@example.com");
     assert!(
@@ -5136,7 +5135,16 @@ fn persist_login_renews_an_existing_claude_account_without_switching() {
     assert_eq!(a.access_token, "new-at");
     assert!(!a.needs_relogin);
     assert_eq!(a.refresh_token_expires_at(), Some(77));
-    assert_eq!(a.oauth_account.as_ref().unwrap()["accountUuid"], "original");
+    // Renewed identity metadata replaces the old snapshot along with the login.
+    assert_eq!(
+        a.oauth_account.as_ref().unwrap()["accountUuid"],
+        "from-login"
+    );
+    assert_eq!(
+        a.oauth_account.as_ref().unwrap()["planDisplayName"],
+        "Ultra"
+    );
+    assert_eq!(claude_plan_label(a).as_deref(), Some("Ultra"));
     assert!(a.keychain_blob.contains("\"clientId\":\"kept\""));
 }
 
@@ -6233,4 +6241,88 @@ fn legacy_classic_setting_is_ignored_on_load() {
         .unwrap()
         .get("autoswap_engine")
         .is_none());
+}
+
+#[test]
+fn claude_identity_refresh_persists_ultra_without_a_usage_fetch() {
+    with_claude_home("a@e.com", |_| {
+        let mut account = claude_account_with_identity("a@e.com", 3_600_000);
+        account.plan = Some("Max 20x".into());
+        account.oauth_account.as_mut().unwrap()["organizationType"] = "claude_max".into();
+        account.oauth_account.as_mut().unwrap()["organizationRateLimitTier"] =
+            "default_claude_max_20x".into();
+        seed_claude_state(vec![account.clone()], Some("a@e.com"));
+        let mut identity = account.oauth_account.clone().unwrap();
+        identity["planDisplayName"] = "Ultra".into();
+        write_claude_identity(&identity, None).unwrap();
+        with_state_lock(|| {
+            let mut state = State::load()?;
+            sync_active_claude_identity(&mut state);
+            state.save()
+        })
+        .unwrap();
+        let state = State::load().unwrap();
+        let saved = state.find("a@e.com").unwrap();
+        assert_eq!(saved.plan.as_deref(), Some("Ultra"));
+        assert_eq!(
+            saved.oauth_account.as_ref().unwrap()["planDisplayName"],
+            "Ultra"
+        );
+        assert_eq!(saved.keychain_blob, account.keychain_blob);
+        assert_eq!(row_from_account(saved).plan.as_deref(), Some("Ultra"));
+
+        // A stale active marker must not copy a different login's plan.
+        write_claude_identity(
+            &serde_json::json!({
+                "emailAddress": "stranger@e.com", "accountUuid": "uuid-stranger@e.com",
+                "planDisplayName": "Pro",
+            }),
+            None,
+        )
+        .unwrap();
+        let mut state = state;
+        sync_active_claude_identity(&mut state);
+        assert_eq!(
+            state.find("a@e.com").unwrap().plan.as_deref(),
+            Some("Ultra")
+        );
+    });
+}
+
+#[test]
+fn claude_identity_refresh_keeps_missing_fields_and_lapsed_status() {
+    let mut account = claude_account_with_identity("a@e.com", 3_600_000);
+    account.oauth_account.as_mut().unwrap()["planDisplayName"] = "Ultra".into();
+    update_claude_identity(&mut account, &serde_json::json!({"planDisplayName": null}));
+    assert_eq!(claude_plan_label(&account).as_deref(), Some("Ultra"));
+    account.no_subscription = true;
+    account.plan = Some("Free".into());
+    update_claude_identity(
+        &mut account,
+        &serde_json::json!({"planDisplayName": "Ultra"}),
+    );
+    assert_eq!(claude_plan_label(&account).as_deref(), Some("Free"));
+}
+
+#[test]
+fn older_cli_profile_does_not_undo_a_background_profile_refresh() {
+    with_claude_home("a@e.com", |_| {
+        let mut account = claude_account_with_identity("a@e.com", 3_600_000);
+        account.plan = Some("Ultra".into());
+        account.oauth_account.as_mut().unwrap()["planDisplayName"] = "Ultra".into();
+        account.oauth_account.as_mut().unwrap()["profileFetchedAt"] = 2000.into();
+        seed_claude_state(vec![account.clone()], Some("a@e.com"));
+        let mut old = account.oauth_account.clone().unwrap();
+        old["planDisplayName"] = "Max 20x".into();
+        old["profileFetchedAt"] = 1000.into();
+        write_claude_identity(&old, None).unwrap();
+        let mut state = State::load().unwrap();
+        sync_active_claude_identity(&mut state);
+        assert_eq!(state.accounts[0].plan.as_deref(), Some("Ultra"));
+        old["profileFetchedAt"] = 3000.into();
+        old["planDisplayName"] = "New plan".into();
+        write_claude_identity(&old, None).unwrap();
+        sync_active_claude_identity(&mut state);
+        assert_eq!(state.accounts[0].plan.as_deref(), Some("New plan"));
+    });
 }
