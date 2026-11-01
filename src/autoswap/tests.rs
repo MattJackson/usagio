@@ -1040,15 +1040,11 @@ fn t36_r2b2_dev8_1752_skip_to_100_with_pick() {
     assert_eq!(d.reason, Reason::Draining, "{d:?}");
     assert!(d.stuck);
     assert!(d.need_reading.is_empty(), "0 verification reads");
-    // 17:55:46 Real 100: nothing servable, no Prepare (pick).
+    // 17:55:46 Real 100: the pick no longer prevents preparing an earlier reset.
     s.now = at(17, 55, 50);
     s.accounts[0] = acct("dev8", 76.0, 100.0, at(17, 55, 46)).wreset(Some(ymd(10, 26, 21, 0, 0)));
     let d = decide(&s);
-    assert_eq!(d.reason, Reason::AllBlocked, "{d:?}");
-    assert!(
-        switched(&d).is_none(),
-        "no Prepare while the pick is active"
-    );
+    assert_eq!(switched(&d), Some(("dev6", Kind::Prepare)), "{d:?}");
     assert!(d.need_reading.is_empty(), "0 dev8 fetches afterwards");
 }
 
@@ -1640,4 +1636,35 @@ fn rf5_stuck_notice_rearms_only_on_a_real_tier_change() {
     s.memory = m.clone();
     assert!(!stuck_update(&mut m, &decide(&s), "act"));
     assert!(!m.stuck_notified);
+}
+
+#[test]
+fn blocked_manual_pick_prepares_earlier_session_reset_after_cooldown() {
+    let now = at(12, 0, 0);
+    for settled in [Tier::Ready, Tier::Draining, Tier::Blocked] {
+        let mut s = snap(
+            now,
+            "dev8",
+            vec![
+                acct("dev8", 100.0, 27.0, now).sreset(Some(now + Duration::hours(4))),
+                acct("dev4", 100.0, 54.0, now - Duration::minutes(30))
+                    .sreset(Some(now + Duration::hours(2))),
+            ],
+        );
+        s.manual = pick("dev8", now - Duration::hours(1), settled);
+        let d = decide(&s);
+        assert_eq!(switched(&d), Some(("dev4", Kind::Prepare)), "{d:?}");
+        s.memory.last_switch_at = Some(now.timestamp());
+        let d = decide(&s);
+        assert_eq!(d.reason, Reason::Cooldown, "{d:?}");
+        assert!(switched(&d).is_none());
+        s.memory.last_switch_at = None;
+        s.accounts.swap(0, 1);
+        s.active = "dev4".to_string();
+        s.manual = pick("dev4", now - Duration::hours(1), settled);
+        assert!(
+            switched(&decide(&s)).is_none(),
+            "never prepare to a later reset"
+        );
+    }
 }

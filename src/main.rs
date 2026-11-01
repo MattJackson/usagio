@@ -9,6 +9,7 @@
 //! service string is intentionally frozen at "claude-usage" to preserve
 //! existing tokens (see `providers/claude/mod.rs`).
 
+mod account_order;
 mod autoswap;
 mod burn_rate;
 mod claude_profiles;
@@ -2467,52 +2468,23 @@ fn attach_prepaid_balance(cu: &mut CachedUsage, acct: &Account) {
     });
 }
 
-/// Order accounts for `usagio list` exactly like the menu bar's
-/// `account_priority_cmp`, so the two surfaces always agree:
-///   1. Locked-and-not-active sinks to the bottom (an active locked account
-///      stays in normal rotation).
-///   2. Sunk accounts by unlock time (soonest usable first); everyone else by
-///      soonest weekly reset. No reset time sorts last within its rank.
-///   3. More headroom first.
-///   4. Email ascending.
+/// Use the shared display priority; active status never changes account order.
 pub(crate) fn menu_order(
     a: &Row,
     b: &Row,
-    active: Option<&str>,
+    _active: Option<&str>,
     now: DateTime<Utc>,
 ) -> std::cmp::Ordering {
-    let locked_until = |r: &Row| {
-        if active == Some(r.email.as_str()) {
-            return None;
-        }
-        match countdown::compute_display(&row_to_account_usage(r), now) {
-            countdown::DisplayState::Locked { until, .. } => Some(until),
-            _ => None,
-        }
-    };
-    // Lapsed subscriptions always sink to the bottom, alphabetically — their
-    // cached usage/reset times are meaningless, so don't rank on them.
-    match (a.no_subscription, b.no_subscription) {
-        (true, true) => return a.email.cmp(&b.email),
-        (true, false) => return std::cmp::Ordering::Greater,
-        (false, true) => return std::cmp::Ordering::Less,
-        (false, false) => {}
-    }
-    let key = |r: &Row| {
-        let lu = locked_until(r);
-        (
-            lu.is_some(),
-            lu.or(r.weekly.resets_at)
-                .unwrap_or(DateTime::<Utc>::MAX_UTC),
+    let priority = |r: &Row| {
+        crate::account_order::Priority::new(
+            r.no_subscription,
+            &row_to_account_usage(r),
+            r.headroom(),
+            now,
         )
     };
-    key(a)
-        .cmp(&key(b))
-        .then(
-            b.headroom()
-                .partial_cmp(&a.headroom())
-                .unwrap_or(std::cmp::Ordering::Equal),
-        )
+    priority(a)
+        .cmp(&priority(b))
         .then_with(|| a.email.cmp(&b.email))
 }
 
