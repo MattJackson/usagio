@@ -211,6 +211,31 @@ fn plan_status_from_profile_reports_label_and_activity() {
 }
 
 #[test]
+fn metadata_profile_request_handles_http_and_parse_failures() {
+    for (status, body) in [
+        (401, "{}"),
+        (403, "{}"),
+        (429, "{}"),
+        (500, "{}"),
+        (200, "not-json"),
+    ] {
+        let (url, _) = crate::tests::spawn_mock_usage_server(status, body.into());
+        set_profile_url_override(Some(&format!("{url}/api/oauth/profile")));
+        assert!(
+            fetch_profile_metadata("test-access").is_none(),
+            "HTTP {status}: {body}"
+        );
+    }
+    let mut expected = sample_profile();
+    expected["organization"]["plan_display_name"] = "Ultra".into();
+    let (url, _) = crate::tests::spawn_mock_usage_server(200, expected.to_string());
+    set_profile_url_override(Some(&format!("{url}/api/oauth/profile")));
+    let actual = fetch_profile_metadata("test-access").unwrap();
+    set_profile_url_override(None);
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn fetch_error_display_texts() {
     assert_eq!(
         FetchError::RateLimited.to_string(),

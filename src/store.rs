@@ -132,6 +132,10 @@ pub struct Account {
     /// back to the captured `oauth_account` when never checked.
     #[serde(default)]
     pub plan: Option<String>,
+    /// Earliest unix second for the next background Claude profile request.
+    /// Persisted so restart loops and concurrent pollers respect its throttle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_refresh_after: Option<i64>,
     /// Which of usagio's sign-in window cookie stores holds this account's
     /// vendor session (`crate::login::store_id`); `None` = the one keyed by
     /// its own email. Set when the account was added via "Sign in to a new
@@ -173,6 +177,7 @@ impl Account {
             needs_relogin: false,
             no_subscription: false,
             plan: None,
+            profile_refresh_after: None,
             login_store: None,
         })
     }
@@ -214,6 +219,7 @@ impl Account {
     /// the login (expiry, scopes, plan) — keeping every other field Claude
     /// Code put in the blob.
     pub fn adopt_login(&mut self, fresh: &Account) {
+        self.profile_refresh_after = None;
         self.set_tokens(
             fresh.access_token.clone(),
             fresh.refresh_token.clone(),
@@ -697,6 +703,9 @@ impl State {
                         .and_then(|x| x.as_bool())
                         .unwrap_or(false),
                     plan: obj.get("plan").and_then(|x| x.as_str()).map(String::from),
+                    profile_refresh_after: obj
+                        .get("profile_refresh_after")
+                        .and_then(|x| x.as_i64()),
                     login_store: obj
                         .get("login_store")
                         .and_then(|x| x.as_str())
