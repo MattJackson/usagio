@@ -504,6 +504,37 @@ pub fn fetch_profile(access_token: &str) -> Option<serde_json::Value> {
         .ok()
 }
 
+#[cfg(test)]
+thread_local! {
+    static PROFILE_URL_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_profile_url_override(url: Option<&str>) {
+    PROFILE_URL_OVERRIDE.with(|value| *value.borrow_mut() = url.map(String::from));
+}
+
+/// A bounded metadata-only request. Tests require an explicit mock endpoint;
+/// watch-cycle tests must never contact Anthropic for incidental plan checks.
+pub(crate) fn fetch_profile_metadata(access_token: &str) -> Option<serde_json::Value> {
+    #[cfg(test)]
+    let mock_url = PROFILE_URL_OVERRIDE.with(|value| value.borrow().clone())?;
+    #[cfg(test)]
+    let url = mock_url.as_str();
+    #[cfg(not(test))]
+    let url = config::PROFILE_URL;
+    super::http_agent()
+        .get(url)
+        .timeout(std::time::Duration::from_secs(5))
+        .set("Authorization", &format!("Bearer {access_token}"))
+        .set("anthropic-beta", config::OAUTH_BETA)
+        .set("anthropic-version", "2023-06-01")
+        .call()
+        .ok()?
+        .into_json()
+        .ok()
+}
+
 /// Whether a profile response shows a paid Claude plan. The profile endpoint
 /// is separate from `/api/oauth/usage` and keeps answering for a lapsed
 /// account, so it's the cheap way to both detect a lapse and notice a renewal
