@@ -1,6 +1,6 @@
 [package]
 name = "usagio"
-version = "1.0.6"
+version = "1.0.7"
 edition = "2021"
 rust-version = "1.88"
 description = "Track usage / limits across every AI coding CLI you use, and switch between accounts."
@@ -162,6 +162,7 @@ embed-manifest = "1"
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+tempfile = "3"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [
     "NSTimer",

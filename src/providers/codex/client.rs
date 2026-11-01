@@ -280,24 +280,17 @@ pub(crate) fn start_and_verify(expected: &crate::providers::IdentitySnapshot) ->
         .context("cannot resolve Codex home")?;
     let deadline = std::time::Instant::now() + Duration::from_secs(45);
     loop {
-        let mut process = Command::new(binary(&home))
-            .args(["app-server", "daemon", "start"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("starting Codex daemon")?;
-        let status = loop {
-            if let Some(status) = process.try_wait()? {
-                break status;
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = process.kill();
-                let _ = process.wait();
-                bail!("Codex daemon start timed out; handoff remains pending");
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        };
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .context("Codex daemon start timed out; handoff remains pending")?;
+        let status = crate::platform::current()
+            .run_independent(
+                &binary(&home),
+                &["app-server", "daemon", "start"],
+                &[("CODEX_HOME", home.as_os_str())],
+                remaining,
+            )
+            .context("starting independent Codex daemon; handoff remains pending")?;
         if status.success() {
             break;
         }
