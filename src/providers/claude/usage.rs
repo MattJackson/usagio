@@ -500,8 +500,15 @@ pub fn fetch_email(access_token: &str) -> Option<String> {
 
 /// Fetch the raw profile JSON (`account`, `organization`, ...).
 pub fn fetch_profile(access_token: &str) -> Option<serde_json::Value> {
+    // Tests must never contact Anthropic: no mock URL means no request.
+    #[cfg(test)]
+    let mock_url = PROFILE_URL_OVERRIDE.with(|value| value.borrow().clone())?;
+    #[cfg(test)]
+    let url = mock_url.as_str();
+    #[cfg(not(test))]
+    let url = config::PROFILE_URL;
     let resp = super::http_agent()
-        .get(config::PROFILE_URL)
+        .get(url)
         .set("Authorization", &format!("Bearer {access_token}"))
         .set("anthropic-beta", config::OAUTH_BETA)
         .set("anthropic-version", "2023-06-01")
