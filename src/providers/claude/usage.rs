@@ -10,14 +10,14 @@ use crate::providers::trait_def::{
 /// Why a usage fetch failed. Lets callers keep the last-known cache on transient
 /// failures (and back off on rate limits) instead of surfacing a hard error.
 #[derive(Debug)]
-pub enum FetchError {
+pub(crate) enum FetchError {
     /// HTTP 429 — we're being rate limited; back off and reuse the cache.
     RateLimited,
     /// HTTP 401 — token expired or revoked.
     Auth,
     /// HTTP 403 — the token is valid but the account may not use the endpoint.
     /// Seen when the account's Claude subscription has lapsed; the caller
-    /// confirms via the profile (`Provider::check_plan`) before treating it as that.
+    /// confirms via the profile (`PlanCheck::check_plan`) before treating it as that.
     Forbidden,
     /// Network / transport failure (no HTTP status).
     Transient(String),
@@ -40,43 +40,43 @@ impl std::fmt::Display for FetchError {
 impl std::error::Error for FetchError {}
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct Window {
+pub(crate) struct Window {
     /// Percent of the limit used (e.g. 9.0 == 9%).
     #[serde(default)]
-    pub utilization: Option<f64>,
+    pub(crate) utilization: Option<f64>,
     /// ISO-8601 timestamp when this window resets.
     #[serde(default)]
-    pub resets_at: Option<String>,
+    pub(crate) resets_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct Usage {
+pub(crate) struct Usage {
     /// Rolling session limit (the ~5-hour window).
-    pub five_hour: Option<Window>,
+    pub(crate) five_hour: Option<Window>,
     /// Weekly (7-day) all-models limit.
-    pub seven_day: Option<Window>,
+    pub(crate) seven_day: Option<Window>,
     /// Weekly Opus-scoped limit, when present.
-    pub seven_day_opus: Option<Window>,
+    pub(crate) seven_day_opus: Option<Window>,
     /// Extra-usage (pay-as-you-go credits) settings and state. Kept as raw
     /// JSON and read leniently by [`reported_usage`] so a renamed or retyped
     /// field can never fail the whole usage parse.
     #[serde(default)]
-    pub extra_usage: Option<serde_json::Value>,
+    extra_usage: Option<serde_json::Value>,
     /// Money actually spent on extra usage (`{used, limit, balance, …}`).
     #[serde(default)]
-    pub spend: Option<serde_json::Value>,
+    spend: Option<serde_json::Value>,
     /// Where this week's usage went (`{rows: [{key, display_name, percent}]}`).
     #[serde(default)]
-    pub seven_day_breakdown: Option<serde_json::Value>,
+    seven_day_breakdown: Option<serde_json::Value>,
     /// Every limit the account has, including per-model scoped weekly ones.
     #[serde(default)]
-    pub limits: Option<serde_json::Value>,
+    pub(crate) limits: Option<serde_json::Value>,
     /// The `cedar_ember` reset-grant block, present only when the request asks
     /// for it (`?cedar_ember=1`) with a current `claude-cli` user-agent. Kept
     /// as raw JSON and read leniently by [`reset_grants`] so a shape change
     /// can never fail the whole usage parse.
     #[serde(default)]
-    pub cedar_ember: Option<serde_json::Value>,
+    cedar_ember: Option<serde_json::Value>,
 }
 
 /// Parse a money object `{amount_minor, currency, exponent}`; `None` for null
@@ -259,7 +259,7 @@ fn reset_grants(u: &Usage) -> Vec<ResetGrant> {
 }
 
 /// Everything beyond the fixed windows that the usage response reported.
-pub fn reported_usage(u: &Usage) -> ReportedUsage {
+pub(crate) fn reported_usage(u: &Usage) -> ReportedUsage {
     ReportedUsage {
         credits: credits(u),
         breakdown: breakdown(u),
@@ -268,31 +268,8 @@ pub fn reported_usage(u: &Usage) -> ReportedUsage {
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Test-only override for the usage endpoint — see
-    /// `oauth::TOKEN_URL_OVERRIDE` for the rationale (an in-process mock
-    /// server standing in for the real Anthropic endpoint so tests never
-    /// depend on outbound network access).
-    static USAGE_URL_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Install (or clear) the current thread's usage-URL override. Test-only.
-#[cfg(test)]
-pub(crate) fn set_usage_url_override(url: Option<&str>) {
-    USAGE_URL_OVERRIDE.with(|c| *c.borrow_mut() = url.map(String::from));
-}
-
-#[cfg(test)]
 fn usage_url() -> String {
-    USAGE_URL_OVERRIDE
-        .with(|c| c.borrow().clone())
-        .unwrap_or_else(|| config::USAGE_URL.to_string())
-}
-
-#[cfg(not(test))]
-fn usage_url() -> String {
-    config::USAGE_URL.to_string()
+    crate::endpoints::url(crate::endpoints::Endpoint::ClaudeUsage)
 }
 
 /// Usage fields usagio doesn't read yet, all `null` so far; logged when they
@@ -307,7 +284,7 @@ const WATCHED_FIELDS: &[&str] = &[
     "seven_day_cowork",
 ];
 
-pub fn fetch(access_token: &str) -> std::result::Result<Usage, FetchError> {
+pub(crate) fn fetch(access_token: &str) -> std::result::Result<Usage, FetchError> {
     let resp = super::http_agent()
         .get(&usage_url())
         // Ask for the `cedar_ember` reset-grant block; the CLI user-agent is
@@ -348,7 +325,7 @@ pub fn fetch(access_token: &str) -> std::result::Result<Usage, FetchError> {
 /// knows why a click did nothing (e.g. the grant was already spent, or the
 /// account isn't actually at a limit yet).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClaimOutcome {
+pub(crate) enum ClaimOutcome {
     /// The reset was applied — windows cleared.
     Reset,
     /// A non-success outcome the server named (`already_used`, `not_limited`,
@@ -383,7 +360,7 @@ fn request_id() -> String {
 /// Not gated on `cfg(test)`: no test invokes it (so none hits the network), and
 /// gating it out would break the test build of its `main::claim_claude_reset`
 /// caller.
-pub fn claim_reset(
+pub(crate) fn claim_reset(
     access_token: &str,
     org_uuid: &str,
     grant_id: &str,
@@ -428,7 +405,7 @@ pub fn claim_reset(
 /// The prepaid wallet balance from a `prepaid/credits` response: `balance.money`
 /// when present, else `balance.credits` / top-level `amount` (both minor units)
 /// in the top-level `currency`. `None` for any other shape.
-pub fn prepaid_balance(body: &serde_json::Value) -> Option<Money> {
+fn prepaid_balance(body: &serde_json::Value) -> Option<Money> {
     let balance = body.get("balance").filter(|v| v.is_object());
     if let Some(m) = money(get(balance, "money")) {
         return Some(m);
@@ -440,21 +417,48 @@ pub fn prepaid_balance(body: &serde_json::Value) -> Option<Money> {
         .unwrap_or(Money::CREDITS);
     if let Some(c) = get(balance, "credits").and_then(|c| c.as_object()) {
         if let Some(amount) = c.get("amount_minor").and_then(|x| x.as_i64()) {
-            let exponent = c.get("exponent").and_then(|x| x.as_u64()).unwrap_or(2);
-            return Money::new(amount, u32::try_from(exponent).ok()?, unit);
+            let exponent = match c.get("exponent").and_then(|x| x.as_u64()) {
+                Some(e) => u32::try_from(e).ok()?,
+                None => iso4217_minor_units(unit),
+            };
+            return Money::new(amount, exponent, unit);
         }
     }
     let amount = body.get("amount")?;
     let amount = amount
         .as_i64()
         .or_else(|| amount.as_f64().map(|f| f.round() as i64))?;
-    Money::new(amount, 2, unit)
+    Money::new(amount, iso4217_minor_units(unit), unit)
+}
+
+/// ISO 4217 minor-unit count for `currency` (case-insensitive): how many
+/// decimal places its minor unit has. 0 for zero-decimal currencies (JPY,
+/// KRW, ...), 3 for the three-decimal ones (KWD, BHD, ...), 4 for the
+/// four-decimal fund codes, else 2 (USD, EUR, and credits).
+fn iso4217_minor_units(currency: &str) -> u32 {
+    const ZERO: &[&str] = &[
+        "BIF", "CLP", "DJF", "GNF", "ISK", "JPY", "KMF", "KRW", "PYG", "RWF", "UGX", "UYI", "VND",
+        "VUV", "XAF", "XOF", "XPF",
+    ];
+    const THREE: &[&str] = &["BHD", "IQD", "JOD", "KWD", "LYD", "OMR", "TND"];
+    const FOUR: &[&str] = &["CLF", "UYW"];
+    let c = currency.trim();
+    let is = |list: &[&str]| list.iter().any(|x| x.eq_ignore_ascii_case(c));
+    if is(ZERO) {
+        0
+    } else if is(THREE) {
+        3
+    } else if is(FOUR) {
+        4
+    } else {
+        2
+    }
 }
 
 /// Best-effort prepaid wallet balance for `org_uuid` (see
 /// [`config::prepaid_credits_url`]). `None` on any failure — the caller keeps
 /// whatever it last knew.
-pub fn fetch_prepaid_balance(access_token: &str, org_uuid: &str) -> Option<Money> {
+pub(crate) fn fetch_prepaid_balance(access_token: &str, org_uuid: &str) -> Option<Money> {
     let body: serde_json::Value = super::http_agent()
         .get(&config::prepaid_credits_url(org_uuid))
         .set("Authorization", &format!("Bearer {access_token}"))
@@ -469,7 +473,7 @@ pub fn fetch_prepaid_balance(access_token: &str, org_uuid: &str) -> Option<Money
 }
 
 /// Best-effort account email from the profile endpoint.
-pub fn fetch_email(access_token: &str) -> Option<String> {
+pub(crate) fn fetch_email(access_token: &str) -> Option<String> {
     #[derive(Deserialize)]
     struct Account {
         email: Option<String>,
@@ -480,14 +484,9 @@ pub fn fetch_email(access_token: &str) -> Option<String> {
         account: Option<Account>,
     }
     // Tests must never contact Anthropic: no mock URL means no request.
-    #[cfg(test)]
-    let mock_url = PROFILE_URL_OVERRIDE.with(|value| value.borrow().clone())?;
-    #[cfg(test)]
-    let url = mock_url.as_str();
-    #[cfg(not(test))]
-    let url = config::PROFILE_URL;
+    let url = crate::endpoints::mocked_url(crate::endpoints::Endpoint::ClaudeProfile)?;
     let resp = super::http_agent()
-        .get(url)
+        .get(&url)
         .set("Authorization", &format!("Bearer {access_token}"))
         .set("anthropic-beta", config::OAUTH_BETA)
         .set("anthropic-version", "2023-06-01")
@@ -499,16 +498,11 @@ pub fn fetch_email(access_token: &str) -> Option<String> {
 }
 
 /// Fetch the raw profile JSON (`account`, `organization`, ...).
-pub fn fetch_profile(access_token: &str) -> Option<serde_json::Value> {
+pub(crate) fn fetch_profile(access_token: &str) -> Option<serde_json::Value> {
     // Tests must never contact Anthropic: no mock URL means no request.
-    #[cfg(test)]
-    let mock_url = PROFILE_URL_OVERRIDE.with(|value| value.borrow().clone())?;
-    #[cfg(test)]
-    let url = mock_url.as_str();
-    #[cfg(not(test))]
-    let url = config::PROFILE_URL;
+    let url = crate::endpoints::mocked_url(crate::endpoints::Endpoint::ClaudeProfile)?;
     let resp = super::http_agent()
-        .get(url)
+        .get(&url)
         .set("Authorization", &format!("Bearer {access_token}"))
         .set("anthropic-beta", config::OAUTH_BETA)
         .set("anthropic-version", "2023-06-01")
@@ -524,27 +518,12 @@ pub fn fetch_profile(access_token: &str) -> Option<serde_json::Value> {
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    static PROFILE_URL_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) fn set_profile_url_override(url: Option<&str>) {
-    PROFILE_URL_OVERRIDE.with(|value| *value.borrow_mut() = url.map(String::from));
-}
-
 /// A bounded metadata-only request. Tests require an explicit mock endpoint;
 /// watch-cycle tests must never contact Anthropic for incidental plan checks.
 pub(crate) fn fetch_profile_metadata(access_token: &str) -> Option<serde_json::Value> {
-    #[cfg(test)]
-    let mock_url = PROFILE_URL_OVERRIDE.with(|value| value.borrow().clone())?;
-    #[cfg(test)]
-    let url = mock_url.as_str();
-    #[cfg(not(test))]
-    let url = config::PROFILE_URL;
+    let url = crate::endpoints::mocked_url(crate::endpoints::Endpoint::ClaudeProfile)?;
     super::http_agent()
-        .get(url)
+        .get(&url)
         .timeout(std::time::Duration::from_secs(5))
         .set("Authorization", &format!("Bearer {access_token}"))
         .set("anthropic-beta", config::OAUTH_BETA)
@@ -562,7 +541,7 @@ pub(crate) fn fetch_profile_metadata(access_token: &str) -> Option<serde_json::V
 /// dropping to `claude_free` and/or a terminal `subscription_status`
 /// (observed: `organization_type: claude_free`, `subscription_status:
 /// canceled` after a Max plan expired).
-pub fn subscription_active_from_profile(profile: &serde_json::Value) -> Option<bool> {
+fn subscription_active_from_profile(profile: &serde_json::Value) -> Option<bool> {
     let org = profile.get("organization")?.as_object()?;
     let org_type = org.get("organization_type").and_then(|v| v.as_str());
     let status = org.get("subscription_status").and_then(|v| v.as_str());
@@ -573,7 +552,7 @@ pub fn subscription_active_from_profile(profile: &serde_json::Value) -> Option<b
 
 /// The organization uuid from a profile response — the `{org}` segment the
 /// reset-claim endpoint needs. `None` if the profile has no organization.
-pub fn org_uuid_from_profile(profile: &serde_json::Value) -> Option<String> {
+pub(crate) fn org_uuid_from_profile(profile: &serde_json::Value) -> Option<String> {
     profile
         .get("organization")?
         .get("uuid")?
@@ -584,7 +563,7 @@ pub fn org_uuid_from_profile(profile: &serde_json::Value) -> Option<String> {
 
 /// What the user bought: Anthropic's own plan name ("Ultra") when the profile
 /// carries one, else mapped from the org type / rate-limit tier.
-pub fn plan_label(
+pub(crate) fn plan_label(
     display_name: Option<&str>,
     org_type: Option<&str>,
     tier: Option<&str>,
@@ -608,7 +587,7 @@ pub fn plan_label(
 }
 
 /// Plan label + lapsed/active from a profile response.
-pub fn plan_status_from_profile(
+pub(crate) fn plan_status_from_profile(
     profile: &serde_json::Value,
 ) -> Option<crate::providers::trait_def::PlanStatus> {
     let active = subscription_active_from_profile(profile)?;
@@ -630,7 +609,7 @@ pub fn plan_status_from_profile(
 /// `~/.claude.json`) from a profile response. Used to backfill the identity for
 /// accounts captured before we started snapshotting it. Claude refreshes the
 /// remaining fields (e.g. `profileFetchedAt`) on its next profile fetch.
-pub fn oauth_account_from_profile(profile: &serde_json::Value) -> Option<serde_json::Value> {
+pub(crate) fn oauth_account_from_profile(profile: &serde_json::Value) -> Option<serde_json::Value> {
     let acct = profile.get("account")?;
     let org = profile.get("organization");
     let get = |v: Option<&serde_json::Value>, k: &str| {

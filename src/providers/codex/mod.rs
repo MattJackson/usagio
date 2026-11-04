@@ -28,10 +28,8 @@
 //! process-exit verification, startup and cached-account verification. Session
 //! ownership belongs to Codex and is distinct from credential identity.
 
-#![allow(dead_code)]
-
 mod client;
-pub mod oauth;
+pub(crate) mod oauth;
 
 use std::path::PathBuf;
 
@@ -48,6 +46,14 @@ use crate::providers::trait_def::{
     IdentitySnapshot, Money, PResult, Provider, ProviderError, ReportedUsage, ResetGrant,
     SecretBackend, TokenGrant, UsageSnapshot, UsageWindow,
 };
+use crate::providers::ActiveSlot;
+use crate::providers::ClientHandoff;
+use crate::providers::CredentialSync;
+use crate::providers::Launcher;
+use crate::providers::LoginCapture;
+use crate::providers::LoginFlow;
+use crate::providers::TokenLifecycle;
+use crate::providers::UsageSource;
 
 fn launch_command(mode: crate::providers::trait_def::LaunchMode) -> std::process::Command {
     let mut command = std::process::Command::new("codex");
@@ -60,7 +66,7 @@ fn launch_command(mode: crate::providers::trait_def::LaunchMode) -> std::process
 /// Read/write timeout applied to every outbound HTTP call this provider
 /// makes. The default `ureq::Agent` only bounds the TCP *connect* (30s); a
 /// server or proxy that accepts the connection but then stalls mid-response
-/// (or mid-request-write) would otherwise hang `menubar::poll_loop`'s
+/// (or mid-request-write) would otherwise hang `menubar::poller::poll_loop`'s
 /// network thread forever with no diagnostics. 15s is generous for a
 /// legitimate slow response but tight enough to fail fast and let the next
 /// poll tick retry.
@@ -126,14 +132,8 @@ fn capture_blob(blob: String) -> PResult<CapturedAccount> {
     let tokens = TokenGrant {
         access: parsed.tokens.access_token.clone(),
         refresh: parsed.tokens.refresh_token.clone(),
-        // The vendor blob doesn't record `expires_in` directly; use the
-        // JWT's `exp` claim minus `now` when present, else default to
-        // "expired" so callers refresh eagerly.
-        expires_in_secs: id_claims
-            .get("exp")
-            .and_then(|x| x.as_i64())
-            .map(|exp| exp.saturating_sub(Utc::now().timestamp()))
-            .unwrap_or(0),
+        // Unknown expiry reads as "expired" so callers refresh eagerly.
+        expires_in_secs: expires_in_secs(blob_access_expires_at(&parsed)),
     };
     Ok(CapturedAccount {
         identity,
@@ -143,32 +143,18 @@ fn capture_blob(blob: String) -> PResult<CapturedAccount> {
 }
 
 /// Constructor called from `providers::build()` behind the `codex` feature.
-pub fn new() -> Box<dyn Provider> {
+pub(crate) fn new() -> Box<dyn Provider> {
     Box::new(CodexProvider)
 }
 
-pub struct CodexProvider;
+pub(crate) struct CodexProvider;
 
 /// Codex rate-limit / usage endpoint. The ChatGPT backend variant works for
 /// tokens issued by the standard ChatGPT-plan OAuth flow the CLI uses.
-const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
-
-#[cfg(test)]
-thread_local! {
-    static USAGE_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) fn set_usage_url_override(url: Option<String>) {
-    USAGE_OVERRIDE.with(|value| *value.borrow_mut() = url);
-}
+pub(crate) const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
 fn usage_url() -> String {
-    #[cfg(test)]
-    if let Some(url) = USAGE_OVERRIDE.with(|value| value.borrow().clone()) {
-        return url;
-    }
-    USAGE_URL.to_string()
+    crate::endpoints::url(crate::endpoints::Endpoint::CodexUsage)
 }
 
 /// Parse the ChatGPT usage endpoint body into rate-limit windows. Pure (no
@@ -186,9 +172,7 @@ fn usage_url() -> String {
 /// The ChatGPT plan from the usage response's `plan_type` ("plus", "pro",
 /// "prolite", "free", …). A "free" plan has no Codex allowance of its own —
 /// that's what a lapsed subscription drops to.
-pub(crate) fn parse_plan(
-    body: &serde_json::Value,
-) -> Option<crate::providers::trait_def::PlanStatus> {
+fn parse_plan(body: &serde_json::Value) -> Option<crate::providers::trait_def::PlanStatus> {
     let raw = body.get("plan_type")?.as_str()?;
     let label = match raw {
         "free" => "Free".to_string(),
@@ -211,7 +195,7 @@ pub(crate) fn parse_plan(
 /// `unlimited`, `overage_limit_reached`, `balance` as a decimal string in
 /// Codex credits — not a currency). Preserve an explicit zero balance so
 /// accounts without credits still show the same menu row.
-pub(crate) fn parse_credits(body: &serde_json::Value) -> Option<Credits> {
+fn parse_credits(body: &serde_json::Value) -> Option<Credits> {
     let c = body.get("credits")?.as_object()?;
     let flag = |k: &str| c.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
     // The backend sends ten decimal places ("636.4935245000"); two read fine.
@@ -360,7 +344,7 @@ fn apply_reported_lock(
 /// grant, so the menu shows one is available. `usable_now` follows
 /// `applicable_available_count` (a reset that would apply right now). The id
 /// carries the count so a newly banked reset announces itself again.
-pub(crate) fn parse_reset_credits(body: &Value) -> Vec<ResetGrant> {
+fn parse_reset_credits(body: &Value) -> Vec<ResetGrant> {
     let Some(c) = body
         .get("rate_limit_reset_credits")
         .and_then(Value::as_object)
@@ -426,16 +410,84 @@ impl Provider for CodexProvider {
         &["session", "weekly"]
     }
 
-    /// Codex's refresh grant is a plain, programmatic HTTPS POST (no vendor
-    /// CLI / browser step) — see `oauth.rs`'s module doc for the endpoint
-    /// research. `oauth::active_refresh_cas` is the CAS-safe entry point a
-    /// future proactive-refresh caller should use for the single active
-    /// login; nothing in the credential-sync loop wires it up yet (that loop
-    /// lives in `credentials.rs`, out of this provider's scope).
-    fn supports_active_refresh(&self) -> bool {
-        true
+    /// One email can sign into several ChatGPT workspaces, each with its own
+    /// account_id, credentials and limits: key by both (`email#account_id`).
+    fn account_identifier(&self, id: &IdentitySnapshot) -> String {
+        match &id.email {
+            Some(email) => crate::providers::trait_def::workspace_key(email, id.uuid.as_deref()),
+            // Same fallbacks as the default identifier.
+            None => id.uuid.clone().unwrap_or_else(|| {
+                format!(
+                    "anon-{}",
+                    crate::providers::trait_def::short_hash(&id.native_blob)
+                )
+            }),
+        }
     }
 
+    /// Older builds keyed Codex accounts by email alone. Derive the
+    /// workspace from the stored identity, else from the stored auth blob;
+    /// an entry with neither keeps its key until it is next captured.
+    fn upgraded_account_key(&self, account: &crate::store::ProviderAccount) -> Option<String> {
+        if account
+            .key
+            .contains(crate::providers::trait_def::WORKSPACE_KEY_SEP)
+        {
+            return None;
+        }
+        let email = account.identity_email.as_deref().unwrap_or(&account.key);
+        if !email.eq_ignore_ascii_case(&account.key) {
+            return None; // not an email key (uuid/anon fallback): leave it
+        }
+        let workspace = account
+            .identity_uuid
+            .clone()
+            .filter(|w| !w.trim().is_empty())
+            .or_else(|| {
+                parse_codex_blob(&account.secret_blob)
+                    .ok()
+                    .and_then(|p| blob_account_id(&p))
+            })?;
+        Some(crate::providers::trait_def::workspace_key(
+            email,
+            Some(&workspace),
+        ))
+    }
+
+    fn login_capture(&self) -> Option<&dyn LoginCapture> {
+        Some(self)
+    }
+
+    fn login_flow(&self) -> Option<&dyn LoginFlow> {
+        Some(self)
+    }
+
+    fn token_lifecycle(&self) -> Option<&dyn TokenLifecycle> {
+        Some(self)
+    }
+
+    fn usage_source(&self) -> Option<&dyn UsageSource> {
+        Some(self)
+    }
+
+    fn active_slot(&self) -> Option<&dyn ActiveSlot> {
+        Some(self)
+    }
+
+    fn client_handoff(&self) -> Option<&dyn ClientHandoff> {
+        Some(self)
+    }
+
+    fn launcher(&self) -> Option<&dyn Launcher> {
+        Some(self)
+    }
+
+    fn credential_sync(&self) -> Option<&dyn CredentialSync> {
+        Some(self)
+    }
+}
+
+impl LoginCapture for CodexProvider {
     // --- Capture -----------------------------------------------------------
 
     fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
@@ -452,10 +504,12 @@ impl Provider for CodexProvider {
             .map_err(|e| ProviderError::Other(format!("auth.json is not UTF-8: {e}")))?;
         Ok(Some(capture_blob(blob)?))
     }
+}
 
-    fn login_spec(&self) -> Option<crate::providers::trait_def::LoginSpec> {
+impl LoginFlow for CodexProvider {
+    fn login_spec(&self) -> crate::providers::trait_def::LoginSpec {
         use crate::providers::trait_def::{LoginSpec, TokenRequestStyle};
-        Some(LoginSpec {
+        LoginSpec {
             authorize_url: "https://auth.openai.com/oauth/authorize",
             token_url: oauth::TOKEN_URL,
             client_id: oauth::CLIENT_ID,
@@ -468,6 +522,8 @@ impl Provider for CodexProvider {
                 "api.connectors.invoke",
             ],
             redirect_port: Some(1455),
+            // Codex's registered fallback for a busy 1455.
+            fallback_redirect_port: Some(1457),
             redirect_host: "127.0.0.1",
             redirect_path: "/auth/callback",
             extra_authorize_params: &[
@@ -477,7 +533,7 @@ impl Provider for CodexProvider {
             ],
             login_hint_param: Some("login_hint"),
             token_request: TokenRequestStyle::Form,
-        })
+        }
     }
 
     fn complete_login(&self, response: &Value) -> PResult<CapturedAccount> {
@@ -518,23 +574,26 @@ impl Provider for CodexProvider {
         }
         Ok(captured)
     }
+}
+
+impl TokenLifecycle for CodexProvider {
+    /// Codex's refresh grant is a plain, programmatic HTTPS POST (no vendor
+    /// CLI / browser step) — see `oauth.rs`'s module doc for the endpoint
+    /// research. `oauth::active_refresh_cas` is the CAS-safe entry point a
+    /// future proactive-refresh caller should use for the single active
+    /// login; nothing in the credential-sync loop wires it up yet (that loop
+    /// lives in `credentials.rs`, out of this provider's scope).
+    fn supports_active_refresh(&self) -> bool {
+        true
+    }
 
     fn parse_stored_blob(&self, blob: &str) -> PResult<TokenGrant> {
         let parsed = parse_codex_blob(blob)?;
-        let id_claims = parsed
-            .tokens
-            .id_token
-            .as_deref()
-            .and_then(jwt_payload_claims)
-            .unwrap_or_default();
+        let expires_in_secs = expires_in_secs(blob_access_expires_at(&parsed));
         Ok(TokenGrant {
             access: parsed.tokens.access_token,
             refresh: parsed.tokens.refresh_token,
-            expires_in_secs: id_claims
-                .get("exp")
-                .and_then(|x| x.as_i64())
-                .map(|exp| exp.saturating_sub(Utc::now().timestamp()))
-                .unwrap_or(0),
+            expires_in_secs,
         })
     }
 
@@ -598,55 +657,27 @@ impl Provider for CodexProvider {
         }
         Ok((grant, updated.to_string()))
     }
+}
 
-    fn client_status(&self) -> PResult<crate::providers::ClientStatus> {
-        if let Some(path) = auth_json_path() {
-            ensure_file_backend(&path)?;
-        }
-        client::probe()
-            .map(|state| match state {
-                Some(state) => crate::providers::ClientStatus {
-                    running: true,
-                    busy: state.busy,
-                    account_key: state.email,
-                    account_id: state.account_id,
-                    handoff_token: state.instance_token,
-                },
-                None => crate::providers::ClientStatus::default(),
-            })
-            .map_err(|error| ProviderError::Other(error.to_string()))
+impl UsageSource for CodexProvider {
+    // --- Usage -------------------------------------------------------------
+
+    fn fetch_usage(&self, access_token: &str) -> PResult<UsageSnapshot> {
+        fetch_usage_as(access_token, None)
     }
 
-    fn begin_handoff(&self, token: &str) -> PResult<()> {
-        client::begin_drain(token).map_err(|error| ProviderError::Other(error.to_string()))
+    /// Like the Codex client, name the ChatGPT workspace the token is for
+    /// (`ChatGPT-Account-Id`, from `tokens.account_id`): one login can belong
+    /// to several workspaces, each with its own limits.
+    fn fetch_account_usage(&self, access_token: &str, secret_blob: &str) -> PResult<UsageSnapshot> {
+        let account_id = parse_codex_blob(secret_blob)
+            .ok()
+            .and_then(|parsed| blob_account_id(&parsed));
+        fetch_usage_as(access_token, account_id.as_deref())
     }
+}
 
-    fn launch_client(
-        &self,
-        mode: crate::providers::trait_def::LaunchMode,
-    ) -> PResult<std::process::ExitStatus> {
-        launch_command(mode).status().map_err(ProviderError::Io)
-    }
-
-    fn handoff_stops_synchronously(&self) -> bool {
-        cfg!(unix)
-    }
-
-    fn handoff_request_is_idempotent(&self) -> bool {
-        crate::platform::graceful_drain_is_idempotent()
-    }
-
-    fn verify_handoff_stopped(&self, token: &str) -> PResult<()> {
-        client::verify_stopped(token).map_err(|error| ProviderError::Other(error.to_string()))
-    }
-
-    fn handoff_client(&self, identity: &IdentitySnapshot, token: Option<&str>) -> PResult<()> {
-        if token.is_none() {
-            return Ok(());
-        }
-        client::start_and_verify(identity).map_err(|error| ProviderError::Other(error.to_string()))
-    }
-
+impl ActiveSlot for CodexProvider {
     fn read_active_identity(&self) -> PResult<Option<IdentitySnapshot>> {
         Ok(self
             .capture_current_login()?
@@ -665,46 +696,6 @@ impl Provider for CodexProvider {
                 "reading Codex credentials: {error}"
             ))),
         }
-    }
-
-    // --- Usage -------------------------------------------------------------
-
-    fn fetch_usage(&self, access_token: &str) -> PResult<UsageSnapshot> {
-        let url = usage_url();
-        let resp = http_agent()
-            .get(&url)
-            .set("Authorization", &format!("Bearer {access_token}"))
-            .set("Content-Type", "application/json")
-            .call();
-        let body: Value = match resp {
-            Ok(r) => r
-                .into_json()
-                .map_err(|e| ProviderError::Other(format!("parsing codex usage: {e}")))?,
-            Err(ureq::Error::Status(401, _)) => return Err(ProviderError::Auth),
-            Err(ureq::Error::Status(429, _)) => {
-                return Err(ProviderError::RateLimited {
-                    retry_after_secs: None,
-                })
-            }
-            Err(ureq::Error::Status(code, _)) => {
-                return Err(ProviderError::Other(format!(
-                    "codex usage endpoint returned HTTP {code}"
-                )))
-            }
-            Err(e) => return Err(ProviderError::Transient(e.to_string())),
-        };
-
-        crate::providers::log_watched_fields("codex", &body, WATCHED_FIELDS);
-        Ok(UsageSnapshot {
-            windows: parse_usage_windows(&body),
-            fetched_at: Utc::now(),
-            plan: parse_plan(&body),
-            reported: ReportedUsage {
-                credits: parse_credits(&body),
-                reset_grants: parse_reset_credits(&body),
-                ..ReportedUsage::default()
-            },
-        })
     }
 
     // --- Switching -----------------------------------------------------------
@@ -760,7 +751,61 @@ impl Provider for CodexProvider {
         }
         self.write_active_account(blob, &current.identity)
     }
+}
 
+impl ClientHandoff for CodexProvider {
+    fn client_status(&self) -> PResult<crate::providers::ClientStatus> {
+        if let Some(path) = auth_json_path() {
+            ensure_file_backend(&path)?;
+        }
+        client::probe()
+            .map(|state| match state {
+                Some(state) => crate::providers::ClientStatus {
+                    running: true,
+                    busy: state.busy,
+                    account_key: state.email,
+                    account_id: state.account_id,
+                    handoff_token: state.instance_token,
+                },
+                None => crate::providers::ClientStatus::default(),
+            })
+            .map_err(|error| ProviderError::Other(error.to_string()))
+    }
+
+    fn begin_handoff(&self, token: &str) -> PResult<()> {
+        client::begin_drain(token).map_err(|error| ProviderError::Other(error.to_string()))
+    }
+
+    fn handoff_stops_synchronously(&self) -> bool {
+        cfg!(unix)
+    }
+
+    fn handoff_request_is_idempotent(&self) -> bool {
+        crate::platform::graceful_drain_is_idempotent()
+    }
+
+    fn verify_handoff_stopped(&self, token: &str) -> PResult<()> {
+        client::verify_stopped(token).map_err(|error| ProviderError::Other(error.to_string()))
+    }
+
+    fn handoff_client(&self, identity: &IdentitySnapshot, token: Option<&str>) -> PResult<()> {
+        if token.is_none() {
+            return Ok(());
+        }
+        client::start_and_verify(identity).map_err(|error| ProviderError::Other(error.to_string()))
+    }
+}
+
+impl Launcher for CodexProvider {
+    fn launch_client(
+        &self,
+        mode: crate::providers::trait_def::LaunchMode,
+    ) -> PResult<std::process::ExitStatus> {
+        launch_command(mode).status().map_err(ProviderError::Io)
+    }
+}
+
+impl CredentialSync for CodexProvider {
     // --- Credential sync ---------------------------------------------------
 
     fn credential_paths(&self) -> Vec<PathBuf> {
@@ -791,22 +836,28 @@ impl Provider for CodexProvider {
                     .and_then(|x| x.as_str())
                     .map(String::from)
             })?;
-        Some(AccountKey::new(self.provider_id(), email))
+        let workspace = blob_account_id(&parsed);
+        Some(AccountKey::new(
+            self.provider_id(),
+            crate::providers::trait_def::workspace_key(&email, workspace.as_deref()),
+        ))
     }
 
     fn credential_freshness(&self, blob: &str) -> CredentialFreshness {
         let Ok(parsed) = serde_json::from_str::<AuthDotJson>(blob) else {
             return CredentialFreshness::Invalid;
         };
-        let Some(claims) = parsed
+        // No decodable id_token: the blob cannot be attributed to an account.
+        if parsed
             .tokens
             .id_token
             .as_deref()
             .and_then(jwt_payload_claims)
-        else {
+            .is_none()
+        {
             return CredentialFreshness::Invalid;
-        };
-        let Some(exp) = claims.get("exp").and_then(|x| x.as_i64()) else {
+        }
+        let Some(exp) = blob_access_expires_at(&parsed) else {
             return CredentialFreshness::Unknown;
         };
         let now = Utc::now().timestamp();
@@ -839,13 +890,7 @@ impl Provider for CodexProvider {
             Ok(p) => p,
             Err(_) => return Ok(()), // not a usable token blob; nothing to absorb
         };
-        let id_claims = parsed
-            .tokens
-            .id_token
-            .as_deref()
-            .and_then(jwt_payload_claims)
-            .unwrap_or_default();
-        let expires_at = id_claims.get("exp").and_then(|x| x.as_i64()).unwrap_or(0);
+        let expires_at = blob_access_expires_at(&parsed).unwrap_or(0);
         let access = parsed.tokens.access_token.clone();
         // A blob without a refresh token must not wipe the stored grant (or
         // clear needs_relogin); Claude's absorb refuses such blobs too.
@@ -889,6 +934,48 @@ impl Provider for CodexProvider {
     }
 }
 
+/// GET the usage endpoint, as `account_id`'s workspace when known.
+fn fetch_usage_as(access_token: &str, account_id: Option<&str>) -> PResult<UsageSnapshot> {
+    let url = usage_url();
+    let mut request = http_agent()
+        .get(&url)
+        .set("Authorization", &format!("Bearer {access_token}"))
+        .set("Content-Type", "application/json");
+    if let Some(account_id) = account_id.filter(|id| !id.is_empty()) {
+        request = request.set("ChatGPT-Account-Id", account_id);
+    }
+    let resp = request.call();
+    let body: Value = match resp {
+        Ok(r) => r
+            .into_json()
+            .map_err(|e| ProviderError::Other(format!("parsing codex usage: {e}")))?,
+        Err(ureq::Error::Status(401, _)) => return Err(ProviderError::Auth),
+        Err(ureq::Error::Status(429, _)) => {
+            return Err(ProviderError::RateLimited {
+                retry_after_secs: None,
+            })
+        }
+        Err(ureq::Error::Status(code, _)) => {
+            return Err(ProviderError::Other(format!(
+                "codex usage endpoint returned HTTP {code}"
+            )))
+        }
+        Err(e) => return Err(ProviderError::Transient(e.to_string())),
+    };
+
+    crate::providers::log_watched_fields("codex", &body, WATCHED_FIELDS);
+    Ok(UsageSnapshot {
+        windows: parse_usage_windows(&body),
+        fetched_at: Utc::now(),
+        plan: parse_plan(&body),
+        reported: ReportedUsage {
+            credits: parse_credits(&body),
+            reset_grants: parse_reset_credits(&body),
+            ..ReportedUsage::default()
+        },
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -899,19 +986,19 @@ impl Provider for CodexProvider {
 /// same shape (to pull `refresh_token` and check `last_refresh` staleness)
 /// without duplicating this struct.
 #[derive(Debug, Deserialize)]
-pub(super) struct AuthDotJson {
+struct AuthDotJson {
     #[serde(default)]
     pub(super) tokens: TokenData,
     /// RFC 3339 timestamp of the last successful refresh. Absent on a blob
-    /// that has never been refreshed since login. Used by `oauth.rs` to
-    /// enforce the same ~8-day proactive-refresh cadence the vendor CLI uses
-    /// independently of the access token's own expiry.
+    /// that has never been refreshed since login. With an opaque access
+    /// token, the 8-day cadence from here is the refresh due time
+    /// (`access_expires_at`), as in the Codex client.
     #[serde(default)]
-    pub(super) last_refresh: Option<String>,
+    last_refresh: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
-pub(super) struct TokenData {
+struct TokenData {
     #[serde(default)]
     pub(super) id_token: Option<String>,
     #[serde(default)]
@@ -920,6 +1007,46 @@ pub(super) struct TokenData {
     pub(super) refresh_token: Option<String>,
     #[serde(default)]
     pub(super) account_id: Option<String>,
+}
+
+/// Codex's proactive refresh cadence for an access token whose expiry it
+/// cannot read (`TOKEN_REFRESH_INTERVAL`, 8 days, in openai/codex
+/// `login/src/auth/manager.rs`).
+const REFRESH_INTERVAL_SECS: i64 = 8 * 86_400;
+
+/// When a Codex access token is due for refresh (unix seconds), judged the
+/// way the Codex client judges it (`proactive_refresh_reason`): the access
+/// token's own JWT `exp`; else `last_refresh` plus the 8-day cadence. The
+/// id_token's `exp` describes the ID token, not the access token, so it is
+/// only a last resort for a blob with neither (it errs early). `None` when
+/// nothing is known.
+fn access_expires_at(
+    access_token: &str,
+    last_refresh: Option<&str>,
+    id_token: Option<&str>,
+) -> Option<i64> {
+    let exp_of = |jwt: &str| jwt_payload_claims(jwt)?.get("exp")?.as_i64();
+    exp_of(access_token)
+        .or_else(|| {
+            let at = chrono::DateTime::parse_from_rfc3339(last_refresh?).ok()?;
+            Some(at.timestamp().saturating_add(REFRESH_INTERVAL_SECS))
+        })
+        .or_else(|| exp_of(id_token?))
+}
+
+fn blob_access_expires_at(parsed: &AuthDotJson) -> Option<i64> {
+    access_expires_at(
+        &parsed.tokens.access_token,
+        parsed.last_refresh.as_deref(),
+        parsed.tokens.id_token.as_deref(),
+    )
+}
+
+/// Seconds from now until `expires_at`; 0 (refresh now) when unknown.
+pub(super) fn expires_in_secs(expires_at: Option<i64>) -> i64 {
+    expires_at
+        .map(|exp| exp.saturating_sub(Utc::now().timestamp()))
+        .unwrap_or(0)
 }
 
 /// The Codex workspace id of a parsed blob: `tokens.account_id`, else the
@@ -943,13 +1070,14 @@ fn blob_account_id(parsed: &AuthDotJson) -> Option<String> {
         })
 }
 
-pub(super) fn parse_codex_blob(blob: &str) -> PResult<AuthDotJson> {
+fn parse_codex_blob(blob: &str) -> PResult<AuthDotJson> {
     let v: AuthDotJson = serde_json::from_str(blob)
         .map_err(|e| ProviderError::Other(format!("parsing codex auth.json: {e}")))?;
     if v.tokens.access_token.is_empty() {
-        return Err(ProviderError::Other(
-            "codex auth.json has no tokens.access_token (API-key-only blob)".into(),
-        ));
+        return Err(ProviderError::Other(format!(
+            "codex auth.json has no tokens.access_token ({} blob)",
+            crate::providers::trait_def::API_KEY_ONLY_MARK
+        )));
     }
     Ok(v)
 }
@@ -977,7 +1105,7 @@ fn ensure_file_backend(auth_path: &std::path::Path) -> PResult<()> {
     }
 }
 
-pub(super) fn auth_json_path() -> Option<PathBuf> {
+fn auth_json_path() -> Option<PathBuf> {
     // An empty `CODEX_HOME` counts as unset (as in Codex itself and
     // `context_ledger::codex`); otherwise the path would be cwd-relative.
     if let Some(h) = crate::paths::path_env_var("CODEX_HOME").filter(|h| !h.is_empty()) {
@@ -1013,7 +1141,7 @@ fn fs_ctx<T>(r: std::io::Result<T>, op: &str, path: &std::path::Path) -> PResult
 /// the tmp file so a secret-bearing orphan never survives (H4 finding from
 /// the same audit).
 #[cfg(unix)]
-pub(super) fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult<()> {
+fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -1078,7 +1206,7 @@ const WINDOWS_RENAME_RETRIES: u32 = 3;
 const WINDOWS_RENAME_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[cfg(not(unix))]
-pub(super) fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult<()> {
+fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult<()> {
     let dir = path
         .parent()
         .ok_or_else(|| ProviderError::Other("auth.json path has no parent directory".into()))?;
@@ -1119,7 +1247,7 @@ pub(super) fn write_auth_json_atomically(path: &std::path::Path, contents: &str)
 /// claims we would trust the provider to have written. `pub(super)` so
 /// `oauth.rs` can compute `expires_in_secs` from a freshly-refreshed
 /// `access_token`/`id_token` the same way capture does.
-pub(super) fn jwt_payload_claims(jwt: &str) -> Option<serde_json::Map<String, Value>> {
+fn jwt_payload_claims(jwt: &str) -> Option<serde_json::Map<String, Value>> {
     let mut parts = jwt.split('.');
     let _hdr = parts.next()?;
     let payload = parts.next()?;
@@ -1344,7 +1472,7 @@ mod tests {
                 plan: parse_plan(&body),
                 reported: ReportedUsage::default(),
             };
-            let cache = crate::cached_from_usage_snapshot(&snapshot);
+            let cache = crate::rows::cached_from_usage_snapshot(&snapshot);
             assert_eq!(cache.weekly_pct, Some(40.0));
             assert_eq!(cache.session_pct, secondary_seconds.map(|_| 12.0));
             assert_eq!(
@@ -1849,6 +1977,88 @@ mod tests {
     }
 
     #[test]
+    fn usage_request_names_the_chatgpt_workspace() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/wham/usage", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut headers = Vec::new();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                    break;
+                }
+                headers.push(line.trim().to_ascii_lowercase());
+            }
+            let body = "{}";
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            headers
+        });
+        let blob = serde_json::json!({
+            "tokens": {
+                "id_token": make_id_token("u@e.com", 4_000_000_000),
+                "access_token": "at",
+                "account_id": "ws-1",
+            }
+        })
+        .to_string();
+        crate::endpoints::set_test_override(crate::endpoints::Endpoint::CodexUsage, Some(&url));
+        let result = CodexProvider.fetch_account_usage("at", &blob);
+        crate::endpoints::set_test_override(crate::endpoints::Endpoint::CodexUsage, None);
+        result.unwrap();
+        let headers = server.join().unwrap();
+        assert!(
+            headers.iter().any(|h| h == "chatgpt-account-id: ws-1"),
+            "{headers:?}"
+        );
+    }
+
+    #[test]
+    fn access_token_expiry_comes_from_the_access_token_not_the_id_token() {
+        // The Codex client judges the access token by its own `exp`; an
+        // expired id_token says nothing about it.
+        let now = Utc::now().timestamp();
+        let blob = serde_json::json!({
+            "tokens": {
+                "id_token": make_id_token("u@e.com", 1),
+                "access_token": make_id_token("u@e.com", now + 7200),
+                "refresh_token": "rt",
+            }
+        })
+        .to_string();
+        assert_eq!(
+            CodexProvider.credential_freshness(&blob),
+            CredentialFreshness::Fresh
+        );
+        let grant = CodexProvider.parse_stored_blob(&blob).unwrap();
+        assert!((7100..=7200).contains(&grant.expires_in_secs), "{grant:?}");
+        // An opaque access token is due 8 days after `last_refresh`, the
+        // Codex client's scheduled-refresh cadence.
+        let last = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let blob = serde_json::json!({
+            "tokens": {
+                "id_token": make_id_token("u@e.com", 1),
+                "access_token": "opaque",
+                "refresh_token": "rt",
+            },
+            "last_refresh": last,
+        })
+        .to_string();
+        let grant = CodexProvider.parse_stored_blob(&blob).unwrap();
+        let seven_days = 7 * 86_400;
+        assert!(
+            (seven_days - 60..=seven_days).contains(&grant.expires_in_secs),
+            "{grant:?}"
+        );
+    }
+
+    #[test]
     fn credential_paths_uses_codex_home_when_set() {
         // Serialised across the crate via `env_lock::ENV_LOCK` — no other
         // test can flip `$CODEX_HOME` mid-assertion.
@@ -1874,7 +2084,7 @@ mod tests {
         // state.providers["codex"] via `with_state_lock_absorb` — the state
         // v2 equivalent of Claude's `absorb_credential`.
         let _cfg = crate::store::ScopedConfigDir::new();
-        crate::credentials::with_state_lock(|| {
+        crate::credentials::with_state_lock(|_| {
             let mut st = crate::store::State::load()?;
             st.upsert_provider_account(
                 "codex",
@@ -1915,7 +2125,7 @@ mod tests {
     #[test]
     fn absorb_credential_without_refresh_token_keeps_stored_grant() {
         let _cfg = crate::store::ScopedConfigDir::new();
-        crate::credentials::with_state_lock(|| {
+        crate::credentials::with_state_lock(|_| {
             let mut st = crate::store::State::load()?;
             st.upsert_provider_account(
                 "codex",
@@ -1998,7 +2208,7 @@ mod tests {
             }})
             .to_string()
         };
-        crate::credentials::with_state_lock(|| {
+        crate::credentials::with_state_lock(|_| {
             let mut st = crate::store::State::load()?;
             st.upsert_provider_account(
                 "codex",
@@ -2022,12 +2232,13 @@ mod tests {
             st.save()
         })
         .unwrap();
-        let k = AccountKey::new("codex", "user@example.com");
+        // Loading the email-keyed entry upgrades it to email#workspace.
+        let k = AccountKey::new("codex", "user@example.com#ws-personal");
         let team = blob_for("ws-team", 5_000_000_000);
         assert!(CodexProvider.absorb_credential(&k, &team).is_err());
         let st = crate::store::State::load().unwrap();
         let a = st
-            .find_provider_account("codex", "user@example.com")
+            .find_provider_account("codex", "user@example.com#ws-personal")
             .unwrap();
         assert_eq!(a.refresh_token, "old-rt", "other workspace must not absorb");
         // Same workspace still absorbs.
@@ -2035,7 +2246,7 @@ mod tests {
         CodexProvider.absorb_credential(&k, &same).unwrap();
         let st = crate::store::State::load().unwrap();
         let a = st
-            .find_provider_account("codex", "user@example.com")
+            .find_provider_account("codex", "user@example.com#ws-personal")
             .unwrap();
         assert_eq!(a.refresh_token, "rt-new");
     }
@@ -2139,5 +2350,88 @@ mod tests {
             })
             .count();
         assert_eq!(leftovers, 0);
+    }
+
+    use crate::providers;
+    use crate::providers::Provider;
+    use crate::test_support::codex_login_response;
+
+    #[test]
+    fn codex_browser_login_uses_vendor_contract_and_rejects_missing_identity() {
+        let provider = providers::codex::CodexProvider;
+        let spec = provider.login_spec();
+        assert_eq!(spec.redirect_port, Some(1455));
+        assert_eq!(spec.redirect_host, "127.0.0.1");
+        assert_eq!(spec.redirect_path, "/auth/callback");
+        assert_eq!(
+            spec.token_request,
+            providers::trait_def::TokenRequestStyle::Form
+        );
+        let captured = provider
+            .complete_login(&codex_login_response("b@example.com", "account-b"))
+            .unwrap();
+        assert_eq!(captured.identity.email.as_deref(), Some("b@example.com"));
+        assert_eq!(captured.identity.uuid.as_deref(), Some("account-b"));
+        let blob: serde_json::Value = serde_json::from_str(&captured.secret_blob).unwrap();
+        assert_eq!(blob["tokens"]["account_id"], "account-b");
+        assert_eq!(
+            blob["tokens"]["oauth_provenance"]["client_id"],
+            providers::codex::oauth::CLIENT_ID
+        );
+        assert!(provider
+            .complete_login(&serde_json::json!({"access_token": "at", "refresh_token": "rt"}))
+            .is_err());
+        assert!(provider
+            .complete_login(
+                &serde_json::json!({"access_token": "at", "refresh_token": "rt", "id_token": "invalid"})
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn codex_non_file_backend_is_rejected_before_drain_or_write() {
+        let _cfg = crate::store::ScopedConfigDir::new();
+        let dir = tempfile::tempdir().unwrap();
+        crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+            let provider = providers::codex::CodexProvider;
+            let captured = provider
+                .complete_login(&codex_login_response("a@example.com", "a"))
+                .unwrap();
+            let path = dir.path().join("auth.json");
+            std::fs::write(&path, "stale-fallback").unwrap();
+            for mode in ["keyring", "auto", "ephemeral"] {
+                std::fs::write(
+                    dir.path().join("config.toml"),
+                    format!("cli_auth_credentials_store = \"{mode}\"\n"),
+                )
+                .unwrap();
+                assert!(provider.client_status().is_err());
+                assert!(provider.capture_current_login().is_err());
+                assert!(provider.read_active_slot().is_err());
+                assert!(provider.credential_paths().is_empty());
+                assert!(provider
+                    .write_active_account(&captured.secret_blob, &captured.identity)
+                    .is_err());
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "stale-fallback");
+            }
+            std::fs::write(
+                dir.path().join("config.toml"),
+                "cli_auth_credentials_store = \"file\"\n",
+            )
+            .unwrap();
+            provider
+                .write_active_account(&captured.secret_blob, &captured.identity)
+                .unwrap();
+            assert_eq!(
+                provider
+                    .capture_current_login()
+                    .unwrap()
+                    .unwrap()
+                    .identity
+                    .email
+                    .as_deref(),
+                Some("a@example.com")
+            );
+        });
     }
 }

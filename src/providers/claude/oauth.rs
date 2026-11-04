@@ -1,5 +1,6 @@
-//! OAuth refresh-token grant. We only ever refresh here; new accounts are
-//! onboarded by capturing a real `claude` login from the keychain.
+//! OAuth refresh-token grant. We only ever refresh here; new accounts come
+//! from the provider's own browser login (`ClaudeProvider::login_spec` /
+//! `complete_login`) or from capturing a real `claude` login.
 
 use serde::Deserialize;
 
@@ -35,7 +36,7 @@ fn now_millis() -> i64 {
 /// as HTTP 400 invalid_grant and is permanently dead for that grant family.
 /// The account needs a fresh `/login`; no amount of retrying will help.
 #[derive(Debug)]
-pub enum RefreshError {
+pub(crate) enum RefreshError {
     /// Anthropic said 400 (or the account has no refresh token to send).
     /// The stored refresh token is now permanently dead; user must re-login.
     InvalidGrant,
@@ -63,8 +64,8 @@ impl std::fmt::Display for RefreshError {
 
 impl std::error::Error for RefreshError {}
 
-/// Refresh an account's access token in place, keeping the keychain blob in
-/// sync. Returns true (it always changes the tokens on success).
+/// Refresh an account's access token in place (not persisted; see below).
+/// Returns true (it always changes the tokens on success).
 ///
 /// Errors are typed so the caller can decide policy: `InvalidGrant` means the
 /// account needs a fresh `/login` (flag `needs_relogin` in state); anything
@@ -111,45 +112,26 @@ pub(crate) fn refresh(acct: &mut Account) -> Result<bool, RefreshError> {
 /// account for re-login. So under a cross-process lock we first adopt any
 /// rotation someone else already saved, and only POST if that's still stale —
 /// then save before releasing the lock, so the next refresher sees it.
-pub fn ensure_fresh(acct: &mut Account, skew_secs: i64) -> Result<bool, RefreshError> {
+///
+/// On a failed request `acct` is left holding the grant that was actually
+/// sent (which may be a newer saved rotation than the one passed in), so a
+/// re-login flag can compare against the token that was rejected.
+pub(crate) fn ensure_fresh(acct: &mut Account, skew_secs: i64) -> Result<bool, RefreshError> {
     crate::lifecycle::ensure_claude_fresh(acct, skew_secs)
 }
 
 /// Exclusive `refresh.lock` in the config dir, held until dropped. Always
 /// taken BEFORE the state lock (a switch's commit takes it too, so it sees a
 /// rotation that was in flight).
-pub(crate) fn refresh_lock() -> anyhow::Result<std::fs::File> {
+pub(crate) fn refresh_lock() -> anyhow::Result<crate::lifecycle::RefreshGuard> {
     crate::lifecycle::refresh_lock()
 }
 
 #[cfg(test)]
 use crate::lifecycle::needs_refresh;
 
-#[cfg(test)]
-thread_local! {
-    /// Test-only override for the OAuth token endpoint, so integration tests
-    /// (`main_tests.rs::refresh_usage_cache_does_not_touch_the_active_account`)
-    /// can point `post_token` at an in-process mock HTTP server instead of the
-    /// real Anthropic endpoint, and count exactly how many POSTs land.
-    static TOKEN_URL_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Install (or clear) the current thread's token-URL override. Test-only.
-#[cfg(test)]
-pub(crate) fn set_token_url_override(url: Option<&str>) {
-    TOKEN_URL_OVERRIDE.with(|c| *c.borrow_mut() = url.map(String::from));
-}
-
-#[cfg(test)]
 fn token_url() -> String {
-    TOKEN_URL_OVERRIDE
-        .with(|c| c.borrow().clone())
-        .unwrap_or_else(|| config::TOKEN_URL.to_string())
-}
-
-#[cfg(not(test))]
-fn token_url() -> String {
-    config::TOKEN_URL.to_string()
+    crate::endpoints::url(crate::endpoints::Endpoint::ClaudeToken)
 }
 
 fn post_token(body: &serde_json::Value) -> Result<TokenResponse, RefreshError> {

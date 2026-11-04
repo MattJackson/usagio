@@ -1,14 +1,21 @@
 //! Shared account identity and credential persistence rules.
-use crate::credentials::with_state_lock;
-use crate::providers::{IdentitySnapshot, Provider, TokenGrant};
+use crate::credentials::{with_state_lock, StateGuard};
+use crate::providers::{require, IdentitySnapshot, Provider, TokenGrant};
 use crate::store::{Account, ProviderAccount, State};
 use crate::{logging, providers};
 use anyhow::{bail, Result};
 use chrono::Utc;
 
+/// Proof that this process holds the refresh lock (see [`refresh_lock`]);
+/// released when dropped. Functions that must run under it take
+/// `&RefreshGuard`.
+pub(crate) struct RefreshGuard {
+    _file: std::fs::File,
+}
+
 /// Serialize refresh and switch preparation across usagio processes. Always
 /// acquire this before the state lock, including on the legacy Claude path.
-pub fn refresh_lock() -> Result<std::fs::File> {
+pub(crate) fn refresh_lock() -> Result<RefreshGuard> {
     use fs2::FileExt;
     let dir = crate::store::config_dir()?;
     std::fs::create_dir_all(&dir)?;
@@ -19,7 +26,7 @@ pub fn refresh_lock() -> Result<std::fs::File> {
         .write(true)
         .open(dir.join("refresh.lock"))?;
     file.lock_exclusive()?;
-    Ok(file)
+    Ok(RefreshGuard { _file: file })
 }
 
 /// One transaction policy for both account stores: serialize, reload ownership,
@@ -56,7 +63,7 @@ pub(crate) fn needs_refresh(expires_at_ms: i64, now_ms: i64, skew_secs: i64) -> 
     expires_at_ms.saturating_sub(now_ms) <= skew_secs.saturating_mul(1000)
 }
 
-pub fn ensure_provider_fresh(provider: &dyn Provider, key: &str) -> Result<ProviderAccount> {
+pub(crate) fn ensure_provider_fresh(provider: &dyn Provider, key: &str) -> Result<ProviderAccount> {
     let slug = provider.provider_id();
     refresh_transaction(
         crate::credentials::REFRESH_SKEW_SECS,
@@ -68,8 +75,8 @@ pub fn ensure_provider_fresh(provider: &dyn Provider, key: &str) -> Result<Provi
             if snapshot.refresh_token.is_empty() {
                 return Err(crate::providers::ProviderError::Auth.into());
             }
-            let (grant, blob) =
-                provider.refresh_credential(&snapshot.secret_blob, &snapshot.refresh_token)?;
+            let (grant, blob) = require(provider.token_lifecycle())?
+                .refresh_credential(&snapshot.secret_blob, &snapshot.refresh_token)?;
             let mut candidate = snapshot.clone();
             candidate.secret_blob = blob;
             candidate.access_token = grant.access;
@@ -90,7 +97,7 @@ fn prepare_provider_refresh(
     key: &str,
 ) -> Result<PreparedRefresh<ProviderAccount>> {
     let slug = provider.provider_id();
-    let (snapshot, active) = crate::credentials::with_state_lock(|| {
+    let (snapshot, active) = crate::credentials::with_state_lock(|_| {
         let state = crate::store::State::load()?;
         let active = state
             .provider_accounts(slug)
@@ -110,7 +117,7 @@ fn prepare_provider_refresh(
     // vendor blob proves the vendor holds no OAuth login, i.e. no match.
     let matched = match matching_active_blob(provider, &snapshot.identity_snapshot()) {
         Ok(m) => m,
-        Err(e) if format!("{e:#}").contains("API-key-only") => None,
+        Err(e) if format!("{e:#}").contains(crate::providers::trait_def::API_KEY_ONLY_MARK) => None,
         Err(e) => {
             logging::log(&format!(
                 "event=refresh_skipped provider={slug} account={key} reason=vendor_slot_unreadable:{e:#}"
@@ -123,8 +130,8 @@ fn prepare_provider_refresh(
         }
     };
     if let Some(blob) = matched {
-        let grant = provider.parse_stored_blob(&blob)?;
-        let adopted = crate::credentials::with_state_lock(|| {
+        let grant = require(provider.token_lifecycle())?.parse_stored_blob(&blob)?;
+        let adopted = crate::credentials::with_state_lock(|_| {
             let mut state = crate::store::State::load()?;
             let account = state
                 .find_provider_account_mut(slug, key)
@@ -165,7 +172,7 @@ fn commit_provider_refresh(
     snapshot: &ProviderAccount,
     refreshed: Result<ProviderAccount>,
 ) -> Result<ProviderAccount> {
-    crate::credentials::with_state_lock(|| {
+    crate::credentials::with_state_lock(|_| {
         let mut state = crate::store::State::load()?;
         let account = state
             .find_provider_account_mut(slug, key)
@@ -196,7 +203,7 @@ fn commit_provider_refresh(
     })
 }
 
-pub fn identity_fields_match(
+pub(crate) fn identity_fields_match(
     expected_uuid: Option<&str>,
     expected_email: Option<&str>,
     actual_uuid: Option<&str>,
@@ -214,7 +221,7 @@ pub fn identity_fields_match(
     }
 }
 
-pub fn identity_matches(expected: &IdentitySnapshot, actual: &IdentitySnapshot) -> bool {
+pub(crate) fn identity_matches(expected: &IdentitySnapshot, actual: &IdentitySnapshot) -> bool {
     // Adoption requires evidence of identity, even for legacy incomplete records.
     (expected.uuid.is_some() || expected.email.is_some())
         && identity_fields_match(
@@ -225,8 +232,14 @@ pub fn identity_matches(expected: &IdentitySnapshot, actual: &IdentitySnapshot) 
         )
 }
 
-pub fn validate_stored_identity(provider: &dyn Provider, account: &ProviderAccount) -> Result<()> {
-    if let Some(key) = provider.identify_credential(&account.secret_blob) {
+pub(crate) fn validate_stored_identity(
+    provider: &dyn Provider,
+    account: &ProviderAccount,
+) -> Result<()> {
+    if let Some(key) = provider
+        .credential_sync()
+        .and_then(|sync| sync.identify_credential(&account.secret_blob))
+    {
         if key.provider != provider.provider_id() || !key.key.eq_ignore_ascii_case(&account.key) {
             bail!(
                 "stored credentials belong to another account; renew login for {}",
@@ -237,7 +250,7 @@ pub fn validate_stored_identity(provider: &dyn Provider, account: &ProviderAccou
     Ok(())
 }
 
-pub fn set_provider_tokens(
+pub(crate) fn set_provider_tokens(
     provider: &dyn Provider,
     account: &mut ProviderAccount,
     access: &str,
@@ -250,7 +263,8 @@ pub fn set_provider_tokens(
         refresh: Some(refresh.to_owned()),
         expires_in_secs: expires_at.saturating_sub(chrono::Utc::now().timestamp()),
     };
-    let blob = provider.patch_stored_blob(&account.secret_blob, &grant)?;
+    let blob =
+        require(provider.token_lifecycle())?.patch_stored_blob(&account.secret_blob, &grant)?;
     account.secret_blob = blob;
     account.access_token = grant.access;
     account.refresh_token = refresh.to_owned();
@@ -262,18 +276,19 @@ pub fn set_provider_tokens(
 /// Read a vendor-owned credential only when its identity remains stable across
 /// the read. Claude stores identity separately from its secret; Codex embeds it.
 /// Neither path may adopt a different login into the selected saved account.
-pub fn matching_active_blob(
+pub(crate) fn matching_active_blob(
     provider: &dyn Provider,
     expected: &IdentitySnapshot,
 ) -> Result<Option<String>> {
-    let Some(before) = provider.read_active_identity()? else {
+    let slot = require(provider.active_slot())?;
+    let Some(before) = slot.read_active_identity()? else {
         return Ok(None);
     };
     if !identity_matches(expected, &before) {
         return Ok(None);
     }
-    let blob = provider.read_active_slot()?;
-    let Some(after) = provider.read_active_identity()? else {
+    let blob = slot.read_active_slot()?;
+    let Some(after) = slot.read_active_identity()? else {
         return Ok(None);
     };
     if !identity_matches(&before, &after) || !identity_matches(expected, &after) {
@@ -295,9 +310,10 @@ pub(crate) enum ActiveRefreshOutcome {
     RefreshFailed,
 }
 
-/// Adopt only the matching vendor-owned login. Caller holds the state lock.
+/// Adopt only the matching vendor-owned login, under the state lock.
 /// Never POST a refresh grant for a credential owned by the vendor client.
 pub(crate) fn active_refresh_cas(
+    _lock: &StateGuard,
     provider: &dyn Provider,
     acct: &mut Account,
 ) -> ActiveRefreshOutcome {
@@ -352,7 +368,9 @@ pub(crate) fn active_refresh_cas(
                 "userID": acct.user_id,
             }),
         };
-        return match provider.write_active_account(&acct.keychain_blob, &identity) {
+        let written = require(provider.active_slot())
+            .and_then(|slot| slot.write_active_account(&acct.keychain_blob, &identity));
+        return match written {
             Ok(()) => {
                 acct.live_write_pending = None;
                 logging::log(&format!(
@@ -398,10 +416,13 @@ pub(crate) fn refresh_provider_active_account(slug: &str) {
     let Some(provider) = providers::get(slug) else {
         return;
     };
-    if !provider.supports_active_refresh() {
+    if !provider
+        .token_lifecycle()
+        .is_some_and(|t| t.supports_active_refresh())
+    {
         return;
     }
-    let result = with_state_lock(|| {
+    let result = with_state_lock(|_| {
         let mut state = State::load()?;
         let Some(active_key) = state.provider_accounts(slug).and_then(|p| p.active.clone()) else {
             return Ok(()); // nothing captured / nothing active for this provider yet
@@ -458,7 +479,7 @@ fn provider_active_refresh(slug: &str, acct: &ProviderAccount) -> ProviderRefres
     };
     match matching_active_blob(provider, &acct.identity_snapshot()) {
         Ok(Some(blob)) if blob != acct.secret_blob || acct.needs_relogin => {
-            match provider.parse_stored_blob(&blob) {
+            match require(provider.token_lifecycle()).and_then(|t| t.parse_stored_blob(&blob)) {
                 Ok(grant) => ProviderRefreshOutcome::Refreshed(blob, grant),
                 Err(e) => {
                     logging::log(&format!(
@@ -490,6 +511,9 @@ pub(crate) fn ensure_claude_fresh(
         return Ok(false);
     }
     let initial = acct.clone();
+    // The account whose grant was actually POSTed: `prepare` may have adopted
+    // a newer saved rotation, so on failure the caller's copy is stale.
+    let sent = std::cell::RefCell::new(None::<Account>);
     let refreshed = refresh_transaction::<_, RefreshError>(
         skew_secs,
         || {
@@ -508,7 +532,9 @@ pub(crate) fn ensure_claude_fresh(
             Ok(candidate)
         },
         |snapshot, response| {
-            let candidate = response?;
+            let candidate = response.inspect_err(|_| {
+                *sent.borrow_mut() = Some(snapshot.clone());
+            })?;
             save_rotation(&candidate, &snapshot.refresh_token).map_err(|error| {
                 RefreshError::Transient(format!(
                     "refreshed, but saving the new token failed: {error:#}"
@@ -516,7 +542,19 @@ pub(crate) fn ensure_claude_fresh(
             })?;
             Ok(candidate)
         },
-    )?;
+    );
+    let refreshed = match refreshed {
+        Ok(r) => r,
+        Err(e) => {
+            // Hand back the grant that was rejected, so a re-login flag CAS
+            // (`flag_needs_relogin_if_unchanged`, the poll merge) compares
+            // against the token actually sent rather than the caller's copy.
+            if let Some(sent) = sent.into_inner() {
+                *acct = sent;
+            }
+            return Err(e);
+        }
+    };
     let changed = refreshed.keychain_blob != initial.keychain_blob;
     *acct = refreshed;
     Ok(changed)
@@ -542,7 +580,7 @@ fn adopt_saved_rotation(acct: &mut Account) -> Result<(bool, bool)> {
 /// moved on meanwhile: the account went active (its tokens now come only from
 /// the vendor's slot), or a newer login replaced `sent` ("Renew login…").
 fn save_rotation(acct: &Account, sent: &str) -> anyhow::Result<()> {
-    crate::credentials::with_state_lock(|| {
+    crate::credentials::with_state_lock(|_| {
         let mut st = crate::store::State::load()?;
         if crate::credentials::is_active_key(acct.key(), st.active.as_deref()) {
             return Ok(());
@@ -560,10 +598,23 @@ fn save_rotation(acct: &Account, sent: &str) -> anyhow::Result<()> {
     })
 }
 
-/// Drain before changing credentials. Caller holds state and refresh locks.
+/// The running client's status; a stateless client (no handoff capability)
+/// reports the default, not-running status.
+pub(crate) fn client_status(
+    provider: &dyn Provider,
+) -> providers::PResult<providers::ClientStatus> {
+    match provider.client_handoff() {
+        Some(handoff) => handoff.client_status(),
+        None => Ok(providers::ClientStatus::default()),
+    }
+}
+
+/// Drain before changing credentials, under the state and refresh locks.
 /// The durable receipt prevents retries from sending a second shutdown request,
 /// which some vendors interpret as force termination.
 pub(crate) fn prepare_handoff(
+    _lock: &StateGuard,
+    _refresh: &RefreshGuard,
     provider: &dyn Provider,
     status: &providers::ClientStatus,
     state: &mut State,
@@ -571,6 +622,8 @@ pub(crate) fn prepare_handoff(
     manual: bool,
 ) -> Result<bool> {
     let slug = provider.provider_id();
+    // A stateless client (no handoff capability) needs no drain.
+    let handoff = provider.client_handoff();
     let renewed_account = state
         .provider_accounts(slug)
         .and_then(|accounts| accounts.pending_switch.as_ref())
@@ -591,10 +644,16 @@ pub(crate) fn prepare_handoff(
             .is_none_or(|accounts| accounts.pending_switch.is_none())
     {
         if let Some(account) = state.find_provider_account(slug, key) {
+            // The daemon reports the signed-in email; the workspace is
+            // checked through `account_id` below.
+            let email = account
+                .identity_email
+                .as_deref()
+                .unwrap_or(crate::providers::trait_def::key_email(key));
             if status
                 .account_key
                 .as_deref()
-                .is_some_and(|current| current.eq_ignore_ascii_case(key))
+                .is_some_and(|current| current.eq_ignore_ascii_case(email))
                 && status.account_id == account.identity_uuid
                 && matching_active_blob(provider, &account.identity_snapshot())?.is_some()
             {
@@ -636,7 +695,9 @@ pub(crate) fn prepare_handoff(
             .and_then(|accounts| accounts.pending_switch.as_ref())
             .and_then(|pending| pending.drain_token.as_deref())
         {
-            provider.verify_handoff_stopped(token)?;
+            if let Some(handoff) = handoff {
+                handoff.verify_handoff_stopped(token)?;
+            }
         }
         return Ok(true);
     }
@@ -684,17 +745,25 @@ pub(crate) fn prepare_handoff(
     if changed {
         state.save()?;
     }
-    if !already_requested || provider.handoff_request_is_idempotent() {
-        provider.begin_handoff(token)?;
+    if !already_requested || handoff.is_some_and(|h| h.handoff_request_is_idempotent()) {
+        if let Some(handoff) = handoff {
+            handoff.begin_handoff(token)?;
+        }
         logging::log(&format!(
             "event=client_drain_requested provider={slug} account={key}"
         ));
     }
     // A bounded provider stop can finish synchronously. Publish/restart in
     // this transaction instead of leaving clients disconnected until polling.
-    if provider.handoff_stops_synchronously() && !provider.client_status()?.running {
-        provider.verify_handoff_stopped(token)?;
-        return Ok(true);
+    if let Some(handoff) = handoff.filter(|h| h.handoff_stops_synchronously()) {
+        if !handoff.client_status()?.running {
+            handoff.verify_handoff_stopped(token)?;
+            return Ok(true);
+        }
     }
     Ok(false)
 }
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod tests;

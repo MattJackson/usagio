@@ -5,8 +5,10 @@
 use super::*;
 use crate::providers::trait_def::{
     AccountKey, Capabilities, CaptureMode, CapturedAccount, CredentialFreshness, IdentitySnapshot,
-    LaunchMode, PResult, Provider, ProviderError, SecretBackend, TokenGrant, UsageSnapshot,
+    LaunchMode, PResult, Provider, SecretBackend, UsageSnapshot,
 };
+use crate::providers::CredentialSync;
+use crate::providers::LoginCapture;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -75,15 +77,23 @@ impl Provider for FakeProvider {
             capture_mode: CaptureMode::CredsOnDisk,
         }
     }
+
+    fn login_capture(&self) -> Option<&dyn LoginCapture> {
+        Some(self)
+    }
+
+    fn credential_sync(&self) -> Option<&dyn CredentialSync> {
+        Some(self)
+    }
+}
+
+impl LoginCapture for FakeProvider {
     fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
         Ok(None)
     }
-    fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
-        Err(ProviderError::Unsupported)
-    }
-    fn patch_stored_blob(&self, _blob: &str, _grant: &TokenGrant) -> PResult<String> {
-        Err(ProviderError::Unsupported)
-    }
+}
+
+impl CredentialSync for FakeProvider {
     fn credential_paths(&self) -> Vec<PathBuf> {
         self.paths.clone()
     }
@@ -368,7 +378,7 @@ fn refresh_skew_is_fifteen_minutes() {
 
 // -----------------------------------------------------------------------------
 // with_state_lock reentrancy — regression test for the switch-time deadlock
-// where absorb_before_switch -> Provider::absorb_credential ->
+// where absorb_before_switch -> CredentialSync::absorb_credential ->
 // with_state_lock_absorb -> with_state_lock reopens the same lock file and
 // flock(LOCK_EX) blocks forever on the same process's outer frame.
 // -----------------------------------------------------------------------------
@@ -397,7 +407,7 @@ fn with_isolated_home<F: FnOnce()>(f: F) {
 #[test]
 fn nested_with_state_lock_does_not_deadlock() {
     // The switch path takes with_state_lock, then calls absorb_before_switch
-    // which recurses into with_state_lock_absorb (a Provider::absorb_credential
+    // which recurses into with_state_lock_absorb (a CredentialSync::absorb_credential
     // implementation) which in turn takes with_state_lock again. Before the
     // reentrancy fix this second flock(LOCK_EX) blocked forever on the same
     // process's outer frame. Run the nested call on a worker thread and fail
@@ -415,9 +425,9 @@ fn nested_with_state_lock_does_not_deadlock() {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
             crate::store::set_home_override(Some(home_path));
-            let r: Result<()> = with_state_lock(|| {
+            let r: Result<()> = with_state_lock(|_| {
                 // Nested direct call — before the fix this blocked forever.
-                with_state_lock(|| Ok(()))?;
+                with_state_lock(|_| Ok(()))?;
                 Ok(())
             });
             let _ = tx.send(());
@@ -489,7 +499,7 @@ fn refresh_inactive_if_stale_skips_currently_active_account() {
     with_isolated_home(|| {
         // Seed state.json: one account, marked active. If the fn refreshed it
         // we'd race the vendor CLI's rotation — which is the whole bug.
-        with_state_lock(|| {
+        with_state_lock(|_| {
             let mut st = State::default();
             let a = Account {
                 email: Some("only@e.com".into()),
@@ -562,7 +572,7 @@ fn far_future_account(email: &str) -> crate::store::Account {
 fn refresh_inactive_if_stale_leaves_fresh_inactive_account_untouched() {
     use crate::store::State;
     with_isolated_home(|| {
-        with_state_lock(|| {
+        with_state_lock(|_| {
             let mut st = State::default();
             st.accounts.push(far_future_account("inactive@e.com"));
             st.active = None;
@@ -583,7 +593,7 @@ fn refresh_inactive_if_stale_leaves_fresh_inactive_account_untouched() {
 fn refresh_inactive_if_stale_considers_every_account_from_one_snapshot() {
     use crate::store::State;
     with_isolated_home(|| {
-        with_state_lock(|| {
+        with_state_lock(|_| {
             let mut st = State::default();
             st.accounts.push(far_future_account("first@e.com"));
             st.accounts.push(far_future_account("second@e.com"));
@@ -644,15 +654,23 @@ impl Provider for PanicOnceProvider {
             capture_mode: CaptureMode::CredsOnDisk,
         }
     }
+
+    fn login_capture(&self) -> Option<&dyn LoginCapture> {
+        Some(self)
+    }
+
+    fn credential_sync(&self) -> Option<&dyn CredentialSync> {
+        Some(self)
+    }
+}
+
+impl LoginCapture for PanicOnceProvider {
     fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
         Ok(None)
     }
-    fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
-        Err(ProviderError::Unsupported)
-    }
-    fn patch_stored_blob(&self, _blob: &str, _grant: &TokenGrant) -> PResult<String> {
-        Err(ProviderError::Unsupported)
-    }
+}
+
+impl CredentialSync for PanicOnceProvider {
     fn credential_paths(&self) -> Vec<PathBuf> {
         let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if n == 0 {
@@ -917,10 +935,10 @@ fn with_state_lock_holds_a_real_lock_and_tracks_nesting_depth() {
         let depth = || STATE_LOCK_DEPTH.with(|d| d.get());
 
         assert_eq!(depth(), 0);
-        with_state_lock(|| {
+        with_state_lock(|_| {
             assert_eq!(depth(), 1);
             assert!(probe_is_blocked(), "outer frame must hold the OS lock");
-            with_state_lock(|| {
+            with_state_lock(|_| {
                 assert_eq!(depth(), 2, "nesting increments the depth");
                 assert!(probe_is_blocked());
                 Ok(())
@@ -961,13 +979,13 @@ fn last_chance_fallback_keeps_the_first_blob_on_a_freshness_tie() {
 struct TokenUrlGuard;
 impl TokenUrlGuard {
     fn set(url: &str) -> Self {
-        crate::providers::claude::oauth::set_token_url_override(Some(url));
+        crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeToken, Some(url));
         TokenUrlGuard
     }
 }
 impl Drop for TokenUrlGuard {
     fn drop(&mut self) {
-        crate::providers::claude::oauth::set_token_url_override(None);
+        crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeToken, None);
     }
 }
 
@@ -1053,7 +1071,7 @@ fn expired_account(email: &str) -> crate::store::Account {
 }
 
 fn seed_state(accounts: Vec<crate::store::Account>, active: Option<&str>) {
-    with_state_lock(|| {
+    with_state_lock(|_| {
         let st = crate::store::State {
             accounts,
             active: active.map(String::from),
@@ -1143,6 +1161,35 @@ fn ensure_fresh_adopts_a_rotation_already_saved_instead_of_reposting() {
                 .find("twice@example.com")
                 .unwrap()
                 .needs_relogin
+        );
+    });
+}
+
+#[test]
+fn ensure_fresh_reports_the_grant_it_sent_when_that_grant_is_rejected() {
+    // The caller's copy holds an older grant; ensure_fresh adopts the newer
+    // saved (still expired) rotation and sends that. On invalid_grant the
+    // caller must see the token that was rejected, or its re-login CAS
+    // compares against the wrong one and skips flagging a dead account.
+    with_isolated_home(|| {
+        let mut saved = expired_account("sent@example.com");
+        saved.set_tokens("rotated-at".into(), "rotated-rt".into(), 1);
+        seed_state(vec![saved], None);
+        let (url, hits) = spawn_token_server(400, || {});
+        let _u = TokenUrlGuard::set(&url);
+
+        let mut stale = expired_account("sent@example.com");
+        let err = crate::providers::claude::oauth::ensure_fresh(&mut stale, 900).unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::providers::claude::oauth::RefreshError::InvalidGrant
+        ));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(stale.refresh_token, "rotated-rt", "the grant actually sent");
+        assert_eq!(
+            flag_needs_relogin_if_unchanged("sent@example.com", &stale.refresh_token).unwrap(),
+            FlagOutcome::Flagged
         );
     });
 }
@@ -1507,4 +1554,64 @@ fn a_dead_grant_does_not_stop_the_loop_before_the_next_inactive_account() {
             assert!(st.find(email).unwrap().needs_relogin, "{email} not flagged");
         }
     });
+}
+
+#[test]
+fn watcher_forwards_only_credential_file_events() {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    let names = vec![
+        OsString::from(".credentials.json"),
+        OsString::from("auth.json"),
+    ];
+    let ev = |p: &str| vec![PathBuf::from(p)];
+    assert!(event_touches_credentials(
+        &ev("/h/.claude/.credentials.json"),
+        &names
+    ));
+    assert!(event_touches_credentials(
+        &ev("/h/.claude/.credentials.json.tmp.123"),
+        &names
+    ));
+    assert!(event_touches_credentials(
+        &ev("/h/.codex/auth.json"),
+        &names
+    ));
+    assert!(!event_touches_credentials(
+        &ev("/h/.claude/projects/x.jsonl"),
+        &names
+    ));
+    assert!(!event_touches_credentials(
+        &ev("/h/.codex/history.jsonl"),
+        &names
+    ));
+    // A rescan with no paths may hide a credential change.
+    assert!(event_touches_credentials(&[], &names));
+}
+
+#[test]
+fn debounce_gives_up_after_its_max_wait_under_a_steady_stream() {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let s2 = stop.clone();
+    let feeder = std::thread::spawn(move || {
+        while !s2.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = tx.send(());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+    let t = std::time::Instant::now();
+    drain_debounced(
+        &rx,
+        std::time::Duration::from_millis(100),
+        std::time::Duration::from_millis(300),
+    );
+    let took = t.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    feeder.join().unwrap();
+    assert!(
+        took < std::time::Duration::from_secs(2),
+        "debounce ran {took:?}"
+    );
+    assert!(took >= std::time::Duration::from_millis(300));
 }

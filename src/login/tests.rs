@@ -1,4 +1,9 @@
 use super::*;
+use crate::providers::CapturedAccount;
+use crate::providers::LoginCapture;
+use crate::providers::LoginFlow;
+use crate::providers::PResult;
+use crate::providers::ProviderError;
 use std::io::{BufRead, BufReader, Read};
 use std::sync::atomic::AtomicBool;
 
@@ -9,6 +14,7 @@ fn spec(token_url: &'static str, style: TokenRequestStyle) -> LoginSpec {
         client_id: "client-123",
         scopes: &["user:profile", "user:inference"],
         redirect_port: None,
+        fallback_redirect_port: None,
         redirect_host: "localhost",
         redirect_path: "/callback",
         extra_authorize_params: &[("code", "true")],
@@ -357,7 +363,7 @@ fn transient_accept_errors_are_retried_not_fatal() {
 #[test]
 fn a_cancelled_flow_frees_its_port_before_it_returns() {
     let lb = Loopback::bind(&spec("http://unused", TokenRequestStyle::Form)).unwrap();
-    let port = lb.listener.local_addr().unwrap().port();
+    let port = lb.port();
     let cancel = AtomicBool::new(true);
     let r = wait_and_release(lb, "st", Duration::from_secs(5), &cancel);
     assert!(r.is_err());
@@ -380,7 +386,7 @@ fn an_idle_connection_does_not_delay_cancel() {
     // A browser preconnect that never sends a request must not hold the
     // listener (and its fixed port) past a supersede/cancel.
     let lb = Loopback::bind(&spec("http://unused", TokenRequestStyle::Form)).unwrap();
-    let port = lb.listener.local_addr().unwrap().port();
+    let port = lb.port();
     let idle = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
     let cancel = std::sync::Arc::new(AtomicBool::new(false));
     let c = std::sync::Arc::clone(&cancel);
@@ -432,4 +438,246 @@ fn a_sign_in_nobody_completes_times_out() {
         .recv_timeout(Duration::from_secs(2))
         .expect("wait_for_code never re-checked its deadline: accept() blocked");
     assert!(format!("{}", r.unwrap_err()).contains("timed out"));
+}
+
+/// A provider with a loopback login and nothing else, to drive [`start`].
+struct LoginOnly;
+
+impl Provider for LoginOnly {
+    fn provider_id(&self) -> &'static str {
+        "t-login-only"
+    }
+    fn display_name(&self) -> &'static str {
+        "LoginOnly"
+    }
+    fn capabilities(&self) -> crate::providers::trait_def::Capabilities {
+        use crate::providers::trait_def::{Capabilities, CaptureMode, SecretBackend};
+        Capabilities {
+            supports_usage: false,
+            supports_switching: false,
+            supports_launch: false,
+            supports_remove: false,
+            supports_email_capture: false,
+            secret_backend: SecretBackend::File,
+            capture_mode: CaptureMode::CredsOnDisk,
+        }
+    }
+
+    fn login_capture(&self) -> Option<&dyn LoginCapture> {
+        Some(self)
+    }
+
+    fn login_flow(&self) -> Option<&dyn LoginFlow> {
+        Some(self)
+    }
+}
+
+impl LoginCapture for LoginOnly {
+    fn capture_current_login(
+        &self,
+    ) -> crate::providers::trait_def::PResult<Option<crate::providers::trait_def::CapturedAccount>>
+    {
+        Ok(None)
+    }
+}
+
+impl LoginFlow for LoginOnly {
+    fn login_spec(&self) -> LoginSpec {
+        spec("http://unused", TokenRequestStyle::Form)
+    }
+
+    fn complete_login(&self, token_response: &serde_json::Value) -> PResult<CapturedAccount> {
+        let _ = token_response;
+        Err(ProviderError::Unsupported)
+    }
+}
+
+static LOGIN_ONLY: LoginOnly = LoginOnly;
+
+#[test]
+fn start_releases_the_redirect_port_before_on_done_runs() {
+    use std::sync::atomic::AtomicU16;
+    let _home = crate::store::ScopedConfigDir::new();
+    let port = Arc::new(AtomicU16::new(0));
+    let seen = Arc::clone(&port);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let started = start(
+        &LOGIN_ONLY,
+        Target::Renew("dev@example.com".into()),
+        move |result: Result<Renewed>| {
+            // A successor started from here binds the same port: it must be
+            // free already, not only once the worker thread exits.
+            let port = seen.load(Ordering::SeqCst);
+            let free = TcpListener::bind(("127.0.0.1", port)).is_ok();
+            let _ = tx.send((result.is_err(), free));
+        },
+    )
+    .unwrap();
+    let url = url::Url::parse(&started.url).unwrap();
+    let redirect = url
+        .query_pairs()
+        .find(|(k, _)| k == "redirect_uri")
+        .map(|(_, v)| url::Url::parse(&v).unwrap())
+        .unwrap();
+    port.store(redirect.port().unwrap(), Ordering::SeqCst);
+    started.progress.cancel();
+    let (failed, free) = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("on_done never ran: the worker could not finish");
+    assert!(failed, "a cancelled flow reports an error");
+    assert!(free, "the redirect port was still bound when on_done ran");
+    assert!(started.progress.is_finished());
+}
+
+#[test]
+fn a_localhost_redirect_owns_both_loopback_addresses() {
+    // "localhost" may resolve to ::1: nobody else may hold [::1]:port.
+    let lb = Loopback::bind(&spec("http://unused", TokenRequestStyle::Form)).unwrap();
+    let port = lb.port();
+    assert!(TcpListener::bind(("127.0.0.1", port)).is_err());
+    if lb.listeners.len() == 2 {
+        assert!(
+            TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).is_err(),
+            "[::1]:{port} left free for another process to squat"
+        );
+    } else {
+        assert!(
+            TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).is_err(),
+            "IPv6 loopback exists but was not bound"
+        );
+    }
+}
+
+#[test]
+fn a_squatted_ipv6_port_is_never_used() {
+    // Hold [::1]:P first; a fixed-port login on P must refuse, not listen on
+    // IPv4 alone while the squatter receives the redirect.
+    let Ok(squat) = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)) else {
+        return; // no IPv6 loopback on this machine: nothing to squat
+    };
+    let port = squat.local_addr().unwrap().port();
+    let mut s = spec("http://unused", TokenRequestStyle::Form);
+    s.redirect_port = Some(port);
+    let Err(e) = Loopback::bind(&s) else {
+        panic!("bound beside a squatter on [::1]:{port}");
+    };
+    assert!(format!("{e:#}").contains("[::1]"), "{e:#}");
+    // An ephemeral-port login just picks another port.
+    let lb = Loopback::bind(&spec("http://unused", TokenRequestStyle::Form)).unwrap();
+    assert_ne!(lb.port(), port);
+}
+
+#[test]
+fn a_squatted_ipv6_preferred_port_falls_back_to_the_registered_one() {
+    // [::1] is taken on the preferred fixed port (IPv4 is free): the login
+    // must move to the registered fallback port, not fail and not listen on
+    // the preferred port beside the squatter.
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let Ok(squat) = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)) else {
+        return; // no IPv6 loopback on this machine: nothing to squat
+    };
+    let preferred = squat.local_addr().unwrap().port();
+    let fallback = loop {
+        let (a, b) = two_free_ports();
+        let candidate = if a == preferred { b } else { a };
+        if candidate != preferred {
+            break candidate;
+        }
+    };
+    let mut s = spec("http://unused", TokenRequestStyle::Form);
+    s.redirect_port = Some(preferred);
+    s.fallback_redirect_port = Some(fallback);
+    let lb = Loopback::bind(&s).unwrap();
+    assert_eq!(lb.port(), fallback);
+    assert_eq!(
+        lb.redirect_uri,
+        format!("http://localhost:{fallback}/callback"),
+        "the redirect_uri must name the port actually bound"
+    );
+    assert!(
+        lb.listeners
+            .iter()
+            .all(|l| l.local_addr().unwrap().port() == fallback),
+        "nothing may listen on the squatted preferred port"
+    );
+    // The preferred port's IPv4 side was released again.
+    assert!(TcpListener::bind(("127.0.0.1", preferred)).is_ok());
+}
+
+#[test]
+fn a_literal_ipv4_redirect_binds_only_ipv4() {
+    let mut s = spec("http://unused", TokenRequestStyle::Form);
+    s.redirect_host = "127.0.0.1";
+    let lb = Loopback::bind(&s).unwrap();
+    assert_eq!(lb.listeners.len(), 1);
+}
+
+#[test]
+fn the_redirect_is_served_on_ipv6_loopback_too() {
+    let lb = Loopback::bind(&spec("http://unused", TokenRequestStyle::Form)).unwrap();
+    if lb.listeners.len() < 2 {
+        return; // no IPv6 loopback here
+    }
+    let port = lb.port();
+    let client = std::thread::spawn(move || {
+        let mut s = std::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port)).unwrap();
+        s.write_all(b"GET /callback?code=c6&state=S HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out
+    });
+    let code = lb
+        .wait_for_code("S", Duration::from_secs(5), &AtomicBool::new(false))
+        .unwrap();
+    assert_eq!(code, "c6");
+    assert!(client.join().unwrap().starts_with("HTTP/1.1 200"));
+}
+
+/// Two loopback ports that were free a moment ago.
+fn two_free_ports() -> (u16, u16) {
+    let a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    (
+        a.local_addr().unwrap().port(),
+        b.local_addr().unwrap().port(),
+    )
+}
+
+#[test]
+fn a_busy_redirect_port_falls_back_to_the_registered_one() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let (preferred, fallback) = two_free_ports();
+    let _held = std::net::TcpListener::bind(("127.0.0.1", preferred)).unwrap();
+    let mut s = spec("http://127.0.0.1:1/token", TokenRequestStyle::Form);
+    s.redirect_port = Some(preferred);
+    s.fallback_redirect_port = Some(fallback);
+    s.redirect_host = "127.0.0.1";
+    s.redirect_path = "/auth/callback";
+    let loopback = Loopback::bind(&s).unwrap();
+    assert_eq!(
+        loopback.redirect_uri,
+        format!("http://127.0.0.1:{fallback}/auth/callback"),
+        "the redirect_uri must name the port actually bound"
+    );
+    // Both busy: an error, not some other port.
+    let _held_fallback = loopback;
+    let err =
+        bind_redirect_listener(preferred, Some(fallback), 2, Duration::from_millis(1)).unwrap_err();
+    assert!(err.to_string().contains("in use"), "{err}");
+    // Preferred free: it wins.
+    drop(_held);
+    let l = bind_redirect_listener(preferred, Some(fallback), 2, Duration::from_millis(1)).unwrap();
+    assert_eq!(l.local_addr().unwrap().port(), preferred);
+}
+
+#[cfg(feature = "codex")]
+#[test]
+fn codex_registers_1457_as_its_fallback_redirect_port() {
+    let spec = crate::providers::codex::new()
+        .login_flow()
+        .unwrap()
+        .login_spec();
+    assert_eq!(spec.redirect_port, Some(1455));
+    assert_eq!(spec.fallback_redirect_port, Some(1457));
 }

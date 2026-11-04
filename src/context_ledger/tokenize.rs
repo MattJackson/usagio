@@ -7,7 +7,7 @@
 //! For the ledger UX, ±20% accuracy is fine — this is a signal, not a bill.
 
 #[derive(Copy, Clone, Debug)]
-pub enum TokenizerHint {
+pub(crate) enum TokenizerHint {
     /// Use OpenAI cl100k_base / o200k_base via tiktoken-rs. Accurate.
     OpenAi,
     /// Approximate — Anthropic doesn't ship a Rust tokenizer.
@@ -21,7 +21,7 @@ pub enum TokenizerHint {
 
 /// Count tokens in `text`. Falls back to chars/3.6 when a real tokenizer isn't
 /// available or the specific model's encoder can't be constructed.
-pub fn count_tokens(text: &str, hint: TokenizerHint) -> usize {
+pub(crate) fn count_tokens(text: &str, hint: TokenizerHint) -> usize {
     if text.is_empty() {
         return 0;
     }

@@ -14,18 +14,18 @@ use chrono::{DateTime, Duration, Utc};
 pub(crate) const LOCKED_THRESHOLD_PCT: f64 = 99.5;
 
 #[derive(Clone, Debug)]
-pub struct AccountUsage {
-    pub session_pct: Option<f64>,
-    pub session_reset: Option<DateTime<Utc>>,
-    pub weekly_pct: Option<f64>,
-    pub weekly_reset: Option<DateTime<Utc>>,
+pub(crate) struct AccountUsage {
+    pub(crate) session_pct: Option<f64>,
+    pub(crate) session_reset: Option<DateTime<Utc>>,
+    pub(crate) weekly_pct: Option<f64>,
+    pub(crate) weekly_reset: Option<DateTime<Utc>>,
     /// When the cached usage values were fetched. Used to detect a stale
     /// cache that predates a reset boundary (see `DisplayState::StaleAfterReset`).
-    pub fetched_at: Option<DateTime<Utc>>,
+    pub(crate) fetched_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum DisplayState {
+pub(crate) enum DisplayState {
     Usage {
         session_pct: Option<f64>,
         weekly_pct: Option<f64>,
@@ -48,12 +48,12 @@ pub enum DisplayState {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum BlockingWindow {
+pub(crate) enum BlockingWindow {
     Session,
     Weekly,
 }
 
-pub fn compute_display(usage: &AccountUsage, now: DateTime<Utc>) -> DisplayState {
+pub(crate) fn compute_display(usage: &AccountUsage, now: DateTime<Utc>) -> DisplayState {
     // A window is "blocking" only if it's over the threshold AND its reset is
     // still in the future. Stale reset times (past) are treated as unlocked
     // since data is presumed stale — the next refresh will correct it.
@@ -151,7 +151,7 @@ fn is_blocking(
 /// unusable, so its usage cannot change until that reset — polling it only
 /// burns request budget (and risks the shared-tenant HTTP 429s that then
 /// starve the accounts we DO need to refresh). The reset-boundary wake
-/// (`menubar::next_reset_wake_secs`) brings the poller back exactly at expiry,
+/// (`menubar::poller::next_reset_wake_secs`) brings the poller back exactly at expiry,
 /// at which point this returns `false` (the reset is now in the past) and the
 /// account refreshes to its fresh post-reset reading.
 ///
@@ -161,7 +161,7 @@ fn is_blocking(
 /// unknown (we can't prove when it unlocks, so we don't skip). The caller must
 /// never skip the ACTIVE account — its adopt/CAS keeps the vendor slot in sync
 /// regardless of lock state.
-pub fn is_locked_until_reset(u: &AccountUsage, now: DateTime<Utc>) -> bool {
+pub(crate) fn is_locked_until_reset(u: &AccountUsage, now: DateTime<Utc>) -> bool {
     is_blocking(u.session_pct, u.session_reset, now).is_some()
         || is_blocking(u.weekly_pct, u.weekly_reset, now).is_some()
 }
@@ -188,7 +188,7 @@ fn is_stale_after_reset(
 /// Format a remaining duration into one of: "1d 23h" | "23h 52m" | "51m" | "<1m".
 /// Saturating: negative/huge durations are clamped to "<1m" and the largest
 /// representable-day-count respectively; never panics.
-pub fn format_countdown(remaining: Duration) -> String {
+pub(crate) fn format_countdown(remaining: Duration) -> String {
     // Saturating: anything at-or-below zero → "<1m" (the "never show 0" rule).
     if remaining <= Duration::zero() {
         return "<1m".to_string();

@@ -822,13 +822,11 @@ fn working_mcp_server() -> serde_json::Value {
 }
 
 #[test]
-fn claude_collect_reports_working_mcp_server_skills_and_plugins() {
+fn claude_collect_reports_working_mcp_server_and_skills() {
     with_home(|home| {
         let dir = home.join(".claude");
         fs::create_dir_all(dir.join("skills/my-skill")).unwrap();
         fs::write(dir.join("skills/my-skill/SKILL.md"), "skill body").unwrap();
-        fs::create_dir_all(dir.join("plugins/my-plugin")).unwrap();
-        fs::write(dir.join("plugins/my-plugin/plugin.json"), r#"{"name":"p"}"#).unwrap();
         let settings = serde_json::json!({ "mcpServers": { "good": working_mcp_server() } });
         fs::write(
             dir.join("settings.json"),
@@ -848,10 +846,6 @@ fn claude_collect_reports_working_mcp_server_skills_and_plugins() {
             .items
             .iter()
             .any(|i| i.kind == ItemKind::Skill && i.name == "skill: my-skill"));
-        assert!(l
-            .items
-            .iter()
-            .any(|i| i.kind == ItemKind::PluginManifest && i.name == "plugin: my-plugin"));
     });
 }
 
@@ -1283,4 +1277,457 @@ fn opencode_home_resolves_like_the_rest_of_the_crate() {
             assert_eq!(names, vec!["instructions: ~/rules.md"]);
         },
     );
+}
+
+#[test]
+fn provider_aliases_agree_across_ledger_cost_and_display() {
+    // Every slug either is known to discovery, cost and display alike, or to
+    // none of them: the alias table lives in one place.
+    with_home(|_| {
+        for slug in [
+            "claude",
+            "claude-code",
+            "codex",
+            "opencode",
+            "open-code",
+            "gpt",
+            "",
+        ] {
+            let built = build_ledger(slug, None).is_ok();
+            let priced = estimate_cost(slug, 1).is_some();
+            let named = Cli::from_slug(slug).is_some();
+            assert_eq!(built, priced, "{slug}");
+            assert_eq!(built, named, "{slug}");
+        }
+        assert_eq!(
+            Cli::from_slug("claude-code").map(Cli::display_name),
+            Some("Claude Code")
+        );
+    });
+}
+
+#[test]
+fn remote_typed_mcp_server_without_url_is_never_spawned() {
+    let td = tempdir().unwrap();
+    for t in ["sse", "http", "ws"] {
+        let marker = td.path().join(t);
+        let cfg = serde_json::json!({
+            "type": t, "command": "/usr/bin/touch", "args": [marker.to_str().unwrap()]
+        });
+        let e = mcp::fetch_tools(&cfg).unwrap_err();
+        assert!(e.contains(&format!("{t} transport")), "{t}: {e}");
+        assert!(!marker.exists(), "{t} server was spawned as stdio");
+    }
+    // An explicit stdio type still probes.
+    let script = format!("read a; echo '{INIT_OK}'; read b; read c; echo '{TOOLS_OK}'; sleep 5");
+    let mut cfg = sh_server(&script);
+    cfg["type"] = "stdio".into();
+    assert_eq!(mcp::fetch_tools(&cfg).unwrap().tool_count, 2);
+}
+
+#[test]
+fn opencode_remote_server_without_url_is_never_spawned() {
+    with_home(|home| {
+        let dir = home.join(".config/opencode");
+        fs::create_dir_all(&dir).unwrap();
+        let marker = home.join("ran");
+        let cfg = serde_json::json!({ "mcp": { "r": {
+            "type": "remote", "command": "/usr/bin/touch", "args": [marker.to_str().unwrap()]
+        } } });
+        fs::write(dir.join("opencode.json"), cfg.to_string()).unwrap();
+        let l = build_ledger("opencode", None).unwrap();
+        assert!(l.items.is_empty(), "{:?}", l.items);
+        assert!(!marker.exists(), "remote server was spawned");
+    });
+}
+
+#[test]
+fn codex_mcp_server_gets_codex_env_and_cwd() {
+    let home = tempdir().unwrap();
+    let dir = home.path().join(".codex");
+    fs::create_dir_all(&dir).unwrap();
+    let work = tempdir().unwrap();
+    let work_dir = fs::canonicalize(work.path()).unwrap();
+    let out = home.path().join("env.txt");
+    let script = format!(
+        "printf '%s|%s|%s|%s|%s' \"$USAGIO_T_PASS\" \"$USAGIO_T_OBJ\" \"$USAGIO_T_LEAK\" \"$USAGIO_T_SET\" \"$(pwd -P)\" > '{}'; \
+         read a; echo '{INIT_OK}'; read b; read c; echo '{TOOLS_OK}'; sleep 5",
+        out.display()
+    );
+    fs::write(
+        dir.join("config.toml"),
+        format!(
+            "[mcp_servers.s]\ncommand = \"/bin/sh\"\nargs = [\"-c\", {script:?}]\n\
+             env_vars = [\"USAGIO_T_PASS\", {{ name = \"USAGIO_T_OBJ\", source = \"local\" }}]\n\
+             env = {{ USAGIO_T_SET = \"set\" }}\ncwd = {:?}\n",
+            work_dir.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    with_env(
+        &[
+            ("HOME", home.path().to_str()),
+            ("USAGIO_T_PASS", Some("pass")),
+            ("USAGIO_T_OBJ", Some("obj")),
+            ("USAGIO_T_LEAK", Some("leak")),
+        ],
+        || {
+            let l = build_ledger("codex", None).unwrap();
+            assert_eq!(l.items.len(), 1, "{:?}", l.items);
+            assert_eq!(l.items[0].tool_count, Some(2));
+        },
+    );
+    let got = fs::read_to_string(&out).unwrap();
+    assert_eq!(got, format!("pass|obj||set|{}", work_dir.display()));
+}
+
+#[test]
+fn codex_launch_rejects_remote_env_vars_and_defaults_cwd_to_project() {
+    let cfg = serde_json::json!({
+        "command": "x", "env_vars": [{ "name": "A", "source": "remote" }]
+    });
+    assert!(mcp::codex_launch(&cfg, None)
+        .unwrap_err()
+        .contains("remote"));
+    let cfg = serde_json::json!({ "command": "x" });
+    let l = mcp::codex_launch(&cfg, Some(std::path::Path::new("/proj"))).unwrap();
+    assert!(l.clear_env);
+    assert_eq!(l.cwd.as_deref(), Some(std::path::Path::new("/proj")));
+    let e = mcp::codex_launch(&serde_json::json!({ "url": "https://x" }), None).unwrap_err();
+    assert!(e.contains("http transport"), "{e}");
+}
+
+fn item<'a>(l: &'a Ledger, name: &str) -> Option<&'a LedgerItem> {
+    l.items.iter().find(|i| i.name == name)
+}
+
+#[test]
+fn opencode_global_config_files_merge_with_jsonc_on_top() {
+    with_home(|home| {
+        let dir = home.join(".config/opencode");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(home.join("a.md"), "aaa").unwrap();
+        fs::write(home.join("b.md"), "bbb").unwrap();
+        let cfg = serde_json::json!({
+            "prompt": "from json",
+            "instructions": ["~/a.md"],
+            "mcp": { "good": working_mcp_server() }
+        });
+        fs::write(dir.join("opencode.json"), cfg.to_string()).unwrap();
+        fs::write(
+            dir.join("opencode.jsonc"),
+            r#"{ // later file wins
+  "prompt": "from jsonc!",
+  "instructions": ["~/b.md"],
+}"#,
+        )
+        .unwrap();
+        let l = build_ledger("opencode", None).unwrap();
+        let p = item(&l, "opencode prompt").expect("prompt");
+        assert_eq!(p.content_bytes, "from jsonc!".len());
+        assert_eq!(p.path, dir.join("opencode.jsonc"));
+        // The json's MCP server survives the merge; its row points at json.
+        let m = item(&l, "mcp: good").expect("mcp from opencode.json");
+        assert_eq!(m.path, dir.join("opencode.json"));
+        // Within the global files, instructions replace rather than append.
+        assert!(item(&l, "instructions: ~/b.md").is_some());
+        assert!(item(&l, "instructions: ~/a.md").is_none());
+    });
+}
+
+#[test]
+fn opencode_env_and_project_configs_layer_over_global() {
+    let home = tempdir().unwrap();
+    let h = home.path();
+    let dir = h.join(".config/opencode");
+    fs::create_dir_all(&dir).unwrap();
+    let marker = h.join("ran");
+    for f in ["g.md", "e.md", "r.md"] {
+        fs::write(h.join(f), f).unwrap();
+    }
+    let global = serde_json::json!({
+        "prompt": "global",
+        "instructions": ["~/g.md"],
+        "mcp": { "noisy": mcp_marker_server(&marker) }
+    });
+    fs::write(dir.join("opencode.json"), global.to_string()).unwrap();
+    let custom = h.join("custom.json");
+    fs::write(
+        &custom,
+        r#"{"prompt":"custom env","instructions":["~/e.md"]}"#,
+    )
+    .unwrap();
+    let repo = tempdir().unwrap();
+    let repo_root = fs::canonicalize(repo.path()).unwrap();
+    fs::create_dir_all(repo_root.join(".git")).unwrap();
+    fs::write(
+        repo_root.join("opencode.json"),
+        r#"{"prompt":"repo root","instructions":["~/r.md"],"mcp":{"noisy":{"enabled":false}}}"#,
+    )
+    .unwrap();
+    let sub = repo_root.join("pkg");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("opencode.jsonc"), r#"{"prompt":"nearest"}"#).unwrap();
+
+    let run = |extra: &[(&str, Option<&str>)]| {
+        let mut vars = vec![("HOME", h.to_str()), ("OPENCODE_CONFIG", custom.to_str())];
+        vars.extend_from_slice(extra);
+        let mut out = None;
+        with_env(&vars, || {
+            out = Some(build_ledger("opencode", Some(&sub)).unwrap())
+        });
+        out.unwrap()
+    };
+
+    let l = run(&[]);
+    let p = item(&l, "opencode prompt").unwrap();
+    assert_eq!(p.content_bytes, "nearest".len());
+    assert_eq!(p.path, sub.join("opencode.jsonc"));
+    // instructions concatenate across global, $OPENCODE_CONFIG and project.
+    for n in ["~/g.md", "~/e.md", "~/r.md"] {
+        assert!(item(&l, &format!("instructions: {n}")).is_some(), "{n}");
+    }
+    // The project disabled the global server: deep merge keeps it off.
+    assert!(item(&l, "mcp: noisy").is_none());
+    assert!(!marker.exists(), "project-disabled server was started");
+
+    // Project config disabled: $OPENCODE_CONFIG wins, global server runs.
+    let l = run(&[("OPENCODE_DISABLE_PROJECT_CONFIG", Some("true"))]);
+    assert_eq!(
+        item(&l, "opencode prompt").unwrap().content_bytes,
+        "custom env".len()
+    );
+    assert!(item(&l, "instructions: ~/r.md").is_none());
+    assert!(
+        marker.exists(),
+        "global server should run without the project override"
+    );
+}
+
+#[test]
+fn opencode_dot_opencode_dir_and_inline_content_take_precedence() {
+    let home = tempdir().unwrap();
+    let h = home.path();
+    let repo = tempdir().unwrap();
+    let root = fs::canonicalize(repo.path()).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("opencode.json"), r#"{"prompt":"project"}"#).unwrap();
+    fs::create_dir_all(root.join(".opencode")).unwrap();
+    fs::write(
+        root.join(".opencode/opencode.json"),
+        r#"{"prompt":"dot-opencode"}"#,
+    )
+    .unwrap();
+    let mut got = Vec::new();
+    for content in [None, Some(r#"{"prompt":"inline content wins"}"#)] {
+        with_env(
+            &[("HOME", h.to_str()), ("OPENCODE_CONFIG_CONTENT", content)],
+            || {
+                let l = build_ledger("opencode", Some(&root)).unwrap();
+                got.push(item(&l, "opencode prompt").unwrap().content_bytes);
+            },
+        );
+    }
+    assert_eq!(got, vec!["dot-opencode".len(), "inline content wins".len()]);
+}
+
+#[test]
+fn claude_md_imports_expand_recursively_up_to_four_hops() {
+    with_home(|home| {
+        let dir = home.join(".claude");
+        fs::create_dir_all(dir.join("notes")).unwrap();
+        fs::write(dir.join("CLAUDE.md"), "root @notes/h1.md").unwrap();
+        // Relative imports resolve against the importing file's directory.
+        fs::write(dir.join("notes/h1.md"), "one @h2.md").unwrap();
+        // A cycle back to an already-loaded file is not counted again.
+        fs::write(dir.join("notes/h2.md"), "two @h3.md @../CLAUDE.md @h1.md").unwrap();
+        fs::write(dir.join("notes/h3.md"), "three @~/.claude/notes/h4.md").unwrap();
+        fs::write(dir.join("notes/h4.md"), "four @h5.md").unwrap();
+        fs::write(dir.join("notes/h5.md"), "five: too deep").unwrap();
+        let l = build_ledger("claude", None).unwrap();
+        let names: Vec<_> = l.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Global CLAUDE.md",
+                "@notes/h1.md (from CLAUDE.md)",
+                "@h2.md (from h1.md)",
+                "@h3.md (from h2.md)",
+                "@~/.claude/notes/h4.md (from h3.md)",
+            ]
+        );
+        assert!(l
+            .items
+            .iter()
+            .all(|i| i.kind == ItemKind::GlobalInstructions));
+    });
+}
+
+#[test]
+fn project_claude_md_external_imports_need_approval() {
+    with_home(|home| {
+        fs::write(home.join("outside.md"), "personal notes").unwrap();
+        let repo = tempdir().unwrap();
+        let proj = fs::canonicalize(repo.path()).unwrap();
+        fs::create_dir_all(proj.join(".git")).unwrap();
+        fs::write(proj.join("inside.md"), "in repo").unwrap();
+        fs::write(proj.join("CLAUDE.md"), "@inside.md\n@~/outside.md").unwrap();
+        let names = |approved: Option<bool>| {
+            let mut entry = serde_json::json!({});
+            if let Some(a) = approved {
+                entry["hasClaudeMdExternalIncludesApproved"] = a.into();
+            }
+            let cfg = serde_json::json!({ "projects": { proj.to_str().unwrap(): entry } });
+            fs::write(home.join(".claude.json"), cfg.to_string()).unwrap();
+            let l = build_ledger("claude", Some(&proj)).unwrap();
+            l.items
+                .iter()
+                .filter(|i| i.name.starts_with('@'))
+                .map(|i| (i.name.clone(), i.kind))
+                .collect::<Vec<_>>()
+        };
+        let inside = (
+            "@inside.md (from CLAUDE.md)".to_string(),
+            ItemKind::ProjectInstructions,
+        );
+        let outside = (
+            "@~/outside.md (from CLAUDE.md)".to_string(),
+            ItemKind::ProjectInstructions,
+        );
+        assert_eq!(names(None), vec![inside.clone()]);
+        assert_eq!(names(Some(false)), vec![inside.clone()]);
+        assert_eq!(names(Some(true)), vec![inside, outside]);
+    });
+}
+
+fn write_json(path: &std::path::Path, v: serde_json::Value) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, v.to_string()).unwrap();
+}
+
+#[test]
+fn claude_installed_plugins_contribute_skills_commands_agents_and_mcp() {
+    with_home(|home| {
+        let plugins = home.join(".claude/plugins");
+        let root = plugins.join("cache/mkt/demo/1.0.0");
+        write_json(
+            &root.join(".claude-plugin/plugin.json"),
+            serde_json::json!({ "name": "demo", "agents": ["./custom/rev.md"] }),
+        );
+        fs::create_dir_all(root.join("skills/s1")).unwrap();
+        fs::write(
+            root.join("skills/s1/SKILL.md"),
+            format!(
+                "---\nname: s1\ndescription: d\n---\n{}",
+                "body ".repeat(500)
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("commands")).unwrap();
+        fs::write(
+            root.join("commands/c1.md"),
+            "First line\nlong body ".repeat(50),
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("agents")).unwrap();
+        fs::write(root.join("agents/ignored.md"), "replaced by manifest").unwrap();
+        fs::create_dir_all(root.join("custom")).unwrap();
+        fs::write(
+            root.join("custom/rev.md"),
+            "---\ndescription: reviews\n---\nbody",
+        )
+        .unwrap();
+        let script = format!(
+            "echo ran > \"$0\"; read a; echo '{INIT_OK}'; read b; read c; echo '{TOOLS_OK}'; sleep 5"
+        );
+        write_json(
+            &root.join(".mcp.json"),
+            serde_json::json!({ "mcpServers": { "srv": {
+                "command": "/bin/sh", "args": ["-c", script, "${CLAUDE_PLUGIN_ROOT}/ran"]
+            } } }),
+        );
+        // A disabled plugin and an install for another project contribute nothing.
+        let off = plugins.join("cache/mkt/off/1.0.0");
+        fs::create_dir_all(off.join("skills/x")).unwrap();
+        fs::write(off.join("skills/x/SKILL.md"), "x").unwrap();
+        let other = plugins.join("cache/mkt/other/1.0.0");
+        fs::create_dir_all(other.join("skills/y")).unwrap();
+        fs::write(other.join("skills/y/SKILL.md"), "y").unwrap();
+        // The old guessed layout is not a plugin.
+        write_json(
+            &plugins.join("legacy/plugin.json"),
+            serde_json::json!({"name": "legacy"}),
+        );
+        write_json(
+            &plugins.join("installed_plugins.json"),
+            serde_json::json!({ "version": 2, "plugins": {
+                "demo@mkt": [{ "scope": "user", "installPath": root }],
+                "off@mkt": [{ "scope": "user", "installPath": off }],
+                "other@mkt": [{ "scope": "project", "projectPath": "/elsewhere", "installPath": other }]
+            } }),
+        );
+        write_json(
+            &home.join(".claude/settings.json"),
+            serde_json::json!({ "enabledPlugins": { "off@mkt": false } }),
+        );
+        let l = build_ledger("claude", None).unwrap();
+        let mut names: Vec<_> = l.items.iter().map(|i| i.name.as_str()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "mcp: plugin:demo:srv",
+                "plugin agent: demo:rev",
+                "plugin command: demo:c1",
+                "plugin skill: demo:s1",
+            ]
+        );
+        let by = |n: &str| l.items.iter().find(|i| i.name == n).unwrap();
+        assert_eq!(
+            by("plugin command: demo:c1").content_bytes,
+            "First line".len()
+        );
+        assert_eq!(
+            by("plugin skill: demo:s1").content_bytes,
+            "name: s1\ndescription: d\n".len()
+        );
+        assert_eq!(by("mcp: plugin:demo:srv").tool_count, Some(2));
+        assert_eq!(by("mcp: plugin:demo:srv").path, root.join(".mcp.json"));
+        assert!(
+            fs::canonicalize(&root).unwrap().join("ran").exists(),
+            "${{CLAUDE_PLUGIN_ROOT}} not substituted"
+        );
+    });
+}
+
+#[test]
+fn claude_project_scoped_plugin_needs_trust() {
+    with_home(|home| {
+        let repo = tempdir().unwrap();
+        let proj = fs::canonicalize(repo.path()).unwrap();
+        let root = home.join(".claude/plugins/cache/mkt/team/1.0.0");
+        fs::create_dir_all(root.join("skills/t")).unwrap();
+        fs::write(root.join("skills/t/SKILL.md"), "team skill").unwrap();
+        write_json(
+            &home.join(".claude/plugins/installed_plugins.json"),
+            serde_json::json!({ "plugins": { "team@mkt": [
+                { "scope": "project", "projectPath": proj, "installPath": root }
+            ] } }),
+        );
+        let run = |trusted: bool| {
+            write_json(
+                &home.join(".claude.json"),
+                serde_json::json!({ "projects": { proj.to_str().unwrap(): {
+                    "hasTrustDialogAccepted": trusted
+                } } }),
+            );
+            build_ledger("claude", Some(&proj))
+                .unwrap()
+                .items
+                .iter()
+                .any(|i| i.name == "plugin skill: team:t")
+        };
+        assert!(!run(false), "untrusted project plugin loaded");
+        assert!(run(true), "trusted project plugin missing");
+    });
 }

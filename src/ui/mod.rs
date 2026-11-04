@@ -6,7 +6,7 @@
 //! `#[cfg(target_os = ...)]` — which keeps `tests/strict_cfg.rs` happy without
 //! scattering OS checks through `src/ui/`.
 //!
-//! The data layer (`menubar::build_snapshot` / `Snapshot` / the provider-group
+//! The data layer (`menubar::model::build_snapshot` / `Snapshot` / the provider-group
 //! and account ordering / `handle_click`'s id-routing) is UNCHANGED. This module
 //! only adds a *renderer*: `menubar::popover_model` folds a `Snapshot` into the
 //! toolkit-neutral [`PopoverModel`] below, and [`popover`] draws it with native
@@ -19,7 +19,7 @@
 
 pub(crate) mod popover;
 
-/// Usage-severity band for a percentage span, mirroring `menubar::Severity`
+/// Usage-severity band for a percentage span, mirroring `menubar::model::Severity`
 /// but kept local so the view-model layer doesn't depend on the private
 /// renderer enum. The popover maps these to `NSColor` semantic system colors
 /// (`systemOrangeColor` / `systemRedColor`) so dark/light mode is automatic.
@@ -31,13 +31,13 @@ pub(crate) enum Sev {
 
 /// A colored run inside an account row's trailing `S% / W%` (or locked
 /// countdown) text. Offsets/lengths are UTF-16 code units — the unit
-/// `NSRange` counts in — matching how `menubar::trailing_for_account`
+/// `NSRange` counts in — matching how `menubar::render::trailing_for_account`
 /// produces them.
 #[derive(Clone, Debug)]
 pub(crate) struct PctSpan {
-    pub start: usize,
-    pub len: usize,
-    pub sev: Sev,
+    pub(crate) start: usize,
+    pub(crate) len: usize,
+    pub(crate) sev: Sev,
 }
 
 /// One rendered row of the popover's top-level list. Each variant carries the
@@ -74,5 +74,5 @@ pub(crate) enum PopoverRow {
 /// [`popover::PopoverHost`].
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PopoverModel {
-    pub rows: Vec<PopoverRow>,
+    pub(crate) rows: Vec<PopoverRow>,
 }

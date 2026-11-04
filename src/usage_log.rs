@@ -35,37 +35,37 @@ use crate::store;
 /// The whole point of the history log — every field is here so downstream
 /// analyses (sparkline, pace, burn rate, cost) never have to re-derive them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Snapshot {
-    pub ts: DateTime<Utc>,
-    pub provider: String,
-    pub account: String,
+pub(crate) struct Snapshot {
+    pub(crate) ts: DateTime<Utc>,
+    pub(crate) provider: String,
+    pub(crate) account: String,
     #[serde(default)]
-    pub session_pct: Option<f32>,
+    pub(crate) session_pct: Option<f32>,
     #[serde(default)]
-    pub weekly_pct: Option<f32>,
+    pub(crate) weekly_pct: Option<f32>,
     #[serde(default)]
-    pub active_model: Option<String>,
+    pub(crate) active_model: Option<String>,
     /// Whether the account was the provider's active one (0.12.2+; replay).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active: Option<bool>,
+    pub(crate) active: Option<bool>,
     /// The windows' reported resets (0.12.2+; replay).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_reset: Option<DateTime<Utc>>,
+    pub(crate) session_reset: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub weekly_reset: Option<DateTime<Utc>>,
+    pub(crate) weekly_reset: Option<DateTime<Utc>>,
     /// When the reading in this row was fetched (unix secs; 0.12.2+). A
     /// 429/err/skip row repeats the cached reading, so this is older than `ts`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fetched_at: Option<i64>,
+    pub(crate) fetched_at: Option<i64>,
     /// `"ok"`, `"429"`, `"err"` or `"skip"` (0.12.2+). Rows without it are
     /// pre-0.12.2 successful readings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outcome: Option<String>,
+    pub(crate) outcome: Option<String>,
 }
 
 impl Snapshot {
     /// A successful reading (not a 429/err/skip row repeating the cache).
-    pub fn is_reading(&self) -> bool {
+    pub(crate) fn is_reading(&self) -> bool {
         self.outcome.as_deref().is_none_or(|o| o == "ok")
     }
 }
@@ -75,13 +75,13 @@ impl Snapshot {
 /// upcoming burn/cost modules). String-typed for portability across the state
 /// v1 (email-keyed) and future v2 (bucket-keyed) layouts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub struct AccountKey {
-    pub provider: String,
-    pub account: String,
+pub(crate) struct AccountKey {
+    pub(crate) provider: String,
+    pub(crate) account: String,
 }
 
 impl AccountKey {
-    pub fn new(provider: impl Into<String>, account: impl Into<String>) -> Self {
+    pub(crate) fn new(provider: impl Into<String>, account: impl Into<String>) -> Self {
         Self {
             provider: provider.into(),
             account: account.into(),
@@ -93,11 +93,11 @@ impl AccountKey {
 /// `slope_pct_per_hour` is percentage points per hour; `confidence` is R² of
 /// the fit (0..=1); `sample_count` is the number of samples used.
 #[derive(Debug, Clone)]
-pub struct PaceEstimate {
-    pub slope_pct_per_hour: f64,
-    pub confidence: f64,
+pub(crate) struct PaceEstimate {
+    pub(crate) slope_pct_per_hour: f64,
+    pub(crate) confidence: f64,
     #[allow(dead_code)] // rendered by v0.5.0 pace/burn detail row
-    pub sample_count: usize,
+    pub(crate) sample_count: usize,
 }
 
 /// Batch fsyncs every this many appended rows. The daemon polls on the order
@@ -140,7 +140,7 @@ fn month_path_ym(dir: &Path, year: i32, month: u32) -> PathBuf {
 /// Append `snap` to the current month's history file. Rotation-pruning runs
 /// once per process (first append), month-boundary handoff is automatic (the
 /// appender reopens when the target path changes). O_APPEND-atomic per line.
-pub fn append(snap: &Snapshot) -> Result<()> {
+pub(crate) fn append(snap: &Snapshot) -> Result<()> {
     let dir = log_dir()?;
     std::fs::create_dir_all(&dir).context("creating history dir")?;
     // Prune stale month files on the first append per process.
@@ -168,7 +168,7 @@ pub fn append(snap: &Snapshot) -> Result<()> {
 /// `RETAIN_DAYS` and mark this process as having rotated. Cheap; safe to call
 /// repeatedly. `now` is threaded through so tests can pin a moment in time.
 #[allow(dead_code)] // wired into daily maintenance loop in v0.5.0
-pub fn rotate_if_needed(now: DateTime<Utc>) -> Result<()> {
+fn rotate_if_needed(now: DateTime<Utc>) -> Result<()> {
     let dir = log_dir()?;
     std::fs::create_dir_all(&dir).context("creating history dir")?;
     rotate_files(&dir, now)?;
@@ -185,7 +185,7 @@ pub fn rotate_if_needed(now: DateTime<Utc>) -> Result<()> {
 /// by a process-wide mtime-keyed cache: month files whose mtime is unchanged
 /// since the last read are served from memory. Cache is invalidated as soon
 /// as any tracked month file's mtime advances.
-pub fn last_n_days(account: &AccountKey, days: u32) -> Vec<Snapshot> {
+pub(crate) fn last_n_days(account: &AccountKey, days: u32) -> Vec<Snapshot> {
     let Ok(dir) = log_dir() else {
         return Vec::new();
     };
@@ -196,6 +196,40 @@ pub fn last_n_days(account: &AccountKey, days: u32) -> Vec<Snapshot> {
     // reader (sparkline, pace, burn rate, rates) wants real readings only.
     rows.retain(Snapshot::is_reading);
     rows
+}
+
+// ---------------------------------------------------------------------------
+// History aliases
+// ---------------------------------------------------------------------------
+
+/// Account → the older key its earlier rows were written under (an account
+/// renamed by a keying upgrade; see `State::rename_provider_account`).
+fn history_aliases() -> &'static Mutex<HashMap<AccountKey, AccountKey>> {
+    static ALIASES: OnceLock<Mutex<HashMap<AccountKey, AccountKey>>> = OnceLock::new();
+    ALIASES.get_or_init(Default::default)
+}
+
+/// Make `provider`/`legacy` rows read as `provider`/`key`'s history.
+pub(crate) fn register_history_alias(provider: &str, key: &str, legacy: &str) {
+    if let Ok(mut aliases) = history_aliases().lock() {
+        aliases.insert(
+            AccountKey::new(provider, key.to_ascii_lowercase()),
+            AccountKey::new(provider, legacy),
+        );
+    }
+}
+
+/// `account` itself, then the key its older rows were written under.
+fn history_keys(account: &AccountKey) -> Vec<AccountKey> {
+    let lookup = AccountKey::new(
+        account.provider.clone(),
+        account.account.to_ascii_lowercase(),
+    );
+    let alias = history_aliases()
+        .lock()
+        .ok()
+        .and_then(|aliases| aliases.get(&lookup).cloned());
+    std::iter::once(account.clone()).chain(alias).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +247,42 @@ pub fn last_n_days(account: &AccountKey, days: u32) -> Vec<Snapshot> {
 #[derive(Default, Clone)]
 struct MonthIndex {
     by_account: HashMap<AccountKey, Vec<Snapshot>>,
+    /// The last [`GUARD_BYTES`] of the file bytes this index covers. A later
+    /// stamp change that only grew the file is re-read from the cached length
+    /// (not re-parsed whole) when these bytes still sit just before it, i.e.
+    /// another process appended. Empty = unknown, so the next miss re-parses.
+    guard: Vec<u8>,
+}
+
+/// Bytes of file tail kept to confirm the cached prefix is still the file's.
+const GUARD_BYTES: u64 = 64;
+
+/// The up-to-[`GUARD_BYTES`] bytes of `path` ending at offset `len`.
+fn read_guard(path: &Path, len: u64) -> Vec<u8> {
+    use std::io::{Read, Seek, SeekFrom};
+    let start = len.saturating_sub(GUARD_BYTES);
+    let Ok(mut f) = File::open(path) else {
+        return Vec::new();
+    };
+    let mut buf = vec![0u8; (len - start) as usize];
+    if f.seek(SeekFrom::Start(start)).is_err() || f.read_exact(&mut buf).is_err() {
+        return Vec::new();
+    }
+    buf
+}
+
+/// Parse only the rows of `path` after offset `from`, when the cached prefix
+/// provably still leads the file. `None` = fall back to a whole-month parse.
+fn parse_appended(path: &Path, prev: &MonthIndex, from: u64) -> Option<Vec<Snapshot>> {
+    use std::io::{Seek, SeekFrom};
+    if prev.guard.is_empty() || from == 0 || read_guard(path, from) != prev.guard {
+        return None;
+    }
+    let mut f = File::open(path).ok()?;
+    f.seek(SeekFrom::Start(from)).ok()?;
+    #[cfg(test)]
+    TAIL_PARSE_COUNT.with(|c| c.set(c.get() + 1));
+    Some(parse_reader(BufReader::new(f)))
 }
 
 impl MonthIndex {
@@ -224,7 +294,10 @@ impl MonthIndex {
                 .or_default()
                 .push(snap);
         }
-        Self { by_account }
+        Self {
+            by_account,
+            guard: Vec::new(),
+        }
     }
 }
 
@@ -257,6 +330,7 @@ fn month_ordinal(year: i32, month: u32) -> i32 {
 #[cfg(test)]
 thread_local! {
     static PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TAIL_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Default)]
@@ -278,6 +352,7 @@ fn read_range_cached(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Vec<Snapshot> {
+    let keys = history_keys(account);
     let mut out = Vec::new();
     let mut y = from.year();
     let mut m = from.month();
@@ -286,8 +361,8 @@ fn read_range_cached(
         let path = month_path_ym(dir, y, m);
         let index = load_month_cached(&path, y, m);
         // Only this account's rows are scanned, not the whole month's.
-        if let Some(rows) = index.by_account.get(account) {
-            for snap in rows {
+        for key in &keys {
+            for snap in index.by_account.get(key).into_iter().flatten() {
                 if snap.ts >= from && snap.ts <= to {
                     out.push(snap.clone());
                 }
@@ -328,16 +403,34 @@ fn load_month_cached_with(
 ) -> Arc<MonthIndex> {
     let stamp = file_stamp(path);
 
+    let mut stale = None;
     if let Ok(cache) = month_cache().lock() {
         if let Some((cached, index)) = cache.months.get(&(year, month)) {
             if *cached == stamp {
                 return Arc::clone(index);
             }
+            stale = Some((*cached, Arc::clone(index)));
         }
     }
-    // Cache miss / stale — parse (unlocked), index by account, and store.
-    let index = Arc::new(MonthIndex::build(parse_month(path)));
+    // Cache miss / stale — parse (unlocked), index by account, and store. A file
+    // that only grew (another process appended) parses just its new tail.
+    let mut built = stale
+        .filter(|((mtime, len), _)| stamp.1 > *len && stamp.0 >= *mtime)
+        .and_then(|((_, len), prev)| {
+            let tail = parse_appended(path, &prev, len)?;
+            let mut idx = (*prev).clone();
+            for snap in tail {
+                idx.by_account
+                    .entry(AccountKey::new(snap.provider.clone(), snap.account.clone()))
+                    .or_default()
+                    .push(snap);
+            }
+            Some(idx)
+        })
+        .unwrap_or_else(|| MonthIndex::build(parse_month(path)));
     after_parse();
+    built.guard = read_guard(path, stamp.1);
+    let index = Arc::new(built);
     // Cache only if the file did not move during the parse: an index that may
     // hold rows newer than its stamp would be double-patched by a later append.
     if file_stamp(path) != stamp {
@@ -361,6 +454,7 @@ fn load_month_cached_with(
 /// the whole month), otherwise drop the entry.
 fn cache_note_append(path: &Path, snap: &Snapshot, before: FileStamp, line_len: u64) {
     let after = file_stamp(path);
+    let guard = read_guard(path, after.1);
     let (year, month) = (snap.ts.year(), snap.ts.month());
     let Ok(mut cache) = month_cache().lock() else {
         return;
@@ -372,6 +466,7 @@ fn cache_note_append(path: &Path, snap: &Snapshot, before: FileStamp, line_len: 
                 .entry(AccountKey::new(snap.provider.clone(), snap.account.clone()))
                 .or_default()
                 .push(snap.clone());
+            index_guard(index, guard);
             *stamp = after;
             true
         }
@@ -380,6 +475,10 @@ fn cache_note_append(path: &Path, snap: &Snapshot, before: FileStamp, line_len: 
     if !patched {
         cache.months.remove(&(year, month));
     }
+}
+
+fn index_guard(index: &mut Arc<MonthIndex>, guard: Vec<u8>) {
+    Arc::make_mut(index).guard = guard;
 }
 
 fn parse_month(path: &Path) -> Vec<Snapshot> {
@@ -432,7 +531,7 @@ pub(crate) fn evict_recent_months() {
 /// Most recent snapshot for `account` in the current + previous month's
 /// history files, or `None` if this account has no rows yet. Used by the
 /// notifications module to derive a "prev" for the pair-based `evaluate`.
-pub fn last_snapshot(account: &AccountKey) -> Option<Snapshot> {
+pub(crate) fn last_snapshot(account: &AccountKey) -> Option<Snapshot> {
     let dir = log_dir().ok()?;
     let now = Utc::now();
     // Read enough history to survive a month boundary just after midnight UTC.
@@ -441,11 +540,12 @@ pub fn last_snapshot(account: &AccountKey) -> Option<Snapshot> {
     // of NDJSON per tick is wasteful.
     let (from, to) = (now - Duration::days(35), now);
     // Scan the cached per-account rows for the newest reading; clone only it.
+    let keys = history_keys(account);
     let (mut y, mut m) = (from.year(), from.month());
     let mut best: Option<Snapshot> = None;
     loop {
         let index = load_month_cached(&month_path_ym(&dir, y, m), y, m);
-        if let Some(rows) = index.by_account.get(account) {
+        for rows in keys.iter().filter_map(|k| index.by_account.get(k)) {
             let newest = rows
                 .iter()
                 .filter(|s| s.ts >= from && s.ts <= to && s.is_reading())
@@ -473,7 +573,7 @@ pub fn last_snapshot(account: &AccountKey) -> Option<Snapshot> {
 /// for `account`, oldest bucket on the left. Missing day = `·`. Cutoffs at
 /// 0/20/40/60/80 map to ▁▂▄▇█.
 #[allow(dead_code)] // wired into v0.5.0 sparkline row
-pub fn sparkline_7d(account: &AccountKey) -> String {
+fn sparkline_7d(account: &AccountKey) -> String {
     let snaps = last_n_days(account, 7);
     sparkline_from_snaps(&snaps, Local::now().date_naive())
 }
@@ -482,7 +582,7 @@ pub fn sparkline_7d(account: &AccountKey) -> String {
 /// most recent reset), as slope + R² confidence + sample count. Returns None
 /// if the current window has fewer than 6 samples or the slope is not
 /// strictly positive.
-pub fn pace(account: &AccountKey) -> Option<PaceEstimate> {
+pub(crate) fn pace(account: &AccountKey) -> Option<PaceEstimate> {
     let snaps = last_n_days(account, 8);
     pace_from_snaps(&snaps)
 }
@@ -501,7 +601,7 @@ fn decisions_path(dir: &Path, ts: DateTime<Utc>) -> PathBuf {
 /// history log). One `write_all` of the whole line with O_APPEND, so
 /// concurrent writers never interleave a line. Rare (one line per decision change), so no
 /// batching.
-pub fn append_decision(v: &serde_json::Value) -> Result<()> {
+pub(crate) fn append_decision(v: &serde_json::Value) -> Result<()> {
     let dir = log_dir()?;
     std::fs::create_dir_all(&dir).context("creating history dir")?;
     if !BOOT_ROTATED.swap(true, Ordering::SeqCst) {
@@ -522,7 +622,7 @@ pub fn append_decision(v: &serde_json::Value) -> Result<()> {
 
 /// Every decision line in this month's decisions log (tests and replay).
 #[cfg(test)]
-pub fn read_decisions() -> Vec<serde_json::Value> {
+pub(crate) fn read_decisions() -> Vec<serde_json::Value> {
     let Ok(dir) = log_dir() else {
         return Vec::new();
     };
@@ -700,6 +800,7 @@ fn read_range(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Vec<Snapshot> {
+    let keys = history_keys(account);
     let mut out = Vec::new();
     let mut y = from.year();
     let mut m = from.month();
@@ -721,8 +822,9 @@ fn read_range(
                     continue;
                 }
                 if let Ok(snap) = serde_json::from_str::<Snapshot>(&line) {
-                    let account_matches =
-                        snap.provider == account.provider && snap.account == account.account;
+                    let account_matches = keys
+                        .iter()
+                        .any(|k| snap.provider == k.provider && snap.account == k.account);
                     if snap.ts >= from && snap.ts <= to && account_matches {
                         out.push(snap);
                     }
@@ -1751,6 +1853,48 @@ mod tests {
             parses,
             "an append must not force a whole-month re-parse"
         );
+    }
+
+    #[test]
+    fn another_process_append_parses_only_the_tail_and_a_rewrite_reparses() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = AccountKey::new("claude", "a@x.io");
+        let path = month_path_ym(dir.path(), 2046, 4);
+        let line = |d: u32, pct: f32| {
+            format!(
+                "{}\n",
+                serde_json::to_string(&snap("claude", "a@x.io", utc(2046, 4, d, 0), Some(pct)))
+                    .unwrap()
+            )
+        };
+        let read = || {
+            weeklies(&read_range_cached(
+                dir.path(),
+                &key,
+                utc(2046, 4, 1, 0),
+                utc(2046, 4, 28, 0),
+            ))
+        };
+        std::fs::write(&path, line(1, 1.0)).unwrap();
+        assert_eq!(read(), vec![1.0]);
+        let (full, tail) = (
+            PARSE_COUNT.with(|c| c.get()),
+            TAIL_PARSE_COUNT.with(|c| c.get()),
+        );
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(line(2, 2.0).as_bytes()).unwrap();
+        drop(f);
+        assert_eq!(read(), vec![1.0, 2.0]);
+        assert_eq!(PARSE_COUNT.with(|c| c.get()), full, "no whole-month parse");
+        assert_eq!(TAIL_PARSE_COUNT.with(|c| c.get()), tail + 1);
+        // A longer file whose prefix changed is not an append: full re-parse.
+        std::fs::write(
+            &path,
+            format!("{}{}{}", line(1, 7.0), line(2, 8.0), line(3, 9.0)),
+        )
+        .unwrap();
+        assert_eq!(read(), vec![7.0, 8.0, 9.0]);
+        assert!(PARSE_COUNT.with(|c| c.get()) > full);
     }
 
     #[test]

@@ -24,21 +24,27 @@ const INACTIVE_FLOOR_S: i64 = 600;
 
 /// One simulated account: its true usage and what usagio has cached.
 #[derive(Clone, Debug)]
-pub struct SimAccount {
-    pub key: String,
-    pub s: f64,
-    pub s_reset: DateTime<Utc>,
-    pub has_session: bool,
-    pub w: f64,
-    pub w_reset: DateTime<Utc>,
-    pub credits: Option<i64>,
+pub(crate) struct SimAccount {
+    pub(crate) key: String,
+    pub(crate) s: f64,
+    s_reset: DateTime<Utc>,
+    has_session: bool,
+    pub(crate) w: f64,
+    w_reset: DateTime<Utc>,
+    pub(crate) credits: Option<i64>,
     /// When usagio last read it (the initial cache is a reading at this
     /// time of the start values); `None` = never read.
-    pub read_at: Option<DateTime<Utc>>,
+    read_at: Option<DateTime<Utc>>,
 }
 
 impl SimAccount {
-    pub fn new(key: &str, s: f64, w: f64, s_reset: DateTime<Utc>, w_reset: DateTime<Utc>) -> Self {
+    pub(crate) fn new(
+        key: &str,
+        s: f64,
+        w: f64,
+        s_reset: DateTime<Utc>,
+        w_reset: DateTime<Utc>,
+    ) -> Self {
         SimAccount {
             key: key.to_string(),
             s,
@@ -51,7 +57,7 @@ impl SimAccount {
         }
     }
 
-    pub fn read(mut self, at: DateTime<Utc>) -> Self {
+    pub(crate) fn read(mut self, at: DateTime<Utc>) -> Self {
         self.read_at = Some(at);
         self
     }
@@ -72,30 +78,30 @@ type Mask = Box<dyn Fn(&str, DateTime<Utc>) -> bool>;
 type Correlated = (f64, Box<dyn Fn(DateTime<Utc>) -> bool>);
 
 /// A scenario (§8.2).
-pub struct Scenario {
-    pub start: DateTime<Utc>,
-    pub end: DateTime<Utc>,
-    pub accounts: Vec<SimAccount>,
-    pub active: String,
+pub(crate) struct Scenario {
+    pub(crate) start: DateTime<Utc>,
+    pub(crate) end: DateTime<Utc>,
+    pub(crate) accounts: Vec<SimAccount>,
+    pub(crate) active: String,
     /// `(from, session_rate, weekly_rate)` pct/min, sorted by `from`.
-    pub workload: Vec<(DateTime<Utc>, f64, f64)>,
-    pub trigger: f64,
+    workload: Vec<(DateTime<Utc>, f64, f64)>,
+    pub(crate) trigger: f64,
     /// Per-account 429 mask for usage reads.
-    pub mask_429: Mask,
+    mask_429: Mask,
     /// Correlated 429s: one draw per cycle for every token, while `in(t)`.
-    pub correlated: Option<Correlated>,
+    correlated: Option<Correlated>,
     /// `NeedReading` reads that fail (non-429).
-    pub verify_fail: Mask,
-    pub manual: Vec<(DateTime<Utc>, String)>,
-    pub external: Vec<(DateTime<Utc>, String)>,
-    pub sleep: Vec<(DateTime<Utc>, DateTime<Utc>)>,
-    pub post_leave_lag: bool,
-    pub use_credits: bool,
-    pub seed: u64,
+    verify_fail: Mask,
+    pub(crate) manual: Vec<(DateTime<Utc>, String)>,
+    pub(crate) external: Vec<(DateTime<Utc>, String)>,
+    pub(crate) sleep: Vec<(DateTime<Utc>, DateTime<Utc>)>,
+    post_leave_lag: bool,
+    pub(crate) use_credits: bool,
+    pub(crate) seed: u64,
 }
 
 impl Scenario {
-    pub fn new(
+    pub(crate) fn new(
         start: DateTime<Utc>,
         end: DateTime<Utc>,
         active: &str,
@@ -123,49 +129,57 @@ impl Scenario {
 
 /// One switch.
 #[derive(Clone, Debug)]
-pub struct SimSwitch {
-    pub t: DateTime<Utc>,
-    pub from: String,
-    pub to: String,
-    pub kind: Kind,
+struct SimSwitch {
+    pub(crate) t: DateTime<Utc>,
+    pub(crate) from: String,
+    pub(crate) to: String,
+    pub(crate) kind: Kind,
     /// The target's reading time when the switch was decided.
-    pub target_fetched_at: Option<i64>,
+    target_fetched_at: Option<i64>,
     /// When we last left the target before this switch, if ever.
-    pub target_left_at: Option<i64>,
+    target_left_at: Option<i64>,
     /// The target's assessment at decision time (latches, runway).
-    pub target: Assessed,
+    pub(crate) target: Assessed,
     /// The account left's assessment at decision time.
-    pub source: Assessed,
+    pub(crate) source: Assessed,
     /// Some other account was servable when the switch was decided.
-    pub servable_existed: bool,
+    servable_existed: bool,
 }
 
 /// What a run did (§8.2).
 #[derive(Debug, Default)]
-pub struct Trace {
-    pub switches: Vec<SimSwitch>,
+pub(crate) struct Trace {
+    switches: Vec<SimSwitch>,
     /// Seconds on a truly blocked active account while another account
     /// truly had room.
-    pub blocked_secs: i64,
-    pub notices: usize,
+    blocked_secs: i64,
+    pub(crate) notices: usize,
     /// `(t, key, outcome, kind)` for every usage request (kind: active,
     /// verify, poll).
-    pub fetches: Vec<(DateTime<Utc>, String, String, &'static str)>,
+    pub(crate) fetches: Vec<(DateTime<Utc>, String, String, &'static str)>,
     /// A sliding-window budget overrun (§5.7), if any.
-    pub budget_overrun: Option<String>,
+    budget_overrun: Option<String>,
     /// `(t, decision)` per cycle.
-    pub decisions: Vec<(DateTime<Utc>, Decision)>,
+    decisions: Vec<(DateTime<Utc>, Decision)>,
     /// Invariant violations seen by the per-cycle checks.
-    pub violations: Vec<String>,
+    violations: Vec<String>,
     /// The first time the active account was read at or over the trigger,
     /// per account.
-    pub first_real_at_trigger: Vec<(String, DateTime<Utc>)>,
+    first_real_at_trigger: Vec<(String, DateTime<Utc>)>,
 }
 
 impl Trace {
-    pub fn blocked_minutes(&self) -> f64 {
+    fn blocked_minutes(&self) -> f64 {
         self.blocked_secs as f64 / 60.0
     }
+}
+
+/// The sim's manual pick: the decision input plus its own settling state.
+#[derive(Clone)]
+struct SimPick {
+    pick: ManualPick,
+    at: i64,
+    settled_by_fresh: bool,
 }
 
 struct World {
@@ -175,7 +189,7 @@ struct World {
     history: Vec<Vec<Point>>,
     active: String,
     memory: SwapMemory,
-    manual: Option<ManualPick>,
+    manual: Option<SimPick>,
     budget: Budget,
     cur: u64,
     last_active_attempt: Option<(i64, bool)>,
@@ -355,7 +369,8 @@ impl World {
                     true
                 } else {
                     let max = c.s.unwrap_or(0.0).max(c.w);
-                    let floor = crate::v2_active_floor_secs(Some(max), trigger, 180) as i64;
+                    let floor =
+                        crate::poll::claude::v2_active_floor_secs(Some(max), trigger, 180) as i64;
                     let backoff = self
                         .last_active_attempt
                         .is_some_and(|(t, failed)| failed && now_ts - t < self.cur as i64);
@@ -407,13 +422,19 @@ impl World {
                 if let Some(p) = self.manual.as_mut() {
                     if !p.settled_by_fresh && now_ts <= p.at + policy::MANUAL_PICK_SETTLE_S {
                         let c = self.cache[ai].as_ref().unwrap();
-                        p.settled = crate::tier_for_pct(c.s.unwrap_or(0.0).max(c.w), trigger);
+                        p.pick.settled = crate::switching::manual_pick::tier_for_pct(
+                            c.s.unwrap_or(0.0).max(c.w),
+                            trigger,
+                        );
                         p.settled_by_fresh = true;
                     } else if let Some(c) = self.cache[ai].as_ref() {
                         // The hold ends once the pick's tier improves (0.12.1).
-                        let t = crate::tier_for_pct(c.s.unwrap_or(0.0).max(c.w), trigger);
-                        if t < p.settled {
-                            p.settled = t;
+                        let t = crate::switching::manual_pick::tier_for_pct(
+                            c.s.unwrap_or(0.0).max(c.w),
+                            trigger,
+                        );
+                        if t < p.pick.settled {
+                            p.pick.settled = t;
                         }
                         p.settled_by_fresh = true;
                     }
@@ -461,7 +482,7 @@ impl World {
             provider: "claude".into(),
             active: self.active.clone(),
             accounts,
-            manual: self.manual.clone(),
+            manual: self.manual.as_ref().map(|p| p.pick.clone()),
             memory: self.memory.clone(),
             policy: {
                 let mut p = Policy::new(trigger, trigger);
@@ -619,7 +640,7 @@ impl World {
 }
 
 /// Run a scenario.
-pub fn run(sc: Scenario) -> Trace {
+pub(crate) fn run(sc: Scenario) -> Trace {
     let start = sc.start;
     let end = sc.end;
     let accts = sc.accounts.clone();
@@ -671,13 +692,20 @@ pub fn run(sc: Scenario) -> Trace {
             let i = w.idx(&key);
             let settled = w.cache[i]
                 .as_ref()
-                .map(|c| crate::tier_for_pct(c.s.unwrap_or(0.0).max(c.w), w.sc.trigger))
+                .map(|c| {
+                    crate::switching::manual_pick::tier_for_pct(
+                        c.s.unwrap_or(0.0).max(c.w),
+                        w.sc.trigger,
+                    )
+                })
                 .unwrap_or(Tier::Ready);
             w.note_switch(&from, &key, t, ChangeKind::Manual);
-            w.manual = Some(ManualPick {
-                key: key.clone(),
+            w.manual = Some(SimPick {
+                pick: ManualPick {
+                    key: key.clone(),
+                    settled,
+                },
                 at: t.timestamp(),
-                settled,
                 settled_by_fresh: false,
             });
             just_switched = true;
@@ -726,7 +754,7 @@ pub fn run(sc: Scenario) -> Trace {
                 w.cur = policy::ACTIVE_TIGHT_FLOOR_S;
                 5
             } else {
-                w.cur = crate::next_interval_v2(
+                w.cur = crate::watch::cadence::next_interval_v2(
                     w.cur,
                     180,
                     rate_limited,

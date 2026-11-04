@@ -9,7 +9,7 @@ use super::{build_ledger, render_terminal};
 use std::io::Write;
 use std::path::PathBuf;
 
-pub fn run(provider: Option<String>, project: Option<PathBuf>) -> anyhow::Result<()> {
+pub(crate) fn run(provider: Option<String>, project: Option<PathBuf>) -> anyhow::Result<()> {
     let providers = match provider {
         Some(p) => vec![p],
         None => vec![

@@ -138,7 +138,7 @@ pub(crate) struct PopoverHost {
 
 impl PopoverHost {
     /// Create the popover anchored to `button`. `on_click` is invoked with a
-    /// row's click-id on `mouseDown:` (wire it to `menubar::handle_click`).
+    /// row's click-id on `mouseDown:` (wire it to `menubar::actions::handle_click`).
     /// `persistent` selects `ApplicationDefined` behavior (stays open — used by
     /// the `USAGIO_POPOVER_SHOW_ON_LAUNCH` screenshot path) instead of the
     /// normal `.transient` (auto-dismiss on click-outside / focus loss).

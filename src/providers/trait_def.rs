@@ -3,7 +3,6 @@
 // yet to land), so dead-code warnings on the trait/enum surface itself are
 // noise rather than signal. R2-CRAFT-01: narrowed from the previous crate-wide
 // #![allow(dead_code)] on providers/mod.rs to just this file (and state.rs).
-#![allow(dead_code)]
 
 //! Provider trait scaffolding.
 //!
@@ -25,7 +24,7 @@ use std::time::Duration;
 /// menu code can decide how to surface each variant (silence, retry, warn,
 /// disable auto-swap) without string-matching.
 #[derive(Debug)]
-pub enum ProviderError {
+pub(crate) enum ProviderError {
     /// The provider does not implement this operation. Default trait methods
     /// return this so callers can distinguish "not yet built" from "failed".
     Unsupported,
@@ -75,14 +74,14 @@ impl From<std::io::Error> for ProviderError {
     }
 }
 
-pub type PResult<T> = std::result::Result<T, ProviderError>;
+pub(crate) type PResult<T> = std::result::Result<T, ProviderError>;
 
 /// Coarse window classification used by analytics modules (burn-rate,
 /// cost-tracking) that don't need the full `UsageWindow` metadata but do need
 /// to distinguish "the ~5h session bucket" from "the ~7d weekly bucket."
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum Window {
+pub(crate) enum Window {
     Session,
     Weekly,
 }
@@ -91,42 +90,42 @@ pub enum Window {
 /// scheduling. Providers translate their own on-disk blob to/from this shape
 /// via `parse_stored_blob` / `patch_stored_blob`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TokenGrant {
-    pub access: String,
-    pub refresh: Option<String>,
+pub(crate) struct TokenGrant {
+    pub(crate) access: String,
+    pub(crate) refresh: Option<String>,
     /// Seconds from issuance until the access token expires. Providers whose
     /// blob only stores an absolute expiry compute this at parse time.
-    pub expires_in_secs: i64,
+    pub(crate) expires_in_secs: i64,
 }
 
 /// One rate-limit / quota window as displayed in the menu. `id` is a stable
 /// per-provider slug ("session", "weekly", "opus", ...); `label` is what the
 /// menu prints. `utilization` is a percentage in `0.0..=100.0`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct UsageWindow {
-    pub id: String,
-    pub label: String,
-    pub utilization: Option<f64>,
-    pub resets_at: Option<DateTime<Utc>>,
+pub(crate) struct UsageWindow {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) utilization: Option<f64>,
+    pub(crate) resets_at: Option<DateTime<Utc>>,
 }
 
 /// Snapshot of every usage window a provider reports for a single account.
 /// `Vec`, not a map — order is provider-defined and deterministic without
 /// depending on serde's `preserve_order` feature.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct UsageSnapshot {
-    pub windows: Vec<UsageWindow>,
-    pub fetched_at: DateTime<Utc>,
+pub(crate) struct UsageSnapshot {
+    pub(crate) windows: Vec<UsageWindow>,
+    pub(crate) fetched_at: DateTime<Utc>,
     /// The account's plan, when the usage response reports it (Codex's
     /// `plan_type`). `None` when the provider only exposes it elsewhere —
-    /// see [`Provider::check_plan`].
+    /// see [`PlanCheck::check_plan`].
     #[serde(default)]
-    pub plan: Option<PlanStatus>,
+    pub(crate) plan: Option<PlanStatus>,
     /// Extra figures the provider itself reported alongside the windows
     /// (credits, where the week's usage went, per-model limits). Never an
     /// estimate — empty when the provider reported nothing meaningful.
     #[serde(default)]
-    pub reported: ReportedUsage,
+    pub(crate) reported: ReportedUsage,
 }
 
 /// Provider-reported extras beyond the fixed session/weekly windows. Every
@@ -134,26 +133,26 @@ pub struct UsageSnapshot {
 /// generically. All fields default so a cache written before they existed
 /// (or a provider that reports none of them) round-trips cleanly.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct ReportedUsage {
+pub(crate) struct ReportedUsage {
     /// Credits / extra-usage spend, when the provider reports any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub credits: Option<Credits>,
+    pub(crate) credits: Option<Credits>,
     /// How this week's usage splits across the provider's products/surfaces
     /// (Claude: Claude Code / Chats / Cowork / Other), in provider order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub breakdown: Vec<UsageShare>,
+    pub(crate) breakdown: Vec<UsageShare>,
     /// Extra limits scoped to one model or surface (e.g. a "Fable" weekly
     /// bucket), beyond the fixed windows. `label` is display-ready.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub scoped_limits: Vec<UsageWindow>,
+    pub(crate) scoped_limits: Vec<UsageWindow>,
     /// One-shot usage-limit reset grants the provider is offering this account
     /// (Claude's `cedar_ember` promo resets). Empty when none are banked.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub reset_grants: Vec<ResetGrant>,
+    pub(crate) reset_grants: Vec<ResetGrant>,
 }
 
 impl ReportedUsage {
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.credits.is_none()
             && self.breakdown.is_empty()
             && self.scoped_limits.is_empty()
@@ -167,55 +166,59 @@ impl ReportedUsage {
 /// when it can be spent right now (typically the account is at its limit).
 /// Provider-agnostic so a Codex equivalent can fill the same shape.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResetGrant {
+pub(crate) struct ResetGrant {
     /// Stable grant id — the dedup key for "already notified" and the value
     /// POSTed to claim it.
-    pub id: String,
+    pub(crate) id: String,
     /// Human label the provider gives the grant (e.g. "Claude Opus 5.5
     /// launch: one usage-limit reset for Pro and Max").
     #[serde(default)]
-    pub label: String,
+    pub(crate) label: String,
     /// How many resets remain on this grant (0 == already spent).
     #[serde(default)]
-    pub resets_left: u32,
+    pub(crate) resets_left: u32,
     /// Whether the reset can be claimed right now (vs. banked until the
     /// account actually hits a limit, or still in cooldown).
     #[serde(default)]
-    pub usable_now: bool,
+    pub(crate) usable_now: bool,
     /// When the grant expires and can no longer be claimed, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<DateTime<Utc>>,
+    pub(crate) expires_at: Option<DateTime<Utc>>,
 }
 
 impl ResetGrant {
     /// A grant worth surfacing: it still has a reset left to spend.
-    pub fn is_available(&self) -> bool {
+    pub(crate) fn is_available(&self) -> bool {
         self.resets_left >= 1
     }
 }
+
+/// Marker in the error a vendor-slot read returns for an API-key-only blob
+/// (no OAuth login). `lifecycle` matches on it; keep both ends on this const.
+pub(crate) const API_KEY_ONLY_MARK: &str = "API-key-only";
 
 /// An exact amount of money or credits: `amount_minor / 10^exponent` in
 /// `unit`. Kept in integer minor units so formatting never drifts through a
 /// float. `unit` is an ISO currency code ("USD") or [`Money::CREDITS`] for a
 /// provider's own credit unit.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Money {
-    pub amount_minor: i64,
+pub(crate) struct Money {
+    pub(crate) amount_minor: i64,
     #[serde(default)]
-    pub exponent: u32,
-    pub unit: String,
+    pub(crate) exponent: u32,
+    pub(crate) unit: String,
 }
 
 impl Money {
     /// `unit` for amounts in a provider's own credits rather than a currency.
-    pub const CREDITS: &'static str = "credits";
+    pub(crate) const CREDITS: &'static str = "credits";
     /// Largest exponent we'll format; anything bigger is a garbled response.
     const MAX_EXPONENT: u32 = 12;
     /// `amount_minor` standing for "unlimited" (see `Credits::spendable`):
     /// ranks above any real amount and renders as "unlimited".
     const UNLIMITED_MINOR: i64 = i64::MAX;
 
-    pub fn new(amount_minor: i64, exponent: u32, unit: impl Into<String>) -> Option<Self> {
+    pub(crate) fn new(amount_minor: i64, exponent: u32, unit: impl Into<String>) -> Option<Self> {
         (exponent <= Self::MAX_EXPONENT).then(|| Money {
             amount_minor,
             exponent,
@@ -225,7 +228,7 @@ impl Money {
 
     /// Parse a plain decimal string ("120", "12.50", "-3.1") exactly.
     /// Anything else (exponents, junk, too many digits) is `None`.
-    pub fn from_decimal_str(s: &str, unit: impl Into<String>) -> Option<Self> {
+    pub(crate) fn from_decimal_str(s: &str, unit: impl Into<String>) -> Option<Self> {
         let s = s.trim();
         let (neg, digits) = match s.strip_prefix('-') {
             Some(rest) => (true, rest),
@@ -251,18 +254,18 @@ impl Money {
         Money::new(amount, exponent, unit)
     }
 
-    pub fn is_zero(&self) -> bool {
+    pub(crate) fn is_zero(&self) -> bool {
         self.amount_minor == 0
     }
 
     /// Display form: "$12.34", "€5.00", "12.34 CAD", or "120" for credits.
-    pub fn display(&self) -> String {
+    pub(crate) fn display(&self) -> String {
         self.render(false)
     }
 
     /// Whole units only, rounded down: "$627" for $627.06. For tight spots
     /// like an account row; `display` keeps the exact figure.
-    pub fn display_whole(&self) -> String {
+    pub(crate) fn display_whole(&self) -> String {
         self.render(true)
     }
 
@@ -321,31 +324,31 @@ fn group_thousands(n: i128) -> String {
 
 /// Credits / extra-usage spend as the provider reports it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct Credits {
+pub(crate) struct Credits {
     /// Credits / extra usage is switched on for the account.
     #[serde(default)]
-    pub enabled: bool,
+    pub(crate) enabled: bool,
     /// The provider reports unlimited credits.
     #[serde(default)]
-    pub unlimited: bool,
+    pub(crate) unlimited: bool,
     /// The spend cap / overage limit has been hit.
     #[serde(default)]
-    pub limit_reached: bool,
+    pub(crate) limit_reached: bool,
     /// Spent so far in the current period.
     #[serde(default)]
-    pub used: Option<Money>,
+    pub(crate) used: Option<Money>,
     /// The spend cap for the period.
     #[serde(default)]
-    pub limit: Option<Money>,
+    pub(crate) limit: Option<Money>,
     /// Remaining prepaid balance.
     #[serde(default)]
-    pub balance: Option<Money>,
+    pub(crate) balance: Option<Money>,
 }
 
 impl Credits {
     /// Worth showing at all: switched on, capped, or carrying a non-zero
     /// figure. An all-off, all-zero report is noise and maps to `None`.
-    pub fn is_meaningful(&self) -> bool {
+    pub(crate) fn is_meaningful(&self) -> bool {
         self.enabled
             || self.unlimited
             || self.limit_reached
@@ -361,7 +364,7 @@ impl Credits {
     /// or nothing is left — i.e. "can this account keep working on credits".
     /// Unlimited credits are always spendable (until the cap is reported
     /// reached), whatever balance is reported.
-    pub fn spendable(&self) -> Option<Money> {
+    pub(crate) fn spendable(&self) -> Option<Money> {
         if !(self.enabled || self.unlimited) || self.limit_reached {
             return None;
         }
@@ -407,35 +410,35 @@ impl Credits {
 
 /// One product/surface's share of the week's usage, as the provider reports it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct UsageShare {
+pub(crate) struct UsageShare {
     /// Provider's stable key ("claude_code", "chat", …).
     #[serde(default)]
-    pub key: String,
+    pub(crate) key: String,
     /// Display name ("Claude Code", "Chats", …).
-    pub label: String,
+    pub(crate) label: String,
     /// Share of the week's usage, `0.0..=100.0`.
-    pub percent: f64,
+    pub(crate) percent: f64,
 }
 
 /// What plan an account is on, and whether it still pays for one. A lapsed
 /// plan (`active == false`) is rendered as "-" with an explanation, never
 /// polled for usage, and never a swap target — uniformly across providers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PlanStatus {
+pub(crate) struct PlanStatus {
     /// Short human label ("Max 20x", "Pro", "Free", …) when known.
-    pub label: Option<String>,
-    pub active: bool,
+    pub(crate) label: Option<String>,
+    pub(crate) active: bool,
 }
 
 /// Identity fields we know about an account. All optional so a provider with
 /// only a UUID (opencode, qwen-code) can still populate what it has; the raw
 /// vendor blob rides along in `native_blob` for round-tripping.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct IdentitySnapshot {
-    pub email: Option<String>,
-    pub uuid: Option<String>,
-    pub display_name: Option<String>,
-    pub native_blob: Value,
+pub(crate) struct IdentitySnapshot {
+    pub(crate) email: Option<String>,
+    pub(crate) uuid: Option<String>,
+    pub(crate) display_name: Option<String>,
+    pub(crate) native_blob: Value,
 }
 
 /// Where the provider stores its secret bytes. state.json holds only a
@@ -443,7 +446,7 @@ pub struct IdentitySnapshot {
 /// lives inside state.json.
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-pub enum SecretBackend {
+pub(crate) enum SecretBackend {
     Keychain,
     File,
     Sqlite,
@@ -452,40 +455,43 @@ pub enum SecretBackend {
 /// Result of `capture_current_login`: identity + the exact secret bytes we
 /// need to persist plus the decoded token grant for refresh math.
 #[derive(Clone, Debug)]
-pub struct CapturedAccount {
-    pub identity: IdentitySnapshot,
-    pub secret_blob: String,
-    pub tokens: TokenGrant,
+pub(crate) struct CapturedAccount {
+    pub(crate) identity: IdentitySnapshot,
+    pub(crate) secret_blob: String,
+    pub(crate) tokens: TokenGrant,
 }
 
 /// A provider's browser login: OAuth 2.0 authorization code + PKCE (RFC 7636)
 /// with a loopback redirect — the flow every vendor CLI's own `login` runs.
 /// One engine (`crate::login`) drives it for every provider; a provider only
 /// describes its endpoints here and turns the token response into its own
-/// credential blob in [`Provider::complete_login`].
+/// credential blob in [`LoginFlow::complete_login`].
 #[derive(Clone, Debug)]
-pub struct LoginSpec {
-    pub authorize_url: &'static str,
-    pub token_url: &'static str,
-    pub client_id: &'static str,
-    pub scopes: &'static [&'static str],
+pub(crate) struct LoginSpec {
+    pub(crate) authorize_url: &'static str,
+    pub(crate) token_url: &'static str,
+    pub(crate) client_id: &'static str,
+    pub(crate) scopes: &'static [&'static str],
     /// Loopback redirect port; `None` = any free port. Some vendors register
     /// one fixed port (Codex: 1455).
-    pub redirect_port: Option<u16>,
+    pub(crate) redirect_port: Option<u16>,
+    /// A second registered port, used when `redirect_port` stays busy
+    /// (Codex: 1457, as in openai/codex `login/src/server.rs`).
+    pub(crate) fallback_redirect_port: Option<u16>,
     /// Registered loopback host (localhost or the IPv4 loopback literal).
-    pub redirect_host: &'static str,
+    pub(crate) redirect_host: &'static str,
     /// Loopback redirect path, e.g. `/callback`.
-    pub redirect_path: &'static str,
+    pub(crate) redirect_path: &'static str,
     /// Vendor-specific authorize query params, added verbatim.
-    pub extra_authorize_params: &'static [(&'static str, &'static str)],
+    pub(crate) extra_authorize_params: &'static [(&'static str, &'static str)],
     /// Authorize param that pre-fills the sign-in email, if the vendor has one.
-    pub login_hint_param: Option<&'static str>,
-    pub token_request: TokenRequestStyle,
+    pub(crate) login_hint_param: Option<&'static str>,
+    pub(crate) token_request: TokenRequestStyle,
 }
 
 /// How the authorization-code exchange is encoded.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum TokenRequestStyle {
+pub(crate) enum TokenRequestStyle {
     /// JSON body; `include_state` echoes `state` (Anthropic expects it).
     Json { include_state: bool },
     /// `application/x-www-form-urlencoded` (RFC 6749 §4.1.3).
@@ -494,18 +500,18 @@ pub enum TokenRequestStyle {
 
 /// Runtime metadata used by the shared handoff policy.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ClientStatus {
-    pub running: bool,
-    pub busy: bool,
-    pub account_key: Option<String>,
-    pub account_id: Option<String>,
-    pub handoff_token: Option<String>,
+pub(crate) struct ClientStatus {
+    pub(crate) running: bool,
+    pub(crate) busy: bool,
+    pub(crate) account_key: Option<String>,
+    pub(crate) account_id: Option<String>,
+    pub(crate) handoff_token: Option<String>,
 }
 
 /// How to launch the vendor CLI after a swap. Providers that don't shell out
 /// (reporting-only) may ignore this.
 #[derive(Copy, Clone, Debug)]
-pub enum LaunchMode {
+pub(crate) enum LaunchMode {
     Fresh,
     Continue,
 }
@@ -513,9 +519,9 @@ pub enum LaunchMode {
 /// Amber / red thresholds for menu row coloring. Providers may override in
 /// `Provider::severity_bands` if their quota semantics differ.
 #[derive(Copy, Clone, Debug)]
-pub struct SeverityBands {
-    pub amber: f64,
-    pub red: f64,
+pub(crate) struct SeverityBands {
+    pub(crate) amber: f64,
+    pub(crate) red: f64,
 }
 
 /// How a provider onboards a new account. The menu's "Add account" flow uses
@@ -524,7 +530,7 @@ pub struct SeverityBands {
 /// user for a raw key + optional nickname).
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-pub enum CaptureMode {
+pub(crate) enum CaptureMode {
     /// Read credentials that the vendor CLI wrote to disk / keychain during
     /// its own `login` flow (Claude, Codex, ...).
     CredsOnDisk,
@@ -540,28 +546,32 @@ pub enum CaptureMode {
 /// to construct a "Switch to this account" / "Launch client" / "Remove…" row
 /// at all — they must stay truthful. Before this fix, `supports_switching`
 /// alone gated BOTH the Switch row and the Launch row (a provider whose
-/// `write_active_account` was wired but whose `launch_client` was still the
-/// `Unsupported` trait default would still get a Launch row that always
-/// errored), and the Remove row wasn't gated on anything.
+/// `write_active_account` was wired but which had no launcher would still
+/// get a Launch row that always errored), and the Remove row wasn't gated on
+/// anything.
 #[derive(Copy, Clone, Debug)]
-pub struct Capabilities {
-    pub supports_usage: bool,
-    pub supports_switching: bool,
+pub(crate) struct Capabilities {
+    pub(crate) supports_usage: bool,
+    pub(crate) supports_switching: bool,
     /// True only if `launch_client` is actually wired to spawn the vendor
     /// CLI. Independent of `supports_switching` — a provider can support one
     /// without the other (e.g. `write_active_account` implemented, no client
     /// launcher yet).
-    pub supports_launch: bool,
+    pub(crate) supports_launch: bool,
     /// True if removing a captured account (dropping it from state.json) is
     /// safe for this provider. Defaults to `true` for every provider that
     /// sets it explicitly — removing an account is a generic state.json
     /// operation every provider can, in principle, support — but stays an
     /// explicit field so a future provider needing extra cleanup (e.g.
     /// deleting an on-disk auth file) can flip it off until that's wired.
-    pub supports_remove: bool,
-    pub supports_email_capture: bool,
-    pub secret_backend: SecretBackend,
-    pub capture_mode: CaptureMode,
+    pub(crate) supports_remove: bool,
+    /// Declared provider metadata; asserted by each provider's tests, not
+    /// read by the app yet.
+    #[allow(dead_code)]
+    pub(crate) supports_email_capture: bool,
+    #[allow(dead_code)]
+    pub(crate) secret_backend: SecretBackend,
+    pub(crate) capture_mode: CaptureMode,
 }
 
 /// Stable per-provider identity for an account. `provider` is the owning
@@ -572,13 +582,13 @@ pub struct Capabilities {
 /// route a blob it just read from disk back to the right account slot
 /// without needing to know per-provider schemas.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct AccountKey {
-    pub provider: String,
-    pub key: String,
+pub(crate) struct AccountKey {
+    pub(crate) provider: String,
+    pub(crate) key: String,
 }
 
 impl AccountKey {
-    pub fn new(provider: impl Into<String>, key: impl Into<String>) -> Self {
+    pub(crate) fn new(provider: impl Into<String>, key: impl Into<String>) -> Self {
         AccountKey {
             provider: provider.into(),
             key: key.into().to_ascii_lowercase(),
@@ -587,10 +597,10 @@ impl AccountKey {
 }
 
 /// How fresh a stored credential blob is relative to `now`. Returned by
-/// `Provider::credential_freshness` so a provider-agnostic sync layer can
+/// `CredentialSync::credential_freshness` so a provider-agnostic sync layer can
 /// compare rotations across paths without knowing per-provider timestamps.
 #[derive(Clone, Debug, PartialEq)]
-pub enum CredentialFreshness {
+pub(crate) enum CredentialFreshness {
     /// Access token has significant remaining life (> refresh skew).
     Fresh,
     /// Access token expires within `Duration` — refresh soon.
@@ -608,7 +618,7 @@ impl CredentialFreshness {
     /// Order for "pick the freshest of several blobs": Fresh > ExpiresIn(long
     /// remaining) > ExpiresIn(short) > Expired > Invalid > Unknown. Used by
     /// the last-chance fallback when re-reading credential paths.
-    pub fn rank(&self) -> i64 {
+    pub(crate) fn rank(&self) -> i64 {
         match self {
             CredentialFreshness::Fresh => i64::MAX,
             CredentialFreshness::ExpiresIn(d) => d.as_secs() as i64,
@@ -621,7 +631,7 @@ impl CredentialFreshness {
     /// True if we consider this blob still usable as-is (bearer + refresh).
     /// `Expired` is deliberately not usable — we want to hand out fresh
     /// access tokens only.
-    pub fn is_usable(&self) -> bool {
+    pub(crate) fn is_usable(&self) -> bool {
         matches!(
             self,
             CredentialFreshness::Fresh | CredentialFreshness::ExpiresIn(_)
@@ -631,7 +641,14 @@ impl CredentialFreshness {
 
 /// One provider (Claude, Codex, opencode, ...). Registered once at startup
 /// via `providers::init()`; every method is called through `&dyn Provider`.
-pub trait Provider: Send + Sync + 'static {
+///
+/// The core trait covers only what every provider has: its identity, its
+/// UI flags, and how its accounts are keyed and labelled. Everything a
+/// provider may or may not support is a separate capability trait, reached
+/// through an accessor that returns `None` when the provider lacks it — a
+/// caller asks for the capability and handles its absence, instead of
+/// calling a method that answers `Unsupported`.
+pub(crate) trait Provider: Send + Sync + 'static {
     // --- Identity of the provider itself ---
 
     /// Stable machine-readable slug: "claude", "codex", "opencode", ...
@@ -651,50 +668,121 @@ pub trait Provider: Send + Sync + 'static {
         }
     }
 
-    /// Auto-swap trigger ladder shown in the menu (percentages).
-    fn trigger_options(&self) -> &'static [f64] {
-        &[90.0, 95.0, 98.0]
-    }
-
     /// Order in which `UsageWindow::id`s should render in the menu.
     fn window_order(&self) -> &'static [&'static str] {
         &[]
     }
 
-    // --- Capture / listing ---
+    // --- Account identity helpers ---
 
-    /// Read whatever the vendor CLI persisted on this host. `Ok(None)` means
-    /// "nothing captured / not logged in"; `Err(Unsupported)` means the
-    /// provider is a pure stub with no capture path wired yet.
-    fn capture_current_login(&self) -> PResult<Option<CapturedAccount>>;
-
-    /// Register an account onboarded via a pasted API key. `nickname` is the
-    /// user-supplied label (used for menu display and, for providers that
-    /// can't derive an email from the key alone, for `account_identifier`);
-    /// `key` is the raw API key. Default is `Unsupported` for providers whose
-    /// `capture_mode` is `CredsOnDisk`.
-    fn capture_api_key(&self, nickname: String, key: String) -> PResult<CapturedAccount> {
-        let _ = (nickname, key);
-        Err(ProviderError::Unsupported)
-    }
-
-    /// This provider's browser login, if usagio can run it itself (the "Renew
-    /// login…" action). `None` = the user must log in through the vendor CLI.
-    fn login_spec(&self) -> Option<LoginSpec> {
+    /// The key a stored account should have under this build's keying, when
+    /// it differs from `account.key` (an older build keyed it differently).
+    /// `State::from_value` renames such entries on load. Default: never.
+    fn upgraded_account_key(&self, account: &crate::store::ProviderAccount) -> Option<String> {
+        let _ = account;
         None
     }
+
+    /// Stable per-provider key used inside state.json's `providers.<slug>
+    /// .accounts.<key>` namespace. Default: lowercased email, then UUID,
+    /// then a short hash of `native_blob`.
+    fn account_identifier(&self, id: &IdentitySnapshot) -> String {
+        id.email
+            .as_ref()
+            .map(|e| e.to_ascii_lowercase())
+            .or_else(|| id.uuid.clone())
+            .unwrap_or_else(|| format!("anon-{}", short_hash(&id.native_blob)))
+    }
+
+    // --- Capabilities (None = the provider doesn't have it) ---
+
+    /// Reading the login the vendor CLI persisted on this host.
+    fn login_capture(&self) -> Option<&dyn LoginCapture> {
+        None
+    }
+
+    /// Onboarding an account from a pasted API key.
+    fn api_key_capture(&self) -> Option<&dyn ApiKeyCapture> {
+        None
+    }
+
+    /// usagio's own browser sign-in for this provider.
+    fn login_flow(&self) -> Option<&dyn LoginFlow> {
+        None
+    }
+
+    /// Decoding, patching and refreshing the stored credential blob.
+    fn token_lifecycle(&self) -> Option<&dyn TokenLifecycle> {
+        None
+    }
+
+    /// Fetching usage from the provider's usage endpoint.
+    fn usage_source(&self) -> Option<&dyn UsageSource> {
+        None
+    }
+
+    /// Asking which plan an account is on, separately from usage.
+    fn plan_check(&self) -> Option<&dyn PlanCheck> {
+        None
+    }
+
+    /// Reading and writing the vendor CLI's active login (switching).
+    fn active_slot(&self) -> Option<&dyn ActiveSlot> {
+        None
+    }
+
+    /// Draining a running client that caches credentials before a switch.
+    /// Absent = the client is stateless and needs no handoff.
+    fn client_handoff(&self) -> Option<&dyn ClientHandoff> {
+        None
+    }
+
+    /// Launching the vendor CLI.
+    fn launcher(&self) -> Option<&dyn Launcher> {
+        None
+    }
+
+    /// Following rotations the vendor CLI writes to disk (fsnotify sync,
+    /// proactive refresh, and the invalid_grant last-chance fallback).
+    fn credential_sync(&self) -> Option<&dyn CredentialSync> {
+        None
+    }
+}
+
+/// A capability a caller cannot do without: `Unsupported` when absent.
+pub(crate) fn require<C: ?Sized>(capability: Option<&C>) -> PResult<&C> {
+    capability.ok_or(ProviderError::Unsupported)
+}
+
+/// Reads whatever the vendor CLI persisted on this host.
+pub(crate) trait LoginCapture: Send + Sync {
+    /// `Ok(None)` means "nothing captured / not logged in".
+    fn capture_current_login(&self) -> PResult<Option<CapturedAccount>>;
+}
+
+/// Registers an account onboarded via a pasted API key.
+pub(crate) trait ApiKeyCapture: Send + Sync {
+    /// `nickname` is the user-supplied label (used for menu display and, for
+    /// providers that can't derive an email from the key alone, for
+    /// `account_identifier`); `key` is the raw API key.
+    fn capture_api_key(&self, nickname: String, key: String) -> PResult<CapturedAccount>;
+}
+
+/// usagio's own browser login (the "Renew login…" action). A provider
+/// without it is signed in through the vendor CLI.
+pub(crate) trait LoginFlow: Send + Sync {
+    /// The authorization endpoints and client parameters of the login.
+    fn login_spec(&self) -> LoginSpec;
 
     /// Turn a successful authorization-code exchange (the token endpoint's
     /// JSON response) into a captured account: identity resolved from the
     /// provider (never trusted from the window) plus the credential blob the
     /// vendor CLI would have written.
-    fn complete_login(&self, token_response: &Value) -> PResult<CapturedAccount> {
-        let _ = token_response;
-        Err(ProviderError::Unsupported)
-    }
+    fn complete_login(&self, token_response: &Value) -> PResult<CapturedAccount>;
+}
 
-    // --- Token lifecycle ---
-
+/// The stored credential blob's token lifecycle.
+pub(crate) trait TokenLifecycle: Send + Sync {
     /// Decode the vendor's on-disk credential bytes to a `TokenGrant`.
     fn parse_stored_blob(&self, blob: &str) -> PResult<TokenGrant>;
 
@@ -702,12 +790,8 @@ pub trait Provider: Send + Sync + 'static {
     /// a refresh); returns the bytes to persist.
     fn patch_stored_blob(&self, blob: &str, grant: &TokenGrant) -> PResult<String>;
 
-    /// Refresh an access token using the stored refresh token. Default is
-    /// `Unsupported` for providers that don't do refresh math themselves.
-    fn refresh_token(&self, refresh: &str) -> PResult<TokenGrant> {
-        let _ = refresh;
-        Err(ProviderError::Unsupported)
-    }
+    /// Refresh an access token using the stored refresh token.
+    fn refresh_token(&self, refresh: &str) -> PResult<TokenGrant>;
 
     /// Refresh a saved credential, preserving vendor metadata alongside tokens.
     /// Ownership, serialization and persistence belong to the lifecycle engine.
@@ -725,87 +809,41 @@ pub trait Provider: Send + Sync + 'static {
     /// compare-and-swap on that file (see `codex::oauth::active_refresh_cas`
     /// for the reference implementation and its doc comment for why Codex's
     /// CAS is simpler than a keychain-backed provider's).
-    ///
-    /// Deliberately a trait method with a `false` default rather than a
-    /// `Capabilities` field: `Capabilities` is a plain struct literal
-    /// constructed by every provider, so adding a required field there would
-    /// force an unrelated edit onto every other provider module. A method
-    /// with a default impl lets Codex opt in without touching anyone else.
-    fn supports_active_refresh(&self) -> bool {
-        false
-    }
+    fn supports_active_refresh(&self) -> bool;
+}
 
-    // --- Usage ---
-
+/// The provider's usage endpoint.
+pub(crate) trait UsageSource: Send + Sync {
     /// Call the provider's usage endpoint with the given access token.
-    /// Default is `Unsupported` for reporting-only providers without one.
-    fn fetch_usage(&self, access_token: &str) -> PResult<UsageSnapshot> {
-        let _ = access_token;
-        Err(ProviderError::Unsupported)
+    fn fetch_usage(&self, access_token: &str) -> PResult<UsageSnapshot>;
+
+    /// [`Self::fetch_usage`] for a stored account, whose `secret_blob` may
+    /// carry request context the token alone lacks (Codex's ChatGPT
+    /// workspace id). Defaults to `fetch_usage`.
+    fn fetch_account_usage(&self, access_token: &str, secret_blob: &str) -> PResult<UsageSnapshot> {
+        let _ = secret_blob;
+        self.fetch_usage(access_token)
     }
+}
 
-    /// Ask the provider which plan the account is on, WITHOUT touching the
-    /// usage endpoint (so it's safe to call while that endpoint 403s/429s a
-    /// lapsed account). Used to confirm a suspected lapse and to notice a
-    /// renewal. `None` = unknown or unsupported; callers then fall back to
-    /// the plan reported in [`UsageSnapshot::plan`], if any.
-    fn check_plan(&self, access_token: &str) -> Option<PlanStatus> {
-        let _ = access_token;
-        None
-    }
+/// Asks the provider which plan the account is on, WITHOUT touching the
+/// usage endpoint (so it's safe to call while that endpoint 403s/429s a
+/// lapsed account). Used to confirm a suspected lapse and to notice a
+/// renewal.
+pub(crate) trait PlanCheck: Send + Sync {
+    /// `None` = unknown; callers then fall back to the plan reported in
+    /// [`UsageSnapshot::plan`], if any.
+    fn check_plan(&self, access_token: &str) -> Option<PlanStatus>;
+}
 
-    // --- Switching ---
-
+/// The vendor CLI's active login: what account switching writes.
+pub(crate) trait ActiveSlot: Send + Sync {
     /// Persist `blob` as the active login for this provider and update any
     /// identity-adjacent files the vendor CLI expects to read.
-    fn write_active_account(&self, blob: &str, identity: &IdentitySnapshot) -> PResult<()> {
-        let _ = (blob, identity);
-        Err(ProviderError::Unsupported)
-    }
+    fn write_active_account(&self, blob: &str, identity: &IdentitySnapshot) -> PResult<()>;
 
     /// Read whatever the vendor CLI currently considers the active identity.
-    fn read_active_identity(&self) -> PResult<Option<IdentitySnapshot>> {
-        Err(ProviderError::Unsupported)
-    }
-
-    /// Inspect a client that caches credentials. Stateless clients need no handoff.
-    fn client_status(&self) -> PResult<ClientStatus> {
-        Ok(ClientStatus::default())
-    }
-
-    /// Load the newly written credentials and verify the running identity.
-    /// Called only after the shared engine permits the handoff.
-    fn begin_handoff(&self, token: &str) -> PResult<()> {
-        let _ = token;
-        Ok(())
-    }
-
-    /// Whether begin_handoff waits for process exit within a bounded deadline.
-    fn handoff_stops_synchronously(&self) -> bool {
-        false
-    }
-
-    /// Whether retrying the same stop request is supported.
-    fn handoff_request_is_idempotent(&self) -> bool {
-        false
-    }
-
-    /// Confirm that the drained instance has fully exited before credentials change.
-    fn verify_handoff_stopped(&self, token: &str) -> PResult<()> {
-        let _ = token;
-        Ok(())
-    }
-
-    fn handoff_client(&self, identity: &IdentitySnapshot, token: Option<&str>) -> PResult<()> {
-        let _ = (identity, token);
-        Ok(())
-    }
-
-    /// Launch the vendor CLI in the given mode (fresh session vs continue).
-    fn launch_client(&self, mode: LaunchMode) -> PResult<ExitStatus> {
-        let _ = mode;
-        Err(ProviderError::Unsupported)
-    }
+    fn read_active_identity(&self) -> PResult<Option<IdentitySnapshot>>;
 
     /// Persist `blob` to the vendor CLI's OS-native credential storage for
     /// wherever `read_active_identity` would report as the current login.
@@ -819,10 +857,7 @@ pub trait Provider: Send + Sync + 'static {
     /// close.
     ///
     /// The default impl delegates to `write_active_account` using the
-    /// current identity — providers with no switching support (whose
-    /// `read_active_identity` is still the `Unsupported` trait default)
-    /// inherit `Unsupported` transitively, which is the correct behavior:
-    /// there's nowhere vendor-native to mirror to yet.
+    /// current identity.
     fn mirror_rotated_token(&self, blob: &str) -> PResult<()> {
         match self.read_active_identity()? {
             Some(id) => self.write_active_account(blob, &id),
@@ -836,38 +871,58 @@ pub trait Provider: Send + Sync + 'static {
     /// credentials file on Linux/Windows).
     ///
     /// This is the read half of the compare-and-swap the ACTIVE account's
-    /// refresh cycle uses (`main.rs::active_refresh_cas`): usagio reads this
+    /// refresh cycle uses (`lifecycle::active_refresh_cas`): usagio reads this
     /// slot before AND after its own `/token` POST to detect whether the
     /// vendor CLI rotated the same slot concurrently, without introducing any
     /// new OS-specific code outside `platform/*` — providers implement this
     /// purely in terms of `Platform::secrets()` / `credential_paths()`, the
     /// same primitives `mirror_rotated_token` already uses.
     ///
-    /// `Ok(None)` means the slot is empty (nothing captured yet). Default is
-    /// `Unsupported` — only providers with `mirror_rotated_token` wired
-    /// (Claude, Codex) implement this.
-    fn read_active_slot(&self) -> PResult<Option<String>> {
-        Err(ProviderError::Unsupported)
-    }
+    /// `Ok(None)` means the slot is empty (nothing captured yet).
+    fn read_active_slot(&self) -> PResult<Option<String>>;
+}
 
-    // --- Credential sync (fsnotify + proactive refresh + last-chance fallback) ---
+/// A client that caches credentials in a running process, so a switch must
+/// drain it first.
+pub(crate) trait ClientHandoff: Send + Sync {
+    /// Inspect the running client.
+    fn client_status(&self) -> PResult<ClientStatus>;
 
+    /// Load the newly written credentials and verify the running identity.
+    /// Called only after the shared engine permits the handoff.
+    fn begin_handoff(&self, token: &str) -> PResult<()>;
+
+    /// Whether begin_handoff waits for process exit within a bounded deadline.
+    fn handoff_stops_synchronously(&self) -> bool;
+
+    /// Whether retrying the same stop request is supported.
+    fn handoff_request_is_idempotent(&self) -> bool;
+
+    /// Confirm that the drained instance has fully exited before credentials change.
+    fn verify_handoff_stopped(&self, token: &str) -> PResult<()>;
+
+    fn handoff_client(&self, identity: &IdentitySnapshot, token: Option<&str>) -> PResult<()>;
+}
+
+/// Launches the vendor CLI.
+pub(crate) trait Launcher: Send + Sync {
+    /// Launch the vendor CLI in the given mode (fresh session vs continue).
+    fn launch_client(&self, mode: LaunchMode) -> PResult<ExitStatus>;
+}
+
+/// Credential sync: following rotations the vendor CLI writes behind our
+/// back (fsnotify + proactive refresh + last-chance fallback).
+pub(crate) trait CredentialSync: Send + Sync {
     /// On-disk paths where the vendor CLI may write this provider's
     /// credential blob. The credential-sync watcher subscribes to these with
     /// notify(); the last-chance fallback re-reads them on invalid_grant to
-    /// adopt whichever rotation the vendor did behind our back. Default is
-    /// empty — providers that don't persist to disk don't participate.
-    fn credential_paths(&self) -> Vec<PathBuf> {
-        Vec::new()
-    }
+    /// adopt whichever rotation the vendor did behind our back.
+    fn credential_paths(&self) -> Vec<PathBuf>;
 
     /// Which account does this raw credential blob belong to? Returns
     /// `Some(AccountKey)` if the blob is recognisable and carries an
-    /// identifier this provider tracks. Default is `None` (unknown).
-    fn identify_credential(&self, blob: &str) -> Option<AccountKey> {
-        let _ = blob;
-        None
-    }
+    /// identifier this provider tracks.
+    fn identify_credential(&self, blob: &str) -> Option<AccountKey>;
 
     /// Last-resort identification for a blob `identify_credential` could not
     /// place (e.g. tokens but no embedded identity). May perform ONE network
@@ -881,45 +936,53 @@ pub trait Provider: Send + Sync + 'static {
     /// Report how fresh the blob's access token is right now. Used to pick
     /// the freshest of several observed rotations, and to decide when to
     /// pre-emptively refresh an inactive account.
-    fn credential_freshness(&self, blob: &str) -> CredentialFreshness {
-        let _ = blob;
-        CredentialFreshness::Unknown
+    fn credential_freshness(&self, blob: &str) -> CredentialFreshness;
+
+    /// Absorb a rotated blob into `account`'s stored credentials.
+    fn absorb_credential(&self, account: &AccountKey, blob: &str) -> PResult<()>;
+}
+
+/// Separates an account key's email from the workspace it belongs to, for
+/// providers where one email signs into several workspaces (Codex keys are
+/// `email#chatgpt_account_id`). Emails never contain it.
+pub(crate) const WORKSPACE_KEY_SEP: char = '#';
+
+/// The email part of an account key (the whole key when it has no workspace).
+pub(crate) fn key_email(key: &str) -> &str {
+    key.split_once(WORKSPACE_KEY_SEP)
+        .map_or(key, |(email, _)| email)
+}
+
+/// `email` (lowercased) qualified by `workspace` when known.
+pub(crate) fn workspace_key(email: &str, workspace: Option<&str>) -> String {
+    let email = email.to_ascii_lowercase();
+    match workspace.map(str::trim).filter(|w| !w.is_empty()) {
+        Some(w) => format!("{email}{WORKSPACE_KEY_SEP}{}", w.to_ascii_lowercase()),
+        None => email,
     }
+}
 
-    /// Absorb a rotated blob into `account`'s stored credentials. Providers
-    /// that own a slot in state.json overwrite it in place; providers with
-    /// no first-class account storage yet may no-op. Default is a no-op so
-    /// non-tracked providers don't need to opt in.
-    fn absorb_credential(&self, account: &AccountKey, blob: &str) -> PResult<()> {
-        let _ = (account, blob);
-        Ok(())
-    }
-
-    // --- Account identity helpers ---
-
-    /// Stable per-provider key used inside state.json's `providers.<slug>
-    /// .accounts.<key>` namespace. Default: lowercased email, then UUID,
-    /// then a short hash of `native_blob`.
-    fn account_identifier(&self, id: &IdentitySnapshot) -> String {
-        id.email
-            .as_ref()
-            .map(|e| e.to_ascii_lowercase())
-            .or_else(|| id.uuid.clone())
-            .unwrap_or_else(|| format!("anon-{}", short_hash(&id.native_blob)))
-    }
-
-    /// Human-facing label for an account row in the menu.
-    fn account_display(&self, id: &IdentitySnapshot) -> String {
-        id.email
-            .clone()
-            .or_else(|| id.display_name.clone())
-            .unwrap_or_else(|| format!("{} account", self.display_name()))
+/// Human label for account `key` among the keys of the same provider: the
+/// email, plus a short workspace tag only when another account shares it.
+pub(crate) fn account_label<'a>(key: &str, siblings: impl IntoIterator<Item = &'a str>) -> String {
+    let Some((email, workspace)) = key.split_once(WORKSPACE_KEY_SEP) else {
+        return key.to_string();
+    };
+    let shared = siblings
+        .into_iter()
+        .filter(|k| !k.eq_ignore_ascii_case(key))
+        .any(|k| key_email(k).eq_ignore_ascii_case(email));
+    if shared {
+        let tag: String = workspace.chars().take(8).collect();
+        format!("{email} (workspace {tag})")
+    } else {
+        email.to_string()
     }
 }
 
 /// Short deterministic id derived from a JSON blob. Used only as an
 /// account-identifier fallback when neither email nor UUID is available.
-fn short_hash(v: &Value) -> String {
+pub(crate) fn short_hash(v: &Value) -> String {
     use sha2::{Digest, Sha256};
     let bytes = serde_json::to_vec(v).unwrap_or_default();
     let digest = Sha256::digest(&bytes);
@@ -1104,34 +1167,32 @@ mod tests {
                 capture_mode: CaptureMode::CredsOnDisk,
             }
         }
+
+        fn login_capture(&self) -> Option<&dyn LoginCapture> {
+            Some(self)
+        }
+    }
+
+    impl LoginCapture for Dummy {
         fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
             Ok(None)
-        }
-        fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
-            Err(ProviderError::Unsupported)
-        }
-        fn patch_stored_blob(&self, _blob: &str, _grant: &TokenGrant) -> PResult<String> {
-            Err(ProviderError::Unsupported)
         }
     }
 
     #[test]
-    fn defaults_return_unsupported() {
+    fn defaults_expose_no_capabilities() {
         let p = Dummy;
+        assert!(p.api_key_capture().is_none());
+        assert!(p.login_flow().is_none());
+        assert!(p.token_lifecycle().is_none());
+        assert!(p.usage_source().is_none());
+        assert!(p.plan_check().is_none());
+        assert!(p.active_slot().is_none());
+        assert!(p.client_handoff().is_none());
+        assert!(p.launcher().is_none());
+        assert!(p.credential_sync().is_none());
         assert!(matches!(
-            p.refresh_token("r"),
-            Err(ProviderError::Unsupported)
-        ));
-        assert!(matches!(
-            p.fetch_usage("a"),
-            Err(ProviderError::Unsupported)
-        ));
-        assert!(matches!(
-            p.launch_client(LaunchMode::Fresh),
-            Err(ProviderError::Unsupported)
-        ));
-        assert!(matches!(
-            p.capture_api_key("n".into(), "k".into()),
+            require(p.launcher()).map(|_| ()),
             Err(ProviderError::Unsupported)
         ));
     }
@@ -1156,15 +1217,13 @@ mod tests {
 
     #[test]
     fn credential_defaults_report_nothing() {
-        // A provider that opts out of credential sync must return empty
-        // paths, unknown identity, and unknown freshness — the sync layer
-        // treats these as "nothing to do".
+        // A provider that opts out of credential sync exposes no capability,
+        // and the sync layer treats that as "nothing to do".
         let p = Dummy;
-        assert!(p.credential_paths().is_empty());
-        assert!(p.identify_credential("{}").is_none());
-        assert_eq!(p.credential_freshness("{}"), CredentialFreshness::Unknown);
+        assert!(p.credential_sync().is_none());
+        assert!(crate::credentials::absorb_all_lagging(&p).is_empty());
         let k = AccountKey::new("dummy", "x");
-        assert!(p.absorb_credential(&k, "{}").is_ok());
+        assert!(!crate::credentials::last_chance_fallback(&p, &k));
     }
 
     #[test]
@@ -1274,26 +1333,8 @@ mod tests {
     }
 
     #[test]
-    fn default_trigger_ladder_and_window_order() {
-        let p = Dummy;
-        assert_eq!(p.trigger_options(), &[90.0, 95.0, 98.0]);
-        assert!(p.window_order().is_empty());
-    }
-
-    #[test]
-    fn account_display_prefers_email_then_name_then_generic() {
-        let p = Dummy;
-        let mut id = IdentitySnapshot {
-            email: Some("Foo@Example.com".into()),
-            uuid: None,
-            display_name: Some("Foo".into()),
-            native_blob: json!({}),
-        };
-        assert_eq!(p.account_display(&id), "Foo@Example.com");
-        id.email = None;
-        assert_eq!(p.account_display(&id), "Foo");
-        id.display_name = None;
-        assert_eq!(p.account_display(&id), "Dummy account");
+    fn default_window_order_is_empty() {
+        assert!(Dummy.window_order().is_empty());
     }
 
     #[test]

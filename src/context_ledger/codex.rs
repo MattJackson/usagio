@@ -37,7 +37,7 @@ pub(crate) fn resolve_codex_dir(
     }
 }
 
-pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
+pub(crate) fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     let mut items = Vec::new();
     let Some(codex_dir) = codex_dir() else {
         return Ok(items);
@@ -119,7 +119,10 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
                 Ok(parsed) => {
                     if let Some(mcp_servers) = parsed.get("mcp_servers").and_then(|v| v.as_table())
                     {
-                        // Convert TOML to JSON for the mcp module's uniform interface.
+                        // Convert TOML to JSON, then resolve each server the
+                        // way Codex launches it (env_vars / cwd / clean env).
+                        let cwd = project
+                            .map(|p| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()));
                         let servers = mcp_servers
                             .iter()
                             // `enabled = false` servers are never started by Codex.
@@ -127,13 +130,14 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
                                 cfg.get("enabled").and_then(|e| e.as_bool()) != Some(false)
                             })
                             .map(|(name, cfg)| {
+                                let json = serde_json::to_value(cfg).map_err(|e| e.to_string());
                                 (
                                     name.clone(),
-                                    serde_json::to_value(cfg).unwrap_or(serde_json::Value::Null),
+                                    json.and_then(|j| super::mcp::codex_launch(&j, cwd.as_deref())),
                                 )
                             })
                             .collect();
-                        for (name, result) in super::probe_servers(servers) {
+                        for (name, result) in super::probe_launches(servers) {
                             match result {
                                 Ok(summary) => items.push(LedgerItem {
                                     kind: ItemKind::McpTools,

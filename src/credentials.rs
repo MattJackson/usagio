@@ -7,7 +7,7 @@
 //! freshest match, and only flag `needs_relogin` if all paths agree the
 //! token is dead.
 //!
-//! Everything here is provider-agnostic — it drives `Provider::credential_paths`,
+//! Everything here is provider-agnostic — it drives `CredentialSync::credential_paths`,
 //! `identify_credential`, `credential_freshness`, and `absorb_credential`, so
 //! adding a new provider just means implementing those four methods on its
 //! trait impl.
@@ -22,12 +22,13 @@ use anyhow::{Context, Result};
 use crate::providers::trait_def::{
     AccountKey, CredentialFreshness, PResult, Provider, ProviderError,
 };
+use crate::providers::CredentialSync;
 use crate::store::{self, State};
 
 /// Refresh a token if it expires within this many seconds. Bumped from the
 /// legacy 300s (5 min) to 900s (15 min) so an inactive account's refresh
 /// happens well before another `claude` invocation could race us.
-pub const REFRESH_SKEW_SECS: i64 = 900;
+pub(crate) const REFRESH_SKEW_SECS: i64 = 900;
 
 /// Run `f` holding the shared advisory lock on state.json. Provider
 /// `absorb_credential` implementations use this to commit without importing
@@ -38,16 +39,12 @@ pub(crate) fn with_state_lock_absorb<F>(f: F) -> PResult<()>
 where
     F: FnOnce(&mut State) -> Result<()>,
 {
-    with_state_lock(|| {
+    with_state_lock(|_| {
         let mut st = State::load()?;
-        // Skip the (fsync-heavy, backup-rotating) save when the closure left
-        // the state untouched: the steady-state absorb rewrites identical
-        // credentials every cycle.
-        let before = serde_json::to_value(&st).ok();
         f(&mut st)?;
-        if before.is_some() && before == serde_json::to_value(&st).ok() {
-            return Ok(());
-        }
+        // `save` skips the (fsync-heavy, backup-rotating) write when the
+        // closure left the state untouched: the steady-state absorb rewrites
+        // identical credentials every cycle.
         st.save()
     })
     .map_err(|e| ProviderError::Other(format!("state lock: {e:#}")))
@@ -58,7 +55,7 @@ thread_local! {
     /// outermost frame owns the actual fs2 advisory lock; nested frames
     /// short-circuit and just run the closure. Without this a call chain like
     /// `switch_to_guarded` -> `absorb_before_switch` ->
-    /// `Provider::absorb_credential` -> `with_state_lock_absorb` -> `with_state_lock`
+    /// `CredentialSync::absorb_credential` -> `with_state_lock_absorb` -> `with_state_lock`
     /// would `open()` the lock file a second time in the same process and
     /// `flock(LOCK_EX)` on that fresh open file description, which blocks
     /// forever on both macOS and Linux (per-open-fd semantics).
@@ -82,17 +79,28 @@ pub(crate) fn state_lock_held() -> bool {
     STATE_LOCK_DEPTH.with(|d| d.get()) > 0
 }
 
+/// Proof that the current thread holds the cross-process state lock. Only
+/// [`with_state_lock`] creates one, handing it to its closure for the
+/// closure's duration, so a function that must run under the lock takes
+/// `&StateGuard` and the compiler checks the requirement. Not `Send`: the lock
+/// belongs to the thread that took it.
+pub(crate) struct StateGuard {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
 /// Run `f` holding the shared exclusive advisory lock on the state file.
 /// Serialises state read-modify-write across processes; reentrant within a
 /// single thread so callers can nest without self-deadlocking.
-pub fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+pub(crate) fn with_state_lock<T>(f: impl FnOnce(&StateGuard) -> Result<T>) -> Result<T> {
     use fs2::FileExt;
     // Reentrant fast path: we already hold the OS lock on this thread; just
     // run the closure. The outer frame will unlock when it unwinds.
     if STATE_LOCK_DEPTH.with(|d| d.get()) > 0 {
         STATE_LOCK_DEPTH.with(|d| d.set(d.get() + 1));
         let _g = DepthGuard;
-        return f();
+        return f(&StateGuard {
+            _not_send: std::marker::PhantomData,
+        });
     }
     let dir = store::config_dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -106,7 +114,9 @@ pub fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     file.lock_exclusive().context("acquiring state lock")?;
     STATE_LOCK_DEPTH.with(|d| d.set(1));
     let _g = DepthGuard;
-    let r = f();
+    let r = f(&StateGuard {
+        _not_send: std::marker::PhantomData,
+    });
     // Fully-qualified to fs2's trait: std 1.89 added an inherent unlock() that
     // would otherwise shadow it and break the 1.88 MSRV.
     let _ = fs2::FileExt::unlock(&file);
@@ -115,7 +125,7 @@ pub fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
 
 /// Read a credential file into a string, returning None if it doesn't exist
 /// (the common case for optional paths like `~/.claude/.credentials.json`).
-pub fn read_blob(path: &Path) -> Option<String> {
+fn read_blob(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     String::from_utf8(bytes).ok()
 }
@@ -135,7 +145,7 @@ pub fn read_blob(path: &Path) -> Option<String> {
 /// `last_chance_fallback` does) should check `read_blob` itself rather than
 /// use this helper for that path. Both current callers only need the
 /// "recognised or not" split, which `identified` already gives them.
-fn for_each_credential_path<F>(provider: &dyn Provider, online_identify: bool, mut f: F)
+fn for_each_credential_path<F>(provider: &dyn CredentialSync, online_identify: bool, mut f: F)
 where
     F: FnMut(&Path, &str, Option<(AccountKey, CredentialFreshness)>),
 {
@@ -161,6 +171,14 @@ where
     }
 }
 
+/// The paths a provider's credential sync watches; none without that capability.
+fn credential_paths_of(provider: &dyn Provider) -> Vec<std::path::PathBuf> {
+    provider
+        .credential_sync()
+        .map(|s| s.credential_paths())
+        .unwrap_or_default()
+}
+
 /// Scan a provider's credential paths and let it absorb any lagging
 /// rotations. Returns the set of AccountKeys observed on disk (whether we
 /// absorbed them or not — the caller can use this to detect additions).
@@ -169,8 +187,11 @@ where
 /// while we're reading a path we may see a blob for a DIFFERENT tracked
 /// account (e.g. `~/.claude.json`'s active identity shifted while we were
 /// polling for another). Absorb those too.
-pub fn absorb_all_lagging(provider: &dyn Provider) -> Vec<AccountKey> {
+pub(crate) fn absorb_all_lagging(provider: &dyn Provider) -> Vec<AccountKey> {
     let mut seen = Vec::new();
+    let Some(provider) = provider.credential_sync() else {
+        return seen;
+    };
     for_each_credential_path(provider, false, |path, blob, identified| {
         let Some((key, freshness)) = identified else {
             return;
@@ -214,7 +235,7 @@ pub(crate) fn flag_needs_relogin_if_unchanged(
     email: &str,
     failed_refresh_token: &str,
 ) -> Result<FlagOutcome> {
-    with_state_lock(|| {
+    with_state_lock(|_| {
         let mut st = State::load()?;
         let Some(a) = st.find_mut(email) else {
             return Ok(FlagOutcome::Missing);
@@ -235,7 +256,7 @@ pub(crate) fn flag_needs_relogin_if_unchanged(
 /// token is within REFRESH_SKEW_SECS of expiry. The active account is
 /// deliberately skipped — let the vendor CLI own its own rotation so our
 /// refresh can't race the tokens it's about to write.
-pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
+pub(crate) fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
     // Snapshot {accounts, active} atomically under the state lock, ONCE.
     // Using the hint the caller computed outside the lock is unsafe: a
     // switch that lands between the caller's read and this function's
@@ -253,7 +274,7 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
     // re-loads and re-checks `active` under the lock immediately before
     // saving.
     let (accounts, active_at_snapshot): (Vec<crate::store::Account>, Option<String>) =
-        match with_state_lock(|| {
+        match with_state_lock(|_| {
             let st = State::load()?;
             let active = st.active.clone();
             let accounts = st
@@ -305,7 +326,7 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
                     // fires when the save fails; it is skipped only when the
                     // token rotated or the account was already flagged.
                     let alert = || {
-                        crate::notify(&format!(
+                        crate::notifications::notify(&format!(
                             "{email}: re-login required — run `usagio capture`"
                         ))
                     };
@@ -347,7 +368,7 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
 
 /// True the first time this process sees `(email, refresh token)`; only a hash
 /// of the token is kept in memory.
-pub(crate) fn first_relogin_alert(email: &str, refresh_token: &str) -> bool {
+fn first_relogin_alert(email: &str, refresh_token: &str) -> bool {
     use std::hash::{Hash, Hasher};
     static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(String, u64)>>> =
         std::sync::Mutex::new(None);
@@ -362,7 +383,7 @@ pub(crate) fn first_relogin_alert(email: &str, refresh_token: &str) -> bool {
 /// writes the incoming account's blob to path[0]. This closes the window
 /// where a running `claude` on the outgoing account would silently lose its
 /// last rotation because we blindly overwrote path[0] first.
-pub fn absorb_before_switch(provider: &dyn Provider) {
+pub(crate) fn absorb_before_switch(provider: &dyn Provider) {
     let _ = absorb_all_lagging(provider);
 }
 
@@ -375,7 +396,10 @@ pub fn absorb_before_switch(provider: &dyn Provider) {
 /// Bonus: while we're walking, absorb any blob that matches a DIFFERENT
 /// tracked account. This is the "free-sync" behaviour: we already have
 /// the data in hand, no reason not to update it.
-pub fn last_chance_fallback(provider: &dyn Provider, target: &AccountKey) -> bool {
+pub(crate) fn last_chance_fallback(provider: &dyn Provider, target: &AccountKey) -> bool {
+    let Some(provider) = provider.credential_sync() else {
+        return false;
+    };
     let mut best_for_target: Option<(String, CredentialFreshness)> = None;
     for_each_credential_path(provider, true, |path, blob, identified| {
         let Some((key, freshness)) = identified else {
@@ -427,7 +451,7 @@ pub fn last_chance_fallback(provider: &dyn Provider, target: &AccountKey) -> boo
 /// Handle emitted by `spawn_watchers`. Dropping it drops the underlying
 /// notify::RecommendedWatcher and stops the background thread. Owned by
 /// `WATCHER_REGISTRY` once installed via [`install_watchers`].
-pub struct WatcherHandle {
+struct WatcherHandle {
     // The watcher must outlive the thread, so we keep it here. The thread
     // owns the receiver end and shuts down when we drop the sender-carrying
     // watcher (the notify crate closes the channel on drop).
@@ -443,14 +467,24 @@ pub struct WatcherHandle {
 ///
 /// Errors from watch setup are logged and swallowed: the daemon must not
 /// crash if `~/.claude/` doesn't exist yet on a fresh install.
-pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHandle> {
+fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHandle> {
     use notify::{Event, RecursiveMode, Watcher};
 
     let (tx, rx) = mpsc::channel::<Event>();
+    // Only events on a credential file (or a temp file named after one, as an
+    // atomic rename writes) wake the absorb pass: the watch is on whole parent
+    // directories, whose other files must not keep it busy.
+    let cred_names: Vec<std::ffi::OsString> = providers
+        .iter()
+        .flat_map(|p| credential_paths_of(*p))
+        .filter_map(|p| p.file_name().map(std::ffi::OsStr::to_os_string))
+        .collect();
     let watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
         match res {
             Ok(ev) => {
-                let _ = tx.send(ev);
+                if event_touches_credentials(&ev.paths, &cred_names) {
+                    let _ = tx.send(ev);
+                }
             }
             // R2-EH-03: log mid-stream notify errors so persistent notify
             // failures on a credential-parent path leave a signal instead of
@@ -487,7 +521,7 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
     let mut watched_parents: std::collections::HashSet<std::path::PathBuf> =
         std::collections::HashSet::new();
     for p in &providers {
-        for path in p.credential_paths() {
+        for path in credential_paths_of(*p) {
             // Watch the parent directory (notify's file-level watching is
             // unreliable across atomic-rename rotations, which is exactly
             // how the vendor CLIs write these files).
@@ -606,7 +640,7 @@ pub(crate) fn clear_watchers_for_test() {
 /// registry (replacing the `Box::leak` the daemon used to do). Keeps the
 /// provider list around so the watchdog can rebuild the watcher later without
 /// re-threading it through from `main`.
-pub fn install_watchers(providers: Vec<&'static dyn Provider>) {
+pub(crate) fn install_watchers(providers: Vec<&'static dyn Provider>) {
     let handle = spawn_watchers(providers.clone());
     let mut reg = WATCHER_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     reg.providers = providers;
@@ -622,7 +656,7 @@ pub fn install_watchers(providers: Vec<&'static dyn Provider>) {
 ///
 /// No-op (returns `false`) if no providers were ever installed (e.g. a one-shot
 /// CLI command that never called `install_watchers`).
-pub fn respawn_watchers() -> bool {
+pub(crate) fn respawn_watchers() -> bool {
     let mut reg = WATCHER_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     if reg.providers.is_empty() {
         return false;
@@ -645,6 +679,36 @@ pub fn respawn_watchers() -> bool {
 /// second.
 const WATCHER_PANIC_BACKOFF: Duration = Duration::from_millis(500);
 
+/// Longest the watcher waits for a burst of events to go quiet before it runs
+/// the absorb pass anyway.
+const DEBOUNCE_MAX_WAIT: Duration = Duration::from_secs(2);
+
+/// Whether a filesystem event concerns a credential file: one of its paths is
+/// named after a credential file (exactly, or as a prefix — a vendor's atomic
+/// write goes through `<name>.tmp...`). An event with no paths (a rescan
+/// request) counts, since it may hide a credential change.
+fn event_touches_credentials(paths: &[std::path::PathBuf], names: &[std::ffi::OsString]) -> bool {
+    paths.is_empty()
+        || paths.iter().any(|p| {
+            p.file_name().is_some_and(|f| {
+                let f = f.as_encoded_bytes();
+                names.iter().any(|n| f.starts_with(n.as_encoded_bytes()))
+            })
+        })
+}
+
+/// Swallow events until `quiet` passes with none, or `max_wait` has elapsed
+/// in total, whichever comes first.
+fn drain_debounced<T>(rx: &mpsc::Receiver<T>, quiet: Duration, max_wait: Duration) {
+    let deadline = std::time::Instant::now() + max_wait;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() || rx.recv_timeout(quiet.min(left)).is_err() {
+            return;
+        }
+    }
+}
+
 /// Runs for the lifetime of the fsnotify watcher thread. Blocks on `rx` for
 /// the next raw filesystem event, then hands the debounce+absorb+refresh work
 /// to a `catch_unwind`-guarded closure so a panic anywhere in a provider's
@@ -658,7 +722,8 @@ fn fsnotify_watcher_supervisor(
     providers: Vec<&'static dyn Provider>,
 ) {
     // Debounce: coalesce a burst of writes (atomic rename fires multiple
-    // events) into one absorb pass.
+    // events) into one absorb pass, but never wait longer than
+    // DEBOUNCE_MAX_WAIT so a steady event stream can't starve it.
     let debounce = Duration::from_millis(250);
     loop {
         // Block for the next event outside the panic guard — recv() itself
@@ -670,7 +735,7 @@ fn fsnotify_watcher_supervisor(
             return;
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            while rx.recv_timeout(debounce).is_ok() {}
+            drain_debounced(&rx, debounce, DEBOUNCE_MAX_WAIT);
             for p in &providers {
                 let _ = absorb_all_lagging(*p);
             }

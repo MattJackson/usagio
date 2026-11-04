@@ -1,6 +1,6 @@
 [package]
 name = "usagio"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2021"
 rust-version = "1.88"
 description = "Track usage / limits across every AI coding CLI you use, and switch between accounts."
@@ -298,3 +298,9 @@ serde_json = "1"
 strip = true
 opt-level = "z"
 lto = true
+
+# GHSA-wrw7-89jp-8q8g / RUSTSEC-2024-0429: glib 0.18.5 VariantStrIter unsoundness.
+# wry/webkit2gtk (latest) hard-pin gtk-rs 0.18, so the upstream fix (gtk-rs-core
+# PR #1343) is backported in-tree. See vendor/glib-0.18.5/PATCHED.md.
+[patch.crates-io]
+glib = { path = "vendor/glib-0.18.5" }

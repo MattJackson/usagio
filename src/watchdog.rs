@@ -52,27 +52,27 @@ use std::time::{Duration, Instant};
 /// around ~40 open descriptors; 1500 is far past anything normal operation
 /// produces, so crossing it is an early signal that something is leaking —
 /// logged (not yet remediated) so the trend is visible before it turns critical.
-pub const FD_WARN_THRESHOLD: usize = 1500;
+const FD_WARN_THRESHOLD: usize = 1500;
 
 /// Open-fd count that triggers active remediation. Still comfortably below the
 /// 65536 `RLIMIT_NOFILE` the daemon raises itself to (see
 /// `main::raise_nofile_limit`), but so far above a tray app's ~40-fd baseline
 /// that reaching it means a genuine leak is underway and keychain calls are
 /// about to start failing with EMFILE — the exact outage this module prevents.
-pub const FD_CRITICAL_THRESHOLD: usize = 3000;
+const FD_CRITICAL_THRESHOLD: usize = 3000;
 
 /// Consecutive keychain/secret write failures that trigger remediation. A
 /// single failure can be transient (keychain locked for a moment); three in a
 /// row is the fingerprint of fd-exhaustion EMFILE, which a watcher respawn or
 /// restart clears.
-pub const KEYCHAIN_FAILURE_THRESHOLD: u32 = 3;
+const KEYCHAIN_FAILURE_THRESHOLD: u32 = 3;
 
 /// Minimum wall-clock gap between health checks. The poll cadence itself varies
 /// from 10s (backstop) to 1200s (rate-limit backoff); throttling on wall-clock
 /// time keeps the check to roughly once a minute regardless, so a tight
 /// backstop cadence doesn't run the fd scan six times a minute. The scan is a
 /// single directory read, so this is about tidiness, not cost.
-pub const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Keychain-failure counter (process-global, updated at every write site)
@@ -91,7 +91,7 @@ static KEYCHAIN_OK_TOTAL: AtomicU32 = AtomicU32::new(0);
 /// the keychain write path (`main::keychain_write`) so the watchdog can detect
 /// the EMFILE-from-fd-exhaustion fingerprint without threading a counter
 /// through every call site.
-pub fn record_keychain_result(ok: bool) {
+pub(crate) fn record_keychain_result(ok: bool) {
     if ok {
         KEYCHAIN_CONSEC_FAILURES.store(0, Ordering::Relaxed);
         KEYCHAIN_OK_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -101,7 +101,7 @@ pub fn record_keychain_result(ok: bool) {
 }
 
 /// Current count of consecutive keychain/secret write failures.
-pub fn keychain_consecutive_failures() -> u32 {
+fn keychain_consecutive_failures() -> u32 {
     KEYCHAIN_CONSEC_FAILURES.load(Ordering::Relaxed)
 }
 
@@ -117,7 +117,7 @@ pub fn keychain_consecutive_failures() -> u32 {
 /// descriptor `read_dir` itself holds, so it can be off by one — immaterial
 /// against thresholds in the thousands.
 #[cfg(unix)]
-pub fn count_open_fds() -> Option<usize> {
+fn count_open_fds() -> Option<usize> {
     for dir in ["/proc/self/fd", "/dev/fd"] {
         if let Ok(rd) = std::fs::read_dir(dir) {
             return Some(rd.count());
@@ -129,7 +129,7 @@ pub fn count_open_fds() -> Option<usize> {
 /// Non-Unix fallback: no `/proc` or `/dev/fd`, so the fd self-monitor is inert
 /// (Windows was never affected by the kqueue leak this guards against).
 #[cfg(not(unix))]
-pub fn count_open_fds() -> Option<usize> {
+fn count_open_fds() -> Option<usize> {
     None
 }
 
@@ -139,7 +139,7 @@ pub fn count_open_fds() -> Option<usize> {
 
 /// What the watchdog should do this cycle. Ordered by severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WatchdogAction {
+pub(crate) enum WatchdogAction {
     /// Everything healthy — do nothing.
     None,
     /// fd count is elevated but not yet critical — log a warning only.
@@ -155,16 +155,16 @@ pub enum WatchdogAction {
 /// Inputs to the pure [`decide`] function. Kept as a struct so the boundary
 /// tests read clearly and new signals can be added without churning callers.
 #[derive(Debug, Clone, Copy)]
-pub struct WatchdogInput {
+pub(crate) struct WatchdogInput {
     /// Open-fd count, or `None` if unreadable on this platform (then the fd
     /// signal is ignored and only the keychain signal drives the decision).
-    pub fd_count: Option<usize>,
+    fd_count: Option<usize>,
     /// Consecutive keychain/secret write failures.
-    pub keychain_failures: u32,
+    keychain_failures: u32,
     /// Whether the watcher-respawn remediation has already been tried during
     /// the current unhealthy episode (reset once a check comes back healthy).
     /// Drives the escalation from `RespawnWatcher` to `SelfRestart`.
-    pub already_respawned: bool,
+    already_respawned: bool,
 }
 
 /// The pure remediation decision. No I/O, no side effects — given the measured
@@ -177,7 +177,7 @@ pub struct WatchdogInput {
 ///   `SelfRestart` once a respawn has already been tried and the problem remains;
 /// - else fd merely past the warn threshold → `Warn`;
 /// - else `None`.
-pub fn decide(input: WatchdogInput) -> WatchdogAction {
+pub(crate) fn decide(input: WatchdogInput) -> WatchdogAction {
     let fd_critical = input.fd_count.is_some_and(|n| n >= FD_CRITICAL_THRESHOLD);
     let fd_warn = input.fd_count.is_some_and(|n| n >= FD_WARN_THRESHOLD);
     let keychain_bad = input.keychain_failures >= KEYCHAIN_FAILURE_THRESHOLD;
@@ -202,7 +202,7 @@ pub fn decide(input: WatchdogInput) -> WatchdogAction {
 /// The side effects the watchdog performs, isolated behind a trait so tests can
 /// assert on the decision+wiring without ever respawning a real watcher,
 /// spawning `launchctl`, or calling `exit()`.
-pub trait WatchdogEffects {
+pub(crate) trait WatchdogEffects {
     /// Append a line to the debug log.
     fn log(&mut self, msg: &str);
     /// Drop + recreate the fsnotify watcher. Returns `(before, after)` open-fd
@@ -220,7 +220,7 @@ pub trait WatchdogEffects {
 /// decision to the pure [`decide`] and the actual effects to a
 /// [`WatchdogEffects`].
 #[derive(Default)]
-pub struct Watchdog {
+pub(crate) struct Watchdog {
     last_check: Option<Instant>,
     already_respawned: bool,
     /// A keychain-driven respawn happened and no keychain write has succeeded
@@ -234,7 +234,7 @@ impl Watchdog {
     /// Call once per poll-loop iteration. Throttles to at most one real check
     /// per [`HEALTH_CHECK_INTERVAL`]; when a check is due it reads the live fd
     /// count + keychain-failure counter and runs [`run_check`](Self::run_check).
-    pub fn maybe_run(&mut self, effects: &mut dyn WatchdogEffects) {
+    pub(crate) fn maybe_run(&mut self, effects: &mut dyn WatchdogEffects) {
         let now = Instant::now();
         if let Some(last) = self.last_check {
             if now.duration_since(last) < HEALTH_CHECK_INTERVAL {
@@ -257,7 +257,7 @@ impl Watchdog {
     /// and maintains the `already_respawned` escalation flag. Split from
     /// `maybe_run` so tests can drive it directly with injected inputs and a
     /// mock `effects`, with no throttle clock or real fd read in the way.
-    pub fn run_check(
+    fn run_check(
         &mut self,
         fd_count: Option<usize>,
         keychain_failures: u32,
@@ -349,8 +349,8 @@ fn opt(n: Option<usize>) -> String {
 
 /// The real side effects used by the running daemon. Logging goes to the debug
 /// log; watcher respawn drops+rebuilds the global fsnotify watcher; self-restart
-/// reuses the battle-tested launchd kickstart path (`menubar::watchdog_self_restart`).
-pub struct RealEffects;
+/// reuses the battle-tested launchd kickstart path (`menubar::supervisor::watchdog_self_restart`).
+pub(crate) struct RealEffects;
 
 impl WatchdogEffects for RealEffects {
     fn log(&mut self, msg: &str) {
@@ -385,7 +385,7 @@ impl WatchdogEffects for RealEffects {
         // plain exit() would NOT be revived. Returning `false` there is correct:
         // the watcher-respawn remediation + the surfaced log lines are the
         // safety net for the non-launchd case, with zero restart-loop risk.
-        crate::menubar::watchdog_self_restart()
+        crate::menubar::supervisor::watchdog_self_restart()
     }
 }
 

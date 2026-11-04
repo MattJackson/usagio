@@ -14,29 +14,29 @@ use crate::providers::trait_def::Window;
 use crate::usage_log::{self, AccountKey, Snapshot};
 
 /// Minimum samples inside the current window required before we'll fit a rate.
-pub const MIN_SAMPLES: usize = 6;
+const MIN_SAMPLES: usize = 6;
 
 /// Slope below this magnitude is reported as "flat" — regression noise dominates.
-pub const FLAT_SLOPE_THRESHOLD_PCT_PER_HOUR: f32 = 0.5;
+const FLAT_SLOPE_THRESHOLD_PCT_PER_HOUR: f32 = 0.5;
 
 /// Ceiling on projected "empty in" — anything longer collapses to this to avoid
 /// nonsense like "empty in ~470h."  Chosen so the menu row stays under one screen line.
-pub const MAX_EMPTY_IN_HOURS: i64 = 999;
+pub(crate) const MAX_EMPTY_IN_HOURS: i64 = 999;
 
 #[derive(Clone, Debug)]
-pub struct BurnRateEstimate {
-    pub window: Window,
-    pub current_pct: f32,
+pub(crate) struct BurnRateEstimate {
+    pub(crate) window: Window,
+    pub(crate) current_pct: f32,
     /// Slope of the linear fit, in "percent points per hour."  May be zero.
-    pub rate_pct_per_hour: f32,
+    pub(crate) rate_pct_per_hour: f32,
     /// Projected time to hit 100%.  If `rate_pct_per_hour <= FLAT_SLOPE_THRESHOLD`
     /// this is `now + MAX_EMPTY_IN_HOURS`; callers should render via
     /// `format_menu_row` which handles the flat case in text.
-    pub empty_at: DateTime<Utc>,
-    pub reset_at: Option<DateTime<Utc>>,
+    pub(crate) empty_at: DateTime<Utc>,
+    pub(crate) reset_at: Option<DateTime<Utc>>,
 }
 
-pub fn estimate(
+pub(crate) fn estimate(
     account: &AccountKey,
     window: Window,
     now: DateTime<Utc>,
@@ -93,9 +93,10 @@ fn estimate_from(
     let current_pct = pct_for(samples.last().unwrap(), window).unwrap();
     let reset_at = reset_for(samples.last().unwrap(), window);
 
-    let (slope_per_hour, intercept, _r2) = weighted_linear_fit(&samples, window, now)?;
+    let (slope_per_hour, _intercept, _r2) = weighted_linear_fit(&samples, window, now)?;
 
-    // Empty-at projection: solve intercept + slope*t = 100 (t is hours from `now`).
+    // Empty-at projection: project from the last observed pct (usage since the
+    // last reading is unknown), at the fitted slope, counting forward from `now`.
     let empty_at = if slope_per_hour <= FLAT_SLOPE_THRESHOLD_PCT_PER_HOUR {
         // Flat: cap far in the future.
         now + Duration::hours(MAX_EMPTY_IN_HOURS)
@@ -106,9 +107,6 @@ fn estimate_from(
             .min(MAX_EMPTY_IN_HOURS as f32);
         now + Duration::seconds((hours_to_empty * 3600.0) as i64)
     };
-
-    // Silence unused-var lint on intercept — kept for debug/logging clarity.
-    let _ = intercept;
 
     Some(BurnRateEstimate {
         window,
@@ -123,7 +121,7 @@ fn estimate_from(
 /// runs out before it resets, "Weekly · 61% · lasts to reset" when it
 /// doesn't (or the pace is flat), "Weekly · 61% · pace flat" with no reset.
 /// The reset time itself is on the "renews in" row, so it isn't repeated.
-pub fn format_menu_row(est: &BurnRateEstimate) -> String {
+pub(crate) fn format_menu_row(est: &BurnRateEstimate) -> String {
     let name = match est.window {
         Window::Session => "Session",
         Window::Weekly => "Weekly",

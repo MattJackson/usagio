@@ -40,7 +40,6 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 // muri 0.9's `muda-compat` facade replaces `tray-icon`/`muda` for the Windows
 // tray menu (0.6.0 swap). A pure drop-in: `muri::compat::tray_icon` re-exports
@@ -95,7 +94,7 @@ pub(super) fn daemon_instance_alive(pid: u32, expected_start: &str) -> Result<bo
     Ok(generation.to_string() == expected_start)
 }
 
-pub struct WindowsPlatform {
+pub(crate) struct WindowsPlatform {
     menu: WindowsMenu,
     secrets: WindowsSecrets,
     autostart: WindowsAutostart,
@@ -103,7 +102,7 @@ pub struct WindowsPlatform {
 }
 
 impl WindowsPlatform {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             menu: WindowsMenu::default(),
             secrets: WindowsSecrets,
@@ -193,12 +192,13 @@ unsafe impl Send for TrayState {}
 /// so any future ClickCb-typed variable inherits the same signature.
 type ClickCb = Box<dyn Fn(&str) + Send + Sync + 'static>;
 
-pub struct WindowsMenu {
+struct WindowsMenu {
     tray_state: Mutex<Option<TrayState>>,
     cmd_rx: Mutex<Option<mpsc::Receiver<UiCmd>>>,
     cmd_tx: Mutex<Option<mpsc::Sender<UiCmd>>>,
     click_cb: Arc<Mutex<Option<ClickCb>>>,
     quit: Arc<AtomicBool>,
+    wake: LoopWaker,
 }
 
 impl Default for WindowsMenu {
@@ -209,6 +209,7 @@ impl Default for WindowsMenu {
             cmd_tx: Mutex::new(None),
             click_cb: Arc::new(Mutex::new(None)),
             quit: Arc::new(AtomicBool::new(false)),
+            wake: LoopWaker::default(),
         }
     }
 }
@@ -216,25 +217,101 @@ impl Default for WindowsMenu {
 /// `Send`-safe handle returned to callers. Holds only a channel `Sender` —
 /// never the native `TrayIcon` — so it satisfies `MenuHandle: Send` without
 /// requiring `tray_icon::TrayIcon` itself to be `Send`.
-pub struct WindowsMenuHandle {
+struct WindowsMenuHandle {
     tx: mpsc::Sender<UiCmd>,
+    wake: LoopWaker,
+}
+
+impl WindowsMenuHandle {
+    fn send(&self, cmd: UiCmd) -> Result<()> {
+        self.tx
+            .send(cmd)
+            .map_err(|_| anyhow::anyhow!("tray event loop is not running"))?;
+        self.wake.wake();
+        Ok(())
+    }
 }
 
 impl MenuHandle for WindowsMenuHandle {
     fn set_icon(&self, png_bytes: &[u8]) -> Result<()> {
-        self.tx
-            .send(UiCmd::SetIcon(png_bytes.to_vec()))
-            .map_err(|_| anyhow::anyhow!("tray event loop is not running"))
+        self.send(UiCmd::SetIcon(png_bytes.to_vec()))
     }
     fn set_title(&self, title: &str) -> Result<()> {
-        self.tx
-            .send(UiCmd::SetTitle(title.to_string()))
-            .map_err(|_| anyhow::anyhow!("tray event loop is not running"))
+        self.send(UiCmd::SetTitle(title.to_string()))
     }
     fn set_menu(&self, menu: MenuTree) -> Result<()> {
-        self.tx
-            .send(UiCmd::SetMenu(menu))
-            .map_err(|_| anyhow::anyhow!("tray event loop is not running"))
+        self.send(UiCmd::SetMenu(menu))
+    }
+}
+
+/// Wakes the tray thread out of its message wait when work arrives from
+/// another thread (a `UiCmd`, or a quit request): posts a no-op thread message
+/// to the loop's thread once it has recorded its id. Before that the loop
+/// hasn't waited yet, and drains the channel on its first pass anyway.
+#[derive(Clone, Default)]
+struct LoopWaker(Arc<std::sync::atomic::AtomicU32>);
+
+/// The running tray loop's waker, for [`wake_ui_thread`].
+static UI_WAKER: Mutex<Option<LoopWaker>> = Mutex::new(None);
+
+/// Wake the running tray loop so it drains `menubar::actions::run_ui_tasks` now
+/// rather than at the wait backstop. A no-op before the loop starts.
+pub(super) fn wake_ui_thread() {
+    let waker = UI_WAKER.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+}
+
+/// Thread message used only to end the tray loop's wait.
+const WM_USAGIO_WAKE: u32 = ::windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x55;
+
+impl LoopWaker {
+    fn bind_current_thread(&self) {
+        #[rustfmt::skip]
+        use ::windows::Win32::System::Threading::GetCurrentThreadId;
+        // SAFETY: plain FFI call with no arguments.
+        self.0
+            .store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
+    }
+
+    fn wake(&self) {
+        #[rustfmt::skip]
+        use ::windows::Win32::{
+            Foundation::{LPARAM, WPARAM},
+            UI::WindowsAndMessaging::PostThreadMessageW,
+        };
+        let tid = self.0.load(Ordering::SeqCst);
+        if tid != 0 {
+            // SAFETY: posting a parameterless app message to a thread id; a
+            // stale id just fails. Failure is harmless: the loop's wait has a
+            // timeout as a backstop.
+            let _ = unsafe { PostThreadMessageW(tid, WM_USAGIO_WAKE, WPARAM(0), LPARAM(0)) };
+        }
+    }
+}
+
+/// Upper bound on one wait of the tray loop, a backstop in case a wake is
+/// lost. Normal wake-ups come from window messages or [`LoopWaker`].
+const TRAY_WAIT_BACKSTOP_MS: u32 = 1000;
+
+/// Block until this thread has a message in its queue (window input, a
+/// posted message, a [`LoopWaker`] wake), or the backstop elapses.
+fn wait_for_messages() {
+    #[rustfmt::skip]
+    use ::windows::Win32::UI::WindowsAndMessaging::{
+        MsgWaitForMultipleObjectsEx, MWMO_INPUTAVAILABLE, QS_ALLINPUT,
+    };
+    // SAFETY: no handles; waits only on this thread's message queue.
+    // MWMO_INPUTAVAILABLE returns at once if input is already queued, so a
+    // message that arrived after the last pump is never slept through.
+    unsafe {
+        let _ = MsgWaitForMultipleObjectsEx(
+            None,
+            TRAY_WAIT_BACKSTOP_MS,
+            QS_ALLINPUT,
+            MWMO_INPUTAVAILABLE,
+        );
     }
 }
 
@@ -323,8 +400,8 @@ impl MenuBackend for WindowsMenu {
         let mut tray = Tray::new(decode_icon(initial_icon))
             .tooltip(windows_tooltip(initial_title))
             .menu(Menu::new())
-            .options(crate::menubar::tray_options());
-        if let Some(theme) = crate::menubar::forced_theme() {
+            .options(crate::menubar::theme::tray_options());
+        if let Some(theme) = crate::menubar::theme::forced_theme() {
             tray = tray.theme(theme);
         }
         let mtm = muri::MainThreadMarker::new()
@@ -341,7 +418,10 @@ impl MenuBackend for WindowsMenu {
         *self.cmd_rx.lock().unwrap() = Some(rx);
         *self.cmd_tx.lock().unwrap() = Some(tx.clone());
 
-        Ok(Box::new(WindowsMenuHandle { tx }))
+        Ok(Box::new(WindowsMenuHandle {
+            tx,
+            wake: self.wake.clone(),
+        }))
     }
 
     fn on_click(&self, cb: Box<dyn Fn(&str) + Send + Sync + 'static>) -> Result<()> {
@@ -391,6 +471,10 @@ impl MenuBackend for WindowsMenu {
         );
 
         let menu_rx = MenuEvent::receiver();
+        // From here a sender's wake reaches this thread; anything sent before
+        // is drained by the first pass below.
+        self.wake.bind_current_thread();
+        *UI_WAKER.lock().unwrap_or_else(|e| e.into_inner()) = Some(self.wake.clone());
         loop {
             if self.quit.load(Ordering::SeqCst) {
                 break;
@@ -401,18 +485,27 @@ impl MenuBackend for WindowsMenu {
                     crate::logging::log(&format!("windows tray: UI command failed: {e}"));
                 }
             }
+            // Work a worker handed back to this (the UI) thread.
+            crate::menubar::actions::run_ui_tasks();
             while let Ok(ev) = menu_rx.try_recv() {
                 if let Some(cb) = self.click_cb.lock().unwrap().as_ref() {
                     cb(&ev.id.0);
                 }
             }
-            std::thread::sleep(Duration::from_millis(30));
+            // Menu clicks are dispatched on this thread by the pump above;
+            // UI commands, UI tasks and quit requests from other threads post
+            // a wake.
+            if self.quit.load(Ordering::SeqCst) {
+                break;
+            }
+            wait_for_messages();
         }
         Ok(())
     }
 
     fn request_quit(&self) {
         self.quit.store(true, Ordering::SeqCst);
+        self.wake.wake();
     }
 }
 
@@ -422,7 +515,7 @@ impl MenuBackend for WindowsMenu {
 /// keyring-store` backend. Per-user, DPAPI-encrypted at rest — no fallback
 /// needed the way macOS's unsigned-binary keychain-prompt problem needed one
 /// (see the header comment in `macos.rs`).
-pub struct WindowsSecrets;
+struct WindowsSecrets;
 
 impl SecretStore for WindowsSecrets {
     fn get(&self, service: &str, account: &str) -> Result<Option<String>> {
@@ -438,13 +531,6 @@ impl SecretStore for WindowsSecrets {
     }
 
     fn set(&self, service: &str, account: &str, secret: &str) -> Result<()> {
-        // Shared test seam: a test can arm the next set to fail so the
-        // apply_account rollback path is exercisable on Windows (not just macOS).
-        // Checked before touching the real Credential Manager.
-        #[cfg(test)]
-        if super::test_secret_seam::take_set_failure() {
-            bail!("injected secret-store set failure (test seam)");
-        }
         let entry =
             keyring::Entry::new(service, account).context("opening Credential Manager entry")?;
         entry.set_password(secret).with_context(|| {
@@ -482,7 +568,7 @@ use winreg::RegKey;
 
 const RUN_KEY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
-pub struct WindowsAutostart;
+struct WindowsAutostart;
 
 impl WindowsAutostart {
     fn run_key() -> Result<RegKey> {
@@ -597,7 +683,7 @@ fn split_command_line(value: &str) -> Result<(String, Vec<String>)> {
 
 // ---- Paths -----------------------------------------------------------------
 
-pub struct WindowsPaths;
+struct WindowsPaths;
 
 /// `%APPDATA%` (Roaming) — falls back to `dirs::config_dir()` (which
 /// resolves the same known folder via `SHGetKnownFolderPath` and so doesn't
@@ -656,7 +742,7 @@ impl Paths for WindowsPaths {
 // ---- Terminal launcher ------------------------------------------------------
 //
 // Not (yet) part of the `Platform` trait — no caller launches an interactive
-// REPL in a new terminal window on any OS today (`Provider::launch_client`
+// REPL in a new terminal window on any OS today (`Launcher::launch_client`
 // runs the vendor CLI in-place via `Command::status()`; see
 // `src/providers/claude/mod.rs`). This is the Windows-side primitive for
 // when that lands; kept `pub(crate)` so it's ready to wire up without
@@ -664,7 +750,7 @@ impl Paths for WindowsPaths {
 
 /// Which terminal `launch_repl` picked, exposed for tests / diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TerminalKind {
+enum TerminalKind {
     WindowsTerminal,
     Cmd,
     PowerShell,
@@ -674,7 +760,7 @@ pub(crate) enum TerminalKind {
 /// `exists` is injected so the selection logic is unit-testable without
 /// touching the real `PATH` — production code passes
 /// `|prog| which::which(prog).is_ok()`.
-pub(crate) fn probe_terminal(mut exists: impl FnMut(&str) -> bool) -> TerminalKind {
+fn probe_terminal(mut exists: impl FnMut(&str) -> bool) -> TerminalKind {
     if exists("wt.exe") {
         TerminalKind::WindowsTerminal
     } else if exists("cmd.exe") {
@@ -710,7 +796,7 @@ impl TerminalKind {
 /// probing wt.exe → cmd.exe → powershell.exe. Fire-and-forget: the spawned
 /// terminal owns its own lifetime, we don't wait on it.
 #[allow(dead_code)]
-pub(crate) fn launch_repl(program: &str) -> Result<()> {
+fn launch_repl(program: &str) -> Result<()> {
     let kind = probe_terminal(|prog| which::which(prog).is_ok());
     kind.command(program)
         .spawn()
@@ -902,6 +988,30 @@ mod tests {
     }
 
     // --- M7: request_quit() before run_event_loop() must not be a no-op ----
+
+    #[test]
+    fn a_wake_from_another_thread_ends_the_tray_wait_promptly() {
+        // The tray loop blocks in wait_for_messages instead of polling; a
+        // UiCmd or quit from another thread must end that wait at once, not
+        // after the backstop.
+        let waker = LoopWaker::default();
+        waker.bind_current_thread();
+        pump_windows_messages(); // start from an empty queue
+        let remote = waker.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            remote.wake();
+        });
+        let started = std::time::Instant::now();
+        wait_for_messages();
+        let waited = started.elapsed();
+        t.join().unwrap();
+        pump_windows_messages();
+        assert!(
+            waited < std::time::Duration::from_millis(u64::from(TRAY_WAIT_BACKSTOP_MS) / 2),
+            "wait ran {waited:?}: the wake was not delivered"
+        );
+    }
 
     #[test]
     fn request_quit_before_run_event_loop_returns_immediately() {
