@@ -104,8 +104,25 @@ fn prepare_provider_refresh(
     })?;
     // Saved selection can lag a vendor login. A credential currently owned by
     // the client must never be refreshed by us, even if state calls it inactive.
-    // A read error fails closed: we cannot prove the client does not own it.
-    if let Some(blob) = matching_active_blob(provider, &snapshot.identity_snapshot())? {
+    // A read error fails closed for the REFRESH decision only: we cannot prove
+    // the client does not own it, so skip our own refresh request and hand back
+    // the saved credential so switches and polls keep working. An API-key-only
+    // vendor blob proves the vendor holds no OAuth login, i.e. no match.
+    let matched = match matching_active_blob(provider, &snapshot.identity_snapshot()) {
+        Ok(m) => m,
+        Err(e) if format!("{e:#}").contains("API-key-only") => None,
+        Err(e) => {
+            logging::log(&format!(
+                "event=refresh_skipped provider={slug} account={key} reason=vendor_slot_unreadable:{e:#}"
+            ));
+            return Ok(PreparedRefresh {
+                expires_at_ms: snapshot.expires_at.saturating_mul(1000),
+                owned: true,
+                value: snapshot,
+            });
+        }
+    };
+    if let Some(blob) = matched {
         let grant = provider.parse_stored_blob(&blob)?;
         let adopted = crate::credentials::with_state_lock(|| {
             let mut state = crate::store::State::load()?;

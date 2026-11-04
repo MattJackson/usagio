@@ -1779,11 +1779,39 @@ fn with_inactive_codex_account<R>(exp: i64, f: impl FnOnce(&std::path::Path, &st
 }
 
 #[test]
-fn vendor_slot_read_error_never_triggers_our_own_refresh() {
-    let soon = Utc::now().timestamp() + 10;
-    with_inactive_codex_account(soon, |dir, _| {
-        // The vendor file is mid-rewrite / unreadable.
-        std::fs::write(dir.join("auth.json"), "{not json").unwrap();
+fn vendor_slot_read_error_skips_our_refresh_but_returns_the_saved_credential() {
+    for expired in [false, true] {
+        let exp = if expired {
+            Utc::now().timestamp() + 10
+        } else {
+            4_000_000_000
+        };
+        with_inactive_codex_account(exp, |dir, _| {
+            // Garbled vendor file: a persistent read/parse error.
+            std::fs::write(dir.join("auth.json"), "{not json").unwrap();
+            let (base_url, hits) = spawn_mock_token_server();
+            #[allow(clippy::disallowed_methods)]
+            std::env::set_var(
+                "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+                format!("{base_url}/v1/oauth/token"),
+            );
+            let res = crate::lifecycle::ensure_provider_fresh(
+                crate::providers::get("codex").unwrap(),
+                "user@example.com",
+            );
+            #[allow(clippy::disallowed_methods)]
+            std::env::remove_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE");
+            let acct = res.expect("the saved credential is returned, not an error");
+            assert_eq!(acct.access_token, "at");
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        });
+    }
+}
+
+#[test]
+fn api_key_only_vendor_slot_does_not_block_our_refresh_of_a_saved_account() {
+    with_inactive_codex_account(Utc::now().timestamp() + 10, |dir, _| {
+        std::fs::write(dir.join("auth.json"), r#"{"OPENAI_API_KEY":"sk-x"}"#).unwrap();
         let (base_url, hits) = spawn_mock_token_server();
         #[allow(clippy::disallowed_methods)]
         std::env::set_var(
@@ -1796,10 +1824,11 @@ fn vendor_slot_read_error_never_triggers_our_own_refresh() {
         );
         #[allow(clippy::disallowed_methods)]
         std::env::remove_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE");
+        assert!(res.is_ok(), "{res:?}");
         assert_eq!(
             hits.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "must not POST a refresh for a credential we could not prove we own: {res:?}"
+            1,
+            "the vendor holds no OAuth login, so the saved one is ours to refresh"
         );
     });
 }
