@@ -106,12 +106,10 @@ fn snap(now: DateTime<Utc>, active: &str, accounts: Vec<AccountIn>) -> Snapshot 
     }
 }
 
-fn pick(key: &str, at: DateTime<Utc>, settled: Tier) -> Option<ManualPick> {
+fn pick(key: &str, _at: DateTime<Utc>, settled: Tier) -> Option<ManualPick> {
     Some(ManualPick {
         key: key.to_string(),
-        at: at.timestamp(),
         settled,
-        settled_by_fresh: true,
     })
 }
 

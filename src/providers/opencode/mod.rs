@@ -1,8 +1,9 @@
 //! opencode (SST / opencode.ai) provider — STUB ONLY.
 //!
-//! Registered so the "Capture current login" submenu can list it, but every
-//! real operation is deferred. Nothing here reads credentials or hits the
-//! network yet.
+//! Registered, but hidden from the "Capture current login" submenu (stubs
+//! report `supports_usage: false`, which `partition_capture_providers`
+//! drops) until the real flow lands. Every real operation is deferred.
+//! Nothing here reads credentials or hits the network yet.
 //!
 //! Recon summary (see `wnllabvkg.output` for full detail):
 //!  - Creds path: `~/.local/share/opencode/auth.json` (`OPENCODE_AUTH_CONTENT`

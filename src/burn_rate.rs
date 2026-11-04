@@ -93,9 +93,10 @@ fn estimate_from(
     let current_pct = pct_for(samples.last().unwrap(), window).unwrap();
     let reset_at = reset_for(samples.last().unwrap(), window);
 
-    let (slope_per_hour, intercept, _r2) = weighted_linear_fit(&samples, window, now)?;
+    let (slope_per_hour, _intercept, _r2) = weighted_linear_fit(&samples, window, now)?;
 
-    // Empty-at projection: solve intercept + slope*t = 100 (t is hours from `now`).
+    // Empty-at projection: project from the last observed pct (usage since the
+    // last reading is unknown), at the fitted slope, counting forward from `now`.
     let empty_at = if slope_per_hour <= FLAT_SLOPE_THRESHOLD_PCT_PER_HOUR {
         // Flat: cap far in the future.
         now + Duration::hours(MAX_EMPTY_IN_HOURS)
@@ -106,9 +107,6 @@ fn estimate_from(
             .min(MAX_EMPTY_IN_HOURS as f32);
         now + Duration::seconds((hours_to_empty * 3600.0) as i64)
     };
-
-    // Silence unused-var lint on intercept — kept for debug/logging clarity.
-    let _ = intercept;
 
     Some(BurnRateEstimate {
         window,

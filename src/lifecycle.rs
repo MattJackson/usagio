@@ -110,7 +110,7 @@ fn prepare_provider_refresh(
     // vendor blob proves the vendor holds no OAuth login, i.e. no match.
     let matched = match matching_active_blob(provider, &snapshot.identity_snapshot()) {
         Ok(m) => m,
-        Err(e) if format!("{e:#}").contains("API-key-only") => None,
+        Err(e) if format!("{e:#}").contains(crate::providers::trait_def::API_KEY_ONLY_MARK) => None,
         Err(e) => {
             logging::log(&format!(
                 "event=refresh_skipped provider={slug} account={key} reason=vendor_slot_unreadable:{e:#}"

@@ -947,9 +947,10 @@ pub(super) fn parse_codex_blob(blob: &str) -> PResult<AuthDotJson> {
     let v: AuthDotJson = serde_json::from_str(blob)
         .map_err(|e| ProviderError::Other(format!("parsing codex auth.json: {e}")))?;
     if v.tokens.access_token.is_empty() {
-        return Err(ProviderError::Other(
-            "codex auth.json has no tokens.access_token (API-key-only blob)".into(),
-        ));
+        return Err(ProviderError::Other(format!(
+            "codex auth.json has no tokens.access_token ({} blob)",
+            crate::providers::trait_def::API_KEY_ONLY_MARK
+        )));
     }
     Ok(v)
 }

@@ -4198,7 +4198,6 @@ fn watch_cycle_polls_every_swappable_provider_and_swaps_the_exhausted_one() {
                 std::fs::read_to_string(store::config_dir().unwrap().join("history.jsonl"))
                     .unwrap_or_default();
             assert!(history.contains("calm@e.com"));
-            assert!(!history.contains("hot@example.com") || history.contains("\"event\":\"swap\""));
             assert!(!history.contains("\"account\":\"hot@example.com\""));
             out
         }

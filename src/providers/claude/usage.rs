@@ -440,7 +440,10 @@ pub fn prepaid_balance(body: &serde_json::Value) -> Option<Money> {
         .unwrap_or(Money::CREDITS);
     if let Some(c) = get(balance, "credits").and_then(|c| c.as_object()) {
         if let Some(amount) = c.get("amount_minor").and_then(|x| x.as_i64()) {
-            let exponent = c.get("exponent").and_then(|x| x.as_u64()).unwrap_or(2);
+            let exponent = c
+                .get("exponent")
+                .and_then(|x| x.as_u64())
+                .unwrap_or_else(|| u64::from(default_exponent(unit)));
             return Money::new(amount, u32::try_from(exponent).ok()?, unit);
         }
     }
@@ -448,7 +451,20 @@ pub fn prepaid_balance(body: &serde_json::Value) -> Option<Money> {
     let amount = amount
         .as_i64()
         .or_else(|| amount.as_f64().map(|f| f.round() as i64))?;
-    Money::new(amount, 2, unit)
+    Money::new(amount, default_exponent(unit), unit)
+}
+
+/// ISO 4217 minor-unit exponent for a currency code, used when the response
+/// carries bare minor units with no explicit `exponent`: zero-decimal
+/// currencies (JPY, KRW, ...) have 0, the dinar family 3, everything else
+/// (and the non-currency credits unit) 2.
+fn default_exponent(unit: &str) -> u32 {
+    match unit.to_ascii_uppercase().as_str() {
+        "JPY" | "KRW" | "VND" | "CLP" | "ISK" | "UGX" | "PYG" | "RWF" | "XAF" | "XOF" | "XPF"
+        | "KMF" | "GNF" | "DJF" | "VUV" => 0,
+        "BHD" | "KWD" | "OMR" | "JOD" | "TND" | "IQD" | "LYD" => 3,
+        _ => 2,
+    }
 }
 
 /// Best-effort prepaid wallet balance for `org_uuid` (see

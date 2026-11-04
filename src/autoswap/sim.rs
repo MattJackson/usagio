@@ -168,6 +168,14 @@ impl Trace {
     }
 }
 
+/// The sim's manual pick: the decision input plus its own settling state.
+#[derive(Clone)]
+struct SimPick {
+    pick: ManualPick,
+    at: i64,
+    settled_by_fresh: bool,
+}
+
 struct World {
     sc: Scenario,
     accts: Vec<SimAccount>,
@@ -175,7 +183,7 @@ struct World {
     history: Vec<Vec<Point>>,
     active: String,
     memory: SwapMemory,
-    manual: Option<ManualPick>,
+    manual: Option<SimPick>,
     budget: Budget,
     cur: u64,
     last_active_attempt: Option<(i64, bool)>,
@@ -407,13 +415,13 @@ impl World {
                 if let Some(p) = self.manual.as_mut() {
                     if !p.settled_by_fresh && now_ts <= p.at + policy::MANUAL_PICK_SETTLE_S {
                         let c = self.cache[ai].as_ref().unwrap();
-                        p.settled = crate::tier_for_pct(c.s.unwrap_or(0.0).max(c.w), trigger);
+                        p.pick.settled = crate::tier_for_pct(c.s.unwrap_or(0.0).max(c.w), trigger);
                         p.settled_by_fresh = true;
                     } else if let Some(c) = self.cache[ai].as_ref() {
                         // The hold ends once the pick's tier improves (0.12.1).
                         let t = crate::tier_for_pct(c.s.unwrap_or(0.0).max(c.w), trigger);
-                        if t < p.settled {
-                            p.settled = t;
+                        if t < p.pick.settled {
+                            p.pick.settled = t;
                         }
                         p.settled_by_fresh = true;
                     }
@@ -461,7 +469,7 @@ impl World {
             provider: "claude".into(),
             active: self.active.clone(),
             accounts,
-            manual: self.manual.clone(),
+            manual: self.manual.as_ref().map(|p| p.pick.clone()),
             memory: self.memory.clone(),
             policy: {
                 let mut p = Policy::new(trigger, trigger);
@@ -674,10 +682,12 @@ pub fn run(sc: Scenario) -> Trace {
                 .map(|c| crate::tier_for_pct(c.s.unwrap_or(0.0).max(c.w), w.sc.trigger))
                 .unwrap_or(Tier::Ready);
             w.note_switch(&from, &key, t, ChangeKind::Manual);
-            w.manual = Some(ManualPick {
-                key: key.clone(),
+            w.manual = Some(SimPick {
+                pick: ManualPick {
+                    key: key.clone(),
+                    settled,
+                },
                 at: t.timestamp(),
-                settled,
                 settled_by_fresh: false,
             });
             just_switched = true;

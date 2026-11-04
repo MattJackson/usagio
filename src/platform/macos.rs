@@ -423,7 +423,7 @@ fn run_with_timeout(mut child: Child, timeout: Duration) -> Result<SecurityRun> 
                 kill_group_and_reap(&mut child);
                 let _ = out_reader.join();
                 let _ = err_reader.join();
-                return Err(e).context("waiting on `security`");
+                return Err(e).context("waiting on child process");
             }
         }
     };

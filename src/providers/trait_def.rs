@@ -194,6 +194,10 @@ impl ResetGrant {
     }
 }
 
+/// Marker in the error a vendor-slot read returns for an API-key-only blob
+/// (no OAuth login). `lifecycle` matches on it; keep both ends on this const.
+pub const API_KEY_ONLY_MARK: &str = "API-key-only";
+
 /// An exact amount of money or credits: `amount_minor / 10^exponent` in
 /// `unit`. Kept in integer minor units so formatting never drifts through a
 /// float. `unit` is an ISO currency code ("USD") or [`Money::CREDITS`] for a

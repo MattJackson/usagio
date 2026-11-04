@@ -213,6 +213,42 @@ pub fn last_n_days(account: &AccountKey, days: u32) -> Vec<Snapshot> {
 #[derive(Default, Clone)]
 struct MonthIndex {
     by_account: HashMap<AccountKey, Vec<Snapshot>>,
+    /// The last [`GUARD_BYTES`] of the file bytes this index covers. A later
+    /// stamp change that only grew the file is re-read from the cached length
+    /// (not re-parsed whole) when these bytes still sit just before it, i.e.
+    /// another process appended. Empty = unknown, so the next miss re-parses.
+    guard: Vec<u8>,
+}
+
+/// Bytes of file tail kept to confirm the cached prefix is still the file's.
+const GUARD_BYTES: u64 = 64;
+
+/// The up-to-[`GUARD_BYTES`] bytes of `path` ending at offset `len`.
+fn read_guard(path: &Path, len: u64) -> Vec<u8> {
+    use std::io::{Read, Seek, SeekFrom};
+    let start = len.saturating_sub(GUARD_BYTES);
+    let Ok(mut f) = File::open(path) else {
+        return Vec::new();
+    };
+    let mut buf = vec![0u8; (len - start) as usize];
+    if f.seek(SeekFrom::Start(start)).is_err() || f.read_exact(&mut buf).is_err() {
+        return Vec::new();
+    }
+    buf
+}
+
+/// Parse only the rows of `path` after offset `from`, when the cached prefix
+/// provably still leads the file. `None` = fall back to a whole-month parse.
+fn parse_appended(path: &Path, prev: &MonthIndex, from: u64) -> Option<Vec<Snapshot>> {
+    use std::io::{Seek, SeekFrom};
+    if prev.guard.is_empty() || from == 0 || read_guard(path, from) != prev.guard {
+        return None;
+    }
+    let mut f = File::open(path).ok()?;
+    f.seek(SeekFrom::Start(from)).ok()?;
+    #[cfg(test)]
+    TAIL_PARSE_COUNT.with(|c| c.set(c.get() + 1));
+    Some(parse_reader(BufReader::new(f)))
 }
 
 impl MonthIndex {
@@ -224,7 +260,10 @@ impl MonthIndex {
                 .or_default()
                 .push(snap);
         }
-        Self { by_account }
+        Self {
+            by_account,
+            guard: Vec::new(),
+        }
     }
 }
 
@@ -257,6 +296,7 @@ fn month_ordinal(year: i32, month: u32) -> i32 {
 #[cfg(test)]
 thread_local! {
     static PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TAIL_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Default)]
@@ -328,16 +368,34 @@ fn load_month_cached_with(
 ) -> Arc<MonthIndex> {
     let stamp = file_stamp(path);
 
+    let mut stale = None;
     if let Ok(cache) = month_cache().lock() {
         if let Some((cached, index)) = cache.months.get(&(year, month)) {
             if *cached == stamp {
                 return Arc::clone(index);
             }
+            stale = Some((*cached, Arc::clone(index)));
         }
     }
-    // Cache miss / stale — parse (unlocked), index by account, and store.
-    let index = Arc::new(MonthIndex::build(parse_month(path)));
+    // Cache miss / stale — parse (unlocked), index by account, and store. A file
+    // that only grew (another process appended) parses just its new tail.
+    let mut built = stale
+        .filter(|((mtime, len), _)| stamp.1 > *len && stamp.0 >= *mtime)
+        .and_then(|((_, len), prev)| {
+            let tail = parse_appended(path, &prev, len)?;
+            let mut idx = (*prev).clone();
+            for snap in tail {
+                idx.by_account
+                    .entry(AccountKey::new(snap.provider.clone(), snap.account.clone()))
+                    .or_default()
+                    .push(snap);
+            }
+            Some(idx)
+        })
+        .unwrap_or_else(|| MonthIndex::build(parse_month(path)));
     after_parse();
+    built.guard = read_guard(path, stamp.1);
+    let index = Arc::new(built);
     // Cache only if the file did not move during the parse: an index that may
     // hold rows newer than its stamp would be double-patched by a later append.
     if file_stamp(path) != stamp {
@@ -361,6 +419,7 @@ fn load_month_cached_with(
 /// the whole month), otherwise drop the entry.
 fn cache_note_append(path: &Path, snap: &Snapshot, before: FileStamp, line_len: u64) {
     let after = file_stamp(path);
+    let guard = read_guard(path, after.1);
     let (year, month) = (snap.ts.year(), snap.ts.month());
     let Ok(mut cache) = month_cache().lock() else {
         return;
@@ -372,6 +431,7 @@ fn cache_note_append(path: &Path, snap: &Snapshot, before: FileStamp, line_len: 
                 .entry(AccountKey::new(snap.provider.clone(), snap.account.clone()))
                 .or_default()
                 .push(snap.clone());
+            index_guard(index, guard);
             *stamp = after;
             true
         }
@@ -380,6 +440,10 @@ fn cache_note_append(path: &Path, snap: &Snapshot, before: FileStamp, line_len: 
     if !patched {
         cache.months.remove(&(year, month));
     }
+}
+
+fn index_guard(index: &mut Arc<MonthIndex>, guard: Vec<u8>) {
+    Arc::make_mut(index).guard = guard;
 }
 
 fn parse_month(path: &Path) -> Vec<Snapshot> {
@@ -1751,6 +1815,48 @@ mod tests {
             parses,
             "an append must not force a whole-month re-parse"
         );
+    }
+
+    #[test]
+    fn another_process_append_parses_only_the_tail_and_a_rewrite_reparses() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = AccountKey::new("claude", "a@x.io");
+        let path = month_path_ym(dir.path(), 2046, 4);
+        let line = |d: u32, pct: f32| {
+            format!(
+                "{}\n",
+                serde_json::to_string(&snap("claude", "a@x.io", utc(2046, 4, d, 0), Some(pct)))
+                    .unwrap()
+            )
+        };
+        let read = || {
+            weeklies(&read_range_cached(
+                dir.path(),
+                &key,
+                utc(2046, 4, 1, 0),
+                utc(2046, 4, 28, 0),
+            ))
+        };
+        std::fs::write(&path, line(1, 1.0)).unwrap();
+        assert_eq!(read(), vec![1.0]);
+        let (full, tail) = (
+            PARSE_COUNT.with(|c| c.get()),
+            TAIL_PARSE_COUNT.with(|c| c.get()),
+        );
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(line(2, 2.0).as_bytes()).unwrap();
+        drop(f);
+        assert_eq!(read(), vec![1.0, 2.0]);
+        assert_eq!(PARSE_COUNT.with(|c| c.get()), full, "no whole-month parse");
+        assert_eq!(TAIL_PARSE_COUNT.with(|c| c.get()), tail + 1);
+        // A longer file whose prefix changed is not an append: full re-parse.
+        std::fs::write(
+            &path,
+            format!("{}{}{}", line(1, 7.0), line(2, 8.0), line(3, 9.0)),
+        )
+        .unwrap();
+        assert_eq!(read(), vec![7.0, 8.0, 9.0]);
+        assert!(PARSE_COUNT.with(|c| c.get()) > full);
     }
 
     #[test]
