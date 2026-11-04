@@ -99,6 +99,21 @@ fn parse_callback_accepts_only_our_path_and_state() {
         ),
         Callback::Denied("User said no".into())
     );
+    // An error callback must carry OUR state: a stray local page hitting the
+    // loopback port with `error=` and no/other state must not abort sign-in.
+    assert_eq!(
+        parse_callback("/callback?error=x", "/callback", "S"),
+        Callback::Ignore
+    );
+    assert_eq!(
+        parse_callback("/callback?error=x&state=OTHER", "/callback", "S"),
+        Callback::Ignore
+    );
+    // An empty code is never forwarded to the token exchange.
+    assert_eq!(
+        parse_callback("/callback?code=&state=S", "/callback", "S"),
+        Callback::Ignore
+    );
 }
 
 fn get(url: &str) -> String {
