@@ -235,3 +235,40 @@ fn tier_changes_drop_old_names_but_missing_names_on_the_same_tier_preserve_them(
         .get("planDisplayName")
         .is_none());
 }
+
+#[test]
+fn a_canceled_profile_marks_the_lapse_once_and_an_active_one_restores_it() {
+    let _dir = crate::store::ScopedConfigDir::new();
+    let email = "a@example.com";
+    seed(vec![account(email)]);
+    let log = || {
+        std::fs::read_to_string(crate::store::config_dir().unwrap().join("usagio.log"))
+            .unwrap_or_default()
+    };
+    let count = |event: &str| log().matches(event).count();
+    let snapshot = || State::load().unwrap().find(email).cloned().unwrap();
+    let mut canceled = profile(email);
+    canceled["organization"]["subscription_status"] = "canceled".into();
+
+    assert!(commit(&snapshot(), &canceled).unwrap());
+    let saved = snapshot();
+    assert!(saved.no_subscription, "a canceled plan was not marked lapsed");
+    assert_eq!(saved.plan.as_deref(), Some("Free"));
+    assert_eq!(count("event=subscription_lapsed"), 1);
+
+    // Still canceled on the next refresh: no second notice.
+    assert!(commit(&snapshot(), &canceled).unwrap());
+    assert!(snapshot().no_subscription);
+    assert_eq!(count("event=subscription_lapsed"), 1, "lapse re-announced");
+    assert_eq!(count("event=subscription_restored"), 0);
+
+    // Renewed: the flag clears and the restore is announced once.
+    assert!(commit(&snapshot(), &profile(email)).unwrap());
+    let saved = snapshot();
+    assert!(!saved.no_subscription, "an active plan stayed lapsed");
+    assert_eq!(saved.plan.as_deref(), Some("Ultra"));
+    assert_eq!(count("event=subscription_restored"), 1);
+    assert!(commit(&snapshot(), &profile(email)).unwrap());
+    assert!(!snapshot().no_subscription);
+    assert_eq!(count("event=subscription_restored"), 1, "restore re-announced");
+}
