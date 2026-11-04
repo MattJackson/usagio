@@ -6,7 +6,7 @@
 //! Path layout: `~/.config/usagio/history.YYYY-MM.ndjson`. One JSON
 //! object per line, keyed by (`provider`, `account`), always in UTC.
 //!
-//! The append path is O_APPEND-atomic per line (single small `writeln!`), so
+//! The append path is O_APPEND-atomic per line (one `write_all` of the whole line; see `write_line`), so
 //! concurrent writers from the daemon and menu-bar can never interleave a
 //! record. Writes are batched-fsynced (every 24 rows, or when the appender is
 //! dropped) so a crash loses at most a couple of poll cycles.
@@ -385,16 +385,23 @@ fn cache_note_append(path: &Path, snap: &Snapshot, before: FileStamp, line_len: 
 fn parse_month(path: &Path) -> Vec<Snapshot> {
     #[cfg(test)]
     PARSE_COUNT.with(|c| c.set(c.get() + 1));
-    let mut out = Vec::new();
     let Ok(f) = File::open(path) else {
-        return out;
+        return Vec::new();
     };
-    let rdr = BufReader::new(f);
-    // See the note in `read_range` for why filter_map (not map_while): one
-    // corrupt / non-UTF8 line must not halt the iterator and silently drop
-    // every valid snapshot after it.
-    #[allow(clippy::lines_filter_map_ok)]
-    for line in rdr.lines().filter_map(|r| r.ok()) {
+    parse_reader(BufReader::new(f))
+}
+
+/// Parse snapshots from `rdr`. A non-UTF8 line (`InvalidData`) is skipped —
+/// its bytes are consumed, so later valid lines still count. Any other read
+/// error is persistent (it would repeat forever), so stop there.
+fn parse_reader<R: BufRead>(rdr: R) -> Vec<Snapshot> {
+    let mut out = Vec::new();
+    for line in rdr.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(_) => break,
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -608,6 +615,7 @@ fn rotate_files(dir: &Path, now: DateTime<Utc>) -> Result<()> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Ok(());
     };
+    let mut found: Vec<(std::path::PathBuf, DateTime<Utc>)> = Vec::new();
     for entry in rd.flatten() {
         let name = entry.file_name();
         let n = name.to_string_lossy();
@@ -618,8 +626,21 @@ fn rotate_files(dir: &Path, now: DateTime<Utc>) -> Result<()> {
         let Ok(md) = entry.metadata() else { continue };
         let Ok(mt) = md.modified() else { continue };
         let mt_utc: DateTime<Utc> = mt.into();
+        found.push((entry.path(), mt_utc));
+    }
+    // If even the newest file is past the cutoff, the clock is implausibly
+    // ahead (RTC/VM jump); pruning would wipe everything irrecoverably.
+    if found
+        .iter()
+        .map(|(_, t)| *t)
+        .max()
+        .is_none_or(|t| t < cutoff)
+    {
+        return Ok(());
+    }
+    for (path, mt_utc) in found {
         if mt_utc < cutoff {
-            let _ = std::fs::remove_file(entry.path());
+            let _ = std::fs::remove_file(path);
         }
     }
     Ok(())
@@ -1153,6 +1174,41 @@ mod tests {
     }
 
     #[test]
+    fn rotate_skips_pruning_when_the_clock_is_implausibly_ahead() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2027, 11, 1, 0, 0, 0).unwrap();
+        let a = dir.path().join("history.2026-08.ndjson");
+        let d = dir.path().join("decisions.2026-09.ndjson");
+        let t = SystemTime::from(Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap());
+        touch_with_mtime(&a, t);
+        touch_with_mtime(&d, t);
+        // Every file is older than the cutoff: the clock jumped, not the files.
+        rotate_files(dir.path(), now).unwrap();
+        assert!(
+            a.exists() && d.exists(),
+            "a clock jump must not wipe history"
+        );
+    }
+
+    #[test]
+    fn parse_reader_stops_on_a_persistent_read_error() {
+        struct Failing(std::cell::Cell<u32>);
+        impl std::io::Read for &Failing {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                self.0.set(self.0.get() + 1);
+                if self.0.get() > 1000 {
+                    return Ok(0);
+                }
+                Err(std::io::Error::other("EIO"))
+            }
+        }
+        let f = Failing(std::cell::Cell::new(0));
+        let out = parse_reader(BufReader::new(&f));
+        assert!(out.is_empty());
+        assert_eq!(f.0.get(), 1, "a persistent error must end the loop");
+    }
+
+    #[test]
     fn rotate_keeps_file_exactly_at_cutoff() {
         let dir = tempfile::tempdir().unwrap();
         let now = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
@@ -1178,6 +1234,7 @@ mod tests {
         for p in [&wrong_suffix, &wrong_prefix, &real] {
             touch_with_mtime(p, ancient);
         }
+        touch_with_mtime(&dir.path().join("history.fresh.ndjson"), SystemTime::now());
         rotate_files(dir.path(), Utc::now()).unwrap();
         assert!(wrong_suffix.exists());
         assert!(wrong_prefix.exists());
@@ -1651,6 +1708,9 @@ mod tests {
         let stale_dec = cfg_dir().join("decisions.2020-01.ndjson");
         touch_with_mtime(&stale_hist, old);
         touch_with_mtime(&stale_dec, old);
+        // A current file proves the clock is sane (pruning is skipped when
+        // every file is past the cutoff).
+        touch_with_mtime(&cfg_dir().join("history.2026-11.ndjson"), SystemTime::now());
         // append(): the first call in a process rotates.
         BOOT_ROTATED.store(false, Ordering::SeqCst);
         append(&snap("claude", "a@x.io", utc(2049, 9, 5, 5), Some(1.0))).unwrap();
