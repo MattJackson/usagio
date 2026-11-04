@@ -374,3 +374,38 @@ fn supersede_cancels_and_marks_the_flow() {
     q.cancel();
     assert!(!q.is_superseded(), "a closed window is not a supersede");
 }
+
+/// Run `wait_for_code` on a worker with no client ever connecting; the result
+/// arrives on the channel, or the receive times out if accept() blocks.
+fn wait_in_background(
+    timeout: Duration,
+    cancel: Arc<AtomicBool>,
+) -> std::sync::mpsc::Receiver<Result<String>> {
+    let lb = Loopback::bind(&spec("http://unused", TokenRequestStyle::Form)).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(lb.wait_for_code("S", timeout, &cancel));
+    });
+    rx
+}
+
+#[test]
+fn closing_the_window_while_waiting_in_accept_ends_the_wait() {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let rx = wait_in_background(Duration::from_secs(30), Arc::clone(&cancel));
+    std::thread::sleep(Duration::from_millis(200));
+    cancel.store(true, Ordering::SeqCst);
+    let r = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("wait_for_code never re-checked cancel: accept() blocked");
+    assert!(format!("{}", r.unwrap_err()).contains("closed"));
+}
+
+#[test]
+fn a_sign_in_nobody_completes_times_out() {
+    let rx = wait_in_background(Duration::from_millis(300), Arc::new(AtomicBool::new(false)));
+    let r = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("wait_for_code never re-checked its deadline: accept() blocked");
+    assert!(format!("{}", r.unwrap_err()).contains("timed out"));
+}
