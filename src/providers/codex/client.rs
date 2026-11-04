@@ -376,6 +376,67 @@ fn identity_matches(actual: &ClientState, email: &str, uuid: Option<&String>) ->
 mod tests {
     use super::*;
 
+    /// Run `inspect` against a scripted daemon over a loopback socket pair.
+    /// `status` maps a thread id to its `thread/read` status type; loaded
+    /// threads come in two pages, `t1` then `t2`.
+    fn inspect_scripted(status: fn(&str) -> &'static str) -> Result<ClientState> {
+        use tungstenite::protocol::Role;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut ws = WebSocket::from_raw_socket(tcp, Role::Server, None);
+            while let Ok(msg) = ws.read() {
+                let Message::Text(body) = msg else { continue };
+                let req: Value = serde_json::from_str(&body).unwrap();
+                let Some(id) = req.get("id").cloned() else {
+                    continue; // the `initialized` notification
+                };
+                let result = match req["method"].as_str().unwrap() {
+                    "accountSession/list" => json!({"sessions": [
+                        {"isActive": false, "email": "other@example.com"},
+                        {"isActive": true, "email": "a@example.com",
+                         "selectedWorkspaceAccountId": "acct-1"},
+                    ]}),
+                    "thread/loaded/list" if req["params"]["cursor"].is_null() => {
+                        json!({"data": ["t1"], "nextCursor": "page-2"})
+                    }
+                    "thread/loaded/list" => json!({"data": ["t2"], "nextCursor": null}),
+                    "thread/read" => {
+                        let t = req["params"]["threadId"].as_str().unwrap();
+                        json!({"thread": {"status": {"type": status(t)}}})
+                    }
+                    _ => json!({}),
+                };
+                let reply = json!({"id": id, "result": result}).to_string();
+                if ws.send(Message::Text(reply.into())).is_err() {
+                    break;
+                }
+            }
+        });
+        let tcp = std::net::TcpStream::connect(addr).unwrap();
+        let mut ws = WebSocket::from_raw_socket(tcp, Role::Client, None);
+        let state = inspect(&mut ws);
+        drop(ws);
+        server.join().unwrap();
+        state
+    }
+
+    #[test]
+    fn inspect_reports_busy_for_an_active_thread_on_a_later_page() {
+        let state = inspect_scripted(|t| if t == "t2" { "active" } else { "idle" }).unwrap();
+        assert!(state.busy, "the active thread on page 2 was missed");
+        assert_eq!(state.email.as_deref(), Some("a@example.com"));
+        assert_eq!(state.account_id.as_deref(), Some("acct-1"));
+        let idle = inspect_scripted(|t| if t == "t1" { "notLoaded" } else { "idle" }).unwrap();
+        assert!(!idle.busy);
+    }
+
+    #[test]
+    fn inspect_refuses_an_unknown_thread_state() {
+        assert!(inspect_scripted(|_| "somethingNew").is_err());
+    }
+
     #[test]
     fn identity_matches_checks_email_and_uuid() {
         let st = |email: Option<&str>, id: Option<&str>| ClientState {
