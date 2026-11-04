@@ -1956,7 +1956,7 @@ fn stay_cycle_ends_the_failure_episode() {
 
 #[test]
 fn failure_kind_classifies_causes() {
-    let k = |s: &str| super::shell::failure_kind(&anyhow::anyhow!("{s}"));
+    let k = |s: &str| super::shell::failure_kind(&anyhow::anyhow!("{s}"), "b@e.com");
     assert_eq!(k("keychain write denied"), "credential-write");
     assert_eq!(
         k("client has no supported graceful handoff"),
@@ -1964,4 +1964,119 @@ fn failure_kind_classifies_causes() {
     );
     assert_eq!(k("refresh failed"), "auth");
     assert_eq!(k("boom"), "other");
+}
+
+// --- audit round 3 (B3) ----------------------------------------------------
+
+#[test]
+fn r3_display_switches_off_an_over_trigger_window_when_the_other_is_higher() {
+    // Session shown at 96 (over the 95 trigger); weekly climbs to 99.4 and
+    // then 100: the tray must show the weekly window (§4 override).
+    let now = at(17, 16, 0);
+    let prev = Some(BindingShown {
+        window: WindowId::Session,
+        since: now - Duration::minutes(1),
+    });
+    for w in [99.4, 100.0] {
+        let a = display(96.0, w, Some(0.1), Some(0.01));
+        let next = BindingShown::update(prev, &a, now, 95.0).unwrap();
+        assert_eq!(next.window, WindowId::Weekly, "weekly {w}");
+    }
+    // Both over the trigger, the shown one still higher: keep it.
+    let a = display(98.0, 96.0, Some(0.1), Some(0.01));
+    let next = BindingShown::update(prev, &a, now, 95.0).unwrap();
+    assert_eq!(next.window, WindowId::Session);
+}
+
+#[test]
+fn r3_binding_time_to_block_is_none_for_a_non_binding_window() {
+    let now = at(17, 16, 0);
+    // Neither window binds: session resets in 1 h (ttb 250 min), weekly in
+    // 2 days (ttb ~4.9 days).
+    let a = display(50.0, 30.0, Some(0.2), Some(0.01))
+        .sreset(Some(now + Duration::minutes(60)))
+        .wreset(Some(now + Duration::days(2)));
+    let b = super::runway::binding_window_at(&a, now, 95.0).unwrap();
+    assert_eq!(b.window, WindowId::Session);
+    assert_eq!(b.time_to_block, None, "{b:?}");
+    // Over the trigger but resetting before it could block.
+    let a = display(92.0, 10.0, Some(0.05), Some(0.0)).sreset(Some(now + Duration::minutes(30)));
+    let b = super::runway::binding_window_at(&a, now, 90.0).unwrap();
+    assert_eq!(b.window, WindowId::Session);
+    assert_eq!(b.time_to_block, None, "{b:?}");
+}
+
+#[test]
+fn r3_trigger_latch_keys_on_the_binding_window_not_a_resetting_one() {
+    // Session 97 resets in 1 min (non-binding); weekly 96 binds and drives
+    // the leave: the latch must last until the weekly reset.
+    let now = at(12, 0, 0);
+    let s = snap(
+        now,
+        "act",
+        vec![acct("act", 97.0, 96.0, now - Duration::seconds(20))
+            .sreset(Some(now + Duration::minutes(1)))],
+    );
+    let a = assessed(&s, "act");
+    let ses = a
+        .windows
+        .iter()
+        .find(|w| w.id == WindowId::Session)
+        .unwrap();
+    assert!(!ses.binds, "precondition: the session resets first");
+    assert_eq!(a.binding_window().unwrap().id, WindowId::Weekly);
+    let l = a.latch(now).unwrap();
+    assert_eq!(l.window, WindowId::Weekly);
+    assert_eq!(l.resets_at, Some(far().timestamp()));
+}
+
+#[test]
+fn r3_a_future_fetched_at_is_not_a_fresh_verified_reading() {
+    // Read while the clock was 3 h ahead, then corrected.
+    let now = at(12, 0, 0);
+    let future = now + Duration::hours(3);
+    let s = snap(
+        now,
+        "act",
+        vec![
+            acct("act", 92.0, 10.0, future).backoff(),
+            acct("b", 10.0, 10.0, future),
+        ],
+    );
+    let act = assessed(&s, "act");
+    assert_ne!(act.evidence, Evidence::Real, "{act:?}");
+    assert!(act.blind_in_band, "in band with an untrusted age: project");
+    let b = assessed(&s, "b");
+    assert!(!b.verified, "{b:?}");
+    assert_ne!(b.evidence, Evidence::Real);
+    // Within the slack it is still a fresh reading.
+    let s = snap(
+        now,
+        "act",
+        vec![acct("act", 50.0, 10.0, now + Duration::seconds(30))],
+    );
+    assert_eq!(assessed(&s, "act").evidence, Evidence::Real);
+}
+
+#[test]
+fn r3_failure_kind_ignores_the_account_key_and_flags_renewals() {
+    let k = |s: &str, to: &str| super::shell::failure_kind(&anyhow::anyhow!("{s}"), to);
+    assert_eq!(
+        k(
+            "stored credentials belong to another account; renew login for a@b.com",
+            "a@b.com"
+        ),
+        "auth"
+    );
+    assert_eq!(
+        k("renew login for client.ops@corp.com", "client.ops@corp.com"),
+        "auth"
+    );
+    assert_eq!(
+        k(
+            "no claude account matches 'auth.client@x.io'",
+            "auth.client@x.io"
+        ),
+        "other"
+    );
 }

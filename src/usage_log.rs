@@ -648,17 +648,23 @@ fn rotate_files(dir: &Path, now: DateTime<Utc>) -> Result<()> {
         .map(|(_, _, m)| *m)
         .collect();
     // After a genuine long idle gap no kept file is near the old ones, so the
-    // bridge rule alone would keep them forever. When the newest kept file is
-    // not ahead of `now` and has outlived the settling period, the clock has
-    // been consistent for a while, so retention applies normally. A transient
-    // forward jump (file written under the bad clock: brand new, then ahead of
-    // the corrected clock) never satisfies this.
-    let clock_settled = found
+    // bridge rule alone would keep them forever. When no kept file is ahead of
+    // `now` and the oldest kept one has outlived the settling period, the
+    // clock has been consistent for a while, so retention applies normally.
+    // The oldest (not the newest) is used so a continuously running daemon,
+    // whose current file is always fresh, still prunes at a later rotation. A
+    // transient forward jump (files written under the bad clock: brand new,
+    // then ahead of the corrected clock) never satisfies this.
+    let kept_times: Vec<DateTime<Utc>> = found
         .iter()
         .filter(|(_, t, _)| *t >= cutoff)
         .map(|(_, t, _)| *t)
-        .max()
-        .is_some_and(|newest| newest <= now - Duration::days(CLOCK_SETTLE_DAYS));
+        .collect();
+    let clock_settled = kept_times.iter().all(|t| *t <= now)
+        && kept_times
+            .iter()
+            .min()
+            .is_some_and(|oldest| *oldest <= now - Duration::days(CLOCK_SETTLE_DAYS));
     for (path, mt_utc, month) in &found {
         if *mt_utc < cutoff
             && (clock_settled || kept.iter().any(|k| (*month..=*month + 7).contains(k)))
@@ -1252,6 +1258,30 @@ mod tests {
         rotate_files(dir.path(), now).unwrap();
         assert!(!old.exists(), "pre-gap history must age out");
         assert!(recent.exists());
+    }
+
+    #[test]
+    fn rotate_prunes_after_an_idle_gap_in_a_continuously_running_daemon() {
+        // Jan/Feb 2026, idle Mar-Oct, then running nonstop from Nov: at the
+        // Jan 2027 month rollover the current file is seconds old, but the
+        // Nov file shows the clock has been consistent for weeks.
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2027, 1, 1, 0, 0, 5).unwrap();
+        let ts = |y, m, d| SystemTime::from(Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap());
+        let jan = dir.path().join("history.2026-01.ndjson");
+        let feb = dir.path().join("history.2026-02.ndjson");
+        touch_with_mtime(&jan, ts(2026, 1, 31));
+        touch_with_mtime(&feb, ts(2026, 2, 28));
+        let nov = dir.path().join("history.2026-11.ndjson");
+        touch_with_mtime(&nov, ts(2026, 11, 30));
+        let dec = dir.path().join("history.2026-12.ndjson");
+        touch_with_mtime(&dec, SystemTime::from(now - Duration::seconds(5)));
+        rotate_files(dir.path(), now).unwrap();
+        assert!(
+            !jan.exists() && !feb.exists(),
+            "pre-gap history must age out"
+        );
+        assert!(nov.exists() && dec.exists());
     }
 
     #[test]

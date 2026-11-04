@@ -81,7 +81,7 @@ pub struct SwapMemory {
 }
 
 /// How far past `now` a stored timestamp may sit before it is treated as bogus.
-const FUTURE_SLACK_SECS: i64 = 60;
+pub(super) const FUTURE_SLACK_SECS: i64 = 60;
 
 fn lc(s: &str) -> String {
     s.to_ascii_lowercase()

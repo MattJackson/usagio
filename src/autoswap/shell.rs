@@ -310,10 +310,18 @@ pub struct ShellState {
     pub last_failure: Option<(String, &'static str)>,
 }
 
-/// Coarse class of a failed switch, for notification dedup.
-pub(crate) fn failure_kind(e: &anyhow::Error) -> &'static str {
-    let m = format!("{e:#}").to_ascii_lowercase();
-    if m.contains("keychain") || m.contains("secret") || m.contains("credential") {
+/// Coarse class of a failed switch, for notification dedup. The target's
+/// key is removed from the text first, so an address like `client.ops@…`
+/// can't steer the class; a login that needs renewing is `auth`.
+pub(crate) fn failure_kind(e: &anyhow::Error, target: &str) -> &'static str {
+    let mut m = format!("{e:#}").to_ascii_lowercase();
+    let key = target.to_ascii_lowercase();
+    if !key.is_empty() {
+        m = m.replace(&key, "");
+    }
+    if m.contains("renew login") {
+        "auth"
+    } else if m.contains("keychain") || m.contains("secret") || m.contains("credential") {
         "credential-write"
     } else if m.contains("handoff") || m.contains("client") {
         "client-handoff"
@@ -674,7 +682,7 @@ pub(crate) fn run_cycle(
             }
             Err(e) => {
                 logging::log(&format!("swap to {slug}/{to} failed: {e:#}"));
-                let fk = failure_kind(&e);
+                let fk = failure_kind(&e, to);
                 switch_outcome = Some(format!("failed:{fk}"));
                 if should_notify_failure(&mut shell.last_failure, to, fk) {
                     crate::notify(&format!(

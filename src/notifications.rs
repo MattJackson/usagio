@@ -162,7 +162,7 @@ pub fn evaluate(prev: &Snapshot, curr: &Snapshot, cfg: &NotificationConfig) -> V
             let (Some(p), Some(c)) = (p, c) else { continue };
             // A pair spanning a reset: the new window started from ~0, so
             // judge crossings against that, not the pre-reset level.
-            let p = if is_window_reset(p, c) { 0.0 } else { p };
+            let p = if is_reset(prev, curr, w) { 0.0 } else { p };
             for pct in THRESHOLDS {
                 let t = pct as f32;
                 if p < t && c >= t {
@@ -173,8 +173,10 @@ pub fn evaluate(prev: &Snapshot, curr: &Snapshot, cfg: &NotificationConfig) -> V
     }
     if cfg.reset_back_enabled {
         for (w, p, c) in pairs {
-            let (Some(p), Some(c)) = (p, c) else { continue };
-            if is_window_reset(p, c) {
+            if p.is_none() || c.is_none() {
+                continue;
+            }
+            if is_reset(prev, curr, w) {
                 out.push(Trigger::ResetBack { window: w });
             }
         }
@@ -191,15 +193,31 @@ fn is_window_reset(prev_pct: f32, curr_pct: f32) -> bool {
     prev_pct > 50.0 && curr_pct < prev_pct && (prev_pct - curr_pct >= 20.0 || curr_pct < 10.0)
 }
 
-/// True iff `curr` shows a reset for `w` relative to `prev`. Public so the
-/// watch loop can query it independently of `evaluate` (e.g. to log a reset
-/// even when `reset_back_enabled` is off).
+/// True iff `curr` shows a reset for `w` relative to `prev`: the window's
+/// reported reset time moved later and the old one had passed by `curr`, or
+/// (when reset times are missing or unchanged) the pct heuristic above.
+/// Public so the watch loop can query it independently of `evaluate` (e.g. to
+/// log a reset even when `reset_back_enabled` is off).
 pub fn is_reset(prev: &Snapshot, curr: &Snapshot, w: Window) -> bool {
-    let (p, c) = match w {
-        Window::Session => (prev.session_pct, curr.session_pct),
-        Window::Weekly => (prev.weekly_pct, curr.weekly_pct),
+    let (p, c, pr, cr) = match w {
+        Window::Session => (
+            prev.session_pct,
+            curr.session_pct,
+            prev.session_reset,
+            curr.session_reset,
+        ),
+        Window::Weekly => (
+            prev.weekly_pct,
+            curr.weekly_pct,
+            prev.weekly_reset,
+            curr.weekly_reset,
+        ),
     };
-    matches!((p, c), (Some(p), Some(c)) if is_window_reset(p, c))
+    let (Some(p), Some(c)) = (p, c) else {
+        return false;
+    };
+    let rolled = matches!((pr, cr), (Some(pr), Some(cr)) if pr < cr && pr <= curr.ts);
+    rolled || is_window_reset(p, c)
 }
 
 /// Filter `triggers` against `state`, updating `state` in place. A Threshold
@@ -238,8 +256,11 @@ pub fn dedup_and_apply(
             Trigger::ResetBack { .. } => kept.push(t),
             Trigger::WeeklyPace { .. } => {
                 // Guard against a caller that queued a pace trigger without
-                // going through `evaluate_pace` (which already dedups).
-                if state.pace_fired_this_window {
+                // going through `evaluate_pace` (which already dedups). On the
+                // weekly reset tick the pace fit still covers last week's
+                // samples (the new window has none yet), so it is dropped
+                // without spending the new window's one alert.
+                if state.pace_fired_this_window || is_reset(prev, curr, Window::Weekly) {
                     continue;
                 }
                 state.pace_fired_this_window = true;
@@ -1153,6 +1174,79 @@ mod tests {
         assert!(
             reset_grant_triggers(&mut st, std::slice::from_ref(&g)).is_empty(),
             "second failure: dedup bit stays set"
+        );
+    }
+
+    // --- audit round 3 (B3) ---------------------------------------------------
+
+    #[test]
+    fn r3_a_reset_seen_by_the_reset_time_clears_crossings_and_fires_reset_back() {
+        // Offline across the weekly reset while usage continued elsewhere:
+        // 92 -> 75 is a small drop, but the reported reset moved past.
+        let r = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
+        let mut prev = snap(None, Some(92.0));
+        prev.ts = r - Duration::hours(1);
+        prev.weekly_reset = Some(r);
+        let mut curr = snap(None, Some(75.0));
+        curr.ts = r + Duration::days(3);
+        curr.weekly_reset = Some(r + Duration::days(7));
+        assert!(is_reset(&prev, &curr, Window::Weekly));
+        let cfg = NotificationConfig::default();
+        let trig = evaluate(&prev, &curr, &cfg);
+        assert!(
+            trig.contains(&Trigger::ResetBack {
+                window: Window::Weekly
+            }),
+            "{trig:?}"
+        );
+        let mut state = NotifState {
+            crossings: [(Window::Weekly, 70), (Window::Weekly, 90)]
+                .into_iter()
+                .collect(),
+            ..NotifState::default()
+        };
+        dedup_and_apply(&mut state, &prev, &curr, trig);
+        let mut next = curr.clone();
+        next.weekly_pct = Some(91.0);
+        let fired = dedup_and_apply(&mut state, &curr, &next, evaluate(&curr, &next, &cfg));
+        assert!(
+            fired.contains(&Trigger::Threshold {
+                window: Window::Weekly,
+                pct: 90
+            }),
+            "{fired:?}"
+        );
+        // A reset time that moved but has not passed yet is not a reset.
+        let mut early = curr.clone();
+        early.ts = r - Duration::minutes(30);
+        assert!(!is_reset(&prev, &early, Window::Weekly));
+    }
+
+    #[test]
+    fn r3_no_pace_alert_on_the_weekly_reset_tick() {
+        // The pace fit still covers last week's samples on the reset tick:
+        // it must not use up the new window's one alert.
+        let now = Utc.with_ymd_and_hms(2026, 9, 1, 0, 1, 0).unwrap();
+        let mut prev = snap(None, Some(95.0));
+        prev.weekly_reset = Some(now - Duration::minutes(1));
+        let mut curr = snap(None, Some(2.0));
+        curr.ts = now;
+        curr.weekly_reset = Some(now + Duration::days(7));
+        let pace = PaceEstimate {
+            slope_pct_per_hour: 0.8,
+            confidence: 0.9,
+            sample_count: 200,
+        };
+        let pt = evaluate_pace(Some(&pace), &curr, &pace_cfg(), now).expect("precondition");
+        let mut state = NotifState {
+            pace_fired_this_window: true,
+            ..NotifState::default()
+        };
+        let kept = dedup_and_apply(&mut state, &prev, &curr, vec![pt]);
+        assert!(kept.is_empty(), "{kept:?}");
+        assert!(
+            !state.pace_fired_this_window,
+            "the new window's alert is unspent"
         );
     }
 }
