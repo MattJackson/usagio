@@ -1965,3 +1965,79 @@ fn failure_kind_classifies_causes() {
     assert_eq!(k("refresh failed"), "auth");
     assert_eq!(k("boom"), "other");
 }
+
+#[test]
+fn binding_by_rate_lead_waits_for_the_dwell() {
+    let t0 = at(17, 0, 0);
+    let shown = BindingShown::update(None, &display(0.0, 0.0, Some(1.0), Some(1.0)), t0, 95.0);
+    assert_eq!(shown.unwrap().window, WindowId::Session);
+    // Weekly blocks in 40 min vs session 100: decisive, but not an override.
+    let lead = display(0.0, 60.0, Some(1.0), Some(1.0));
+    let early = BindingShown::update(shown, &lead, t0 + Duration::seconds(30), 95.0);
+    assert_eq!(
+        early.unwrap().window,
+        WindowId::Session,
+        "switched before the dwell"
+    );
+    let just_before = t0 + Duration::seconds(super::policy::BIND_MIN_DWELL_S - 1);
+    let still = BindingShown::update(early, &lead, just_before, 95.0);
+    assert_eq!(still.unwrap().window, WindowId::Session);
+    let after = t0 + Duration::seconds(super::policy::BIND_MIN_DWELL_S + 1);
+    let later = BindingShown::update(still, &lead, after, 95.0);
+    assert_eq!(later.unwrap().window, WindowId::Weekly);
+}
+
+#[test]
+fn ready_serve_ranks_an_unknown_weekly_reset_after_a_known_one() {
+    // Room that resets in a day is spent before room whose reset is unknown,
+    // even when the unknown one is roomier and sorts first by key.
+    let now = ymd(11, 4, 0, 8, 52);
+    let s = snap(
+        now,
+        "dev3",
+        vec![
+            acct("dev3", 0.0, 100.0, now).wreset(Some(ymd(11, 13, 0, 0, 0))),
+            acct("aaa-unknown", 0.0, 0.0, now).wreset(None),
+            acct("known", 0.0, 50.0, now).wreset(Some(now + Duration::days(1))),
+        ],
+    );
+    let mut c: Vec<Assessed> = assess_all(&s)
+        .into_iter()
+        .filter(|a| !a.is_active)
+        .collect();
+    assert!(c.iter().all(|a| a.tier == Tier::Ready), "{c:?}");
+    c.sort_by(|a, b| rank_cmp(a, b, None));
+    assert_eq!(c[0].key, "known", "an unknown reset outranked a known one");
+    let d = decide(&s);
+    assert_eq!(switched(&d), Some(("known", Kind::Serve)), "{d:?}");
+}
+
+#[test]
+fn a_hold_or_a_cleared_or_moved_pick_after_the_cycle_began_is_detected() {
+    use crate::store::State;
+    let mut before = State {
+        active: Some("a@x.io".to_string()),
+        ..Default::default()
+    };
+    before.set_manual_pick("claude", Some("a@x.io"));
+    // A hold added with the pick unchanged.
+    let mut held = before.clone();
+    held.set_manual_hold("claude", Some("a@x.io"));
+    assert_eq!(held.manual_pick("claude"), before.manual_pick("claude"));
+    assert!(super::shell::pick_changed(&before, &held, "claude"));
+    // The hold cleared with the pick unchanged.
+    let mut unheld = held.clone();
+    unheld.set_manual_hold("claude", None);
+    assert!(super::shell::pick_changed(&held, &unheld, "claude"));
+    // The pick cleared, and the pick moved.
+    let mut cleared = before.clone();
+    cleared.set_manual_pick("claude", None);
+    assert!(super::shell::pick_changed(&before, &cleared, "claude"));
+    let mut moved = before.clone();
+    moved.set_manual_pick("claude", Some("b@x.io"));
+    assert!(super::shell::pick_changed(&before, &moved, "claude"));
+    // Another provider's pick is not this one's.
+    let mut other = before.clone();
+    other.set_manual_hold("codex", Some("c@x.io"));
+    assert!(!super::shell::pick_changed(&before, &other, "claude"));
+}
