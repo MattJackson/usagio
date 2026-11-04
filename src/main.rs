@@ -410,7 +410,10 @@ pub(crate) fn capture_current() -> Result<(String, bool)> {
         .capture_current_login()
         .map_err(|e| anyhow!("{e}"))?
         .ok_or_else(|| {
-            anyhow!("no claude.ai login found in the keychain — run `claude` and /login first")
+            anyhow!(
+                "no claude.ai login found (keychain / ~/.claude/.credentials.json) — run \
+                 `claude` and /login first"
+            )
         })?;
     // `Account::from_keychain_blob` parses `expires_at` (epoch millis) out of
     // the verbatim blob exactly as before — reusing it here keeps this an
@@ -880,7 +883,10 @@ fn cmd_list(args: &[String]) -> Result<()> {
     let no_claude = state.accounts.is_empty();
     let no_providers = state.providers.values().all(|p| p.accounts.is_empty());
     if no_claude && no_providers {
-        println!("No accounts yet. Log into one with `claude` (or `codex`), then: usagio capture");
+        println!(
+            "No accounts yet. Log into one with `claude` (or `codex`), then: usagio capture \
+             (or `usagio capture codex`)"
+        );
         return Ok(());
     }
 
