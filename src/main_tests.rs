@@ -6807,3 +6807,38 @@ fn rm_refuses_a_selector_matching_two_providers() {
     assert_eq!(State::load().unwrap().accounts.len(), 1);
     cmd_rm(Some("codex:dev@a.com")).unwrap();
 }
+
+#[test]
+fn bundle_launch_with_empty_args_does_not_panic_on_tail() {
+    let bundle_exe = std::path::PathBuf::from("/Applications/usagio.app/Contents/MacOS/usagio");
+    let args: Vec<String> = Vec::new();
+    // Mirrors the "menubar" dispatch arm for an argv-less bundle launch.
+    if cfg!(unix) {
+        assert_eq!(effective_first_arg(&args, &bundle_exe), Some("menubar"));
+    }
+    assert!(tail_args(&args).is_empty());
+    let one = vec!["menubar".to_string()];
+    assert!(tail_args(&one).is_empty());
+    let two = vec!["menubar".to_string(), "--dark".to_string()];
+    assert_eq!(tail_args(&two), &["--dark".to_string()]);
+}
+
+#[test]
+fn poll_merge_skips_save_when_nothing_changed() {
+    use crate::store::{ScopedConfigDir, State};
+    let _g = ScopedConfigDir::new();
+    let mut st = State {
+        active: Some("a@x.com".into()),
+        ..State::default()
+    };
+    let before = serde_json::to_vec(&st).unwrap();
+    assert!(
+        !save_if_changed(&st, &before).unwrap(),
+        "unchanged state must not be saved"
+    );
+    st.active = Some("b@x.com".into());
+    assert!(
+        save_if_changed(&st, &before).unwrap(),
+        "changed state must be saved"
+    );
+}

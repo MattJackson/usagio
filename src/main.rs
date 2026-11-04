@@ -148,6 +148,22 @@ fn effective_first_arg<'a>(args: &'a [String], exe: &std::path::Path) -> Option<
         .or_else(|| is_app_bundle_launch(exe).then_some("menubar"))
 }
 
+/// Arguments after the subcommand. Empty (not a panic) when argv was empty,
+/// as in an argv-less `.app` bundle launch where the subcommand is implied.
+fn tail_args(args: &[String]) -> &[String] {
+    args.get(1..).unwrap_or(&[])
+}
+
+/// Save the merged poll state only when it differs from what was loaded, so
+/// idle cycles don't rewrite state.json and rotate the rolling backups.
+fn save_if_changed(st: &State, before: &[u8]) -> Result<bool> {
+    if serde_json::to_vec(st).ok().as_deref() == Some(before) {
+        return Ok(false);
+    }
+    st.save()?;
+    Ok(true)
+}
+
 fn run() -> Result<()> {
     // One-shot rename migration: if `~/.config/claude-usage/` still exists
     // and `~/.config/usagio/` doesn't, atomically move it (with a
@@ -255,29 +271,29 @@ fn run() -> Result<()> {
     let exe = std::env::current_exe().unwrap_or_default();
     match effective_first_arg(&args, &exe) {
         None => cmd_list(&[]),
-        Some("list") | Some("ls") => cmd_list(&args[1..]),
-        Some("capture") | Some("add") => cmd_capture(&args[1..]),
+        Some("list") | Some("ls") => cmd_list(tail_args(&args)),
+        Some("capture") | Some("add") => cmd_capture(tail_args(&args)),
         Some("switch") | Some("use") => cmd_switch(args.get(1).map(String::as_str), None),
         Some("start") => cmd_switch(args.get(1).map(String::as_str), Some(Launch::Fresh)),
         Some("continue") | Some("cont") | Some("c") => {
             cmd_switch(args.get(1).map(String::as_str), Some(Launch::Continue))
         }
         Some("token") => cmd_token(args.get(1).map(String::as_str)),
-        Some("watch") => cmd_watch(&args[1..]),
+        Some("watch") => cmd_watch(tail_args(&args)),
         Some("menubar") => {
-            menubar::set_theme_override_from_args(&args[1..]);
+            menubar::set_theme_override_from_args(tail_args(&args));
             menubar::run()
         }
-        Some("report") => cmd_report(&args[1..]),
-        Some("context") => cmd_context(&args[1..]),
+        Some("report") => cmd_report(tail_args(&args)),
+        Some("context") => cmd_context(tail_args(&args)),
         Some("install") => cmd_install(),
         Some("uninstall") => cmd_uninstall(),
         Some("rm") | Some("remove") => cmd_rm(args.get(1).map(String::as_str)),
-        Some("renew") | Some("login") => cmd_renew(&args[1..]),
+        Some("renew") | Some("login") => cmd_renew(tail_args(&args)),
         // Internal, undocumented — see `cmd_secrets_selftest` doc comment.
-        Some("__secrets_selftest") => cmd_secrets_selftest(&args[1..]),
+        Some("__secrets_selftest") => cmd_secrets_selftest(tail_args(&args)),
         // Internal, undocumented — headless screenshot renderer (see cmd doc).
-        Some("__render_shot") => cmd_render_shot(&args[1..]),
+        Some("__render_shot") => cmd_render_shot(tail_args(&args)),
         Some("-h") | Some("--help") | Some("help") => {
             print_help();
             Ok(())
@@ -3521,13 +3537,14 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
     // Merge under the lock with a fresh reload so we don't clobber a switch.
     let merged = with_state_lock(|| {
         let mut st = State::load()?;
+        let before = serde_json::to_vec(&st).unwrap_or_default();
         sync_active_claude_identity(&mut st);
         for (email, acct, cu, ns) in &updates {
             if let Some(a) = st.find_mut(email) {
                 merge_poll_update(a, acct, cu.as_ref(), ns.as_ref());
             }
         }
-        st.save()?;
+        save_if_changed(&st, &before)?;
         Ok(())
     });
     if let Err(e) = merged {
