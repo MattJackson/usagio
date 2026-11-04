@@ -1101,6 +1101,9 @@ pub fn run() -> Result<()> {
             }
         }
     });
+    // Startup sweep of sign-in stores left by accounts removed elsewhere
+    // (`usagio rm`) or by a run that quit mid sign-in.
+    sweep_sign_in_stores_later();
     // The run loop retains the timer; scheduled timers fire in the default mode.
     let _timer =
         unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.75, true, &tick) };
@@ -3622,12 +3625,15 @@ fn begin_renew(slug: &str, key: &str) {
         .map(|st| renew_login_store(&st, slug, key))
         .unwrap_or_else(|| key.to_string());
     let target = crate::login::Target::Renew(key.to_string());
-    let started = crate::login::start(provider, target, |result| match result {
-        Ok(r) => {
-            notify(&renewed_message(&r));
-            request_poll_now();
+    let started = crate::login::start(provider, target, |result| {
+        sweep_sign_in_stores_later();
+        match result {
+            Ok(r) => {
+                notify(&renewed_message(&r));
+                request_poll_now();
+            }
+            Err(e) => notify(&format!("Renew failed: {e:#}")),
         }
-        Err(e) => notify(&format!("Renew failed: {e:#}")),
     });
     match started {
         Ok(s) => show_sign_in(&format!("Renew {key} — usagio"), slug, &store, &s),
@@ -3699,12 +3705,16 @@ fn begin_sign_in(slug: &str) {
     let target = crate::login::Target::Add {
         store: store.clone(),
     };
-    let started = crate::login::start(provider, target, |result| match result {
-        Ok(r) => {
-            notify(&added_message(&r));
-            request_poll_now();
+    let started = crate::login::start(provider, target, |result| {
+        // A failed add leaves its fresh store unclaimed: sweep it.
+        sweep_sign_in_stores_later();
+        match result {
+            Ok(r) => {
+                notify(&added_message(&r));
+                request_poll_now();
+            }
+            Err(e) => notify(&format!("Sign-in failed: {e:#}")),
         }
-        Err(e) => notify(&format!("Sign-in failed: {e:#}")),
     });
     match started {
         Ok(s) => show_sign_in(
@@ -3723,6 +3733,7 @@ fn show_sign_in(title: &str, slug: &str, store: &str, started: &crate::login::St
     let platform = crate::platform();
     present_sign_in(
         slug,
+        crate::login::store_id(slug, store),
         started,
         platform.sign_in_window_available().then_some(|| {
             platform.open_sign_in_window(
@@ -3742,6 +3753,7 @@ fn show_sign_in(title: &str, slug: &str, store: &str, started: &crate::login::St
 /// sign-in for `slug` can stop it (and free its port).
 fn present_sign_in(
     slug: &str,
+    store: [u8; 16],
     started: &crate::login::Started,
     open_window: Option<impl FnOnce() -> Result<()>>,
     open_browser: impl FnOnce() -> Result<()>,
@@ -3755,6 +3767,7 @@ fn present_sign_in(
     });
     if in_window {
         track_login(slug, std::sync::Arc::clone(&started.progress));
+        track_flow_store(store, std::sync::Arc::clone(&started.progress));
         return;
     }
     match open_browser() {
@@ -3764,6 +3777,58 @@ fn present_sign_in(
             notify(&format!("Sign-in failed: {e:#}"));
         }
     }
+}
+
+/// Sign-in window stores of flows still running. A flow whose window closed
+/// can still save its account (the code was already received), so its store
+/// is kept until the flow ends.
+static FLOW_STORES: std::sync::Mutex<Vec<([u8; 16], std::sync::Arc<crate::login::Progress>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn track_flow_store(store: [u8; 16], progress: std::sync::Arc<crate::login::Progress>) {
+    let mut flows = FLOW_STORES.lock().unwrap_or_else(|e| e.into_inner());
+    flows.retain(|(_, p)| !p.is_finished());
+    flows.push((store, progress));
+}
+
+/// Every sign-in store still wanted: each saved account's (the one its
+/// "Renew login…" opens, [`renew_login_store`]) plus those of running flows.
+fn sign_in_stores_to_keep(st: &State) -> std::collections::HashSet<[u8; 16]> {
+    let claude = st
+        .accounts
+        .iter()
+        .map(|a| (CLAUDE_SLUG, a.key().to_string()));
+    let others = st.providers.iter().flat_map(|(slug, p)| {
+        p.accounts
+            .iter()
+            .map(move |a| (slug.as_str(), a.key.clone()))
+    });
+    let mut keep: std::collections::HashSet<[u8; 16]> = claude
+        .chain(others)
+        .map(|(slug, key)| crate::login::store_id(slug, &renew_login_store(st, slug, &key)))
+        .collect();
+    let mut flows = FLOW_STORES.lock().unwrap_or_else(|e| e.into_inner());
+    flows.retain(|(_, p)| !p.is_finished());
+    keep.extend(flows.iter().map(|(id, _)| *id));
+    keep
+}
+
+/// Delete orphaned sign-in stores — a removed account's, a failed add's — on
+/// the UI thread. Never with unreadable state: that would delete them all.
+fn sweep_sign_in_stores() {
+    sweep_sign_in_stores_with(|keep| crate::platform().sweep_sign_in_stores(keep));
+}
+
+fn sweep_sign_in_stores_with(sweep: impl FnOnce(std::collections::HashSet<[u8; 16]>)) {
+    match State::load() {
+        Ok(st) => sweep(sign_in_stores_to_keep(&st)),
+        Err(e) => crate::logging::log(&format!("event=sign_in_store_sweep_skipped reason={e:#}")),
+    }
+}
+
+/// [`sweep_sign_in_stores`] at the UI thread's next tick (callable anywhere).
+pub(crate) fn sweep_sign_in_stores_later() {
+    run_on_ui_thread(sweep_sign_in_stores);
 }
 
 /// "dev@example.com renewed — login good until Oct 31 · live now".
@@ -4035,7 +4100,10 @@ fn handle_remove(slug: &str, key: &str) {
         remove_provider_account_generic(slug, key)
     };
     match result {
-        Ok(_) => notify(&format!("Removed {key}")),
+        Ok(_) => {
+            notify(&format!("Removed {key}"));
+            sweep_sign_in_stores_later();
+        }
         Err(e) => notify(&format!("Remove failed: {e}")),
     }
 }
@@ -4600,6 +4668,8 @@ mod cross_platform {
         // Redraw ticker on its own background thread (see `redraw_loop`'s
         // doc for why it can't be the main thread here).
         std::thread::spawn(move || redraw_loop(handle, initial));
+        // Startup sweep of orphaned sign-in stores (runs on the UI thread).
+        sweep_sign_in_stores_later();
 
         // Blocks, pumping the GTK (Linux) / Win32 (Windows) message loop —
         // see `platform::linux::LinuxMenu` / `platform::windows::WindowsMenu`.
@@ -8986,10 +9056,16 @@ mod tests {
             progress: std::sync::Arc::new(crate::login::Progress::default()),
         };
         let mut browser_opened = false;
-        present_sign_in("t-login-window", &started, Some(|| Ok(())), || {
-            browser_opened = true;
-            Ok(())
-        });
+        present_sign_in(
+            "t-login-window",
+            crate::login::store_id("t-login-window", "s"),
+            &started,
+            Some(|| Ok(())),
+            || {
+                browser_opened = true;
+                Ok(())
+            },
+        );
         assert!(!browser_opened, "the window opened: no browser");
         let prev = supersede_previous_login("t-login-window")
             .expect("a window flow must be tracked so a newer sign-in can stop it");
@@ -9007,6 +9083,7 @@ mod tests {
         let mut browser_opened = false;
         present_sign_in(
             "t-login-fallback",
+            crate::login::store_id("t-login-fallback", "s"),
             &started,
             Some(|| Err(anyhow::anyhow!("no window here"))),
             || {
@@ -9016,6 +9093,69 @@ mod tests {
         );
         assert!(browser_opened);
         assert!(supersede_previous_login("t-login-fallback").is_some());
+    }
+
+    #[test]
+    fn every_saved_account_keeps_the_sign_in_store_its_renew_opens() {
+        let mut st = State::default();
+        let mut added = restore_test_acct("added@x.io");
+        added.login_store = Some("new:abc".into());
+        st.upsert(added);
+        st.upsert(restore_test_acct("plain@x.io"));
+        st.providers
+            .entry("codex".into())
+            .or_default()
+            .accounts
+            .push(codex_state_acct("c@x.io"));
+        let keep = sign_in_stores_to_keep(&st);
+        assert!(keep.contains(&crate::login::store_id(CLAUDE_SLUG, "new:abc")));
+        assert!(
+            !keep.contains(&crate::login::store_id(CLAUDE_SLUG, "added@x.io")),
+            "its renew opens the add's store, not one keyed by email"
+        );
+        assert!(keep.contains(&crate::login::store_id(CLAUDE_SLUG, "plain@x.io")));
+        assert!(keep.contains(&crate::login::store_id("codex", "c@x.io")));
+        assert!(!keep.contains(&crate::login::store_id("codex", "removed@x.io")));
+    }
+
+    #[test]
+    fn a_running_flows_store_is_kept_until_the_flow_ends() {
+        let st = State::default();
+        let id = crate::login::store_id("t-flow-store", "new:running");
+        let progress = std::sync::Arc::new(crate::login::Progress::default());
+        track_flow_store(id, progress.clone());
+        assert!(
+            sign_in_stores_to_keep(&st).contains(&id),
+            "a closed window's flow may still save its account"
+        );
+        progress.mark_finished();
+        assert!(
+            !sign_in_stores_to_keep(&st).contains(&id),
+            "a failed add's store is no longer wanted"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_state_never_sweeps_the_stores() {
+        let _home = crate::store::ScopedConfigDir::new();
+        let path = crate::store::state_json_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{ not json").unwrap();
+        let mut swept = false;
+        sweep_sign_in_stores_with(|_| swept = true);
+        assert!(
+            !swept,
+            "an unreadable state would read as no accounts: keep all"
+        );
+        let mut st = State::default();
+        st.upsert(restore_test_acct("kept@x.io"));
+        std::fs::remove_file(&path).unwrap();
+        st.save().unwrap();
+        let mut kept = None;
+        sweep_sign_in_stores_with(|keep| kept = Some(keep));
+        assert!(kept
+            .expect("a readable state sweeps")
+            .contains(&crate::login::store_id(CLAUDE_SLUG, "kept@x.io")));
     }
 
     #[test]

@@ -132,6 +132,13 @@ pub trait Platform: Send + Sync + 'static {
     fn open_url(&self, url: &str) -> Result<()> {
         sign_in::open_url(url)
     }
+
+    /// Delete every sign-in window cookie store (see `crate::login::store_id`)
+    /// not in `keep` and not used by an open sign-in window. UI thread only;
+    /// best-effort (failures are logged, and the next sweep retries).
+    fn sweep_sign_in_stores(&self, keep: std::collections::HashSet<[u8; 16]>) {
+        sign_in::sweep(keep)
+    }
 }
 
 // ---------- MenuBackend ---------------------------------------------------
