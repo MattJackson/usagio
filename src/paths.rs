@@ -104,17 +104,11 @@ pub fn migrate_between(old: &Path, new: &Path) -> Result<MigrationResult, Migrat
             }
 
             match std::fs::rename(old, new) {
-                Ok(()) => {
-                    eprintln!(
-                        "usagio: migrated config {} → {}",
-                        old.display(),
-                        new.display()
-                    );
-                    Ok(MigrationResult::Migrated {
-                        from: old.to_path_buf(),
-                        to: new.to_path_buf(),
-                    })
-                }
+                // Silent: the caller prints the user-facing message.
+                Ok(()) => Ok(MigrationResult::Migrated {
+                    from: old.to_path_buf(),
+                    to: new.to_path_buf(),
+                }),
                 Err(e) if is_cross_device(&e) => copy_delete_fallback(old, new),
                 Err(e) => Err(MigrationError::RenameFailed(e)),
             }
