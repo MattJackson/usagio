@@ -1799,6 +1799,38 @@ fn credits_in_different_non_dominant_units_are_not_ranked_by_raw_minor_units() {
 }
 
 #[test]
+fn credits_rank_richest_first_within_the_dominant_unit_and_ahead_of_other_units() {
+    let now = at(12, 0, 0);
+    let s = snap(
+        now,
+        "x",
+        vec![
+            acct("x", 100.0, 100.0, now),
+            acct("b", 100.0, 100.0, now),
+            acct("c", 100.0, 100.0, now),
+        ],
+    );
+    let mut v = assess_all(&s);
+    for a in v.iter_mut() {
+        a.tier = Tier::Credits;
+    }
+    let usd = Some("USD");
+    let order = |a: &Assessed, b: &Assessed| rank_cmp(a, b, usd);
+
+    // Same unit: the larger balance sorts first.
+    v[0].credits = Money::new(1_000, 2, "USD");
+    v[1].credits = Money::new(9_000, 2, "USD");
+    assert_eq!(order(&v[1], &v[0]), std::cmp::Ordering::Less);
+    assert_eq!(order(&v[0], &v[1]), std::cmp::Ordering::Greater);
+
+    // The dominant unit sorts ahead of another unit, however large the
+    // foreign raw amount is.
+    v[2].credits = Money::new(99_999_999, 2, "EUR");
+    assert_eq!(order(&v[0], &v[2]), std::cmp::Ordering::Less);
+    assert_eq!(order(&v[2], &v[0]), std::cmp::Ordering::Greater);
+}
+
+#[test]
 fn blind_projection_only_applies_to_windows_that_were_in_the_band() {
     let read = at(12, 0, 0);
     let now = read + Duration::minutes(4);
