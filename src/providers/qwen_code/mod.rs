@@ -10,15 +10,13 @@
 //!    CLI; rate-limit info arrives only as chat-completion response headers.
 //!  - Single-slot; second `/auth` login overwrites via atomic temp+rename.
 
-#![allow(dead_code)]
-
 use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
-pub fn new() -> Box<dyn Provider> {
+pub(crate) fn new() -> Box<dyn Provider> {
     Box::new(QwenCodeProvider)
 }
 
-pub struct QwenCodeProvider;
+struct QwenCodeProvider;
 
 // Not wired yet (no capability exposed):
 // TODO: read `~/.qwen/oauth_creds.json` and populate `TokenGrant` from

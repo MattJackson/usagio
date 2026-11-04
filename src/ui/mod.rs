@@ -35,9 +35,9 @@ pub(crate) enum Sev {
 /// produces them.
 #[derive(Clone, Debug)]
 pub(crate) struct PctSpan {
-    pub start: usize,
-    pub len: usize,
-    pub sev: Sev,
+    pub(crate) start: usize,
+    pub(crate) len: usize,
+    pub(crate) sev: Sev,
 }
 
 /// One rendered row of the popover's top-level list. Each variant carries the
@@ -74,5 +74,5 @@ pub(crate) enum PopoverRow {
 /// [`popover::PopoverHost`].
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PopoverModel {
-    pub rows: Vec<PopoverRow>,
+    pub(crate) rows: Vec<PopoverRow>,
 }

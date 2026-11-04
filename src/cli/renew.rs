@@ -11,7 +11,7 @@ use crate::{login, platform};
 
 /// A `claude:`/`codex:` qualifier on a renew selector picks the provider (as it
 /// does for switch/start/rm); returns the bare account selector.
-pub(crate) fn strip_renew_qualifier(slug: &mut String, selector: Option<String>) -> Option<String> {
+fn strip_renew_qualifier(slug: &mut String, selector: Option<String>) -> Option<String> {
     let sel = selector?;
     match sel.split_once(':') {
         Some((q, account)) => {
@@ -24,7 +24,7 @@ pub(crate) fn strip_renew_qualifier(slug: &mut String, selector: Option<String>)
 
 /// Resolve a non-Claude renew selector (full key or unique prefix) up front, so
 /// a prefix is never passed through as the expected account.
-pub(crate) fn resolve_provider_renew_key(state: &State, slug: &str, sel: &str) -> Result<String> {
+fn resolve_provider_renew_key(state: &State, slug: &str, sel: &str) -> Result<String> {
     resolve_provider_selector(state, &format!("{slug}:{sel}"))
         .map(|(_, key)| key)
         .ok_or_else(|| anyhow!("no unique {slug} account matches '{sel}'"))

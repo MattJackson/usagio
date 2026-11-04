@@ -67,12 +67,7 @@ pub(crate) fn auto_pick_for(
 /// Auto-pick by the v2 `rank_key`: the Ready account whose weekly reset comes
 /// first (then the most runway), then the Draining one with the most hard
 /// runway. Never an account at its limit.
-pub(crate) fn auto_pick_v2(
-    rows: &[Row],
-    ceiling: f64,
-    trigger: f64,
-    now: DateTime<Utc>,
-) -> Result<String> {
+fn auto_pick_v2(rows: &[Row], ceiling: f64, trigger: f64, now: DateTime<Utc>) -> Result<String> {
     if !rows.iter().any(|r| r.has_data()) {
         bail!(
             "no usage data yet — let the menu-bar app or `usagio watch` \

@@ -12,13 +12,13 @@ use super::{AccountIn, Evidence, Policy, Tier, WindowId, WindowIn};
 use crate::providers::trait_def::Money;
 
 /// What the engine needs besides the account itself.
-pub struct Ctx<'a> {
-    pub now: DateTime<Utc>,
-    pub policy: &'a Policy,
-    pub memory: &'a SwapMemory,
+pub(crate) struct Ctx<'a> {
+    pub(crate) now: DateTime<Utc>,
+    pub(crate) policy: &'a Policy,
+    pub(crate) memory: &'a SwapMemory,
     /// Detected sleep intervals `(from, to)` in unix secs (excluded from the
     /// blind age).
-    pub sleep: &'a [(i64, i64)],
+    pub(crate) sleep: &'a [(i64, i64)],
 }
 
 impl Ctx<'_> {
@@ -36,27 +36,27 @@ impl Ctx<'_> {
 
 /// One window's assessment.
 #[derive(Debug, Clone)]
-pub struct WinAssess {
-    pub id: WindowId,
+pub(crate) struct WinAssess {
+    pub(crate) id: WindowId,
     /// The lower bound: the latest successful reading's pct.
-    pub lb: f64,
-    pub resets_at: Option<DateTime<Utc>>,
+    pub(crate) lb: f64,
+    pub(crate) resets_at: Option<DateTime<Utc>>,
     /// The reading predates the window's reset (`resets_at ≤ now`): its pct
     /// is an upper bound only.
-    pub pending: bool,
+    pub(crate) pending: bool,
     /// `lb ≥ BLOCKED_PCT` and not pending.
-    pub blocked: bool,
+    pub(crate) blocked: bool,
     /// `lb ≥ DRAIN_EXIT_PCT` and not pending.
-    pub drain_eligible: bool,
+    drain_eligible: bool,
     /// Drift estimate (room claims only).
-    pub est: f64,
+    pub(crate) est: f64,
     /// Blind projection (active, blind in band only).
-    pub proj: Option<f64>,
-    pub limit: f64,
+    pub(crate) proj: Option<f64>,
+    pub(crate) limit: f64,
     /// Whether the window can block before it resets.
-    pub binds: bool,
+    pub(crate) binds: bool,
     /// Floored rate (`max(rate, DEFAULT)`).
-    pub floored: f64,
+    pub(crate) floored: f64,
 }
 
 impl WinAssess {
@@ -69,49 +69,49 @@ impl WinAssess {
 
 /// One account's assessment.
 #[derive(Debug, Clone)]
-pub struct Assessed {
-    pub key: String,
-    pub is_active: bool,
-    pub has_reading: bool,
-    pub windows: Vec<WinAssess>,
-    pub lapsed: bool,
+pub(crate) struct Assessed {
+    pub(crate) key: String,
+    pub(crate) is_active: bool,
+    pub(crate) has_reading: bool,
+    pub(crate) windows: Vec<WinAssess>,
+    pub(crate) lapsed: bool,
     /// lb-blocked in a non-pending window, or lapsed.
-    pub blocked: bool,
+    pub(crate) blocked: bool,
     /// Max reset of the blocked windows; `None` when unknown (or lapsed).
-    pub blocked_until: Option<DateTime<Utc>>,
+    pub(crate) blocked_until: Option<DateTime<Utc>>,
     /// Minutes until the binding windows reach their limit (floored rate).
-    pub soft_runway: f64,
+    pub(crate) soft_runway: f64,
     /// Minutes until the binding windows reach `DRAIN_EXIT_PCT` (floored).
-    pub hard_runway: f64,
-    pub evidence: Evidence,
+    pub(crate) hard_runway: f64,
+    pub(crate) evidence: Evidence,
     /// Never left, or read at least `POST_LEAVE_SETTLE_S` after we left it.
-    pub post_leave_ok: bool,
+    pub(crate) post_leave_ok: bool,
     /// Some window is reset-pending.
-    pub any_pending: bool,
+    pub(crate) any_pending: bool,
     /// I5.
-    pub verified: bool,
+    pub(crate) verified: bool,
     /// §3.4 `servable`.
-    pub servable: bool,
-    pub tier: Tier,
+    pub(crate) servable: bool,
+    pub(crate) tier: Tier,
     /// Ready apart from freshness (the arms pick from these; the evidence
     /// post-pass decides whether a read is needed first).
-    pub ready_basis: bool,
-    pub trigger_latched: bool,
-    pub drained_latched: bool,
+    pub(crate) ready_basis: bool,
+    pub(crate) trigger_latched: bool,
+    pub(crate) drained_latched: bool,
     /// Active only: last reading in band and older than `BLIND_AFTER_S`.
-    pub blind_in_band: bool,
-    pub credits: Option<Money>,
-    pub attempted: bool,
-    pub unverified: bool,
-    pub in_backoff: bool,
-    pub weekly_reset: Option<DateTime<Utc>>,
-    pub fetched_at: Option<i64>,
+    pub(crate) blind_in_band: bool,
+    pub(crate) credits: Option<Money>,
+    pub(crate) attempted: bool,
+    pub(crate) unverified: bool,
+    pub(crate) in_backoff: bool,
+    pub(crate) weekly_reset: Option<DateTime<Utc>>,
+    pub(crate) fetched_at: Option<i64>,
 }
 
 impl Assessed {
     /// The highest lower bound over binding, non-pending windows, relative
     /// to nothing (raw pct). Used for logs.
-    pub fn max_lb(&self) -> f64 {
+    pub(crate) fn max_lb(&self) -> f64 {
         self.windows
             .iter()
             .filter(|w| !w.pending)
@@ -119,7 +119,7 @@ impl Assessed {
             .fold(0.0, f64::max)
     }
 
-    pub fn max_est(&self) -> f64 {
+    pub(crate) fn max_est(&self) -> f64 {
         self.windows
             .iter()
             .filter(|w| !w.pending)
@@ -127,7 +127,7 @@ impl Assessed {
             .fold(0.0, f64::max)
     }
 
-    pub fn max_proj(&self) -> Option<f64> {
+    pub(crate) fn max_proj(&self) -> Option<f64> {
         self.windows
             .iter()
             .filter_map(|w| w.proj)
@@ -135,14 +135,14 @@ impl Assessed {
     }
 
     /// Some binding window has a lower bound at or above the drain exit.
-    pub fn lb_drain_eligible(&self) -> bool {
+    pub(crate) fn lb_drain_eligible(&self) -> bool {
         self.windows.iter().any(|w| w.binds && w.drain_eligible)
     }
 
     /// The window that drove the account to its limit (for latches): the
     /// blocked window, else the binding window closest to (or most over) its
     /// limit; with no binding window, the non-pending one.
-    pub fn binding_window(&self) -> Option<&WinAssess> {
+    pub(crate) fn binding_window(&self) -> Option<&WinAssess> {
         if let Some(w) = self.windows.iter().find(|w| w.blocked) {
             return Some(w);
         }
@@ -156,7 +156,7 @@ impl Assessed {
     }
 
     /// A latch for leaving this account now.
-    pub fn latch(&self, now: DateTime<Utc>) -> Option<Latch> {
+    pub(crate) fn latch(&self, now: DateTime<Utc>) -> Option<Latch> {
         let w = self.binding_window()?;
         Some(Latch {
             window: w.id,
@@ -203,7 +203,7 @@ fn latch_holds(latch: &Latch, a: &AccountIn, now: DateTime<Utc>) -> bool {
 }
 
 /// Assess `a` (the active account when `is_active`).
-pub fn assess(a: &AccountIn, is_active: bool, ctx: &Ctx) -> Assessed {
+pub(crate) fn assess(a: &AccountIn, is_active: bool, ctx: &Ctx) -> Assessed {
     let now = ctx.now;
     let now_ts = ctx.now_ts();
     let left_at = if is_active {
@@ -458,7 +458,7 @@ fn rank_tier(a: &Assessed) -> Tier {
 }
 
 /// The provider's dominant credits unit: the most common among `accounts`.
-pub fn dominant_unit(accounts: &[Assessed]) -> Option<String> {
+pub(crate) fn dominant_unit(accounts: &[Assessed]) -> Option<String> {
     let mut counts: Vec<(String, usize)> = Vec::new();
     for c in accounts.iter().filter_map(|a| a.credits.as_ref()) {
         match counts.iter_mut().find(|(u, _)| *u == c.unit) {
@@ -480,7 +480,7 @@ pub fn dominant_unit(accounts: &[Assessed]) -> Option<String> {
 /// lost, so the room that expires soonest is spent first. Every Ready account
 /// already clears `MIN_LANDING_MIN`, so this never lands on an account about
 /// to block (D2). Matches the menu order (`account_order::Priority`).
-pub fn rank_cmp(a: &Assessed, b: &Assessed, unit: Option<&str>) -> Ordering {
+pub(crate) fn rank_cmp(a: &Assessed, b: &Assessed, unit: Option<&str>) -> Ordering {
     let (ta, tb) = (rank_tier(a), rank_tier(b));
     ta.cmp(&tb).then_with(|| match ta {
         Tier::Ready => {

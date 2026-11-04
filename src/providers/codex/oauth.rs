@@ -53,9 +53,9 @@ use crate::providers::trait_def::TokenGrant;
 /// Codex's OAuth token endpoint. Override via `CODEX_REFRESH_TOKEN_URL_OVERRIDE`
 /// (same env var name the vendor CLI itself honors) — tests use this to point
 /// at a local mock server instead of the real network.
-pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+pub(crate) const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// Public OAuth client id the `codex` CLI itself uses for the refresh grant.
-pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub(crate) const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 #[cfg(test)]
 const TOKEN_URL_OVERRIDE_ENV: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
@@ -113,7 +113,7 @@ struct RefreshResponse {
 /// future provider-agnostic caller (e.g. a shared active-refresh loop) can
 /// treat both the same way.
 #[derive(Debug)]
-pub enum RefreshError {
+pub(crate) enum RefreshError {
     /// Terminal: `refresh_token_expired` / `refresh_token_reused` /
     /// `refresh_token_invalidated` / bare `invalid_grant`, or no refresh
     /// token to send. The account needs a fresh `codex login`.
@@ -142,11 +142,11 @@ impl std::error::Error for RefreshError {}
 /// `TokenGrant` conversion below — it carries just the fields that conversion
 /// needs.
 #[derive(Debug, Clone)]
-pub struct CodexRefreshGrant {
-    pub id_token: Option<String>,
-    pub access_token: String,
-    pub refresh_token: String,
-    pub expires_in_secs: i64,
+pub(crate) struct CodexRefreshGrant {
+    pub(crate) id_token: Option<String>,
+    pub(crate) access_token: String,
+    pub(crate) refresh_token: String,
+    pub(crate) expires_in_secs: i64,
 }
 
 impl From<CodexRefreshGrant> for TokenGrant {
@@ -182,7 +182,7 @@ fn forbidden_body_is_terminal(body: &str) -> bool {
 /// POST a `refresh_token` grant to Codex's token endpoint. Pure network call
 /// — no filesystem access, no CAS. See `active_refresh_cas` for the
 /// file-safe wrapper used for the single active Codex login.
-pub fn refresh_token_grant(refresh_token: &str) -> Result<CodexRefreshGrant, RefreshError> {
+pub(crate) fn refresh_token_grant(refresh_token: &str) -> Result<CodexRefreshGrant, RefreshError> {
     if refresh_token.trim().is_empty() {
         // Nothing to send; treat identically to a rejected grant so the
         // caller's policy (flag needs_relogin, stop retrying) is uniform.
@@ -252,8 +252,9 @@ pub fn refresh_token_grant(refresh_token: &str) -> Result<CodexRefreshGrant, Ref
 }
 
 /// Outcome of `active_refresh_cas`.
+#[allow(dead_code)] // reserved with `active_refresh_cas`, see below
 #[derive(Debug, PartialEq)]
-pub enum CasOutcome {
+pub(crate) enum CasOutcome {
     /// The on-disk `auth.json` still matches the blob the caller last observed
     /// (`last_known_blob`): the Codex CLI hasn't rotated it, so there is
     /// nothing new to adopt and no state update is needed.
@@ -294,7 +295,14 @@ pub enum CasOutcome {
 /// CLI hasn't rotated anything and we return `Fresh` (no state update needed);
 /// otherwise we return `Adopted(blob)` with the current on-disk bytes for the
 /// caller to absorb.
-pub fn active_refresh_cas(last_known_blob: Option<&str>) -> Result<CasOutcome, RefreshError> {
+///
+/// Not wired into the app yet (the generic `lifecycle` path adopts the active
+/// Codex login today); kept, with its tests, as the file-CAS reference the
+/// provider docs point to.
+#[allow(dead_code)]
+pub(crate) fn active_refresh_cas(
+    last_known_blob: Option<&str>,
+) -> Result<CasOutcome, RefreshError> {
     let path = auth_json_path()
         .ok_or_else(|| RefreshError::Transient("could not resolve $CODEX_HOME / $HOME".into()))?;
     let before = std::fs::read_to_string(&path)

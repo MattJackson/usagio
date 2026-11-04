@@ -19,9 +19,7 @@ pub(crate) fn cmd_context(args: &[String]) -> Result<()> {
 
 /// Parse the `context` subcommand's two supported flags. Unknown flags are
 /// rejected so a typo doesn't silently degrade to "audit every provider".
-pub(crate) fn parse_context_args(
-    args: &[String],
-) -> Result<(Option<String>, Option<std::path::PathBuf>)> {
+fn parse_context_args(args: &[String]) -> Result<(Option<String>, Option<std::path::PathBuf>)> {
     let mut provider: Option<String> = None;
     let mut project: Option<std::path::PathBuf> = None;
     let mut it = args.iter();

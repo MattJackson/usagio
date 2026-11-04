@@ -223,7 +223,7 @@ pub(super) fn now_utc() -> DateTime<Utc> {
 
 /// Locate the active section + account (if any) in the snapshot.
 #[cfg(test)]
-pub(super) fn active_account(snap: &Snapshot) -> Option<(&ProviderSection, &AcctView)> {
+fn active_account(snap: &Snapshot) -> Option<(&ProviderSection, &AcctView)> {
     for sec in &snap.sections {
         if let Some(a) = sec.accounts.iter().find(|a| a.active) {
             return Some((sec, a));
@@ -257,18 +257,14 @@ pub(super) fn blocking_pct(a: &AcctView) -> Option<f64> {
 /// switch we make. Delegates to the shared `crate::env_override::env_override_active` so
 /// the menu display and the `choose_swap_target` auto-swap filter can never
 /// disagree, and so tests can toggle overrides through one hook.
-pub(super) fn env_override_for(provider_id: &str) -> bool {
+fn env_override_for(provider_id: &str) -> bool {
     env_override_active(provider_id)
 }
 
 /// Shared display priority: usable accounts by weekly reset, locked accounts
 /// by unlock time, then headroom and key. Lapsed subscriptions come last.
 /// Active status is only an indicator. Auto-swap uses its separate runway policy.
-pub(super) fn account_priority_cmp(
-    a: &AcctView,
-    b: &AcctView,
-    now: DateTime<Utc>,
-) -> std::cmp::Ordering {
+fn account_priority_cmp(a: &AcctView, b: &AcctView, now: DateTime<Utc>) -> std::cmp::Ordering {
     let priority = |x: &AcctView| {
         let (sp, wp) = summary_pcts(x);
         crate::account_order::Priority::new(
@@ -291,10 +287,7 @@ pub(super) fn account_priority_cmp(
 /// so `account_order` and the section vecs can never disagree (v0.5.18
 /// "1 order only"). `provider_grouped_order` later brackets this flat order by
 /// provider (alphabetically) for rendering.
-pub(super) fn flat_account_order(
-    sections: &[ProviderSection],
-    now: DateTime<Utc>,
-) -> Vec<(usize, usize)> {
+fn flat_account_order(sections: &[ProviderSection], now: DateTime<Utc>) -> Vec<(usize, usize)> {
     let mut idx: Vec<(usize, usize)> = Vec::new();
     for (si, sec) in sections.iter().enumerate() {
         for ai in 0..sec.accounts.len() {
@@ -332,7 +325,7 @@ pub(super) fn provider_grouped_order(snap: &Snapshot) -> Vec<(usize, Vec<usize>)
 /// Claude accounts, so the window set is fixed (session / weekly / opus); the
 /// window IDs come from `provider.window_order()` so this is trivially
 /// generalizable when state v2 lands.
-pub(super) fn acctview_from_row(
+fn acctview_from_row(
     r: &Row,
     active: &Option<String>,
     provider_id: &'static str,
@@ -525,7 +518,7 @@ pub(super) fn build_snapshot() -> Snapshot {
 
 /// Build one `RegisteredProvider` row from a live provider reference.
 /// Extracted so both buckets in `build_snapshot` populate identically.
-pub(super) fn register_provider(p: &'static dyn Provider) -> RegisteredProvider {
+fn register_provider(p: &'static dyn Provider) -> RegisteredProvider {
     RegisteredProvider {
         provider_id: p.provider_id(),
         display_name: p.display_name(),
@@ -553,7 +546,7 @@ pub(super) fn register_provider(p: &'static dyn Provider) -> RegisteredProvider 
 /// Pure function given its inputs: no I/O, no direct state reads — the caller
 /// (`build_snapshot`) is the one that turns `state.json` into
 /// `captured_provider_ids`.
-pub(crate) fn capture_menu_providers(
+fn capture_menu_providers(
     captured_provider_ids: &[&str],
 ) -> (Vec<&'static dyn Provider>, Vec<&'static dyn Provider>) {
     partition_capture_providers(providers::all(), captured_provider_ids)
@@ -562,7 +555,7 @@ pub(crate) fn capture_menu_providers(
 /// Inner form of `capture_menu_providers` that operates on an arbitrary
 /// provider slice so tests can pass their own fixtures without touching the
 /// process-wide registry.
-pub(super) fn partition_capture_providers<'a>(
+fn partition_capture_providers<'a>(
     provs: &'a [Box<dyn Provider>],
     captured_provider_ids: &[&str],
 ) -> (Vec<&'a dyn Provider>, Vec<&'a dyn Provider>) {
@@ -589,9 +582,9 @@ pub(super) fn partition_capture_providers<'a>(
 /// Identity of one version of state.json: mtime, length and (on unix) inode.
 /// Every save is a tmp+rename, so a new inode tells two saves apart even when
 /// a coarse filesystem clock gives them the same mtime.
-pub(super) type StateFileKey = Option<(std::time::SystemTime, u64, u64)>;
+type StateFileKey = Option<(std::time::SystemTime, u64, u64)>;
 
-pub(super) fn state_file_key(path: &std::path::Path) -> StateFileKey {
+fn state_file_key(path: &std::path::Path) -> StateFileKey {
     let m = std::fs::metadata(path).ok()?;
     #[cfg(unix)]
     let ino = std::os::unix::fs::MetadataExt::ino(&m);
@@ -605,7 +598,7 @@ pub(super) fn state_file_key(path: &std::path::Path) -> StateFileKey {
 /// file every tick forever. Called from the main thread, the poller thread
 /// (`next_reset_wake_secs` -> `build_snapshot`) and, on Linux/Windows, the
 /// `redraw_loop` thread, so the Mutex is required.
-pub(super) fn cached_state() -> State {
+fn cached_state() -> State {
     use std::sync::{Mutex, OnceLock};
     struct C {
         key: StateFileKey,

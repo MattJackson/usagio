@@ -6,7 +6,7 @@
 /// `ThemeSource`, which isn't `Clone`), so `forced_theme` re-maps it per call.
 /// A process-global `OnceLock` rather than an env var: the repo lint disallows
 /// `std::env::set_var`, and there is no need to leak this into the environment.
-pub(super) static FORCED_THEME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+static FORCED_THEME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
 /// Map a `--theme <name>` token to muri's [`ThemeSource`](muri::ThemeSource).
 /// `windows`/`macos`/`gnome` force that OEM look on any host; `system`

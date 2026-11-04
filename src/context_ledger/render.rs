@@ -2,7 +2,7 @@
 
 use super::{ItemKind, Ledger};
 
-pub fn terminal(ledger: &Ledger) -> String {
+pub(crate) fn terminal(ledger: &Ledger) -> String {
     let mut out = String::new();
     let project = ledger
         .project

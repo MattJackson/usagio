@@ -14,15 +14,13 @@
 //!    TOML rewrite) and not wired yet.
 //!  - No dedicated usage/quota endpoint (headers-only quota telemetry).
 
-#![allow(dead_code)]
-
 use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
-pub fn new() -> Box<dyn Provider> {
+pub(crate) fn new() -> Box<dyn Provider> {
     Box::new(KimiProvider)
 }
 
-pub struct KimiProvider;
+struct KimiProvider;
 
 // Not wired yet (no capability exposed):
 // TODO: read `~/.kimi/` TOML plus the macOS Keychain entry under

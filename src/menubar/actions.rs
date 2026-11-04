@@ -26,13 +26,13 @@ use crate::watch::cycle::SwapGuards;
 /// `autoswap:now`, `notifications:threshold` / `:resetback` / `:pace`,
 /// `backup:save`, `backup:restore`, `refresh:now`, `noop`, `capture` — the
 /// plain-capture id used only by the submenu title itself, never a click).
-pub(super) struct ClickId<'a> {
+struct ClickId<'a> {
     pub(super) action: &'a str,
     pub(super) slug: Option<&'a str>,
     pub(super) key: Option<&'a str>,
 }
 
-pub(super) fn parse_click_id(id: &str) -> ClickId<'_> {
+fn parse_click_id(id: &str) -> ClickId<'_> {
     let mut it = id.splitn(3, ':');
     let action = it.next().unwrap_or("");
     let slug = it.next();
@@ -93,8 +93,7 @@ pub(super) fn handle_click(id: &str) {
 /// new click would otherwise stack up its own throwaway `SwapGuard` and
 /// thread. `false` = no refresh in flight; CAS to `true` before spawning,
 /// reset to `false` when the spawned thread's cycle completes.
-pub(super) static REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// "Refresh usage now" click (Settings ▸ Advanced ▸). Runs one poll +
 /// auto-swap cycle on a background thread — same `run_cycle` the poll loop
@@ -108,7 +107,7 @@ pub(super) static REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool =
 /// Claude slot and all provider slots, sorted for a stable notification body.
 /// Reads state directly (no network) so it reflects whatever the just-finished
 /// refresh cycle persisted.
-pub(super) fn accounts_needing_relogin() -> Vec<String> {
+fn accounts_needing_relogin() -> Vec<String> {
     let st = State::load().unwrap_or_default();
     let mut out: Vec<String> = st
         .accounts
@@ -129,7 +128,7 @@ pub(super) fn accounts_needing_relogin() -> Vec<String> {
     out
 }
 
-pub(super) fn handle_refresh_now() {
+fn handle_refresh_now() {
     // Single engine owner (design §3.5): a display-only process runs no poll,
     // decide or switch, so it must not run a cycle (a second engine with
     // independent hysteresis). The owner refreshes on its own schedule.
@@ -192,7 +191,7 @@ pub(super) fn handle_refresh_now() {
 
 /// The "Refresh usage now" result toast. Per-account failures are logged and
 /// skipped by the cycle, so they must be counted here, not read off `Ok`.
-pub(super) fn refresh_summary(fetched: usize, failed: usize, stuck: &[String]) -> String {
+fn refresh_summary(fetched: usize, failed: usize, stuck: &[String]) -> String {
     let head = match (fetched, failed) {
         (0, f) if f > 0 => "Refresh failed — no account could be refreshed".to_string(),
         (_, 0) => "Usage refreshed".to_string(),
@@ -215,7 +214,7 @@ pub(super) fn refresh_summary(fetched: usize, failed: usize, stuck: &[String]) -
 /// Factored out from `handle_refresh_now` so a test can inject a counting
 /// closure in place of a real `std::thread::spawn` and assert the second of
 /// two rapid calls never invokes it.
-pub(super) fn try_start_refresh(spawn: impl FnOnce()) {
+fn try_start_refresh(spawn: impl FnOnce()) {
     use std::sync::atomic::Ordering;
     if REFRESH_IN_FLIGHT
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -231,7 +230,7 @@ pub(super) fn try_start_refresh(spawn: impl FnOnce()) {
 /// (persists into state.json + preserves cached usage). For every other
 /// provider, dispatch through the trait (`capture_current_generic`), which
 /// persists the account into `State::providers[slug]`.
-pub(super) fn handle_capture(slug: &str) {
+fn handle_capture(slug: &str) {
     if slug != CLAUDE_SLUG && providers::get(slug).is_none() {
         notify(&format!(
             "Capture failed: provider '{slug}' is not registered"
@@ -255,14 +254,13 @@ pub(super) fn handle_capture(slug: &str) {
 }
 
 /// Captures clicked but not yet run, per provider.
-pub(super) static PENDING_CAPTURES: std::sync::Mutex<
-    Option<std::collections::HashMap<String, usize>>,
-> = std::sync::Mutex::new(None);
+static PENDING_CAPTURES: std::sync::Mutex<Option<std::collections::HashMap<String, usize>>> =
+    std::sync::Mutex::new(None);
 
 /// Run every queued capture for `slug`. Called with the swap guard held, by
 /// the capture's own worker and by every switch worker before its gen check,
 /// so a Switch clicked after a Capture always sees the captured account.
-pub(super) fn run_pending_captures(slug: &str) {
+fn run_pending_captures(slug: &str) {
     let n = PENDING_CAPTURES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -274,7 +272,7 @@ pub(super) fn run_pending_captures(slug: &str) {
     }
 }
 
-pub(super) fn capture_serialized(slug: &str) {
+fn capture_serialized(slug: &str) {
     if slug == CLAUDE_SLUG {
         match capture_current() {
             Ok((email, existed)) => {
@@ -314,7 +312,7 @@ pub(super) fn capture_serialized(slug: &str) {
 /// refresh, a profile fetch and a POST — and refreshes usage on success so the
 /// cleared windows show up right away. This SPENDS a one-shot reset, so it only
 /// ever runs from this explicit click, never automatically.
-pub(super) fn handle_claim(slug: &str, key: &str) {
+fn handle_claim(slug: &str, key: &str) {
     handle_claim_with(
         slug,
         key,
@@ -325,7 +323,7 @@ pub(super) fn handle_claim(slug: &str, key: &str) {
     );
 }
 
-pub(super) fn handle_claim_with(
+fn handle_claim_with(
     slug: &str,
     key: &str,
     ask: impl FnOnce(&str) -> bool,
@@ -340,7 +338,7 @@ pub(super) fn handle_claim_with(
     }
 }
 
-pub(super) fn spawn_claim(key: String) {
+fn spawn_claim(key: String) {
     std::thread::spawn(
         move || match crate::switching::claude::claim_claude_reset(&key) {
             Ok(crate::providers::claude::usage::ClaimOutcome::Reset) => {
@@ -356,10 +354,10 @@ pub(super) fn spawn_claim(key: String) {
     );
 }
 
-pub(super) type UiTask = Box<dyn FnOnce() + Send>;
+type UiTask = Box<dyn FnOnce() + Send>;
 
 /// Work handed to the UI thread from a worker; drained by [`run_ui_tasks`].
-pub(super) static UI_TASKS: std::sync::Mutex<Vec<UiTask>> = std::sync::Mutex::new(Vec::new());
+static UI_TASKS: std::sync::Mutex<Vec<UiTask>> = std::sync::Mutex::new(Vec::new());
 
 /// Queue `task` to run on the UI thread at its next event-loop tick.
 pub(super) fn run_on_ui_thread(task: impl FnOnce() + Send + 'static) {
@@ -384,7 +382,7 @@ pub(crate) fn run_ui_tasks() {
 /// poller holds that guard for a whole `run_cycle` (network fetches, token
 /// refreshes), so taking it on the UI thread would freeze the tray; the
 /// worker waits instead, keeping the serialization with the poller.
-pub(super) fn spawn_serialized_with_poller(work: impl FnOnce(&mut SwapGuards) + Send + 'static) {
+fn spawn_serialized_with_poller(work: impl FnOnce(&mut SwapGuards) + Send + 'static) {
     let shared = shared_swap_guard();
     // Unit tests scope the config dir per thread; carry it to the worker.
     #[cfg(test)]
@@ -397,7 +395,7 @@ pub(super) fn spawn_serialized_with_poller(work: impl FnOnce(&mut SwapGuards) + 
     });
 }
 
-pub(super) fn handle_switch(slug: &str, key: &str) {
+fn handle_switch(slug: &str, key: &str) {
     // Explicit user choice may select an exhausted account. Serialize with the
     // poller so it cannot immediately undo the choice with an older decision;
     // off the UI thread, since the guard can be held across network fetches.
@@ -411,10 +409,10 @@ pub(super) fn handle_switch(slug: &str, key: &str) {
 /// Latest requested switch per provider. `std::sync::Mutex` is not FIFO, so
 /// workers queued behind the poller can wake in any order; each carries the
 /// generation it was requested at and skips if a newer click superseded it.
-pub(super) static SWITCH_GEN: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+static SWITCH_GEN: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
     std::sync::Mutex::new(None);
 
-pub(super) fn spawn_latest_switch(slug: &str, work: impl FnOnce(&mut SwapGuards) + Send + 'static) {
+fn spawn_latest_switch(slug: &str, work: impl FnOnce(&mut SwapGuards) + Send + 'static) {
     let gen = {
         let mut m = SWITCH_GEN.lock().unwrap_or_else(|e| e.into_inner());
         let n = m.get_or_insert_with(Default::default);
@@ -436,7 +434,7 @@ pub(super) fn spawn_latest_switch(slug: &str, work: impl FnOnce(&mut SwapGuards)
     });
 }
 
-pub(super) fn switch_serialized(guard: &mut SwapGuards, slug: &str, key: &str) {
+fn switch_serialized(guard: &mut SwapGuards, slug: &str, key: &str) {
     // State v2 (codex-switch-e2e): dispatch by provider slug instead of
     // hard-gating on Claude — `capabilities().supports_switching` already
     // keeps the "Switch to this account" row from being built for a
@@ -471,7 +469,7 @@ pub(super) fn switch_serialized(guard: &mut SwapGuards, slug: &str, key: &str) {
 /// "coming soon" notification instead of silently swallowing the click. Once
 /// the paste-a-key dialog lands, this dispatches into `provider.capture_api_key`
 /// with the user-entered nickname + key.
-pub(super) fn handle_apikey_capture(slug: &str) {
+fn handle_apikey_capture(slug: &str) {
     let Some(provider) = providers::get(slug) else {
         notify(&format!(
             "Paste API key: provider '{slug}' is not registered"
@@ -500,7 +498,7 @@ pub(super) fn handle_apikey_capture(slug: &str) {
     }
 }
 
-pub(super) fn handle_remove(slug: &str, key: &str) {
+fn handle_remove(slug: &str, key: &str) {
     if !confirm(&format!("Remove account {key}? This cannot be undone.")) {
         return;
     }
@@ -530,7 +528,7 @@ pub(super) fn handle_remove(slug: &str, key: &str) {
 
 /// Enable or disable auto-swap. Surfaces a save failure so the menu checkmark
 /// and on-disk state can't silently disagree.
-pub(super) fn set_autoswap(enabled: bool) {
+fn set_autoswap(enabled: bool) {
     let r = with_state_lock(|_| {
         let mut st = State::load()?;
         st.autoswap_disabled = !enabled;
@@ -543,7 +541,7 @@ pub(super) fn set_autoswap(enabled: bool) {
 
 /// Settings ▸ Auto-swap ▸ "Use credits when every plan is used up". Flips the
 /// stored value under the lock (not the possibly stale menu snapshot's).
-pub(super) fn toggle_use_credits() {
+fn toggle_use_credits() {
     let r = with_state_lock(|_| {
         let mut st = State::load()?;
         st.use_credits_when_exhausted = !st.use_credits_when_exhausted;
@@ -558,7 +556,7 @@ pub(super) fn toggle_use_credits() {
 /// tray follows the agent closest to its limit); any other value pins the tray
 /// to that provider slug. Reads-then-writes under the lock so a stale menu
 /// snapshot can't clobber a concurrent change.
-pub(super) fn set_tray_icon_mode(mode: &str) {
+fn set_tray_icon_mode(mode: &str) {
     let r = with_state_lock(|_| {
         let mut st = State::load()?;
         st.tray_icon_mode = if mode == "at-risk" {
@@ -577,7 +575,7 @@ pub(super) fn set_tray_icon_mode(mode: &str) {
 /// of "threshold" / "resetback" / "pace" (the three click-id suffixes
 /// `menu_tree_from_snapshot` wires up) — reads-then-flips the on-disk value so a stale
 /// menu snapshot can't clobber a setting changed elsewhere in the meantime.
-pub(super) fn toggle_notification_trigger(trigger: &str) {
+fn toggle_notification_trigger(trigger: &str) {
     let r = with_state_lock(|_| {
         let mut st = State::load()?;
         let cfg = &mut st.notification_config;
@@ -595,7 +593,7 @@ pub(super) fn toggle_notification_trigger(trigger: &str) {
 }
 
 /// Set the swap threshold AND enable auto-swap.
-pub(super) fn set_autoswap_threshold(v: f64) {
+fn set_autoswap_threshold(v: f64) {
     let r = with_state_lock(|_| {
         let mut st = State::load()?;
         st.trigger_pct = Some(v);
@@ -622,14 +620,14 @@ pub(super) fn confirm(question: &str) -> bool {
 
 /// What the user answered: `Some(true)` for `button`, `Some(false)` for any
 /// other button, `None` when the dialog produced no button at all.
-pub(super) fn confirm_answer(result: rfd::MessageDialogResult, button: &str) -> Option<bool> {
+fn confirm_answer(result: rfd::MessageDialogResult, button: &str) -> Option<bool> {
     match result {
         rfd::MessageDialogResult::Custom(label) => Some(label == button),
         _ => None,
     }
 }
 
-pub(super) fn confirm_with_button(question: &str, button: &str) -> bool {
+fn confirm_with_button(question: &str, button: &str) -> bool {
     let result = rfd::MessageDialog::new()
         .set_title("usagio")
         .set_description(question)

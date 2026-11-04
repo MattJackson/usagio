@@ -9,13 +9,13 @@ use chrono::Utc;
 /// Proof that this process holds the refresh lock (see [`refresh_lock`]);
 /// released when dropped. Functions that must run under it take
 /// `&RefreshGuard`.
-pub struct RefreshGuard {
+pub(crate) struct RefreshGuard {
     _file: std::fs::File,
 }
 
 /// Serialize refresh and switch preparation across usagio processes. Always
 /// acquire this before the state lock, including on the legacy Claude path.
-pub fn refresh_lock() -> Result<RefreshGuard> {
+pub(crate) fn refresh_lock() -> Result<RefreshGuard> {
     use fs2::FileExt;
     let dir = crate::store::config_dir()?;
     std::fs::create_dir_all(&dir)?;
@@ -63,7 +63,7 @@ pub(crate) fn needs_refresh(expires_at_ms: i64, now_ms: i64, skew_secs: i64) -> 
     expires_at_ms.saturating_sub(now_ms) <= skew_secs.saturating_mul(1000)
 }
 
-pub fn ensure_provider_fresh(provider: &dyn Provider, key: &str) -> Result<ProviderAccount> {
+pub(crate) fn ensure_provider_fresh(provider: &dyn Provider, key: &str) -> Result<ProviderAccount> {
     let slug = provider.provider_id();
     refresh_transaction(
         crate::credentials::REFRESH_SKEW_SECS,
@@ -203,7 +203,7 @@ fn commit_provider_refresh(
     })
 }
 
-pub fn identity_fields_match(
+pub(crate) fn identity_fields_match(
     expected_uuid: Option<&str>,
     expected_email: Option<&str>,
     actual_uuid: Option<&str>,
@@ -221,7 +221,7 @@ pub fn identity_fields_match(
     }
 }
 
-pub fn identity_matches(expected: &IdentitySnapshot, actual: &IdentitySnapshot) -> bool {
+pub(crate) fn identity_matches(expected: &IdentitySnapshot, actual: &IdentitySnapshot) -> bool {
     // Adoption requires evidence of identity, even for legacy incomplete records.
     (expected.uuid.is_some() || expected.email.is_some())
         && identity_fields_match(
@@ -232,7 +232,10 @@ pub fn identity_matches(expected: &IdentitySnapshot, actual: &IdentitySnapshot) 
         )
 }
 
-pub fn validate_stored_identity(provider: &dyn Provider, account: &ProviderAccount) -> Result<()> {
+pub(crate) fn validate_stored_identity(
+    provider: &dyn Provider,
+    account: &ProviderAccount,
+) -> Result<()> {
     if let Some(key) = provider
         .credential_sync()
         .and_then(|sync| sync.identify_credential(&account.secret_blob))
@@ -247,7 +250,7 @@ pub fn validate_stored_identity(provider: &dyn Provider, account: &ProviderAccou
     Ok(())
 }
 
-pub fn set_provider_tokens(
+pub(crate) fn set_provider_tokens(
     provider: &dyn Provider,
     account: &mut ProviderAccount,
     access: &str,
@@ -273,7 +276,7 @@ pub fn set_provider_tokens(
 /// Read a vendor-owned credential only when its identity remains stable across
 /// the read. Claude stores identity separately from its secret; Codex embeds it.
 /// Neither path may adopt a different login into the selected saved account.
-pub fn matching_active_blob(
+pub(crate) fn matching_active_blob(
     provider: &dyn Provider,
     expected: &IdentitySnapshot,
 ) -> Result<Option<String>> {

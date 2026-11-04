@@ -139,12 +139,12 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     (
         "src/menubar/mod.rs",
         "#[cfg(target_os = \"macos\")]",
-        "pub fn run() -> Result<()> {",
+        "pub(crate) fn run() -> Result<()> {",
     ),
     (
         "src/menubar/mod.rs",
         "#[cfg(not(target_os = \"macos\"))]",
-        "pub fn run() -> Result<()> {",
+        "pub(crate) fn run() -> Result<()> {",
     ),
     (
         "src/menubar/cross_platform.rs",
@@ -170,7 +170,7 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     (
         "src/icons.rs",
         "#[cfg_attr(target_os = \"macos\", allow(dead_code))]",
-        "pub fn usagio_tray_icon() -> &'static [u8] {",
+        "pub(crate) fn usagio_tray_icon() -> &'static [u8] {",
     ),
     // Lint-level only (`allow(dead_code)`): no behaviour branch.
     (

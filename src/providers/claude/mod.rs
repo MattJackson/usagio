@@ -15,11 +15,10 @@
 // The trait implementation is only reachable through the registry, which is
 // not yet wired into any command handler. Silence dead-code warnings until
 // later phases start routing through `providers::get`.
-#![allow(dead_code)]
 
-pub mod config;
-pub mod oauth;
-pub mod usage;
+pub(crate) mod config;
+pub(crate) mod oauth;
+pub(crate) mod usage;
 
 use std::process::ExitStatus;
 
@@ -96,11 +95,11 @@ const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 static ACTIVE_SLOT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Constructor called from `providers::build()` behind the `claude` feature.
-pub fn new() -> Box<dyn Provider> {
+pub(crate) fn new() -> Box<dyn Provider> {
     Box::new(ClaudeProvider)
 }
 
-pub struct ClaudeProvider;
+pub(crate) struct ClaudeProvider;
 
 impl Provider for ClaudeProvider {
     fn provider_id(&self) -> &'static str {
@@ -646,7 +645,7 @@ fn identify_via_profile(
 /// Reach into a JSON blob and pull the Claude account email from wherever
 /// Claude decided to put it. Pure so the tests can hit both shapes without
 /// touching disk.
-pub(crate) fn extract_claude_email(v: &Value) -> Option<String> {
+fn extract_claude_email(v: &Value) -> Option<String> {
     // Top-level oauthAccount (identity file / capture blob shape).
     if let Some(e) = v
         .get("oauthAccount")
@@ -987,11 +986,7 @@ fn restore_claude_json_raw(bytes: &[u8], mode: u32) -> PResult<()> {
     write_bytes_atomic_mode(&path, bytes, mode)
 }
 
-pub(crate) fn write_bytes_atomic_mode(
-    path: &std::path::Path,
-    bytes: &[u8],
-    mode: u32,
-) -> PResult<()> {
+fn write_bytes_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> PResult<()> {
     let tmp = path.with_extension("json.usagio.tmp");
     if let Err(e) = crate::store::write_private(&tmp, bytes) {
         let _ = std::fs::remove_file(&tmp);

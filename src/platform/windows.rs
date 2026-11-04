@@ -94,7 +94,7 @@ pub(super) fn daemon_instance_alive(pid: u32, expected_start: &str) -> Result<bo
     Ok(generation.to_string() == expected_start)
 }
 
-pub struct WindowsPlatform {
+pub(crate) struct WindowsPlatform {
     menu: WindowsMenu,
     secrets: WindowsSecrets,
     autostart: WindowsAutostart,
@@ -102,7 +102,7 @@ pub struct WindowsPlatform {
 }
 
 impl WindowsPlatform {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             menu: WindowsMenu::default(),
             secrets: WindowsSecrets,
@@ -192,7 +192,7 @@ unsafe impl Send for TrayState {}
 /// so any future ClickCb-typed variable inherits the same signature.
 type ClickCb = Box<dyn Fn(&str) + Send + Sync + 'static>;
 
-pub struct WindowsMenu {
+struct WindowsMenu {
     tray_state: Mutex<Option<TrayState>>,
     cmd_rx: Mutex<Option<mpsc::Receiver<UiCmd>>>,
     cmd_tx: Mutex<Option<mpsc::Sender<UiCmd>>>,
@@ -217,7 +217,7 @@ impl Default for WindowsMenu {
 /// `Send`-safe handle returned to callers. Holds only a channel `Sender` —
 /// never the native `TrayIcon` — so it satisfies `MenuHandle: Send` without
 /// requiring `tray_icon::TrayIcon` itself to be `Send`.
-pub struct WindowsMenuHandle {
+struct WindowsMenuHandle {
     tx: mpsc::Sender<UiCmd>,
     wake: LoopWaker,
 }
@@ -515,7 +515,7 @@ impl MenuBackend for WindowsMenu {
 /// keyring-store` backend. Per-user, DPAPI-encrypted at rest — no fallback
 /// needed the way macOS's unsigned-binary keychain-prompt problem needed one
 /// (see the header comment in `macos.rs`).
-pub struct WindowsSecrets;
+struct WindowsSecrets;
 
 impl SecretStore for WindowsSecrets {
     fn get(&self, service: &str, account: &str) -> Result<Option<String>> {
@@ -575,7 +575,7 @@ use winreg::RegKey;
 
 const RUN_KEY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
-pub struct WindowsAutostart;
+struct WindowsAutostart;
 
 impl WindowsAutostart {
     fn run_key() -> Result<RegKey> {
@@ -690,7 +690,7 @@ fn split_command_line(value: &str) -> Result<(String, Vec<String>)> {
 
 // ---- Paths -----------------------------------------------------------------
 
-pub struct WindowsPaths;
+struct WindowsPaths;
 
 /// `%APPDATA%` (Roaming) — falls back to `dirs::config_dir()` (which
 /// resolves the same known folder via `SHGetKnownFolderPath` and so doesn't
@@ -757,7 +757,7 @@ impl Paths for WindowsPaths {
 
 /// Which terminal `launch_repl` picked, exposed for tests / diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TerminalKind {
+enum TerminalKind {
     WindowsTerminal,
     Cmd,
     PowerShell,
@@ -767,7 +767,7 @@ pub(crate) enum TerminalKind {
 /// `exists` is injected so the selection logic is unit-testable without
 /// touching the real `PATH` — production code passes
 /// `|prog| which::which(prog).is_ok()`.
-pub(crate) fn probe_terminal(mut exists: impl FnMut(&str) -> bool) -> TerminalKind {
+fn probe_terminal(mut exists: impl FnMut(&str) -> bool) -> TerminalKind {
     if exists("wt.exe") {
         TerminalKind::WindowsTerminal
     } else if exists("cmd.exe") {
@@ -803,7 +803,7 @@ impl TerminalKind {
 /// probing wt.exe → cmd.exe → powershell.exe. Fire-and-forget: the spawned
 /// terminal owns its own lifetime, we don't wait on it.
 #[allow(dead_code)]
-pub(crate) fn launch_repl(program: &str) -> Result<()> {
+fn launch_repl(program: &str) -> Result<()> {
     let kind = probe_terminal(|prog| which::which(prog).is_ok());
     kind.command(program)
         .spawn()

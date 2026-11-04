@@ -11,7 +11,7 @@ use crate::store;
 
 /// Rotate a rotating file once it grows past this size (~1 MB). Shared by the
 /// debug log and history.jsonl so their threshold genuinely can't drift.
-pub const MAX_BYTES: u64 = 1_000_000;
+pub(crate) const MAX_BYTES: u64 = 1_000_000;
 
 /// Cap on `.1`, `.2`, ... uniquification attempts when the primary rotated
 /// name is already taken (e.g. a previous rotation's target is still locked
@@ -69,7 +69,7 @@ static ROTATE_FAILURE_LOGGED: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::n
 /// failure across ALL attempts is logged once per process (guarded per path,
 /// so a persistently-locked file doesn't spam the log it's trying to
 /// rotate).
-pub fn rotate_if_large(path: &std::path::Path, max_bytes: u64) {
+pub(crate) fn rotate_if_large(path: &std::path::Path, max_bytes: u64) {
     let Ok(m) = std::fs::metadata(path) else {
         return;
     };
@@ -152,7 +152,7 @@ pub fn rotate_if_large(path: &std::path::Path, max_bytes: u64) {
 
 /// Correlate credential lifecycle events without exposing token bytes.
 /// The truncated SHA-256 digest is diagnostic only, never an identity check.
-pub fn token_fingerprint(token: &str) -> String {
+pub(crate) fn token_fingerprint(token: &str) -> String {
     use sha2::{Digest, Sha256};
     if token.is_empty() {
         return "none".into();
@@ -163,7 +163,7 @@ pub fn token_fingerprint(token: &str) -> String {
 
 /// Append a timestamped line to the debug log. Best-effort: any failure is
 /// silently ignored so logging never disrupts the daemon.
-pub fn log(msg: &str) {
+pub(crate) fn log(msg: &str) {
     let Ok(dir) = store::config_dir() else {
         return;
     };

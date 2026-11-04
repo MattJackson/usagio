@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 /// Exact title of the disabled section row inserted when a provider's env
 /// override is active. A named constant so `menu_tree_from_snapshot` and the
 /// tests asserting on the visible menu content can't drift out of sync.
-pub(crate) const ENV_OVERRIDE_ROW_TITLE: &str = "env override active — swap disabled";
+const ENV_OVERRIDE_ROW_TITLE: &str = "env override active — swap disabled";
 
 /// A styling directive for one menu row, matched to its native `NSMenuItem` by
 /// the plain title string. We build the muda menu with plain titles (so clicks
@@ -48,7 +48,7 @@ pub(super) struct RowStyle {
     /// concrete x is NOT stored here — it's a `TabX` *intent*. Vestigial now
     /// that muri's compat layer lays out the two-column `label\tvalue` form
     /// itself (see the struct doc); retained only as tested pure output.
-    pub(super) tab_x_kind: Option<TabX>,
+    tab_x_kind: Option<TabX>,
     /// If set, attach the 16px provider icon (looked up by slug in
     /// `crate::icons::png16_for`) to the native menu item via `setImage:`. Only
     /// set on section-header rows so per-provider iconography appears once at
@@ -57,13 +57,13 @@ pub(super) struct RowStyle {
     /// If true, mark the native menu item as `NSControlStateValueOn` so a
     /// leading checkmark glyph appears — the "✓ Active" affordance for the
     /// active account row without changing the plain title text.
-    pub(super) checkmark: bool,
+    checkmark: bool,
     /// If set, paint the run from this UTF-16 offset to the end of the row in
     /// `NSColor::secondaryLabelColor` (macOS "grey secondary" — the same tint
     /// disabled menu items use). Used to render "usagio vX.Y.Z" as a subdued
     /// trailing label on the enabled Quit row: right-aligned via `tab_x_kind`,
     /// grey via this field, without disabling the row's click.
-    pub(super) grey_tail_from: Option<usize>,
+    grey_tail_from: Option<usize>,
     /// v0.5.0: paint the WHOLE row in `NSColor::labelColor()` (the normal
     /// enabled-text color — white in dark mode, black in light) even though
     /// the underlying muda item is `enabled: true`. Used for the reset-window
@@ -72,12 +72,12 @@ pub(super) struct RowStyle {
     /// false` produces) while still routing clicks to a no-op (see the
     /// `("noop", _, _)` arm in `handle_click`) since there's nothing to do
     /// when you click "Session resets in 3h".
-    pub(super) disabled_but_white: bool,
+    disabled_but_white: bool,
     /// Spans (utf16 offset, length) to embolden within the row: the active
     /// account's binding window (auto-swap v2 display, §4). Like the other
     /// styling fields, carried as tested pure output (muri's value spans
     /// carry color only).
-    pub(super) bold_spans: Vec<(usize, usize)>,
+    bold_spans: Vec<(usize, usize)>,
 }
 
 impl RowStyle {
@@ -106,7 +106,7 @@ impl RowStyle {
 /// scheme (e.g. a submenu-local edge) has somewhere to go without another
 /// magic-number field.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum TabX {
+enum TabX {
     /// Right-align at a point computed fresh for each rendered snapshot —
     /// `max(label_width + trailing_width)` over every `MenuRight` row, plus
     /// a small safety pad — so the tab stop always clears the widest label
@@ -126,7 +126,7 @@ pub(super) fn u16len(s: &str) -> usize {
 /// used to read `Session  85%  · resets in 3h` still does after the refactor.
 /// Unknown window ids fall through to the provider's own short `label` so a
 /// future provider still surfaces something readable.
-pub(super) fn stat_display_label(w: &WindowView) -> &str {
+fn stat_display_label(w: &WindowView) -> &str {
     match w.id.as_str() {
         "session" => "Session",
         "weekly" => "Weekly",
@@ -139,7 +139,7 @@ pub(super) fn stat_display_label(w: &WindowView) -> &str {
 /// list row, so every account's email starts at the same x regardless of
 /// provider-name length ("Claude" vs "Codex").
 #[allow(dead_code)] // kept for `main_row`'s tests — see its doc comment.
-pub(super) const PROVIDER_COL: usize = 10;
+const PROVIDER_COL: usize = 10;
 
 /// v0.5.0 flat main-list row: `{provider}    {email}\t{n}% / {n}%`, bold +
 /// checkmarked if active, high percentages colored per the provider's
@@ -157,7 +157,7 @@ pub(super) const PROVIDER_COL: usize = 10;
 /// "compact mode" could plausibly reuse, and deleting it would mean deleting
 /// or rewriting its whole existing test suite for zero behavior change.
 #[allow(dead_code)]
-pub(super) fn main_row(provider_display: &str, a: &AcctView, bands: SeverityBands) -> RowStyle {
+fn main_row(provider_display: &str, a: &AcctView, bands: SeverityBands) -> RowStyle {
     let label = format!("{provider_display:<PROVIDER_COL$}{}", a.display);
     let base = u16len(&label) + 1; // + '\t'
     if let Some((cd, _win)) = locked_countdown_for(a, now_utc()) {
@@ -204,7 +204,7 @@ pub(super) fn main_row(provider_display: &str, a: &AcctView, bands: SeverityBand
 }
 
 /// Time left on a renewable account's login, when it's inside the renew window.
-pub(super) fn login_expiring_in(a: &AcctView, now: DateTime<Utc>) -> Option<chrono::Duration> {
+fn login_expiring_in(a: &AcctView, now: DateTime<Utc>) -> Option<chrono::Duration> {
     if !a.renewable {
         return None;
     }
@@ -214,12 +214,12 @@ pub(super) fn login_expiring_in(a: &AcctView, now: DateTime<Utc>) -> Option<chro
 
 /// A login whose expiry has already passed (it can't be renewed in place by
 /// a refresh any more; the renew flow is the only way back).
-pub(super) fn login_expired(left: chrono::Duration) -> bool {
+fn login_expired(left: chrono::Duration) -> bool {
     left <= chrono::Duration::zero()
 }
 
 /// Coarse "time left" for a login expiry: days, then hours.
-pub(super) fn login_left_label(left: chrono::Duration) -> String {
+fn login_left_label(left: chrono::Duration) -> String {
     if login_expired(left) {
         return "expired".to_string();
     }
@@ -277,11 +277,11 @@ pub(super) fn trailing_for_account(
     (text, colors)
 }
 
-pub(super) fn has_reset(a: &AcctView) -> bool {
+fn has_reset(a: &AcctView) -> bool {
     a.reported.reset_grants.iter().any(ResetGrant::is_available)
 }
 
-pub(super) fn trailing_usage_for_account(
+fn trailing_usage_for_account(
     a: &AcctView,
     bands: SeverityBands,
     now: DateTime<Utc>,
@@ -419,7 +419,7 @@ pub(super) fn spendable_credits(a: &AcctView) -> Option<crate::providers::trait_
 // already nests account rows under the provider header, so the old two-space
 // text indent (a native-NSMenu-era hack) now stacks on top of that gutter and
 // produces a large left margin. Drop it and let muri's layout do the nesting.
-pub(super) const ACCOUNT_INDENT: &str = "";
+const ACCOUNT_INDENT: &str = "";
 
 /// v0.5.3 menu redesign: the row for one account — `<indent><email>\t<trailing>`
 /// where `<trailing>` is whatever `trailing_for_account` decides (locked
@@ -516,7 +516,7 @@ pub(super) fn quit_row_plain() -> String {
 ///
 /// `stale`: the window's reset already passed and the cached reading predates
 /// it (`DisplayState::StaleAfterReset`), so it is not locked, just unrefreshed.
-pub(super) fn window_status_row_at(w: &WindowView, stale: bool) -> Option<(String, bool)> {
+fn window_status_row_at(w: &WindowView, stale: bool) -> Option<(String, bool)> {
     let label = stat_display_label(w);
     if stale {
         return Some((format!("{label} reset · awaiting fresh usage"), false));
@@ -531,7 +531,7 @@ pub(super) fn window_status_row_at(w: &WindowView, stale: bool) -> Option<(Strin
 }
 
 /// Show only what can be used now, never historical spending or a spend cap.
-pub(super) fn credits_row(c: &Credits) -> Option<String> {
+fn credits_row(c: &Credits) -> Option<String> {
     let status = if !c.enabled && !c.unlimited || c.limit_reached {
         "0".to_string()
     } else if c.unlimited {
@@ -549,7 +549,7 @@ pub(super) fn credits_row(c: &Credits) -> Option<String> {
 /// "This week · Claude Code 82% · Chats 18%" — only when at least two
 /// surfaces have a non-zero share (a lone "Claude Code 100%" is noise).
 /// Sorted by share, zeros dropped.
-pub(super) fn breakdown_row(shares: &[UsageShare]) -> Option<String> {
+fn breakdown_row(shares: &[UsageShare]) -> Option<String> {
     let mut nonzero: Vec<&UsageShare> = shares
         .iter()
         .filter(|s| s.percent.is_finite() && s.percent > 0.0)
@@ -572,7 +572,7 @@ pub(super) fn breakdown_row(shares: &[UsageShare]) -> Option<String> {
 
 /// "Fable 7d · 42% · resets in 2d 3h" — a per-model/surface limit, only when
 /// it's actually in use (0% or unreported is skipped).
-pub(super) fn scoped_limit_row(w: &UsageWindow) -> Option<String> {
+fn scoped_limit_row(w: &UsageWindow) -> Option<String> {
     let pct = w.utilization.filter(|p| p.is_finite() && *p > 0.0)?;
     let mut row = format!("{} · {}%", w.label, pct.round() as i64);
     if let Some(reset) = w.resets_at {
@@ -586,7 +586,7 @@ pub(super) fn scoped_limit_row(w: &UsageWindow) -> Option<String> {
 
 /// Whether usagio can claim this provider's reset grants itself.
 /// Codex redemption is not integrated; only Claude has a claim action.
-pub(super) fn claims_resets(provider_id: &str) -> bool {
+fn claims_resets(provider_id: &str) -> bool {
     provider_id == "claude"
 }
 
@@ -613,7 +613,7 @@ pub(super) fn reset_grant_row(g: &ResetGrant) -> Option<String> {
 /// Every provider-reported row for an account, in render order: reset grants
 /// (good news up top), scoped limits, where the week went, then credits. Pure;
 /// provider-agnostic.
-pub(super) fn reported_rows(r: &ReportedUsage) -> Vec<String> {
+fn reported_rows(r: &ReportedUsage) -> Vec<String> {
     let mut rows: Vec<String> = r.reset_grants.iter().filter_map(reset_grant_row).collect();
     rows.extend(r.scoped_limits.iter().filter_map(scoped_limit_row));
     rows.extend(breakdown_row(&r.breakdown));
@@ -769,7 +769,7 @@ pub(super) fn account_extra_info_rows(sec: &ProviderSection, a: &AcctView) -> Ve
 
 /// The compact weekly forecast row from the one rate model (auto-swap v2's
 /// `rates` + `runway::time_to`), at the account's own pace.
-pub(super) fn empty_in_row(
+fn empty_in_row(
     account_key: &crate::usage_log::AccountKey,
     a: &AcctView,
     now: DateTime<Utc>,
@@ -806,7 +806,7 @@ pub(super) fn empty_in_row(
 /// gate consulted, for BOTH the Switch and Launch rows, and Remove had no
 /// gate at all.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct AccountSubmenuRows {
+pub(crate) struct AccountSubmenuRows {
     /// Offer switching only for an inactive account with a subscription.
     pub(super) switch_row: bool,
     /// "Renew login…" — usagio can run this provider's login itself.
@@ -1080,7 +1080,7 @@ pub(super) fn title_for(snap: &Snapshot) -> String {
     title
 }
 
-pub(super) fn usage_title_for(snap: &Snapshot) -> String {
+fn usage_title_for(snap: &Snapshot) -> String {
     match tray_target(snap, snap.tray_icon_mode.as_deref()) {
         Some((sec, a)) => {
             let now = now_utc();
@@ -1107,7 +1107,7 @@ pub(super) fn usage_title_for(snap: &Snapshot) -> String {
 /// active row, severity tint) — a faithful capture with no
 /// launch+screencapture+click harness. Renders the TOP-LEVEL menu (submenu
 /// flyouts are a later muri capability).
-pub fn render_menu_png_for_theme(theme_name: &str, scale: f32) -> Vec<u8> {
+pub(crate) fn render_menu_png_for_theme(theme_name: &str, scale: f32) -> Vec<u8> {
     let snap = build_snapshot();
     let tree = cross_platform::menu_tree_from_snapshot(&snap);
     let native = crate::platform::render::render_menu(&tree);

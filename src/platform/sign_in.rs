@@ -191,7 +191,7 @@ mod imp {
 
     /// Remove every WebKit data store of this app not in `keep` and not used
     /// by an open window. Both calls complete on the main run loop.
-    pub fn sweep(keep: std::collections::HashSet<[u8; 16]>) {
+    pub(crate) fn sweep(keep: std::collections::HashSet<[u8; 16]>) {
         let listed = WebView::fetch_data_store_identifiers(move |ids| {
             for id in ids {
                 if keep.contains(&id) || super::is_open(&id) {
@@ -225,7 +225,7 @@ mod imp {
 
     /// Per-identifier WebKit data stores need macOS 14; before that wry would
     /// silently share one store across every account.
-    pub fn available() -> bool {
+    pub(crate) fn available() -> bool {
         NSProcessInfo::processInfo().isOperatingSystemAtLeastVersion(NSOperatingSystemVersion {
             majorVersion: 14,
             minorVersion: 0,
@@ -269,7 +269,7 @@ mod imp {
         app.setMainMenu(Some(&main));
     }
 
-    pub fn open(
+    pub(crate) fn open(
         title: &str,
         url: &str,
         slug: &str,
@@ -364,15 +364,15 @@ mod imp {
 
     use super::{Progress, HEIGHT, POLL_MS, WIDTH};
 
-    pub fn available() -> bool {
+    pub(crate) fn available() -> bool {
         gtk::is_initialized_main_thread()
     }
 
-    pub fn sweep(keep: std::collections::HashSet<[u8; 16]>) {
+    pub(crate) fn sweep(keep: std::collections::HashSet<[u8; 16]>) {
         super::sweep_webview_dir(&keep);
     }
 
-    pub fn open(
+    pub(crate) fn open(
         title: &str,
         url: &str,
         slug: &str,
@@ -496,15 +496,15 @@ mod imp {
         }
     }
 
-    pub fn available() -> bool {
+    pub(crate) fn available() -> bool {
         true
     }
 
-    pub fn sweep(keep: std::collections::HashSet<[u8; 16]>) {
+    pub(crate) fn sweep(keep: std::collections::HashSet<[u8; 16]>) {
         super::sweep_webview_dir(&keep);
     }
 
-    pub fn open(
+    pub(crate) fn open(
         title: &str,
         url: &str,
         slug: &str,

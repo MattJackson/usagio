@@ -28,7 +28,7 @@ use crate::store::{self, State};
 /// Refresh a token if it expires within this many seconds. Bumped from the
 /// legacy 300s (5 min) to 900s (15 min) so an inactive account's refresh
 /// happens well before another `claude` invocation could race us.
-pub const REFRESH_SKEW_SECS: i64 = 900;
+pub(crate) const REFRESH_SKEW_SECS: i64 = 900;
 
 /// Run `f` holding the shared advisory lock on state.json. Provider
 /// `absorb_credential` implementations use this to commit without importing
@@ -84,14 +84,14 @@ pub(crate) fn state_lock_held() -> bool {
 /// closure's duration, so a function that must run under the lock takes
 /// `&StateGuard` and the compiler checks the requirement. Not `Send`: the lock
 /// belongs to the thread that took it.
-pub struct StateGuard {
+pub(crate) struct StateGuard {
     _not_send: std::marker::PhantomData<*const ()>,
 }
 
 /// Run `f` holding the shared exclusive advisory lock on the state file.
 /// Serialises state read-modify-write across processes; reentrant within a
 /// single thread so callers can nest without self-deadlocking.
-pub fn with_state_lock<T>(f: impl FnOnce(&StateGuard) -> Result<T>) -> Result<T> {
+pub(crate) fn with_state_lock<T>(f: impl FnOnce(&StateGuard) -> Result<T>) -> Result<T> {
     use fs2::FileExt;
     // Reentrant fast path: we already hold the OS lock on this thread; just
     // run the closure. The outer frame will unlock when it unwinds.
@@ -125,7 +125,7 @@ pub fn with_state_lock<T>(f: impl FnOnce(&StateGuard) -> Result<T>) -> Result<T>
 
 /// Read a credential file into a string, returning None if it doesn't exist
 /// (the common case for optional paths like `~/.claude/.credentials.json`).
-pub fn read_blob(path: &Path) -> Option<String> {
+fn read_blob(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     String::from_utf8(bytes).ok()
 }
@@ -187,7 +187,7 @@ fn credential_paths_of(provider: &dyn Provider) -> Vec<std::path::PathBuf> {
 /// while we're reading a path we may see a blob for a DIFFERENT tracked
 /// account (e.g. `~/.claude.json`'s active identity shifted while we were
 /// polling for another). Absorb those too.
-pub fn absorb_all_lagging(provider: &dyn Provider) -> Vec<AccountKey> {
+pub(crate) fn absorb_all_lagging(provider: &dyn Provider) -> Vec<AccountKey> {
     let mut seen = Vec::new();
     let Some(provider) = provider.credential_sync() else {
         return seen;
@@ -256,7 +256,7 @@ pub(crate) fn flag_needs_relogin_if_unchanged(
 /// token is within REFRESH_SKEW_SECS of expiry. The active account is
 /// deliberately skipped — let the vendor CLI own its own rotation so our
 /// refresh can't race the tokens it's about to write.
-pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
+pub(crate) fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
     // Snapshot {accounts, active} atomically under the state lock, ONCE.
     // Using the hint the caller computed outside the lock is unsafe: a
     // switch that lands between the caller's read and this function's
@@ -368,7 +368,7 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
 
 /// True the first time this process sees `(email, refresh token)`; only a hash
 /// of the token is kept in memory.
-pub(crate) fn first_relogin_alert(email: &str, refresh_token: &str) -> bool {
+fn first_relogin_alert(email: &str, refresh_token: &str) -> bool {
     use std::hash::{Hash, Hasher};
     static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(String, u64)>>> =
         std::sync::Mutex::new(None);
@@ -383,7 +383,7 @@ pub(crate) fn first_relogin_alert(email: &str, refresh_token: &str) -> bool {
 /// writes the incoming account's blob to path[0]. This closes the window
 /// where a running `claude` on the outgoing account would silently lose its
 /// last rotation because we blindly overwrote path[0] first.
-pub fn absorb_before_switch(provider: &dyn Provider) {
+pub(crate) fn absorb_before_switch(provider: &dyn Provider) {
     let _ = absorb_all_lagging(provider);
 }
 
@@ -396,7 +396,7 @@ pub fn absorb_before_switch(provider: &dyn Provider) {
 /// Bonus: while we're walking, absorb any blob that matches a DIFFERENT
 /// tracked account. This is the "free-sync" behaviour: we already have
 /// the data in hand, no reason not to update it.
-pub fn last_chance_fallback(provider: &dyn Provider, target: &AccountKey) -> bool {
+pub(crate) fn last_chance_fallback(provider: &dyn Provider, target: &AccountKey) -> bool {
     let Some(provider) = provider.credential_sync() else {
         return false;
     };
@@ -451,7 +451,7 @@ pub fn last_chance_fallback(provider: &dyn Provider, target: &AccountKey) -> boo
 /// Handle emitted by `spawn_watchers`. Dropping it drops the underlying
 /// notify::RecommendedWatcher and stops the background thread. Owned by
 /// `WATCHER_REGISTRY` once installed via [`install_watchers`].
-pub struct WatcherHandle {
+struct WatcherHandle {
     // The watcher must outlive the thread, so we keep it here. The thread
     // owns the receiver end and shuts down when we drop the sender-carrying
     // watcher (the notify crate closes the channel on drop).
@@ -467,7 +467,7 @@ pub struct WatcherHandle {
 ///
 /// Errors from watch setup are logged and swallowed: the daemon must not
 /// crash if `~/.claude/` doesn't exist yet on a fresh install.
-pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHandle> {
+fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHandle> {
     use notify::{Event, RecursiveMode, Watcher};
 
     let (tx, rx) = mpsc::channel::<Event>();
@@ -640,7 +640,7 @@ pub(crate) fn clear_watchers_for_test() {
 /// registry (replacing the `Box::leak` the daemon used to do). Keeps the
 /// provider list around so the watchdog can rebuild the watcher later without
 /// re-threading it through from `main`.
-pub fn install_watchers(providers: Vec<&'static dyn Provider>) {
+pub(crate) fn install_watchers(providers: Vec<&'static dyn Provider>) {
     let handle = spawn_watchers(providers.clone());
     let mut reg = WATCHER_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     reg.providers = providers;
@@ -656,7 +656,7 @@ pub fn install_watchers(providers: Vec<&'static dyn Provider>) {
 ///
 /// No-op (returns `false`) if no providers were ever installed (e.g. a one-shot
 /// CLI command that never called `install_watchers`).
-pub fn respawn_watchers() -> bool {
+pub(crate) fn respawn_watchers() -> bool {
     let mut reg = WATCHER_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     if reg.providers.is_empty() {
         return false;

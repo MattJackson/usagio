@@ -310,7 +310,7 @@ pub(crate) fn refresh_provider_usage_caches_with(
 
 /// Publish an observation only if its credential and starting cache still own
 /// this account. A login or faster poll can finish while the request is in flight.
-pub(crate) fn persist_provider_observation(
+fn persist_provider_observation(
     slug: &str,
     snapshot: &ProviderAccount,
     usage: Option<&CachedUsage>,

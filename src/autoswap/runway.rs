@@ -14,7 +14,7 @@ use super::{AccountIn, WindowId};
 
 /// Minutes until `pct` reaches `limit` at `rate` pct/min. `0` at or over the
 /// limit, `f64::INFINITY` with no (≤ ε) rate below it. Never NaN.
-pub fn time_to(pct: f64, limit: f64, rate: f64) -> f64 {
+pub(crate) fn time_to(pct: f64, limit: f64, rate: f64) -> f64 {
     if !pct.is_finite() || pct >= limit {
         return 0.0;
     }
@@ -25,7 +25,7 @@ pub fn time_to(pct: f64, limit: f64, rate: f64) -> f64 {
 }
 
 /// `pct + rate × minutes × safety`, the drift estimate of a window.
-pub fn est_window(pct: f64, rate: f64, minutes: f64, safety: f64) -> f64 {
+pub(crate) fn est_window(pct: f64, rate: f64, minutes: f64, safety: f64) -> f64 {
     let drift = rate.max(0.0) * minutes.max(0.0) * safety;
     if drift.is_finite() {
         pct + drift
@@ -36,14 +36,14 @@ pub fn est_window(pct: f64, rate: f64, minutes: f64, safety: f64) -> f64 {
 
 /// The window that will block first, for display (§4).
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Binding {
-    pub window: WindowId,
-    pub pct: f64,
+pub(crate) struct Binding {
+    pub(crate) window: WindowId,
+    pub(crate) pct: f64,
     /// Minutes until the window reaches 100% at the account's own rate;
     /// `None` when there's no rate (no-rate mode) or the window doesn't bind.
-    pub time_to_block: Option<f64>,
+    pub(crate) time_to_block: Option<f64>,
     /// Whether this was chosen by the rate (`false`: the higher-pct fallback).
-    pub by_rate: bool,
+    by_rate: bool,
 }
 
 /// One displayed window candidate: (window, pct, time_to_block, binds).
@@ -98,7 +98,7 @@ fn minutes(m: f64) -> Duration {
 /// The binding window of `a` at `now` (§4), with no trigger known: see
 /// [`binding_window_at`].
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn binding_window(a: &AccountIn, now: DateTime<Utc>) -> Option<Binding> {
+pub(crate) fn binding_window(a: &AccountIn, now: DateTime<Utc>) -> Option<Binding> {
     binding_window_at(a, now, f64::INFINITY)
 }
 
@@ -108,7 +108,11 @@ pub fn binding_window(a: &AccountIn, now: DateTime<Utc>) -> Option<Binding> {
 /// shows a higher pct, which then binds; with nothing rated, the higher pct
 /// (ties go to weekly). A reset-pending window is skipped. `None` when no
 /// window can be shown.
-pub fn binding_window_at(a: &AccountIn, now: DateTime<Utc>, trigger: f64) -> Option<Binding> {
+pub(crate) fn binding_window_at(
+    a: &AccountIn,
+    now: DateTime<Utc>,
+    trigger: f64,
+) -> Option<Binding> {
     let wins = display_windows(a, now);
     let highest = |ws: Vec<&DisplayWin>| -> Option<Binding> {
         ws.into_iter()
@@ -162,16 +166,16 @@ fn window_ttb(a: &AccountIn, id: WindowId, now: DateTime<Utc>) -> Option<(f64, f
 /// The window currently shown in the tray for one account, with the time it
 /// was chosen. Kept in memory by the menu-bar process (not persisted).
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct BindingShown {
-    pub window: WindowId,
-    pub since: DateTime<Utc>,
+pub(crate) struct BindingShown {
+    pub(crate) window: WindowId,
+    pub(crate) since: DateTime<Utc>,
 }
 
 impl BindingShown {
     /// Fold a new `binding_window` result into the shown window, applying the
     /// display hysteresis (§4). `trigger` is the auto-swap trigger (a window at
     /// or over it overrides the dwell). Returns the window to display.
-    pub fn update(
+    pub(crate) fn update(
         prev: Option<BindingShown>,
         a: &AccountIn,
         now: DateTime<Utc>,

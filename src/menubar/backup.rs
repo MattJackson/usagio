@@ -27,7 +27,7 @@ pub(super) fn handle_backup_save() {
 /// Testable core of the Save… click: takes the `FileDialog` as a parameter
 /// so `#[cfg(test)]` can pass a `platform::MockFileDialog` instead of
 /// popping a real native panel. See `platform::Platform::file_dialog`.
-pub(super) fn handle_backup_save_with(dialog: &dyn crate::platform::FileDialog) {
+fn handle_backup_save_with(dialog: &dyn crate::platform::FileDialog) {
     let default_name = format!(
         "usagio-state-{}.json",
         chrono::Utc::now().format("%Y%m%d-%H%M%S")
@@ -89,7 +89,7 @@ pub(super) fn handle_backup_restore_dialog() {
 
 /// True if any string anywhere in `v` is the `"<redacted>"` placeholder that
 /// `store::redact_state_for_dump` writes (such a file holds no usable logins).
-pub(super) fn json_contains_redacted(v: &serde_json::Value) -> bool {
+fn json_contains_redacted(v: &serde_json::Value) -> bool {
     match v {
         serde_json::Value::String(s) => s == "<redacted>",
         serde_json::Value::Array(a) => a.iter().any(json_contains_redacted),
@@ -101,7 +101,7 @@ pub(super) fn json_contains_redacted(v: &serde_json::Value) -> bool {
 /// Testable core of the Restore… click: takes the `FileDialog` as a
 /// parameter so `#[cfg(test)]` can pass a `platform::MockFileDialog` instead
 /// of popping a real native panel. See `platform::Platform::file_dialog`.
-pub(super) fn handle_backup_restore_dialog_with(dialog: &dyn crate::platform::FileDialog) {
+fn handle_backup_restore_dialog_with(dialog: &dyn crate::platform::FileDialog) {
     let mut default_dir = None;
     if let Ok(p) = crate::store::state_json_path() {
         let backups_dir = p.parent().map(|d| d.join("backups"));
@@ -181,7 +181,7 @@ pub(super) fn handle_backup_restore_dialog_with(dialog: &dyn crate::platform::Fi
 /// accounts. Names the specific dropped emails (the prior wording was
 /// "will drop 2 account(s)", which told the user nothing
 /// about *which* accounts they were about to lose).
-pub(super) fn restore_drop_confirmation(dropped: &[String]) -> String {
+fn restore_drop_confirmation(dropped: &[String]) -> String {
     format!("Restoring will drop {}. Continue?", dropped.join(", "))
 }
 

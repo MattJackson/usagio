@@ -10,15 +10,13 @@
 //!    submenu while `supports_usage` is false) so the scope is documented; no
 //!    real capture logic wired yet.
 
-#![allow(dead_code)]
-
 use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
-pub fn new() -> Box<dyn Provider> {
+pub(crate) fn new() -> Box<dyn Provider> {
     Box::new(ClineProvider)
 }
 
-pub struct ClineProvider;
+struct ClineProvider;
 
 // Not wired yet (no capability exposed):
 // TODO: read Cline's on-disk config JSON (BYO provider API keys, one

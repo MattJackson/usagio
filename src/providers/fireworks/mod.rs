@@ -15,15 +15,13 @@
 //!    label but not used as the identifier.
 //!  - Usage: `/v1/accounts/<id>/usage` wiring lands in a later phase.
 
-#![allow(dead_code)]
-
 use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
-pub fn new() -> Box<dyn Provider> {
+pub(crate) fn new() -> Box<dyn Provider> {
     Box::new(FireworksProvider)
 }
 
-pub struct FireworksProvider;
+struct FireworksProvider;
 
 // Not wired yet (no capability exposed):
 // TODO: call GET /v1/accounts with the pasted key, use the returned

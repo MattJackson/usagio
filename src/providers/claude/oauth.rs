@@ -36,7 +36,7 @@ fn now_millis() -> i64 {
 /// as HTTP 400 invalid_grant and is permanently dead for that grant family.
 /// The account needs a fresh `/login`; no amount of retrying will help.
 #[derive(Debug)]
-pub enum RefreshError {
+pub(crate) enum RefreshError {
     /// Anthropic said 400 (or the account has no refresh token to send).
     /// The stored refresh token is now permanently dead; user must re-login.
     InvalidGrant,
@@ -116,7 +116,7 @@ pub(crate) fn refresh(acct: &mut Account) -> Result<bool, RefreshError> {
 /// On a failed request `acct` is left holding the grant that was actually
 /// sent (which may be a newer saved rotation than the one passed in), so a
 /// re-login flag can compare against the token that was rejected.
-pub fn ensure_fresh(acct: &mut Account, skew_secs: i64) -> Result<bool, RefreshError> {
+pub(crate) fn ensure_fresh(acct: &mut Account, skew_secs: i64) -> Result<bool, RefreshError> {
     crate::lifecycle::ensure_claude_fresh(acct, skew_secs)
 }
 

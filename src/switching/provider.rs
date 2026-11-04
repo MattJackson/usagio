@@ -29,7 +29,7 @@ pub(crate) fn switch_to_provider_account(slug: &str, key: &str, hold: bool) -> R
 /// The human label for `slug`'s account `key` (see
 /// `trait_def::account_label`): its email, with a workspace tag only when
 /// another captured account shares that email.
-pub(crate) fn provider_account_label(slug: &str, key: &str) -> String {
+fn provider_account_label(slug: &str, key: &str) -> String {
     let siblings: Vec<String> = State::load()
         .ok()
         .and_then(|st| st.provider_accounts(slug).cloned())
@@ -38,16 +38,12 @@ pub(crate) fn provider_account_label(slug: &str, key: &str) -> String {
     providers::trait_def::account_label(key, siblings.iter().map(String::as_str))
 }
 
-pub(crate) fn switch_provider_with_intent(slug: &str, key: &str, manual: bool) -> Result<String> {
+fn switch_provider_with_intent(slug: &str, key: &str, manual: bool) -> Result<String> {
     switch_provider_expecting(slug, key, manual, None)
 }
 
 /// Whether `slug`'s queued switch is still exactly `expected`.
-pub(crate) fn pending_switch_is(
-    state: &State,
-    slug: &str,
-    expected: &store::PendingSwitch,
-) -> bool {
+fn pending_switch_is(state: &State, slug: &str, expected: &store::PendingSwitch) -> bool {
     state
         .provider_accounts(slug)
         .and_then(|pa| pa.pending_switch.as_ref())
@@ -146,7 +142,7 @@ pub(crate) fn complete_pending_switches() {
 
 /// A removal cancels the account choice, not the responsibility to restart a
 /// daemon already told to drain. Never recreate a removed saved account.
-pub(crate) fn recover_obsolete_pending_switch(
+fn recover_obsolete_pending_switch(
     provider: &dyn Provider,
     expected: &store::PendingSwitch,
 ) -> Result<()> {
@@ -231,7 +227,7 @@ pub(crate) fn commit_provider_switch(
 /// `expect_active` is set, the CAS precondition (that account still active, and
 /// no switch queued for a DIFFERENT key, e.g. a renewal staged meanwhile) is
 /// re-checked in the first locked phase; `Ok(None)` if it no longer holds.
-pub(crate) fn commit_provider_switch_guarded(
+fn commit_provider_switch_guarded(
     provider: &dyn Provider,
     slug: &str,
     key: &str,
@@ -435,7 +431,7 @@ pub(crate) fn switch_if_still_active(
 /// Compare-and-set + handoff preparation under the state lock; the commit (which
 /// runs the seconds-long client handoff) happens AFTER the lock is released so
 /// `commit_provider_switch` can keep state reads responsive during the handoff.
-pub(crate) fn switch_provider_if_still_active(
+fn switch_provider_if_still_active(
     refresh: &RefreshGuard,
     provider: &dyn Provider,
     status: &providers::ClientStatus,

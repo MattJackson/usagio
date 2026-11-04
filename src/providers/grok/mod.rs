@@ -14,15 +14,13 @@
 //!  - Switching is "clean" (single-slot swap of the two files) but not wired
 //!    yet.
 
-#![allow(dead_code)]
-
 use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
-pub fn new() -> Box<dyn Provider> {
+pub(crate) fn new() -> Box<dyn Provider> {
     Box::new(GrokProvider)
 }
 
-pub struct GrokProvider;
+struct GrokProvider;
 
 // Not wired yet (no capability exposed):
 // TODO: read `~/.grok/auth.json` and `~/.grok/mcp_credentials.json`,

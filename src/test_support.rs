@@ -43,7 +43,7 @@ pub(crate) fn row_full(email: &str, session: f64, weekly: f64, weekly_reset: Dat
 
 /// Like `row_full`, but with an explicit provider slug — for tests that need
 /// to verify the swap-capability gate on non-Claude / unregistered slugs.
-pub(crate) fn row_full_with_provider(
+fn row_full_with_provider(
     provider_id: &str,
     email: &str,
     session: f64,

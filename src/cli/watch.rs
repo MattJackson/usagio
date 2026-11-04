@@ -6,12 +6,12 @@ use crate::menubar;
 use crate::store::State;
 use crate::watch::cadence::TRIGGER_PCT;
 
-pub(crate) const WATCH_USAGE: &str =
+const WATCH_USAGE: &str =
     "usage: usagio watch [--interval <secs>] [--trigger <pct>] [--ceiling <pct>]";
 
 /// Parse `watch` flags; a missing or unparsable value is an error, never a
 /// silent fallback to the saved/default setting.
-pub(crate) fn parse_watch_opts(args: &[String]) -> Result<menubar::poller::LoopOpts> {
+fn parse_watch_opts(args: &[String]) -> Result<menubar::poller::LoopOpts> {
     fn value<T: std::str::FromStr>(flag: &str, it: &mut std::slice::Iter<'_, String>) -> Result<T> {
         let raw = it
             .next()

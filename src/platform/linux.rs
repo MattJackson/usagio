@@ -48,7 +48,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub struct LinuxPlatform {
+pub(crate) struct LinuxPlatform {
     menu: LinuxMenu,
     secrets: LinuxSecrets,
     autostart: LinuxAutostart,
@@ -56,7 +56,7 @@ pub struct LinuxPlatform {
 }
 
 impl LinuxPlatform {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             menu: LinuxMenu::new(),
             secrets: LinuxSecrets,
@@ -99,7 +99,7 @@ impl Platform for LinuxPlatform {
 // Paths — XDG base directories
 // ---------------------------------------------------------------------------
 
-pub struct LinuxPaths;
+struct LinuxPaths;
 
 /// `$XDG_CONFIG_HOME`, or `~/.config` if unset/empty/relative.
 fn xdg_config_home() -> PathBuf {
@@ -159,7 +159,7 @@ impl Paths for LinuxPaths {
 /// cross-platform `Autostart` trait shape.
 const AUTOSTART_DESKTOP_FILE: &str = "usagio.desktop";
 
-pub struct LinuxAutostart;
+struct LinuxAutostart;
 
 impl LinuxAutostart {
     fn desktop_path() -> PathBuf {
@@ -396,7 +396,7 @@ impl Autostart for LinuxAutostart {
 // SecretStore — Secret Service via `keyring`, with an offline file fallback
 // ---------------------------------------------------------------------------
 
-pub struct LinuxSecrets;
+struct LinuxSecrets;
 
 /// `true` for the `keyring::Error` variants that mean "the daemon isn't
 /// reachable" (no Secret Service running, locked with no prompt possible,
@@ -695,7 +695,7 @@ impl SecretStore for LinuxSecrets {
 // threshold; mirror of `WindowsMenu`'s `ClickCb`.
 type ClickCb = Box<dyn Fn(&str) + Send + Sync + 'static>;
 
-pub struct LinuxMenu {
+struct LinuxMenu {
     click_cb: Arc<Mutex<Option<ClickCb>>>,
     main_loop: Arc<Mutex<Option<gtk::glib::MainLoop>>>,
     gtk_init: OnceLock<Result<(), String>>,
@@ -780,7 +780,7 @@ fn apply_handle_msg(tray: &TrayHandle, msg: HandleMsg) {
     }
 }
 
-pub struct LinuxMenuHandle {
+struct LinuxMenuHandle {
     tx: std::sync::mpsc::Sender<HandleMsg>,
 }
 
@@ -955,7 +955,7 @@ fn binary_exists_on_path(bin: &str) -> bool {
 /// which one was picked (or that none was found) so a user report of
 /// "nothing happened" is diagnosable. Not wired into the `Platform` trait —
 /// see the module doc at the top of this file.
-pub fn launch_claude_in_terminal() -> Result<()> {
+fn launch_claude_in_terminal() -> Result<()> {
     let env_terminal = std::env::var("TERMINAL").ok();
     let Some(term) = find_terminal_with(env_terminal.as_deref(), binary_exists_on_path) else {
         bail!(

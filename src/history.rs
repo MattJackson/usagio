@@ -47,7 +47,7 @@ pub(crate) fn log_event(v: &serde_json::Value) {
 
 /// Log a history.jsonl write failure, at most once per process so a
 /// persistent fault doesn't flood the debug log every poll.
-pub(crate) fn log_history_failure(msg: &str) {
+fn log_history_failure(msg: &str) {
     static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         logging::log(&format!(

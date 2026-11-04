@@ -22,10 +22,10 @@
 
 use std::path::{Path, PathBuf};
 
-pub type Result<T> = anyhow::Result<T>;
+pub(crate) type Result<T> = anyhow::Result<T>;
 
 /// Root platform facade. `current()` returns the concrete impl for this target.
-pub trait Platform: Send + Sync + 'static {
+pub(crate) trait Platform: Send + Sync + 'static {
     fn menu(&self) -> &dyn MenuBackend;
     fn secrets(&self) -> &dyn SecretStore;
     fn autostart(&self) -> &dyn Autostart;
@@ -145,7 +145,7 @@ pub trait Platform: Send + Sync + 'static {
 
 /// Opaque handle to a live status-bar item / tray icon. Dropping it removes
 /// the item from the bar.
-pub trait MenuHandle: Send {
+pub(crate) trait MenuHandle: Send {
     /// Replace the icon (PNG bytes on every platform: a 16pt template on
     /// macOS; decoded via `MuriIcon::from_png` on Windows; ksni on Linux).
     fn set_icon(&self, png_bytes: &[u8]) -> Result<()>;
@@ -159,12 +159,12 @@ pub trait MenuHandle: Send {
 /// it to a live muri (`muda-compat`) menu — the same translator on every OS.
 /// Kept small and imperative so the renderer has room to lay it out natively.
 #[derive(Debug, Clone)]
-pub struct MenuTree {
-    pub items: Vec<MenuItem>,
+pub(crate) struct MenuTree {
+    pub(crate) items: Vec<MenuItem>,
 }
 
 #[derive(Debug, Clone)]
-pub enum MenuItem {
+pub(crate) enum MenuItem {
     /// Clickable row. `id` is opaque to the backend; dispatched back via
     /// `MenuBackend::on_click`.
     Action {
@@ -216,10 +216,10 @@ pub enum MenuItem {
 /// One colored span of a submenu row's trailing value segment. `start`/`len`
 /// are UTF-16 offsets into the value text (after the `\t`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ValueSpan {
-    pub start: usize,
-    pub len: usize,
-    pub color: ValueColor,
+pub(crate) struct ValueSpan {
+    pub(crate) start: usize,
+    pub(crate) len: usize,
+    pub(crate) color: ValueColor,
 }
 
 /// Severity tint for a submenu row's trailing value segment. Platform-agnostic
@@ -227,7 +227,7 @@ pub struct ValueSpan {
 /// backend maps it to muri's `Color` (`SystemRed` / `SystemOrange`). Mirrors
 /// `menubar::model::Severity`'s two bands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ValueColor {
+pub(crate) enum ValueColor {
     Red,
     Amber,
 }
@@ -239,7 +239,7 @@ pub enum ValueColor {
 /// `LinuxMenu` in `linux.rs`). Callers responsible for wiring the menu
 /// backend must arrange the main-thread call sequence documented in
 /// `menubar.rs::run`.
-pub trait MenuBackend: Send + Sync {
+pub(crate) trait MenuBackend: Send + Sync {
     /// Create the status-bar item. Called once at startup. Handle lives for
     /// the process lifetime; the backend owns the event loop.
     fn create_status_item(
@@ -272,7 +272,7 @@ pub trait MenuBackend: Send + Sync {
 /// Kept CLI-shape (String in/out) so macOS keeps its `security(1)` subprocess
 /// contract without a Rust FFI dep, and Linux / Windows can layer their
 /// crates on top.
-pub trait SecretStore: Send + Sync {
+pub(crate) trait SecretStore: Send + Sync {
     fn get(&self, service: &str, account: &str) -> Result<Option<String>>;
     fn set(&self, service: &str, account: &str, secret: &str) -> Result<()>;
     fn delete(&self, service: &str, account: &str) -> Result<()>;
@@ -287,7 +287,7 @@ pub trait SecretStore: Send + Sync {
 
 /// Login-time launch registration. `label` is a reverse-DNS identifier
 /// (`com.mattjackson.usagio.menubar`) reused across install / uninstall.
-pub trait Autostart: Send + Sync {
+pub(crate) trait Autostart: Send + Sync {
     fn install(&self, label: &str, binary: &Path, args: &[&str]) -> Result<()>;
     fn uninstall(&self, label: &str) -> Result<()>;
     fn is_installed(&self, label: &str) -> Result<bool>;
@@ -306,7 +306,7 @@ pub trait Autostart: Send + Sync {
 /// doesn't ripple through every callsite. Legacy code paths that still
 /// resolve the old `"claude-usage"` directory live in
 /// `crate::paths::migrate_config_dir_if_needed`.
-pub trait Paths: Send + Sync {
+pub(crate) trait Paths: Send + Sync {
     fn config_dir(&self, app: &str) -> PathBuf;
     fn data_dir(&self, app: &str) -> PathBuf;
     fn log_dir(&self, app: &str) -> PathBuf;
@@ -328,7 +328,7 @@ pub trait Paths: Send + Sync {
 /// test mock (`MockFileDialog`) intentionally uses `RefCell` — a `Sync`
 /// requirement here would forbid that without buying anything, since nothing
 /// stores `Box<dyn FileDialog>` behind a shared reference across threads.
-pub trait FileDialog {
+pub(crate) trait FileDialog {
     /// Open a SAVE panel defaulting to `default_name` inside `default_dir`
     /// (falls back to the OS's normal default location if `None`). Returns
     /// `None` if the user cancels.
@@ -342,7 +342,7 @@ pub trait FileDialog {
 /// `rfd`-backed `FileDialog`. Stateless — `rfd::FileDialog` is built fresh
 /// per call, so this is a zero-sized marker type wired into every `Platform`
 /// impl via the trait's default method.
-pub struct RfdFileDialog;
+struct RfdFileDialog;
 
 impl FileDialog for RfdFileDialog {
     fn save_file(&self, default_name: &str, default_dir: Option<&Path>) -> Option<PathBuf> {
@@ -369,10 +369,10 @@ impl FileDialog for RfdFileDialog {
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct MockFileDialog {
-    pub save_file_calls: std::cell::RefCell<Vec<(String, Option<PathBuf>)>>,
-    pub save_file_returns: std::cell::RefCell<Option<PathBuf>>,
-    pub pick_file_calls: std::cell::RefCell<Vec<Option<PathBuf>>>,
-    pub pick_file_returns: std::cell::RefCell<Option<PathBuf>>,
+    pub(crate) save_file_calls: std::cell::RefCell<Vec<(String, Option<PathBuf>)>>,
+    save_file_returns: std::cell::RefCell<Option<PathBuf>>,
+    pub(crate) pick_file_calls: std::cell::RefCell<Vec<Option<PathBuf>>>,
+    pub(crate) pick_file_returns: std::cell::RefCell<Option<PathBuf>>,
 }
 
 #[cfg(test)]
@@ -466,7 +466,7 @@ fn secure_permissions_unix(path: &Path) -> Result<()> {
 
 /// Return the platform impl for this OS. Panics only in the impossible case
 /// of an unsupported target that got past the cfg guard.
-pub fn current() -> Box<dyn Platform> {
+pub(crate) fn current() -> Box<dyn Platform> {
     #[cfg(target_os = "macos")]
     return Box::new(macos::MacOsPlatform::new());
     #[cfg(target_os = "linux")]
@@ -849,7 +849,7 @@ fn ps_status_and_start(pid: u32, fixed: bool) -> Result<Option<(String, String)>
 
 /// Outcome of comparing a recorded process generation with the live one.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Generation {
+enum Generation {
     Same,
     Different,
     /// The two can't be compared (unrecognised format, or an offset that may
@@ -858,7 +858,7 @@ pub(crate) enum Generation {
 }
 
 /// Parse a C-locale `ps -o lstart` value (`"Tue Nov  3 10:00:00 2026"`).
-pub(crate) fn parse_lstart(s: &str) -> Option<chrono::NaiveDateTime> {
+fn parse_lstart(s: &str) -> Option<chrono::NaiveDateTime> {
     let norm = s.split_whitespace().collect::<Vec<_>>().join(" ");
     chrono::NaiveDateTime::parse_from_str(&norm, "%a %b %e %H:%M:%S %Y").ok()
 }
@@ -869,7 +869,7 @@ pub(crate) fn parse_lstart(s: &str) -> Option<chrono::NaiveDateTime> {
 /// process. A gap that is a whole number of quarter hours within ±14 h could
 /// be Codex running in another zone, so that is `Unknown`, as is a recorded
 /// value in a format we can't parse (another locale) or no live reading.
-pub(crate) fn compare_generation(
+fn compare_generation(
     expected: &str,
     actual_utc: Option<chrono::NaiveDateTime>,
     local: chrono::FixedOffset,

@@ -6,10 +6,10 @@ use crate::providers::CLAUDE_SLUG;
 /// bypassing the keychain login. When set, any swap we perform is silently
 /// ignored by `claude`, so we skip Claude from auto-swap candidacy AND surface
 /// a disabled "env override active — swap disabled" row in the menu section.
-pub(crate) const CLAUDE_ENV_OVERRIDE_VAR: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+const CLAUDE_ENV_OVERRIDE_VAR: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 
 /// The env var (if any) whose presence overrides `slug`'s stored login.
-pub(crate) fn env_override_var_for(slug: &str) -> Option<&'static str> {
+fn env_override_var_for(slug: &str) -> Option<&'static str> {
     match slug {
         CLAUDE_SLUG => Some(CLAUDE_ENV_OVERRIDE_VAR),
         _ => None,
@@ -45,7 +45,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-pub(crate) fn env_override_hook_lookup(slug: &str) -> Option<bool> {
+fn env_override_hook_lookup(slug: &str) -> Option<bool> {
     ENV_OVERRIDE_TEST_HOOK.with(|h| h.borrow().as_ref().map(|s| s.contains(slug)))
 }
 

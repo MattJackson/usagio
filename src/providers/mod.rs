@@ -12,8 +12,8 @@
 // `providers::state` (a v2-schema scaffold) was superseded by
 // `crate::store::State`'s in-place `providers` HashMap. Deleted to keep the
 // codebase honest about which schema actually persists.
-pub mod trait_def;
-pub use trait_def::*;
+pub(crate) mod trait_def;
+pub(crate) use trait_def::*;
 
 use std::sync::OnceLock;
 
@@ -21,45 +21,45 @@ use std::sync::OnceLock;
 // downstream builds can compile a subset. The Cargo `[features]` table lists
 // every slug used below.
 #[cfg(feature = "amazon-q")]
-pub mod amazon_q;
+mod amazon_q;
 #[cfg(feature = "claude")]
-pub mod claude;
+pub(crate) mod claude;
 #[cfg(feature = "cline")]
-pub mod cline;
+mod cline;
 #[cfg(feature = "codex")]
-pub mod codex;
+pub(crate) mod codex;
 #[cfg(feature = "copilot-cli")]
-pub mod copilot_cli;
+mod copilot_cli;
 #[cfg(feature = "cursor-agent")]
-pub mod cursor_agent;
+mod cursor_agent;
 #[cfg(feature = "deepseek")]
-pub mod deepseek;
+mod deepseek;
 #[cfg(feature = "fireworks")]
-pub mod fireworks;
+mod fireworks;
 #[cfg(feature = "gemini-cli")]
-pub mod gemini_cli;
+mod gemini_cli;
 #[cfg(feature = "grok")]
-pub mod grok;
+mod grok;
 #[cfg(feature = "kimi")]
-pub mod kimi;
+mod kimi;
 #[cfg(feature = "opencode")]
-pub mod opencode;
+pub(crate) mod opencode;
 #[cfg(feature = "openrouter")]
-pub mod openrouter;
+mod openrouter;
 #[cfg(feature = "qwen-code")]
-pub mod qwen_code;
+mod qwen_code;
 #[cfg(feature = "synthetic")]
-pub mod synthetic;
+mod synthetic;
 #[cfg(feature = "vertex-ai")]
-pub mod vertex_ai;
+mod vertex_ai;
 #[cfg(feature = "zai")]
-pub mod zai;
+mod zai;
 
 static REGISTRY: OnceLock<Vec<Box<dyn Provider>>> = OnceLock::new();
 
 /// Build the registry. Called once from `main` and once from `menubar::run`
 /// (idempotent — the second `set` returns `Err` and is discarded).
-pub fn init() {
+pub(crate) fn init() {
     let _ = REGISTRY.set(build());
 }
 
@@ -69,7 +69,7 @@ pub fn init() {
 /// a pure helper), this lazily populates the registry with the production build
 /// so callers never see a panic. Production code paths still `init()` up-front
 /// during process start; the lazy path is a safety net.
-pub fn all() -> &'static [Box<dyn Provider>] {
+pub(crate) fn all() -> &'static [Box<dyn Provider>] {
     if REGISTRY.get().is_none() {
         let _ = REGISTRY.set(build());
     }
@@ -79,7 +79,7 @@ pub fn all() -> &'static [Box<dyn Provider>] {
 /// Look up a provider by its `provider_id` slug. Returns `None` if the slug is
 /// not registered (either because the feature is disabled or because a caller
 /// passed an unknown slug — the caller decides how to treat that).
-pub fn get(id: &str) -> Option<&'static dyn Provider> {
+pub(crate) fn get(id: &str) -> Option<&'static dyn Provider> {
     all().iter().map(|b| &**b).find(|p| p.provider_id() == id)
 }
 
@@ -88,7 +88,7 @@ pub fn get(id: &str) -> Option<&'static dyn Provider> {
 /// production semantics).
 #[cfg(test)]
 #[allow(dead_code)] // reserved for cross-file provider fixture tests
-pub fn init_for_test(v: Vec<Box<dyn Provider>>) {
+fn init_for_test(v: Vec<Box<dyn Provider>>) {
     let _ = REGISTRY.set(v);
 }
 
@@ -141,7 +141,7 @@ fn build() -> Vec<Box<dyn Provider>> {
 /// The non-null values among `paths` (dotted, e.g. `seven_day.locked_reason`)
 /// in a provider response, as `path=json`. `false` and `0` count as empty: the
 /// point is to catch a field that starts carrying real data.
-pub(crate) fn watched_values(body: &serde_json::Value, paths: &[&str]) -> Vec<String> {
+fn watched_values(body: &serde_json::Value, paths: &[&str]) -> Vec<String> {
     paths
         .iter()
         .filter_map(|path| {
@@ -173,7 +173,7 @@ fn is_blank(v: &serde_json::Value) -> bool {
 /// (`api-watch: claude seven_day.locked_reason="…"`), so whether they're worth
 /// using can be decided from real data. Each distinct value is logged once per
 /// process, not every poll.
-pub(crate) fn log_watched_fields(provider: &str, body: &serde_json::Value, paths: &[&str]) {
+fn log_watched_fields(provider: &str, body: &serde_json::Value, paths: &[&str]) {
     use std::collections::HashSet;
     use std::sync::Mutex;
     static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);

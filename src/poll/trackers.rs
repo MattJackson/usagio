@@ -13,7 +13,7 @@ use crate::providers::CLAUDE_SLUG;
 /// failover depends on it.
 pub(crate) const INACTIVE_FETCH_FLOOR_SECS: u64 = 600;
 /// Cap for an inactive account's own backoff after repeated failed fetches.
-pub(crate) const INACTIVE_FETCH_MAX_BACKOFF_SECS: u64 = 3600;
+const INACTIVE_FETCH_MAX_BACKOFF_SECS: u64 = 3600;
 
 /// Key into the in-memory usage-fetch trackers (429 escalation, inactive
 /// backoff, subscription re-checks). Claude keeps the bare email; other
@@ -45,15 +45,15 @@ pub(crate) struct UsageFetchTracker {
     pub(crate) backoff_until_ts: Option<i64>,
     /// Last profile (subscription) check — throttles them to
     /// `SUBSCRIPTION_RECHECK_SECS` per account.
-    pub(crate) last_subscription_check_ts: Option<i64>,
+    last_subscription_check_ts: Option<i64>,
     /// Last usage fetch attempt (unix secs) and whether it failed — so the
     /// v2 poller honours the active account's own backoff instead of
     /// re-fetching on every wake (a failure doesn't advance `fetched_at`).
-    pub(crate) last_attempt_ts: Option<i64>,
-    pub(crate) last_attempt_failed: bool,
+    last_attempt_ts: Option<i64>,
+    last_attempt_failed: bool,
 }
 
-pub(crate) static USAGE_FETCH_TRACKERS: std::sync::Mutex<
+static USAGE_FETCH_TRACKERS: std::sync::Mutex<
     Option<std::collections::HashMap<String, UsageFetchTracker>>,
 > = std::sync::Mutex::new(None);
 
@@ -65,14 +65,14 @@ pub(crate) static USAGE_FETCH_TRACKERS: std::sync::Mutex<
 /// under-predicts by up to 40× and the smart-cadence feature never trips
 /// (Opus adversarial review BLOCKER 1). Zero means "not yet set" and
 /// callers fall back to using the tier floor alone.
-pub(crate) static CURRENT_LOOP_INTERVAL_SECS: std::sync::atomic::AtomicU64 =
+static CURRENT_LOOP_INTERVAL_SECS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn set_current_loop_interval_secs(secs: u64) {
     CURRENT_LOOP_INTERVAL_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
 }
 
-pub(crate) fn with_fetch_trackers<T>(
+fn with_fetch_trackers<T>(
     f: impl FnOnce(&mut std::collections::HashMap<String, UsageFetchTracker>) -> T,
 ) -> T {
     let mut guard = USAGE_FETCH_TRACKERS.lock().unwrap();
@@ -85,9 +85,8 @@ pub(crate) fn with_fetch_trackers<T>(
 /// The last token-refresh / usage-fetch failure per fetch-tracker key, shown
 /// on the account's menu row until a fetch succeeds. In-memory like the
 /// trackers: the polling process is the one whose menu renders it.
-pub(crate) static LAST_REFRESH_ERRORS: std::sync::Mutex<
-    Option<std::collections::HashMap<String, String>>,
-> = std::sync::Mutex::new(None);
+static LAST_REFRESH_ERRORS: std::sync::Mutex<Option<std::collections::HashMap<String, String>>> =
+    std::sync::Mutex::new(None);
 
 pub(crate) fn note_refresh_error(key: &str, err: Option<String>) {
     let mut g = LAST_REFRESH_ERRORS
@@ -135,9 +134,8 @@ pub(crate) fn record_fetch_attempt_failed(key: &str, now_ts: i64) {
 
 /// Per-provider poll interval (the cadence's 429-backoff seed), published by
 /// the poll loop so the v2 active fetch honours the provider's own backoff.
-pub(crate) static PROVIDER_INTERVALS: std::sync::Mutex<
-    Option<std::collections::HashMap<String, u64>>,
-> = std::sync::Mutex::new(None);
+static PROVIDER_INTERVALS: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
 
 pub(crate) fn set_provider_interval_secs(slug: &str, secs: u64) {
     let mut g = PROVIDER_INTERVALS.lock().unwrap_or_else(|e| e.into_inner());
@@ -145,7 +143,7 @@ pub(crate) fn set_provider_interval_secs(slug: &str, secs: u64) {
         .insert(slug.to_string(), secs);
 }
 
-pub(crate) fn provider_interval_secs(slug: &str) -> u64 {
+fn provider_interval_secs(slug: &str) -> u64 {
     PROVIDER_INTERVALS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -165,7 +163,7 @@ pub(crate) fn active_fetch_in_backoff(slug: &str, key: &str, now_ts: i64) -> boo
 
 /// Backoff after `failures` consecutive failed fetches of an inactive
 /// account: the inactive floor, doubling, capped.
-pub(crate) fn inactive_fetch_backoff_secs(failures: u32) -> u64 {
+fn inactive_fetch_backoff_secs(failures: u32) -> u64 {
     let shift = failures.saturating_sub(1).min(8);
     (INACTIVE_FETCH_FLOOR_SECS << shift).min(INACTIVE_FETCH_MAX_BACKOFF_SECS)
 }
@@ -211,8 +209,7 @@ pub(crate) fn clear_inactive_fetch_backoff(email: &str) {
 /// The active account as of the last `refresh_usage_cache`. Lets the poller
 /// notice a switch (manual, auto-swap, or an external `claude /login`) and
 /// refresh the new active account right away at base cadence.
-pub(crate) static LAST_POLLED_ACTIVE: std::sync::Mutex<Option<String>> =
-    std::sync::Mutex::new(None);
+static LAST_POLLED_ACTIVE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Record `active` as polled; returns true if it differs from the last one.
 pub(crate) fn note_polled_active(active: Option<&str>) -> bool {

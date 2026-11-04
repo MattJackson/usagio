@@ -55,21 +55,21 @@ pub(crate) fn set_home_override(p: Option<PathBuf>) {
 /// scheduler's poll; read (never fetched) by `list`, `switch`, and the menu bar
 /// so ad-hoc commands never hit the usage API (and never trigger HTTP 429).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct CachedUsage {
+pub(crate) struct CachedUsage {
     #[serde(default)]
-    pub session_pct: Option<f64>,
+    pub(crate) session_pct: Option<f64>,
     #[serde(default)]
-    pub weekly_pct: Option<f64>,
+    pub(crate) weekly_pct: Option<f64>,
     #[serde(default)]
-    pub session_reset: Option<String>,
+    pub(crate) session_reset: Option<String>,
     #[serde(default)]
-    pub weekly_reset: Option<String>,
+    pub(crate) weekly_reset: Option<String>,
     #[serde(default)]
-    pub opus_pct: Option<f64>,
+    pub(crate) opus_pct: Option<f64>,
     #[serde(default)]
-    pub opus_reset: Option<String>,
+    pub(crate) opus_reset: Option<String>,
     /// Unix epoch seconds when this snapshot was fetched.
-    pub fetched_at: i64,
+    pub(crate) fetched_at: i64,
     /// Credits / breakdown / scoped limits the provider reported with this
     /// snapshot. Absent in state written before these existed (defaults to
     /// empty) and omitted from state.json when there's nothing to keep.
@@ -77,38 +77,38 @@ pub struct CachedUsage {
         default,
         skip_serializing_if = "crate::providers::trait_def::ReportedUsage::is_empty"
     )]
-    pub reported: crate::providers::trait_def::ReportedUsage,
+    pub(crate) reported: crate::providers::trait_def::ReportedUsage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Account {
+pub(crate) struct Account {
     /// The account's email — the identity key. Always set for a captured
     /// account; `None` only transiently while building one from a keychain blob
     /// before its email is resolved.
     #[serde(default)]
-    pub email: Option<String>,
-    pub access_token: String,
-    pub refresh_token: String,
+    pub(crate) email: Option<String>,
+    pub(crate) access_token: String,
+    pub(crate) refresh_token: String,
     /// Unix epoch millis when the access token expires.
-    pub expires_at: i64,
+    pub(crate) expires_at: i64,
     /// The verbatim keychain value: `{"claudeAiOauth":{...}}`.
-    pub keychain_blob: String,
+    pub(crate) keychain_blob: String,
     /// The `oauthAccount` object from `~/.claude.json` at capture time. This is
     /// the identity Claude Code actually uses for the active account, so a switch
     /// must restore it alongside the keychain token.
     #[serde(default)]
-    pub oauth_account: Option<serde_json::Value>,
+    pub(crate) oauth_account: Option<serde_json::Value>,
     /// The `userID` from `~/.claude.json` at capture time.
     #[serde(default)]
-    pub user_id: Option<String>,
+    pub(crate) user_id: Option<String>,
     /// Last usage snapshot; populated only by the scheduler poll.
     #[serde(default)]
-    pub cached_usage: Option<CachedUsage>,
+    pub(crate) cached_usage: Option<CachedUsage>,
     /// Per-account notification bookkeeping (crossings we've already fired,
     /// pace-fired-this-window bit). Persisted alongside the account so a
     /// menu-bar restart doesn't re-fire the same "70% crossed" notification.
     #[serde(default)]
-    pub notif_state: crate::notifications::NotifState,
+    pub(crate) notif_state: crate::notifications::NotifState,
     /// True after the OAuth token endpoint has rejected this account's
     /// refresh token as invalid_grant. Anthropic single-uses refresh tokens
     /// and rotates on every refresh, so any stale grant (most commonly one
@@ -118,13 +118,13 @@ pub struct Account {
     /// switching to it launches `claude /login` instead of failing silently.
     /// Cleared on any successful refresh or fresh capture.
     #[serde(default)]
-    pub needs_relogin: bool,
+    pub(crate) needs_relogin: bool,
     /// Fingerprint of the refresh token whose renewal could not be written to
     /// the live slot (`persist_claude_login`). While it matches the stored
     /// refresh token the active-account CAS rewrites the slot instead of
     /// adopting it; anything else is adopted as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub live_write_pending: Option<String>,
+    pub(crate) live_write_pending: Option<String>,
     /// True while the account's Claude subscription has lapsed (the usage
     /// endpoint answers 403/429 and the profile shows a free/canceled org).
     /// When set: the poller stops calling the usage endpoint for it (those
@@ -133,27 +133,27 @@ pub struct Account {
     /// a plan is back; the menu and `usagio list` show "no subscription";
     /// auto-swap skips it.
     #[serde(default)]
-    pub no_subscription: bool,
+    pub(crate) no_subscription: bool,
     /// Last plan label the provider reported ("Max 20x", "Pro", …); falls
     /// back to the captured `oauth_account` when never checked.
     #[serde(default)]
-    pub plan: Option<String>,
+    pub(crate) plan: Option<String>,
     /// Earliest unix second for the next background Claude profile request.
     /// Persisted so restart loops and concurrent pollers respect its throttle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile_refresh_after: Option<i64>,
+    pub(crate) profile_refresh_after: Option<i64>,
     /// Which of usagio's sign-in window cookie stores holds this account's
     /// vendor session (`crate::login::store_id`); `None` = the one keyed by
     /// its own email. Set when the account was added via "Sign in to a new
     /// account…", whose store existed before the email was known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub login_store: Option<String>,
+    pub(crate) login_store: Option<String>,
 }
 
 impl Account {
     /// Build an Account from a raw keychain blob string. The email is resolved
     /// separately by the caller (it is not present in the keychain blob).
-    pub fn from_keychain_blob(blob: &str) -> Result<Account> {
+    pub(crate) fn from_keychain_blob(blob: &str) -> Result<Account> {
         let v: serde_json::Value =
             serde_json::from_str(blob).context("keychain value is not valid JSON")?;
         let o = v.get("claudeAiOauth").ok_or_else(|| {
@@ -190,13 +190,13 @@ impl Account {
     }
 
     /// The identity key for this account (its email, or "" if unresolved).
-    pub fn key(&self) -> &str {
+    pub(crate) fn key(&self) -> &str {
         self.email.as_deref().unwrap_or("")
     }
 
     /// The account's stable identity from its captured `oauthAccount`: the
     /// accountUuid, or `None` if it has not been captured.
-    pub fn identity_uuid(&self) -> Option<String> {
+    pub(crate) fn identity_uuid(&self) -> Option<String> {
         self.oauth_account
             .as_ref()
             .and_then(|o| o.get("accountUuid"))
@@ -207,12 +207,12 @@ impl Account {
     /// When the refresh token itself dies (unix millis), as recorded in the
     /// blob's `refreshTokenExpiresAt`. Claude Code warns "Your login expires in
     /// N days" off this field, so it must track every rotation we make.
-    pub fn refresh_token_expires_at(&self) -> Option<i64> {
+    pub(crate) fn refresh_token_expires_at(&self) -> Option<i64> {
         blob_refresh_token_expires_at(&self.keychain_blob)
     }
 
     /// Record a new refresh-token expiry in the blob (what the keychain gets).
-    pub fn set_refresh_token_expires_at(&mut self, at: i64) {
+    pub(crate) fn set_refresh_token_expires_at(&mut self, at: i64) {
         if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&self.keychain_blob) {
             if let Some(o) = v.get_mut("claudeAiOauth").and_then(|x| x.as_object_mut()) {
                 o.insert("refreshTokenExpiresAt".into(), serde_json::Value::from(at));
@@ -225,7 +225,7 @@ impl Account {
     /// its tokens unconditionally, plus whatever the new credential says about
     /// the login (expiry, scopes, plan) — keeping every other field Claude
     /// Code put in the blob.
-    pub fn adopt_login(&mut self, fresh: &Account) {
+    pub(crate) fn adopt_login(&mut self, fresh: &Account) {
         self.profile_refresh_after = None;
         self.live_write_pending = None;
         self.set_tokens(
@@ -266,7 +266,7 @@ impl Account {
 
     /// [`Self::set_tokens_if_newer`] from another copy of this account,
     /// carrying its refresh-token expiry along with the tokens.
-    pub fn adopt_tokens_if_newer(&mut self, src: &Account) -> bool {
+    pub(crate) fn adopt_tokens_if_newer(&mut self, src: &Account) -> bool {
         let applied = self.set_tokens_if_newer(
             src.access_token.clone(),
             src.refresh_token.clone(),
@@ -285,12 +285,7 @@ impl Account {
     /// clobbering a fresher token a concurrent refresh rotated in the meantime —
     /// a single-use refresh token, once superseded, would otherwise be lost.
     /// Returns whether the update was applied.
-    pub fn set_tokens_if_newer(
-        &mut self,
-        access: String,
-        refresh: String,
-        expires_at: i64,
-    ) -> bool {
+    fn set_tokens_if_newer(&mut self, access: String, refresh: String, expires_at: i64) -> bool {
         if expires_at >= self.expires_at {
             self.set_tokens(access, refresh, expires_at);
             true
@@ -300,7 +295,7 @@ impl Account {
     }
 
     /// Update the tokens after a refresh, keeping the blob in sync.
-    pub fn set_tokens(&mut self, access: String, refresh: String, expires_at: i64) {
+    pub(crate) fn set_tokens(&mut self, access: String, refresh: String, expires_at: i64) {
         self.access_token = access.clone();
         self.refresh_token = refresh.clone();
         self.expires_at = expires_at;
@@ -330,48 +325,48 @@ impl Account {
 /// mirror the blob's tokens for refresh math, exactly like `Account` does for
 /// Claude.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ProviderAccount {
+pub(crate) struct ProviderAccount {
     /// The provider's own identifier for this account (email, or a UUID/hash
     /// fallback — see `Provider::account_identifier`). Codex qualifies the
     /// email with the ChatGPT workspace: `email#account_id`.
-    pub key: String,
+    pub(crate) key: String,
     /// Verbatim provider credential blob (e.g. Codex's `auth.json` bytes).
-    pub secret_blob: String,
-    pub access_token: String,
+    pub(crate) secret_blob: String,
+    pub(crate) access_token: String,
     #[serde(default)]
-    pub refresh_token: String,
+    pub(crate) refresh_token: String,
     /// Unix epoch SECONDS when the access token expires. (Note: `Account`
     /// above uses epoch MILLIS for Claude's keychain shape — this field uses
     /// SECONDS, matching `TokenGrant::expires_in_secs` math used to compute
     /// it. Callers must not mix the two units across account types.)
     #[serde(default)]
-    pub expires_at: i64,
+    pub(crate) expires_at: i64,
     #[serde(default)]
-    pub identity_email: Option<String>,
+    pub(crate) identity_email: Option<String>,
     #[serde(default)]
-    pub identity_uuid: Option<String>,
+    pub(crate) identity_uuid: Option<String>,
     #[serde(default)]
-    pub identity_display_name: Option<String>,
+    pub(crate) identity_display_name: Option<String>,
     #[serde(default)]
-    pub identity_native_blob: serde_json::Value,
+    pub(crate) identity_native_blob: serde_json::Value,
     #[serde(default)]
-    pub cached_usage: Option<CachedUsage>,
+    pub(crate) cached_usage: Option<CachedUsage>,
     #[serde(default)]
-    pub notif_state: crate::notifications::NotifState,
+    pub(crate) notif_state: crate::notifications::NotifState,
     #[serde(default)]
-    pub needs_relogin: bool,
+    pub(crate) needs_relogin: bool,
     /// Same meaning as [`Account::no_subscription`], for any provider.
     #[serde(default)]
-    pub no_subscription: bool,
+    pub(crate) no_subscription: bool,
     /// Last plan label the provider reported ("Plus", "Pro", …).
     #[serde(default)]
-    pub plan: Option<String>,
+    pub(crate) plan: Option<String>,
 }
 
 impl ProviderAccount {
     /// Rebuild the `IdentitySnapshot` this account was captured with, for
     /// callers that need to hand it back to `ActiveSlot::write_active_account`.
-    pub fn identity_snapshot(&self) -> crate::providers::trait_def::IdentitySnapshot {
+    pub(crate) fn identity_snapshot(&self) -> crate::providers::trait_def::IdentitySnapshot {
         crate::providers::trait_def::IdentitySnapshot {
             email: self.identity_email.clone(),
             uuid: self.identity_uuid.clone(),
@@ -384,7 +379,7 @@ impl ProviderAccount {
 /// `State::resolve` found several accounts for a prefix (typed, so callers
 /// never match on message text).
 #[derive(Debug)]
-pub struct AmbiguousSelector(pub String);
+struct AmbiguousSelector(pub(crate) String);
 
 impl std::fmt::Display for AmbiguousSelector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -395,30 +390,30 @@ impl std::fmt::Display for AmbiguousSelector {
 impl std::error::Error for AmbiguousSelector {}
 
 /// Whether `e` is an [`AmbiguousSelector`] error.
-pub fn is_ambiguous_selector(e: &anyhow::Error) -> bool {
+pub(crate) fn is_ambiguous_selector(e: &anyhow::Error) -> bool {
     e.downcast_ref::<AmbiguousSelector>().is_some()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PendingSwitch {
-    pub key: String,
-    pub manual: bool,
-    pub from: Option<String>,
+pub(crate) struct PendingSwitch {
+    pub(crate) key: String,
+    pub(crate) manual: bool,
+    pub(crate) from: Option<String>,
     #[serde(default)]
-    pub drain_token: Option<String>,
+    pub(crate) drain_token: Option<String>,
     /// Credential publication completed; retries must verify/start the client,
     /// not drain the replacement instance or overwrite a rotated credential.
     #[serde(default)]
-    pub credentials_written: bool,
+    pub(crate) credentials_written: bool,
     /// A renewed active login waits here until the old client has drained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub renewed_account: Option<ProviderAccount>,
+    pub(crate) renewed_account: Option<ProviderAccount>,
     /// This queued "switch" is a login renewal of the already-active account:
     /// its commit must leave the user's pick/hold alone.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub renewal: bool,
+    pub(crate) renewal: bool,
     #[serde(default)]
-    pub leave_latch: Option<(
+    pub(crate) leave_latch: Option<(
         crate::autoswap::memory::LatchKind,
         crate::autoswap::memory::Latch,
     )>,
@@ -430,32 +425,32 @@ pub struct PendingSwitch {
 /// module doc (H3, v0.5.0 codeaudit) — before this, v1 `State` had nowhere to
 /// persist a *second* Codex account to switch to.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct ProviderAccounts {
+pub(crate) struct ProviderAccounts {
     /// Explicit selection waiting for a safe client handoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_switch: Option<PendingSwitch>,
+    pub(crate) pending_switch: Option<PendingSwitch>,
     #[serde(default)]
-    pub accounts: Vec<ProviderAccount>,
+    pub(crate) accounts: Vec<ProviderAccount>,
     /// Key of the account currently written to this provider's active
     /// credential slot, if known.
     #[serde(default)]
-    pub active: Option<String>,
+    pub(crate) active: Option<String>,
     /// Raw `accounts` entries that failed to deserialize at load. Kept
     /// verbatim and written back so a single malformed entry is never
     /// silently erased by the next save (and the overwrite guard counts them).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unparsed_accounts: Vec<serde_json::Value>,
+    pub(crate) unparsed_accounts: Vec<serde_json::Value>,
     /// Sign-in window store an account was added with ("Sign in to a new
     /// account…"), keyed by lowercased account key, so its renewals reopen
     /// that session (see `login::new_store_key`). Claude keeps this on
     /// `Account::login_store` instead.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
-    pub login_stores: std::collections::HashMap<String, String>,
+    pub(crate) login_stores: std::collections::HashMap<String, String>,
 }
 
 impl ProviderAccounts {
     /// The sign-in store `key` was added with, if remembered.
-    pub fn login_store(&self, key: &str) -> Option<&str> {
+    pub(crate) fn login_store(&self, key: &str) -> Option<&str> {
         self.login_stores
             .get(&key.to_lowercase())
             .map(String::as_str)
@@ -616,19 +611,19 @@ impl ProviderAccounts {
         self.unparsed_accounts.len() != before
     }
 
-    pub fn find(&self, key: &str) -> Option<&ProviderAccount> {
+    pub(crate) fn find(&self, key: &str) -> Option<&ProviderAccount> {
         self.accounts
             .iter()
             .find(|a| a.key.eq_ignore_ascii_case(key))
     }
 
-    pub fn find_mut(&mut self, key: &str) -> Option<&mut ProviderAccount> {
+    pub(crate) fn find_mut(&mut self, key: &str) -> Option<&mut ProviderAccount> {
         self.accounts
             .iter_mut()
             .find(|a| a.key.eq_ignore_ascii_case(key))
     }
 
-    pub fn upsert(&mut self, acct: ProviderAccount) {
+    pub(crate) fn upsert(&mut self, acct: ProviderAccount) {
         // A fresh capture supersedes a stale unparseable copy of the same key.
         self.drop_unparsed(&acct.key);
         if let Some(existing) = self.find_mut(&acct.key) {
@@ -651,17 +646,17 @@ impl ProviderAccounts {
 /// fields. Existing v1 `state.json` files therefore continue to load with
 /// nothing lost — see `store_tests::v1_state_json_loads_and_upgrades_to_v2`
 /// for the fixture that pins this contract.
-pub const STATE_SCHEMA_VERSION: u32 = 2;
+const STATE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct State {
+pub(crate) struct State {
     /// Schema version this in-memory `State` represents. Always
     /// [`STATE_SCHEMA_VERSION`] once loaded via `State::load`/`from_value` —
     /// see that constant's doc for the v1→v2 migration story.
     #[serde(default)]
-    pub schema_version: u32,
+    pub(crate) schema_version: u32,
     #[serde(default)]
-    pub accounts: Vec<Account>,
+    pub(crate) accounts: Vec<Account>,
     /// Raw Claude `accounts[]` entries that are not usable accounts (no
     /// `access_token`/`refresh_token`, e.g. a half-written or hand-edited
     /// entry). Kept verbatim and written back so a save never silently erases
@@ -669,10 +664,10 @@ pub struct State {
     /// save while one exists. Re-tried on each load: an entry that gains its
     /// tokens is restored as a real account.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unparsed_accounts: Vec<serde_json::Value>,
+    pub(crate) unparsed_accounts: Vec<serde_json::Value>,
     /// Email of the account currently written to the keychain, if known.
     #[serde(default)]
-    pub active: Option<String>,
+    pub(crate) active: Option<String>,
     /// Per-provider multi-account slots for every non-Claude provider that
     /// supports switching (currently just `codex`), keyed by
     /// `Provider::provider_id`. Claude keeps its dedicated `accounts`/`active`
@@ -680,65 +675,65 @@ pub struct State {
     /// `state.json` needs no data migration at all — this map is simply empty
     /// until a non-Claude account is captured.
     #[serde(default)]
-    pub providers: std::collections::HashMap<String, ProviderAccounts>,
+    pub(crate) providers: std::collections::HashMap<String, ProviderAccounts>,
     /// Menu-bar: auto-swap is on unless this is set (defaults to enabled).
     #[serde(default)]
-    pub autoswap_disabled: bool,
+    pub(crate) autoswap_disabled: bool,
     /// Menu-bar: swap trigger threshold percent (defaults to 95).
     #[serde(default)]
-    pub trigger_pct: Option<f64>,
+    pub(crate) trigger_pct: Option<f64>,
     /// Auto-swap may move onto an account that runs on usage credits (paid
     /// extra usage) once every account's plan usage is used up. Off by
     /// default: it spends real money. Plan usage always wins when there is
     /// any, and the swap leaves credits as soon as a plan account frees up.
     #[serde(default)]
-    pub use_credits_when_exhausted: bool,
+    pub(crate) use_credits_when_exhausted: bool,
     /// Menu-bar: what the tray icon/title reflects. `None` (the default) =
     /// "at risk" — the captured agent closest to its limit across every
     /// provider. `Some(slug)` pins the tray to one registered provider's
     /// active account (e.g. `"claude"`, `"codex"`). Set from Settings ▸ Tray
     /// Icon; read by `menubar::tray::tray_target`/`title_for`.
     #[serde(default)]
-    pub tray_icon_mode: Option<String>,
+    pub(crate) tray_icon_mode: Option<String>,
     /// Menu-bar: Settings ▸ Notifications ▸ per-trigger enable checkboxes
     /// (threshold crossings / reset-back / weekly-pace projection). Read by
     /// `watch_cycle` on every poll so a menu toggle takes effect on the next
     /// cycle without a restart.
     #[serde(default)]
-    pub notification_config: crate::notifications::NotificationConfig,
+    pub(crate) notification_config: crate::notifications::NotificationConfig,
     /// Accounts the user switched to by hand while at/over the trigger, keyed
     /// by provider slug. While a provider's active account is its held one,
     /// auto-swap leaves it alone until it is exhausted or lapses. Shared by
     /// the CLI and the menu bar so a manual choice made in either sticks the
     /// same way.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
-    pub manual_holds: std::collections::HashMap<String, String>,
+    pub(crate) manual_holds: std::collections::HashMap<String, String>,
     /// Every account the user switched to by hand, keyed by provider slug.
     /// While it is still active, auto-swap makes no optional (proactive)
     /// move off it; reaching the trigger still swaps as usual.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
-    pub manual_picks: std::collections::HashMap<String, String>,
+    pub(crate) manual_picks: std::collections::HashMap<String, String>,
     /// When each provider's manual pick was made (unix secs), until the first
     /// reading taken after it settles whether the pick holds. The reading the
     /// switch decided on may be minutes old (see `settle_manual_pick`).
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
-    pub manual_pick_at: std::collections::HashMap<String, i64>,
+    pub(crate) manual_pick_at: std::collections::HashMap<String, i64>,
     /// The settled tier of each provider's manual pick (`"ready"`,
     /// `"draining"`, `"blocked"`), from the switch-time reading and re-settled
     /// by the first fresh one (auto-swap v2). A pick holds while its tier is
     /// Draining or worse. Migrated from `manual_holds` (a held key maps to
     /// Draining) when absent; `manual_holds` is still written for rollback.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
-    pub manual_pick_tier: std::collections::HashMap<String, String>,
+    pub(crate) manual_pick_tier: std::collections::HashMap<String, String>,
     /// Auto-swap v2's persisted swap memory, keyed by provider slug (left
     /// times, latches, cooldown, stuck notice).
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
-    pub swap_memory: std::collections::HashMap<String, crate::autoswap::SwapMemory>,
+    pub(crate) swap_memory: std::collections::HashMap<String, crate::autoswap::SwapMemory>,
     /// Usage-history aliases, keyed by provider slug: account key (lowercase)
     /// → the key its older history rows were written under, for accounts
     /// renamed by a keying upgrade (Codex: email → `email#account_id`).
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
-    pub history_aliases:
+    pub(crate) history_aliases:
         std::collections::HashMap<String, std::collections::BTreeMap<String, String>>,
     /// Emails this in-memory state has explicitly requested be dropped via
     /// `remove()`. NOT serialized — transient authorization consumed by
@@ -805,7 +800,7 @@ fn parse_field_or_warn<T: serde::de::DeserializeOwned + Default>(
 /// macOS, XDG on Linux, `%APPDATA%\usagio` on Windows). Kept as a
 /// `Result` for callsite stability; the underlying trait call is infallible
 /// today.
-pub fn config_dir() -> Result<PathBuf> {
+pub(crate) fn config_dir() -> Result<PathBuf> {
     // Test-only tripwire: every unit test that lands here MUST have installed
     // a `ScopedConfigDir` / `TestConfigDir` first. Without one, a stray
     // `State::load()` or `state.save()` inside a test would resolve to the
@@ -856,7 +851,7 @@ pub fn config_dir() -> Result<PathBuf> {
 }
 
 /// `claudeAiOauth.refreshTokenExpiresAt` from a Claude keychain blob.
-pub fn blob_refresh_token_expires_at(blob: &str) -> Option<i64> {
+pub(crate) fn blob_refresh_token_expires_at(blob: &str) -> Option<i64> {
     serde_json::from_str::<serde_json::Value>(blob)
         .ok()?
         .get("claudeAiOauth")?
@@ -869,7 +864,7 @@ fn state_path() -> Result<PathBuf> {
 }
 
 impl State {
-    pub fn load() -> Result<State> {
+    pub(crate) fn load() -> Result<State> {
         let path = state_path()?;
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
@@ -883,7 +878,7 @@ impl State {
 
     /// Build a State from parsed JSON, migrating the old name-keyed shape
     /// (`Account.name`, `active` = a name) to the email-keyed shape.
-    pub fn from_value(v: &serde_json::Value) -> State {
+    pub(crate) fn from_value(v: &serde_json::Value) -> State {
         let mut accounts = Vec::new();
         // Map an old `name` -> resolved email so a legacy `active` (a name) can be
         // migrated to the new email key.
@@ -1156,7 +1151,7 @@ impl State {
     /// If `key` has no account in `slug` but its email-only (pre-workspace)
     /// form does, rename that account to `key`: a capture of a legacy entry
     /// whose workspace could not be derived on load.
-    pub fn adopt_legacy_provider_key(&mut self, slug: &str, key: &str) {
+    pub(crate) fn adopt_legacy_provider_key(&mut self, slug: &str, key: &str) {
         let email = crate::providers::trait_def::key_email(key);
         if email.len() == key.len() || self.find_provider_account(slug, key).is_some() {
             return;
@@ -1170,7 +1165,7 @@ impl State {
     /// (active, queued switch, manual pick/hold, swap memory), authorise the
     /// old key's disappearance for the save guard, and keep its usage
     /// history reachable. Refuses when `to` already exists.
-    pub fn rename_provider_account(&mut self, slug: &str, from: &str, to: &str) -> bool {
+    fn rename_provider_account(&mut self, slug: &str, from: &str, to: &str) -> bool {
         if from.eq_ignore_ascii_case(to) || self.find_provider_account(slug, to).is_some() {
             return false;
         }
@@ -1251,13 +1246,13 @@ impl State {
     /// manual choice is still that provider's active account. A hold left
     /// behind by a later `claude /login` (or any other switch we didn't
     /// record) is ignored.
-    pub fn manual_hold(&self, slug: &str) -> Option<&str> {
+    pub(crate) fn manual_hold(&self, slug: &str) -> Option<&str> {
         self.still_active(slug, self.manual_holds.get(slug)?)
     }
 
     /// The account the user picked by hand for `slug`, if it is still that
     /// provider's active account (see `manual_hold`).
-    pub fn manual_pick(&self, slug: &str) -> Option<&str> {
+    pub(crate) fn manual_pick(&self, slug: &str) -> Option<&str> {
         self.still_active(slug, self.manual_picks.get(slug)?)
     }
 
@@ -1274,13 +1269,13 @@ impl State {
 
     /// Hold `slug` on `key` (a manual switch), or clear its hold (`None`: an
     /// auto-swap or auto-pick moved it).
-    pub fn set_manual_hold(&mut self, slug: &str, key: Option<&str>) {
+    pub(crate) fn set_manual_hold(&mut self, slug: &str, key: Option<&str>) {
         set_or_clear(&mut self.manual_holds, slug, key);
     }
 
     /// Record `key` as `slug`'s manual pick, or clear it (`None`: an
     /// auto-swap or auto-pick moved it).
-    pub fn set_manual_pick(&mut self, slug: &str, key: Option<&str>) {
+    pub(crate) fn set_manual_pick(&mut self, slug: &str, key: Option<&str>) {
         set_or_clear(&mut self.manual_picks, slug, key);
         match key {
             Some(_) => {
@@ -1295,14 +1290,14 @@ impl State {
     }
 
     /// Record `slug`'s manual-pick tier (`None` clears it).
-    pub fn set_manual_pick_tier(&mut self, slug: &str, tier: Option<&str>) {
+    pub(crate) fn set_manual_pick_tier(&mut self, slug: &str, tier: Option<&str>) {
         set_or_clear(&mut self.manual_pick_tier, slug, tier);
     }
 
     /// Record a change of `slug`'s active account in its swap memory (§3.5):
     /// `left_at[from]`, `last_switch_at`, `last_seen_active`. Only when the key
     /// actually changed — same-account token adoption is not a change.
-    pub fn note_active_change(
+    pub(crate) fn note_active_change(
         &mut self,
         slug: &str,
         from: Option<&str>,
@@ -1334,18 +1329,18 @@ impl State {
     ///   overwriting.
     ///
     /// The atomic tmp+rename semantics of the underlying writer are preserved.
-    pub fn save(&self) -> Result<()> {
+    pub(crate) fn save(&self) -> Result<()> {
         save_state_safe(self)
     }
 
     /// Look up an account by exact email (case-insensitive).
-    pub fn find(&self, email: &str) -> Option<&Account> {
+    pub(crate) fn find(&self, email: &str) -> Option<&Account> {
         self.accounts
             .iter()
             .find(|a| a.key().eq_ignore_ascii_case(email))
     }
 
-    pub fn find_mut(&mut self, email: &str) -> Option<&mut Account> {
+    pub(crate) fn find_mut(&mut self, email: &str) -> Option<&mut Account> {
         self.accounts
             .iter_mut()
             .find(|a| a.key().eq_ignore_ascii_case(email))
@@ -1353,7 +1348,7 @@ impl State {
 
     /// Resolve a user-supplied selector (a full email or a unique prefix) to an
     /// account's email key. Ambiguous prefixes and misses are errors.
-    pub fn resolve(&self, selector: &str) -> Result<String> {
+    pub(crate) fn resolve(&self, selector: &str) -> Result<String> {
         let sel = selector.trim();
         if sel.is_empty() {
             return Err(anyhow!("no account specified"));
@@ -1378,7 +1373,7 @@ impl State {
         }
     }
 
-    pub fn upsert(&mut self, acct: Account) {
+    pub(crate) fn upsert(&mut self, acct: Account) {
         let key = acct.key().to_string();
         // A fresh capture supersedes a stale unusable copy of the same key.
         self.unparsed_accounts
@@ -1394,7 +1389,7 @@ impl State {
     /// drop for the next `save()` by recording its key in `pending_removals`.
     /// The authorization is what lets `save_state_safe` distinguish this
     /// intentional removal from an accidental account-list wipe.
-    pub fn remove(&mut self, email: &str) -> bool {
+    pub(crate) fn remove(&mut self, email: &str) -> bool {
         let before = self.accounts.len();
         // Snapshot the keys we're about to drop so pending_removals can carry
         // their canonical lowercase form (matches the diff below in
@@ -1429,22 +1424,22 @@ impl State {
 
     /// Read-only view of `slug`'s multi-account slot, or `None` if nothing has
     /// ever been captured for that provider.
-    pub fn provider_accounts(&self, slug: &str) -> Option<&ProviderAccounts> {
+    pub(crate) fn provider_accounts(&self, slug: &str) -> Option<&ProviderAccounts> {
         self.providers.get(slug)
     }
 
     /// Mutable view of `slug`'s multi-account slot, creating an empty one if
     /// this is the first account ever captured for that provider.
-    pub fn provider_accounts_mut(&mut self, slug: &str) -> &mut ProviderAccounts {
+    pub(crate) fn provider_accounts_mut(&mut self, slug: &str) -> &mut ProviderAccounts {
         self.providers.entry(slug.to_string()).or_default()
     }
 
     /// Look up one account within `slug`'s slot by key (case-insensitive).
-    pub fn find_provider_account(&self, slug: &str, key: &str) -> Option<&ProviderAccount> {
+    pub(crate) fn find_provider_account(&self, slug: &str, key: &str) -> Option<&ProviderAccount> {
         self.providers.get(slug)?.find(key)
     }
 
-    pub fn find_provider_account_mut(
+    pub(crate) fn find_provider_account_mut(
         &mut self,
         slug: &str,
         key: &str,
@@ -1454,14 +1449,14 @@ impl State {
 
     /// Insert or replace an account within `slug`'s slot, keyed on
     /// `acct.key`.
-    pub fn upsert_provider_account(&mut self, slug: &str, acct: ProviderAccount) {
+    pub(crate) fn upsert_provider_account(&mut self, slug: &str, acct: ProviderAccount) {
         self.provider_accounts_mut(slug).upsert(acct);
     }
 
     /// Drop `key` from `slug`'s slot AND authorise the drop for the next
     /// `save()` (mirrors `remove()`'s `pending_removals` contract, scoped to
     /// provider accounts).
-    pub fn remove_provider_account(&mut self, slug: &str, key: &str) -> bool {
+    pub(crate) fn remove_provider_account(&mut self, slug: &str, key: &str) -> bool {
         let Some(pa) = self.providers.get_mut(slug) else {
             return false;
         };
@@ -1507,12 +1502,12 @@ fn set_or_clear(
 /// Cap on rolling `state.json` backups kept under `backups/`. 20 is a middle
 /// ground between "one botched save can't erase everything" and disk cost —
 /// each backup is a few KB even with a dozen accounts.
-pub(crate) const BACKUP_KEEP_COUNT: usize = 20;
+const BACKUP_KEEP_COUNT: usize = 20;
 
 /// Minimum spacing between rolling backups for saves that keep the same set
 /// of accounts. Without it every poll (each rewrites usage snapshots) rotated
 /// the whole 20-file history out within minutes.
-pub(crate) const BACKUP_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const BACKUP_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// Whether a routine (same-accounts) save should write a rolling backup: no
 /// backup yet, the newest is at least [`BACKUP_MIN_INTERVAL`] old, or it is
@@ -1556,7 +1551,7 @@ fn backup_due(backups_dir: &Path, now: std::time::SystemTime) -> bool {
 /// 2. **Rolling backups.** Before overwriting, copies the current
 ///    `state.json` to `backups/state-YYYYMMDD-HHMMSS.json` (mode 0600 under
 ///    a 0700 dir), then prunes so at most [`BACKUP_KEEP_COUNT`] survive.
-pub fn save_state_safe(state: &State) -> Result<()> {
+fn save_state_safe(state: &State) -> Result<()> {
     let dir = config_dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = state_path()?;
@@ -1762,7 +1757,7 @@ fn fsync_dir(_dir: &std::path::Path) -> std::io::Result<()> {
 /// build a confirmation that names the accounts, rather than just a bare
 /// count (H2, v0.5.0 codeaudit — "will drop 2 account(s)" told the user
 /// nothing about *which* two).
-pub fn accounts_dropped_by(new_state: &State) -> Result<Vec<String>> {
+pub(crate) fn accounts_dropped_by(new_state: &State) -> Result<Vec<String>> {
     let path = state_path()?;
     let old_bytes = match std::fs::read(&path) {
         Ok(b) => b,
@@ -1806,7 +1801,7 @@ pub fn accounts_dropped_by(new_state: &State) -> Result<Vec<String>> {
 /// bypassing it. Runs under the state lock (H2, v0.5.0 codeaudit: the prior
 /// restore path took no lock at all, racing the daemon poll / a concurrent
 /// CLI command).
-pub fn save_state_restore(
+pub(crate) fn save_state_restore(
     _lock: &crate::credentials::StateGuard,
     mut new_state: State,
 ) -> Result<()> {
@@ -1852,7 +1847,7 @@ pub fn save_state_restore(
 /// path (see `save_state_safe`'s doc comment) but had not been applied here
 /// because this restore flow was written fresh for v0.5.0's "Restore…"
 /// dialog.
-pub fn stash_pre_restore(config_dir: &Path) -> Result<Option<PathBuf>> {
+pub(crate) fn stash_pre_restore(config_dir: &Path) -> Result<Option<PathBuf>> {
     let live = state_path()?;
     if !live.exists() {
         return Ok(None);
@@ -2007,7 +2002,7 @@ fn write_rolling_backup(dir: &Path, _state_path: &Path, current_bytes: &[u8]) ->
 /// sort as the oldest). Backups dated in the future (written before the clock
 /// went back) are evicted first, so post-jump history is not reduced to the
 /// one file just written.
-pub(crate) fn prune_backups(dir: &Path, keep: usize, just_written: Option<&Path>) -> Result<()> {
+fn prune_backups(dir: &Path, keep: usize, just_written: Option<&Path>) -> Result<()> {
     let mut entries: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
     for e in std::fs::read_dir(dir).context("read backups dir")? {
         let e = match e {
@@ -2048,11 +2043,7 @@ pub(crate) fn prune_backups(dir: &Path, keep: usize, just_written: Option<&Path>
 /// R2-1: cap `state-rejected-*.json` diagnostic dumps at `keep` so a run of
 /// consecutive save refusals cannot grow unbounded. Oldest are evicted first,
 /// never `just_written` (the dump the REFUSED log line points at).
-pub(crate) fn prune_rejected_dumps(
-    dir: &Path,
-    keep: usize,
-    just_written: Option<&Path>,
-) -> Result<()> {
+fn prune_rejected_dumps(dir: &Path, keep: usize, just_written: Option<&Path>) -> Result<()> {
     let mut entries: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
     for e in std::fs::read_dir(dir).context("read backups dir")? {
         let e = match e {
@@ -2090,7 +2081,7 @@ pub(crate) fn prune_rejected_dumps(
 /// tested entry point for anything that wants to enumerate rolling backups
 /// (a future `usagio backups list` CLI command, or a test).
 #[allow(dead_code)]
-pub fn list_backups() -> Result<Vec<(PathBuf, std::time::SystemTime)>> {
+fn list_backups() -> Result<Vec<(PathBuf, std::time::SystemTime)>> {
     let dir = config_dir()?.join("backups");
     if !dir.exists() {
         return Ok(Vec::new());
@@ -2124,11 +2115,11 @@ pub fn list_backups() -> Result<Vec<(PathBuf, std::time::SystemTime)>> {
 
 /// Path of the live state.json for callers that need to render or open it
 /// (menu bar "Copy current state" / "Restore" flows).
-pub fn state_json_path() -> Result<PathBuf> {
+pub(crate) fn state_json_path() -> Result<PathBuf> {
     state_path()
 }
 
-pub(crate) fn ensure_dir_0700(p: &Path) -> Result<()> {
+fn ensure_dir_0700(p: &Path) -> Result<()> {
     std::fs::create_dir_all(p).context("creating dir")?;
     // Best-effort, matching the prior `#[cfg(unix)]` behavior: a chmod
     // failure here shouldn't fail the caller, only the mkdir above should.

@@ -6,11 +6,11 @@ use std::time::Duration;
 /// Max panic-and-respawn cycles tolerated in `PANIC_LOOP_WINDOW_SECS` before
 /// `poll_loop_supervisor` treats it as a crash-loop (asks launchd for a clean
 /// restart, else respawns slowly) rather than a transient one-off panic.
-pub(super) const MAX_PANICS_PER_WINDOW: usize = 10;
-pub(super) const PANIC_LOOP_WINDOW_SECS: u64 = 60;
+const MAX_PANICS_PER_WINDOW: usize = 10;
+const PANIC_LOOP_WINDOW_SECS: u64 = 60;
 /// What the supervisor does once it sees a panic loop.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum PanicLoopResponse {
+enum PanicLoopResponse {
     Exit,
     KeepRespawning,
 }
@@ -18,7 +18,7 @@ pub(super) enum PanicLoopResponse {
 /// Both LaunchAgent plists ship `KeepAlive=false`, so a bare exit is never
 /// restarted: only exit once a launchd restart was actually issued; otherwise
 /// keep respawning the poller (slowly) so the tray stays alive.
-pub(super) fn panic_loop_response(restart: &LaunchdRestart) -> PanicLoopResponse {
+fn panic_loop_response(restart: &LaunchdRestart) -> PanicLoopResponse {
     match restart {
         LaunchdRestart::Issued => PanicLoopResponse::Exit,
         LaunchdRestart::Failed | LaunchdRestart::NotManaged => PanicLoopResponse::KeepRespawning,
@@ -28,30 +28,30 @@ pub(super) fn panic_loop_response(restart: &LaunchdRestart) -> PanicLoopResponse
 /// Minimum process uptime before a panic loop may ask launchd for a restart.
 /// A process that was itself just restarted and loops again falls to the slow
 /// respawn path, so a deterministic panic cannot kickstart forever.
-pub(super) const MIN_UPTIME_FOR_KICKSTART_SECS: u64 = 600;
+const MIN_UPTIME_FOR_KICKSTART_SECS: u64 = 600;
 
-pub(super) fn may_kickstart(uptime: Duration) -> bool {
+fn may_kickstart(uptime: Duration) -> bool {
     uptime.as_secs() >= MIN_UPTIME_FOR_KICKSTART_SECS
 }
 
 /// When this process started (first call wins; the supervisor primes it).
-pub(super) fn process_uptime() -> Duration {
+fn process_uptime() -> Duration {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     START.get_or_init(std::time::Instant::now).elapsed()
 }
 
 /// Backoff between respawns once a panic loop was detected and no restart
 /// was possible.
-pub(super) const PANIC_LOOP_BACKOFF_SECS: u64 = 300;
+const PANIC_LOOP_BACKOFF_SECS: u64 = 300;
 
 /// Backoff between a `poll_loop` panic and respawning it.
-pub(super) const PANIC_RESPAWN_BACKOFF_SECS: u64 = 5;
+const PANIC_RESPAWN_BACKOFF_SECS: u64 = 5;
 
 /// Best-effort human string for a `catch_unwind` payload (usually a `&str` or
 /// `String` from a `panic!`/`unwrap`/`expect` message; anything else — a
 /// custom payload type — falls back to a fixed string rather than failing to
 /// log at all).
-pub(super) fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -194,7 +194,7 @@ pub(super) fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
 /// Whether the binary at `now` should be relaunched into: it differs from the
 /// one this process started from, and a relaunch into it hasn't already failed
 /// (a failure isn't retried every 10s; a newer binary is tried again).
-pub(super) fn relaunch_due(
+fn relaunch_due(
     start: &std::path::Path,
     now: &std::path::Path,
     failed: Option<&std::path::Path>,
@@ -204,7 +204,7 @@ pub(super) fn relaunch_due(
 
 /// Outcome of attempting a launchd-driven restart.
 #[cfg_attr(not(unix), allow(dead_code))]
-pub(super) enum LaunchdRestart {
+enum LaunchdRestart {
     /// kickstart succeeded — the caller should wait to be replaced.
     Issued,
     /// We're launchd-managed but kickstart failed — caller must NOT exit.
@@ -217,7 +217,7 @@ pub(super) enum LaunchdRestart {
 /// (`launchctl kickstart -k`). We wait on the command's exit status — reporting
 /// success only when the kickstart actually took, so a failed request can't lead
 /// the caller to exit into a dead, unrestarted state.
-pub(super) fn relaunch_via_launchd() -> LaunchdRestart {
+fn relaunch_via_launchd() -> LaunchdRestart {
     if !is_launchd_managed() {
         return LaunchdRestart::NotManaged;
     }
@@ -268,7 +268,7 @@ pub(crate) fn watchdog_self_restart() -> bool {
 // restricts outside `src/platform/`). `cfg(unix)`/`cfg(not(unix))` aren't
 // `target_os` checks, so this needs no allowlist entry.
 #[cfg(unix)]
-pub(super) fn relaunch_via_launchd_kickstart() -> LaunchdRestart {
+fn relaunch_via_launchd_kickstart() -> LaunchdRestart {
     let uid = unsafe { libc::getuid() };
     let target = format!("gui/{uid}/{}", crate::cli::install::AUTOSTART_LABEL);
     crate::logging::log(&format!("relaunching via launchctl kickstart -k {target}"));
@@ -293,19 +293,19 @@ pub(super) fn relaunch_via_launchd_kickstart() -> LaunchdRestart {
 /// Windows — it exists purely so `relaunch_via_launchd` compiles without
 /// `libc` (a unix-only dependency).
 #[cfg(not(unix))]
-pub(super) fn relaunch_via_launchd_kickstart() -> LaunchdRestart {
+fn relaunch_via_launchd_kickstart() -> LaunchdRestart {
     LaunchdRestart::NotManaged
 }
 
 /// Whether we're the launchd-managed agent. `XPC_SERVICE_NAME` is set by launchd
 /// to the job label for a LaunchAgent, so a manual `usagio menubar` run
 /// (which self-spawns fine) isn't misrouted to the kickstart path.
-pub(super) fn is_launchd_managed() -> bool {
+fn is_launchd_managed() -> bool {
     launchd_managed_from_env(std::env::var("XPC_SERVICE_NAME").ok().as_deref())
 }
 
 /// Pure predicate behind `is_launchd_managed`, split out for testing.
-pub(super) fn launchd_managed_from_env(xpc_service_name: Option<&str>) -> bool {
+fn launchd_managed_from_env(xpc_service_name: Option<&str>) -> bool {
     xpc_service_name == Some(crate::cli::install::AUTOSTART_LABEL)
 }
 

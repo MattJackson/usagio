@@ -5,7 +5,7 @@ use super::render::{pct, u16len};
 use chrono::{DateTime, Utc};
 
 /// The engine's view of an account row (display only).
-pub(super) fn account_in_for(a: &AcctView) -> crate::autoswap::AccountIn {
+fn account_in_for(a: &AcctView) -> crate::autoswap::AccountIn {
     use crate::autoswap::{AccountIn, WindowIn};
     let pct_of = |id: &str| a.windows.iter().find(|w| w.id == id).and_then(|w| w.pct);
     AccountIn {
@@ -36,7 +36,7 @@ pub(super) fn binding_for(
 
 /// Displayed binding window per (provider, account), with hysteresis. In
 /// memory only (not persisted, R2-M2).
-pub(super) static BINDING_SHOWN: std::sync::Mutex<
+static BINDING_SHOWN: std::sync::Mutex<
     Option<std::collections::HashMap<String, crate::autoswap::runway::BindingShown>>,
 > = std::sync::Mutex::new(None);
 
@@ -49,12 +49,12 @@ thread_local! {
 /// Whether [`shown_binding`] skips its hysteresis state: never in the app; in
 /// tests unless the thread opted into the real path.
 #[cfg(test)]
-pub(super) fn binding_hysteresis_bypassed() -> bool {
+fn binding_hysteresis_bypassed() -> bool {
     !REAL_BINDING_HYSTERESIS.with(std::cell::Cell::get)
 }
 
 #[cfg(not(test))]
-pub(super) const fn binding_hysteresis_bypassed() -> bool {
+const fn binding_hysteresis_bypassed() -> bool {
     false
 }
 
@@ -132,7 +132,7 @@ pub(super) fn binding_span(
 }
 
 /// `~Nm` / `~Nh Mm` for a minute count.
-pub(super) fn short_minutes(m: f64) -> String {
+fn short_minutes(m: f64) -> String {
     if !m.is_finite() {
         return "—".to_string();
     }

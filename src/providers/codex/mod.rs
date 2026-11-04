@@ -28,10 +28,8 @@
 //! process-exit verification, startup and cached-account verification. Session
 //! ownership belongs to Codex and is distinct from credential identity.
 
-#![allow(dead_code)]
-
 mod client;
-pub mod oauth;
+pub(crate) mod oauth;
 
 use std::path::PathBuf;
 
@@ -145,11 +143,11 @@ fn capture_blob(blob: String) -> PResult<CapturedAccount> {
 }
 
 /// Constructor called from `providers::build()` behind the `codex` feature.
-pub fn new() -> Box<dyn Provider> {
+pub(crate) fn new() -> Box<dyn Provider> {
     Box::new(CodexProvider)
 }
 
-pub struct CodexProvider;
+pub(crate) struct CodexProvider;
 
 /// Codex rate-limit / usage endpoint. The ChatGPT backend variant works for
 /// tokens issued by the standard ChatGPT-plan OAuth flow the CLI uses.
@@ -188,9 +186,7 @@ fn usage_url() -> String {
 /// The ChatGPT plan from the usage response's `plan_type` ("plus", "pro",
 /// "prolite", "free", …). A "free" plan has no Codex allowance of its own —
 /// that's what a lapsed subscription drops to.
-pub(crate) fn parse_plan(
-    body: &serde_json::Value,
-) -> Option<crate::providers::trait_def::PlanStatus> {
+fn parse_plan(body: &serde_json::Value) -> Option<crate::providers::trait_def::PlanStatus> {
     let raw = body.get("plan_type")?.as_str()?;
     let label = match raw {
         "free" => "Free".to_string(),
@@ -213,7 +209,7 @@ pub(crate) fn parse_plan(
 /// `unlimited`, `overage_limit_reached`, `balance` as a decimal string in
 /// Codex credits — not a currency). Preserve an explicit zero balance so
 /// accounts without credits still show the same menu row.
-pub(crate) fn parse_credits(body: &serde_json::Value) -> Option<Credits> {
+fn parse_credits(body: &serde_json::Value) -> Option<Credits> {
     let c = body.get("credits")?.as_object()?;
     let flag = |k: &str| c.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
     // The backend sends ten decimal places ("636.4935245000"); two read fine.
@@ -362,7 +358,7 @@ fn apply_reported_lock(
 /// grant, so the menu shows one is available. `usable_now` follows
 /// `applicable_available_count` (a reset that would apply right now). The id
 /// carries the count so a newly banked reset announces itself again.
-pub(crate) fn parse_reset_credits(body: &Value) -> Vec<ResetGrant> {
+fn parse_reset_credits(body: &Value) -> Vec<ResetGrant> {
     let Some(c) = body
         .get("rate_limit_reset_credits")
         .and_then(Value::as_object)
@@ -1004,7 +1000,7 @@ fn fetch_usage_as(access_token: &str, account_id: Option<&str>) -> PResult<Usage
 /// same shape (to pull `refresh_token` and check `last_refresh` staleness)
 /// without duplicating this struct.
 #[derive(Debug, Deserialize)]
-pub(super) struct AuthDotJson {
+struct AuthDotJson {
     #[serde(default)]
     pub(super) tokens: TokenData,
     /// RFC 3339 timestamp of the last successful refresh. Absent on a blob
@@ -1012,11 +1008,11 @@ pub(super) struct AuthDotJson {
     /// token, the 8-day cadence from here is the refresh due time
     /// (`access_expires_at`), as in the Codex client.
     #[serde(default)]
-    pub(super) last_refresh: Option<String>,
+    last_refresh: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
-pub(super) struct TokenData {
+struct TokenData {
     #[serde(default)]
     pub(super) id_token: Option<String>,
     #[serde(default)]
@@ -1030,7 +1026,7 @@ pub(super) struct TokenData {
 /// Codex's proactive refresh cadence for an access token whose expiry it
 /// cannot read (`TOKEN_REFRESH_INTERVAL`, 8 days, in openai/codex
 /// `login/src/auth/manager.rs`).
-pub(super) const REFRESH_INTERVAL_SECS: i64 = 8 * 86_400;
+const REFRESH_INTERVAL_SECS: i64 = 8 * 86_400;
 
 /// When a Codex access token is due for refresh (unix seconds), judged the
 /// way the Codex client judges it (`proactive_refresh_reason`): the access
@@ -1038,7 +1034,7 @@ pub(super) const REFRESH_INTERVAL_SECS: i64 = 8 * 86_400;
 /// id_token's `exp` describes the ID token, not the access token, so it is
 /// only a last resort for a blob with neither (it errs early). `None` when
 /// nothing is known.
-pub(super) fn access_expires_at(
+fn access_expires_at(
     access_token: &str,
     last_refresh: Option<&str>,
     id_token: Option<&str>,
@@ -1088,7 +1084,7 @@ fn blob_account_id(parsed: &AuthDotJson) -> Option<String> {
         })
 }
 
-pub(super) fn parse_codex_blob(blob: &str) -> PResult<AuthDotJson> {
+fn parse_codex_blob(blob: &str) -> PResult<AuthDotJson> {
     let v: AuthDotJson = serde_json::from_str(blob)
         .map_err(|e| ProviderError::Other(format!("parsing codex auth.json: {e}")))?;
     if v.tokens.access_token.is_empty() {
@@ -1123,7 +1119,7 @@ fn ensure_file_backend(auth_path: &std::path::Path) -> PResult<()> {
     }
 }
 
-pub(super) fn auth_json_path() -> Option<PathBuf> {
+fn auth_json_path() -> Option<PathBuf> {
     // An empty `CODEX_HOME` counts as unset (as in Codex itself and
     // `context_ledger::codex`); otherwise the path would be cwd-relative.
     if let Some(h) = crate::paths::path_env_var("CODEX_HOME").filter(|h| !h.is_empty()) {
@@ -1159,7 +1155,7 @@ fn fs_ctx<T>(r: std::io::Result<T>, op: &str, path: &std::path::Path) -> PResult
 /// the tmp file so a secret-bearing orphan never survives (H4 finding from
 /// the same audit).
 #[cfg(unix)]
-pub(super) fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult<()> {
+fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -1224,7 +1220,7 @@ const WINDOWS_RENAME_RETRIES: u32 = 3;
 const WINDOWS_RENAME_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[cfg(not(unix))]
-pub(super) fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult<()> {
+fn write_auth_json_atomically(path: &std::path::Path, contents: &str) -> PResult<()> {
     let dir = path
         .parent()
         .ok_or_else(|| ProviderError::Other("auth.json path has no parent directory".into()))?;
@@ -1265,7 +1261,7 @@ pub(super) fn write_auth_json_atomically(path: &std::path::Path, contents: &str)
 /// claims we would trust the provider to have written. `pub(super)` so
 /// `oauth.rs` can compute `expires_in_secs` from a freshly-refreshed
 /// `access_token`/`id_token` the same way capture does.
-pub(super) fn jwt_payload_claims(jwt: &str) -> Option<serde_json::Map<String, Value>> {
+fn jwt_payload_claims(jwt: &str) -> Option<serde_json::Map<String, Value>> {
     let mut parts = jwt.split('.');
     let _hdr = parts.next()?;
     let payload = parts.next()?;

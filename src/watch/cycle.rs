@@ -36,7 +36,7 @@ pub(crate) struct SwapGuard {
     // `State::manual_hold`, refreshed every cycle. Auto-swap stays on it
     // until it is exhausted or lapses, and never prepares a switch away from
     // it while every account is blocked.
-    pub(crate) manual_locked_choice: Option<(String, String)>,
+    manual_locked_choice: Option<(String, String)>,
     // Any account the user switched to by hand, as `(slug, key)`. Mirrors
     // `State::manual_pick`. Blocks proactive flip-back off it; reaching the
     // trigger still swaps.
@@ -46,14 +46,14 @@ pub(crate) struct SwapGuard {
     pub(crate) use_credits: bool,
     // Auto-swap v2's in-memory shell state for this provider (request
     // budget, decision-log dedupe). Its persisted memory is in state.json.
-    pub(crate) v2: autoswap::shell::ShellState,
+    v2: autoswap::shell::ShellState,
 }
 
 /// Anti-thrash state for every provider: one independent `SwapGuard` each, so
 /// a Codex swap never starts Claude's cooldown or no-return window.
 #[derive(Default)]
 pub(crate) struct SwapGuards {
-    pub(crate) by_provider: std::collections::HashMap<String, SwapGuard>,
+    by_provider: std::collections::HashMap<String, SwapGuard>,
 }
 
 impl SwapGuards {
@@ -64,40 +64,40 @@ impl SwapGuards {
 
 /// One switchable provider's result for a poll cycle.
 pub(crate) struct ProviderCycle {
-    pub slug: String,
+    pub(crate) slug: String,
     /// The provider's active account after this cycle (post-swap).
-    pub active: Option<String>,
+    pub(crate) active: Option<String>,
     /// The swap made this cycle, if any: (from, to).
-    pub swapped: Option<(String, String)>,
+    pub(crate) swapped: Option<(String, String)>,
     /// The active account's usage fetch was rate-limited (HTTP 429).
-    pub rate_limited: bool,
+    pub(crate) rate_limited: bool,
     /// Accounts whose usage was fetched this cycle.
-    pub fetched: usize,
+    pub(crate) fetched: usize,
     /// Accounts whose token refresh or usage fetch failed this cycle.
-    pub failed: usize,
+    pub(crate) failed: usize,
     /// The ACTIVE account's `Row::max_pct()` (session OR weekly, whichever is
     /// tighter), feeding `next_interval`'s cadence ramp. v0.5.13: scoped to the
     /// active account (see `cadence_max_pct`) so an inactive, already-maxed
     /// account can't pin the cadence at the 30s backstop indefinitely.
-    pub max_pct: Option<f64>,
+    pub(crate) max_pct: Option<f64>,
     /// Whether a swap is actionable this cycle: an eligible target exists for
     /// the active account, even if a cooldown currently blocks it. Feeds
     /// `next_interval` so the 30s backstop only engages when there is actually
     /// something to catch — a maxed active account with no eligible target
     /// (single-account user, or all others full/needs_relogin) falls back to
     /// BASE instead of hammering the usage endpoint into HTTP 429 (v0.5.17).
-    pub actionable: bool,
+    pub(crate) actionable: bool,
     /// Auto-swap v2's urgency for this provider (`None` under the classic
     /// engine): selects the v2 cadence (60 s TIGHT floor, 120 s band cap).
-    pub urgency: Option<autoswap::Urgency>,
+    pub(crate) urgency: Option<autoswap::Urgency>,
     /// Auto-swap v2's next check time (estimate crossing, reset, cooldown
     /// expiry, pre-verify refresh): the loop wakes then even with no fetch due.
-    pub next_check_at: Option<DateTime<Utc>>,
+    pub(crate) next_check_at: Option<DateTime<Utc>>,
 }
 
 /// Result of one poll: one entry per switchable provider with accounts.
 pub(crate) struct CycleOutcome {
-    pub providers: Vec<ProviderCycle>,
+    pub(crate) providers: Vec<ProviderCycle>,
 }
 
 /// `verify_swap_target`, telling a 429 (`Err(true)`, which arms the v2 storm
@@ -396,7 +396,7 @@ pub(crate) fn watch_cycle(
 /// Test entry point (`watch_cycle` dispatches inline so it can carry the v2
 /// urgency to the cadence): v2 delegates to `autoswap::shell::run_cycle`.
 #[cfg(test)]
-pub(crate) fn provider_swap_cycle(
+fn provider_swap_cycle(
     slug: &str,
     rows: &mut [Row],
     active_email: &str,

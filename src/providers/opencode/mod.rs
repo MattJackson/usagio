@@ -61,15 +61,13 @@
 //! no `TokenLifecycle` is exposed, so no active refresh runs.
 //! Revisit this file when v0.6 designs the multi-provider account model.
 
-#![allow(dead_code)]
-
 use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
-pub fn new() -> Box<dyn Provider> {
+pub(crate) fn new() -> Box<dyn Provider> {
     Box::new(OpencodeProvider)
 }
 
-pub struct OpencodeProvider;
+struct OpencodeProvider;
 
 // Not wired yet (no capability exposed):
 // TODO: read `~/.local/share/opencode/auth.json` (or the

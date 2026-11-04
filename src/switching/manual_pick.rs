@@ -12,7 +12,7 @@ use crate::{autoswap, logging};
 /// proactive flip-back (`State::manual_picks`) and auto-swaps off at the
 /// trigger like any other.
 #[cfg(test)]
-pub(crate) fn pick_holds(state: &State, slug: &str, key: &str) -> bool {
+fn pick_holds(state: &State, slug: &str, key: &str) -> bool {
     pick_tier(state, slug, key) >= autoswap::Tier::Draining
 }
 
@@ -41,7 +41,7 @@ pub(crate) fn tier_for_pct(pct: f64, trigger: f64) -> autoswap::Tier {
 
 /// How long after a manual switch its first reading still settles whether
 /// the pick holds (see `settle_manual_pick`).
-pub(crate) const MANUAL_PICK_SETTLE_SECS: i64 = autoswap::policy::MANUAL_PICK_SETTLE_S;
+const MANUAL_PICK_SETTLE_SECS: i64 = autoswap::policy::MANUAL_PICK_SETTLE_S;
 
 /// Re-decide `slug`'s manual hold on the first reading of the picked account
 /// taken after the switch. `pick_holds` decided from the cached reading, which
@@ -50,12 +50,7 @@ pub(crate) const MANUAL_PICK_SETTLE_SECS: i64 = autoswap::policy::MANUAL_PICK_SE
 /// A reading later than `MANUAL_PICK_SETTLE_SECS` after the switch (usage
 /// 429s can delay it) no longer says where the pick started, so it keeps the
 /// switch-time decision. Returns whether `state` changed.
-pub(crate) fn settle_manual_pick(
-    state: &mut State,
-    slug: &str,
-    rows: &[Row],
-    trigger: f64,
-) -> bool {
+fn settle_manual_pick(state: &mut State, slug: &str, rows: &[Row], trigger: f64) -> bool {
     let Some(at) = state.manual_pick_at.get(slug).copied() else {
         return false;
     };
@@ -90,12 +85,7 @@ pub(crate) fn settle_manual_pick(
 /// left over would keep auto-swap from preparing the soonest-resetting
 /// account when it runs out again. The pick itself stays (it still blocks
 /// proactive flip-back). Returns whether `state` changed.
-pub(crate) fn release_reset_hold(
-    state: &mut State,
-    slug: &str,
-    rows: &[Row],
-    trigger: f64,
-) -> bool {
+fn release_reset_hold(state: &mut State, slug: &str, rows: &[Row], trigger: f64) -> bool {
     if state.manual_pick_at.contains_key(slug) {
         return false; // first post-switch reading still decides the hold
     }

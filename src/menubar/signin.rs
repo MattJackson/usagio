@@ -38,7 +38,7 @@ pub(super) fn handle_renew(slug: &str, key: &str) {
     begin_login_after_superseding(&s, move || begin_renew(&slug, &key));
 }
 
-pub(super) fn begin_renew(slug: &str, key: &str) {
+fn begin_renew(slug: &str, key: &str) {
     let Some(provider) = providers::get(slug) else {
         return;
     };
@@ -82,7 +82,7 @@ pub(super) fn handle_sign_in(slug: &str) {
     begin_login_after_superseding(slug, move || begin_sign_in(&owned));
 }
 
-pub(super) fn begin_sign_in(slug: &str) {
+fn begin_sign_in(slug: &str) {
     let Some(provider) = providers::get(slug) else {
         return;
     };
@@ -114,7 +114,7 @@ pub(super) fn begin_sign_in(slug: &str) {
 
 /// Show a started login in the sign-in window, or the default browser where
 /// no window can be shown here. UI thread only.
-pub(super) fn show_sign_in(title: &str, slug: &str, store: &str, started: &crate::login::Started) {
+fn show_sign_in(title: &str, slug: &str, store: &str, started: &crate::login::Started) {
     let platform = crate::platform();
     present_sign_in(
         slug,
@@ -136,7 +136,7 @@ pub(super) fn show_sign_in(title: &str, slug: &str, store: &str, started: &crate
 /// [`show_sign_in`]'s logic with the window and browser injected: try the
 /// window, fall back to the browser, and track the flow either way so a newer
 /// sign-in for `slug` can stop it (and free its port).
-pub(super) fn present_sign_in(
+fn present_sign_in(
     slug: &str,
     store: [u8; 16],
     started: &crate::login::Started,
@@ -167,11 +167,10 @@ pub(super) fn present_sign_in(
 /// Sign-in window stores of flows still running. A flow whose window closed
 /// can still save its account (the code was already received), so its store
 /// is kept until the flow ends.
-pub(super) static FLOW_STORES: std::sync::Mutex<
-    Vec<([u8; 16], std::sync::Arc<crate::login::Progress>)>,
-> = std::sync::Mutex::new(Vec::new());
+static FLOW_STORES: std::sync::Mutex<Vec<([u8; 16], std::sync::Arc<crate::login::Progress>)>> =
+    std::sync::Mutex::new(Vec::new());
 
-pub(super) fn track_flow_store(store: [u8; 16], progress: std::sync::Arc<crate::login::Progress>) {
+fn track_flow_store(store: [u8; 16], progress: std::sync::Arc<crate::login::Progress>) {
     let mut flows = FLOW_STORES.lock().unwrap_or_else(|e| e.into_inner());
     flows.retain(|(_, p)| !p.is_finished());
     flows.push((store, progress));
@@ -205,7 +204,7 @@ pub(super) fn sweep_sign_in_stores() {
     sweep_sign_in_stores_with(|keep| crate::platform().sweep_sign_in_stores(keep));
 }
 
-pub(super) fn sweep_sign_in_stores_with(sweep: impl FnOnce(std::collections::HashSet<[u8; 16]>)) {
+fn sweep_sign_in_stores_with(sweep: impl FnOnce(std::collections::HashSet<[u8; 16]>)) {
     match State::load() {
         Ok(st) => sweep(sign_in_stores_to_keep(&st)),
         Err(e) => crate::logging::log(&format!("event=sign_in_store_sweep_skipped reason={e:#}")),
@@ -218,16 +217,16 @@ pub(crate) fn sweep_sign_in_stores_later() {
 }
 
 /// "dev@example.com renewed — login good until Oct 31 · live now".
-pub(super) fn renewed_message(r: &crate::login::Renewed) -> String {
+fn renewed_message(r: &crate::login::Renewed) -> String {
     login_message(format!("{} renewed", r.key), r)
 }
 
 /// "Added dev@example.com — login good until Oct 31".
-pub(super) fn added_message(r: &crate::login::Renewed) -> String {
+fn added_message(r: &crate::login::Renewed) -> String {
     login_message(format!("Added {}", r.key), r)
 }
 
-pub(super) fn login_message(mut msg: String, r: &crate::login::Renewed) -> String {
+fn login_message(mut msg: String, r: &crate::login::Renewed) -> String {
     if let Some(at) = r.login_expires_at.and_then(DateTime::from_timestamp_millis) {
         msg.push_str(&format!(
             " — login good until {}",
@@ -245,11 +244,11 @@ pub(super) fn login_message(mut msg: String, r: &crate::login::Renewed) -> Strin
 /// open (possibly hidden) window or a closed tab would otherwise keep its
 /// loopback listener — Codex's fixed port 1455 included — and the new flow
 /// could not bind. A superseded window closes itself once its flow ends.
-pub(super) static IN_FLIGHT_LOGINS: std::sync::Mutex<
+static IN_FLIGHT_LOGINS: std::sync::Mutex<
     Option<std::collections::HashMap<String, std::sync::Arc<crate::login::Progress>>>,
 > = std::sync::Mutex::new(None);
 
-pub(super) fn track_login(slug: &str, progress: std::sync::Arc<crate::login::Progress>) {
+fn track_login(slug: &str, progress: std::sync::Arc<crate::login::Progress>) {
     let replaced = IN_FLIGHT_LOGINS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -264,9 +263,7 @@ pub(super) fn track_login(slug: &str, progress: std::sync::Arc<crate::login::Pro
 /// Supersede the previous login for `slug`, if any. Never blocks; the
 /// caller waits for the listener to be released ([`wait_released`]) off the UI
 /// thread before binding the same port again.
-pub(super) fn supersede_previous_login(
-    slug: &str,
-) -> Option<std::sync::Arc<crate::login::Progress>> {
+fn supersede_previous_login(slug: &str) -> Option<std::sync::Arc<crate::login::Progress>> {
     let prev = IN_FLIGHT_LOGINS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -282,7 +279,7 @@ pub(super) fn supersede_previous_login(
 }
 
 /// Wait (briefly) until a superseded flow's worker has released its listener.
-pub(super) fn wait_released(prev: &crate::login::Progress) {
+fn wait_released(prev: &crate::login::Progress) {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while !prev.is_finished() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
@@ -291,10 +288,10 @@ pub(super) fn wait_released(prev: &crate::login::Progress) {
 
 /// Latest sign-in click per provider, so a worker still waiting for an old
 /// listener never starts (and then supersedes) a flow begun by a newer click.
-pub(super) static LOGIN_GEN: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+static LOGIN_GEN: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
     std::sync::Mutex::new(None);
 
-pub(super) fn login_gen(slug: &str, bump: bool) -> u64 {
+fn login_gen(slug: &str, bump: bool) -> u64 {
     let mut m = LOGIN_GEN.lock().unwrap_or_else(|e| e.into_inner());
     let g = m
         .get_or_insert_with(Default::default)
@@ -312,7 +309,7 @@ pub(super) fn login_gen(slug: &str, bump: bool) -> u64 {
 /// flow to release its listener — never the UI thread — and then hands
 /// `begin` back to the UI thread ([`run_on_ui_thread`]). A newer click made
 /// meanwhile wins: the handed-back `begin` then starts nothing.
-pub(super) fn begin_login_after_superseding(slug: &str, begin: impl FnOnce() + Send + 'static) {
+fn begin_login_after_superseding(slug: &str, begin: impl FnOnce() + Send + 'static) {
     let gen = login_gen(slug, true);
     match supersede_previous_login(slug) {
         None => begin(),

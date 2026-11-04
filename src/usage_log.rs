@@ -35,37 +35,37 @@ use crate::store;
 /// The whole point of the history log — every field is here so downstream
 /// analyses (sparkline, pace, burn rate, cost) never have to re-derive them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Snapshot {
-    pub ts: DateTime<Utc>,
-    pub provider: String,
-    pub account: String,
+pub(crate) struct Snapshot {
+    pub(crate) ts: DateTime<Utc>,
+    pub(crate) provider: String,
+    pub(crate) account: String,
     #[serde(default)]
-    pub session_pct: Option<f32>,
+    pub(crate) session_pct: Option<f32>,
     #[serde(default)]
-    pub weekly_pct: Option<f32>,
+    pub(crate) weekly_pct: Option<f32>,
     #[serde(default)]
-    pub active_model: Option<String>,
+    pub(crate) active_model: Option<String>,
     /// Whether the account was the provider's active one (0.12.2+; replay).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active: Option<bool>,
+    pub(crate) active: Option<bool>,
     /// The windows' reported resets (0.12.2+; replay).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_reset: Option<DateTime<Utc>>,
+    pub(crate) session_reset: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub weekly_reset: Option<DateTime<Utc>>,
+    pub(crate) weekly_reset: Option<DateTime<Utc>>,
     /// When the reading in this row was fetched (unix secs; 0.12.2+). A
     /// 429/err/skip row repeats the cached reading, so this is older than `ts`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fetched_at: Option<i64>,
+    pub(crate) fetched_at: Option<i64>,
     /// `"ok"`, `"429"`, `"err"` or `"skip"` (0.12.2+). Rows without it are
     /// pre-0.12.2 successful readings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outcome: Option<String>,
+    pub(crate) outcome: Option<String>,
 }
 
 impl Snapshot {
     /// A successful reading (not a 429/err/skip row repeating the cache).
-    pub fn is_reading(&self) -> bool {
+    pub(crate) fn is_reading(&self) -> bool {
         self.outcome.as_deref().is_none_or(|o| o == "ok")
     }
 }
@@ -75,13 +75,13 @@ impl Snapshot {
 /// upcoming burn/cost modules). String-typed for portability across the state
 /// v1 (email-keyed) and future v2 (bucket-keyed) layouts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub struct AccountKey {
-    pub provider: String,
-    pub account: String,
+pub(crate) struct AccountKey {
+    pub(crate) provider: String,
+    pub(crate) account: String,
 }
 
 impl AccountKey {
-    pub fn new(provider: impl Into<String>, account: impl Into<String>) -> Self {
+    pub(crate) fn new(provider: impl Into<String>, account: impl Into<String>) -> Self {
         Self {
             provider: provider.into(),
             account: account.into(),
@@ -93,11 +93,11 @@ impl AccountKey {
 /// `slope_pct_per_hour` is percentage points per hour; `confidence` is R² of
 /// the fit (0..=1); `sample_count` is the number of samples used.
 #[derive(Debug, Clone)]
-pub struct PaceEstimate {
-    pub slope_pct_per_hour: f64,
-    pub confidence: f64,
+pub(crate) struct PaceEstimate {
+    pub(crate) slope_pct_per_hour: f64,
+    pub(crate) confidence: f64,
     #[allow(dead_code)] // rendered by v0.5.0 pace/burn detail row
-    pub sample_count: usize,
+    pub(crate) sample_count: usize,
 }
 
 /// Batch fsyncs every this many appended rows. The daemon polls on the order
@@ -140,7 +140,7 @@ fn month_path_ym(dir: &Path, year: i32, month: u32) -> PathBuf {
 /// Append `snap` to the current month's history file. Rotation-pruning runs
 /// once per process (first append), month-boundary handoff is automatic (the
 /// appender reopens when the target path changes). O_APPEND-atomic per line.
-pub fn append(snap: &Snapshot) -> Result<()> {
+pub(crate) fn append(snap: &Snapshot) -> Result<()> {
     let dir = log_dir()?;
     std::fs::create_dir_all(&dir).context("creating history dir")?;
     // Prune stale month files on the first append per process.
@@ -168,7 +168,7 @@ pub fn append(snap: &Snapshot) -> Result<()> {
 /// `RETAIN_DAYS` and mark this process as having rotated. Cheap; safe to call
 /// repeatedly. `now` is threaded through so tests can pin a moment in time.
 #[allow(dead_code)] // wired into daily maintenance loop in v0.5.0
-pub fn rotate_if_needed(now: DateTime<Utc>) -> Result<()> {
+fn rotate_if_needed(now: DateTime<Utc>) -> Result<()> {
     let dir = log_dir()?;
     std::fs::create_dir_all(&dir).context("creating history dir")?;
     rotate_files(&dir, now)?;
@@ -185,7 +185,7 @@ pub fn rotate_if_needed(now: DateTime<Utc>) -> Result<()> {
 /// by a process-wide mtime-keyed cache: month files whose mtime is unchanged
 /// since the last read are served from memory. Cache is invalidated as soon
 /// as any tracked month file's mtime advances.
-pub fn last_n_days(account: &AccountKey, days: u32) -> Vec<Snapshot> {
+pub(crate) fn last_n_days(account: &AccountKey, days: u32) -> Vec<Snapshot> {
     let Ok(dir) = log_dir() else {
         return Vec::new();
     };
@@ -210,7 +210,7 @@ fn history_aliases() -> &'static Mutex<HashMap<AccountKey, AccountKey>> {
 }
 
 /// Make `provider`/`legacy` rows read as `provider`/`key`'s history.
-pub fn register_history_alias(provider: &str, key: &str, legacy: &str) {
+pub(crate) fn register_history_alias(provider: &str, key: &str, legacy: &str) {
     if let Ok(mut aliases) = history_aliases().lock() {
         aliases.insert(
             AccountKey::new(provider, key.to_ascii_lowercase()),
@@ -531,7 +531,7 @@ pub(crate) fn evict_recent_months() {
 /// Most recent snapshot for `account` in the current + previous month's
 /// history files, or `None` if this account has no rows yet. Used by the
 /// notifications module to derive a "prev" for the pair-based `evaluate`.
-pub fn last_snapshot(account: &AccountKey) -> Option<Snapshot> {
+pub(crate) fn last_snapshot(account: &AccountKey) -> Option<Snapshot> {
     let dir = log_dir().ok()?;
     let now = Utc::now();
     // Read enough history to survive a month boundary just after midnight UTC.
@@ -573,7 +573,7 @@ pub fn last_snapshot(account: &AccountKey) -> Option<Snapshot> {
 /// for `account`, oldest bucket on the left. Missing day = `·`. Cutoffs at
 /// 0/20/40/60/80 map to ▁▂▄▇█.
 #[allow(dead_code)] // wired into v0.5.0 sparkline row
-pub fn sparkline_7d(account: &AccountKey) -> String {
+fn sparkline_7d(account: &AccountKey) -> String {
     let snaps = last_n_days(account, 7);
     sparkline_from_snaps(&snaps, Local::now().date_naive())
 }
@@ -582,7 +582,7 @@ pub fn sparkline_7d(account: &AccountKey) -> String {
 /// most recent reset), as slope + R² confidence + sample count. Returns None
 /// if the current window has fewer than 6 samples or the slope is not
 /// strictly positive.
-pub fn pace(account: &AccountKey) -> Option<PaceEstimate> {
+pub(crate) fn pace(account: &AccountKey) -> Option<PaceEstimate> {
     let snaps = last_n_days(account, 8);
     pace_from_snaps(&snaps)
 }
@@ -601,7 +601,7 @@ fn decisions_path(dir: &Path, ts: DateTime<Utc>) -> PathBuf {
 /// history log). One `write_all` of the whole line with O_APPEND, so
 /// concurrent writers never interleave a line. Rare (one line per decision change), so no
 /// batching.
-pub fn append_decision(v: &serde_json::Value) -> Result<()> {
+pub(crate) fn append_decision(v: &serde_json::Value) -> Result<()> {
     let dir = log_dir()?;
     std::fs::create_dir_all(&dir).context("creating history dir")?;
     if !BOOT_ROTATED.swap(true, Ordering::SeqCst) {
@@ -622,7 +622,7 @@ pub fn append_decision(v: &serde_json::Value) -> Result<()> {
 
 /// Every decision line in this month's decisions log (tests and replay).
 #[cfg(test)]
-pub fn read_decisions() -> Vec<serde_json::Value> {
+pub(crate) fn read_decisions() -> Vec<serde_json::Value> {
     let Ok(dir) = log_dir() else {
         return Vec::new();
     };

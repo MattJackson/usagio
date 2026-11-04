@@ -11,10 +11,10 @@ use tungstenite::{Message, WebSocket};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ClientState {
-    pub busy: bool,
-    pub email: Option<String>,
-    pub account_id: Option<String>,
-    pub instance_token: Option<String>,
+    pub(crate) busy: bool,
+    pub(crate) email: Option<String>,
+    pub(crate) account_id: Option<String>,
+    pub(crate) instance_token: Option<String>,
 }
 
 struct Proxy {

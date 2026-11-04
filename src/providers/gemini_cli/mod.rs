@@ -10,15 +10,13 @@
 //!  - Usage endpoint: POST `https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist`.
 //!  - Single-slot; second Google login overwrites the keychain entry.
 
-#![allow(dead_code)]
-
 use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
-pub fn new() -> Box<dyn Provider> {
+pub(crate) fn new() -> Box<dyn Provider> {
     Box::new(GeminiCliProvider)
 }
 
-pub struct GeminiCliProvider;
+struct GeminiCliProvider;
 
 // Not wired yet (no capability exposed):
 // TODO: read the macOS Keychain entry `gemini-cli-oauth`/`main-account`

@@ -13,15 +13,13 @@
 //!    rate-limit-status endpoint that "does not consume rate limit points"
 //!    (path not published in the pages consulted).
 
-#![allow(dead_code)]
-
 use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
-pub fn new() -> Box<dyn Provider> {
+pub(crate) fn new() -> Box<dyn Provider> {
     Box::new(CursorAgentProvider)
 }
 
-pub struct CursorAgentProvider;
+struct CursorAgentProvider;
 
 // Not wired yet (no capability exposed):
 // TODO: with `AGENT_CLI_CREDENTIAL_STORE=file`, read

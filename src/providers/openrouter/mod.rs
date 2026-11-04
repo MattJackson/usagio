@@ -15,15 +15,13 @@
 //!  - Switching is not planned (the CLI reads `OPENROUTER_API_KEY`; the
 //!    menu will only rewrite the env / config, not multi-slot swap).
 
-#![allow(dead_code)]
-
 use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
-pub fn new() -> Box<dyn Provider> {
+pub(crate) fn new() -> Box<dyn Provider> {
     Box::new(OpenRouterProvider)
 }
 
-pub struct OpenRouterProvider;
+struct OpenRouterProvider;
 
 // Not wired yet (no capability exposed):
 // API-key providers don't participate in the "read the vendor CLI's

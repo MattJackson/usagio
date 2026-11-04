@@ -73,7 +73,7 @@ use crate::providers::Provider;
 static PLATFORM: std::sync::OnceLock<Box<dyn platform::Platform>> = std::sync::OnceLock::new();
 
 /// Return the process-global platform impl, initializing it on first call.
-pub(crate) fn platform() -> &'static dyn platform::Platform {
+fn platform() -> &'static dyn platform::Platform {
     PLATFORM.get_or_init(platform::current).as_ref()
 }
 

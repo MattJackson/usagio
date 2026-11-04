@@ -592,7 +592,7 @@ pub(crate) fn refresh_usage_cache_with(force: bool, defer_active: bool) -> Refre
 /// freshly reloaded account `a`. Tokens are already saved (rotations by
 /// `oauth::ensure_fresh`, active-slot adoptions by the CAS). Everything here
 /// guards against reverting what a concurrent writer saved since the snapshot.
-pub(crate) fn merge_poll_update(
+fn merge_poll_update(
     a: &mut Account,
     snap: &Account,
     cu: Option<&CachedUsage>,
@@ -726,7 +726,7 @@ pub(crate) fn v2_active_fetch_skip(
 
 /// The cached reading has a window at the limit that hasn't reset yet (a
 /// lower bound, valid at any age): an lb-blocked account.
-pub(crate) fn active_cache_lb_blocked(cu: &CachedUsage, now: DateTime<Utc>) -> bool {
+fn active_cache_lb_blocked(cu: &CachedUsage, now: DateTime<Utc>) -> bool {
     let parse = |s: &Option<String>| {
         s.as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())

@@ -196,15 +196,13 @@ pub(crate) fn cached_from_usage(u: &usage::Usage) -> CachedUsage {
 /// asked again. The balance only moves on top-ups and credit spend, so one
 /// request per account every few minutes is plenty; without this every poll
 /// (down to 30 s) cost an extra request per credits-enabled account.
-pub(crate) const PREPAID_REFRESH_SECS: i64 = 10 * 60;
+const PREPAID_REFRESH_SECS: i64 = 10 * 60;
 
 /// Per-account `(attempted_at, fetched balance)` of the last `prepaid/credits`
 /// request. A failed attempt is recorded too (as `None`), so an erroring
 /// endpoint is not retried every poll.
-pub(crate) type PrepaidCache =
-    std::collections::HashMap<String, (i64, Option<providers::trait_def::Money>)>;
-pub(crate) static PREPAID_CACHE: std::sync::Mutex<Option<PrepaidCache>> =
-    std::sync::Mutex::new(None);
+type PrepaidCache = std::collections::HashMap<String, (i64, Option<providers::trait_def::Money>)>;
+static PREPAID_CACHE: std::sync::Mutex<Option<PrepaidCache>> = std::sync::Mutex::new(None);
 
 /// Fill in the real prepaid wallet balance for an account with credits on.
 /// `/usage` reports `spend.balance: null` even when the wallet holds money, so
@@ -217,7 +215,7 @@ pub(crate) fn attach_prepaid_balance(cu: &mut CachedUsage, acct: &Account) {
     });
 }
 
-pub(crate) fn attach_prepaid_balance_with(
+fn attach_prepaid_balance_with(
     cu: &mut CachedUsage,
     acct: &Account,
     now: i64,
@@ -300,7 +298,7 @@ impl Row {
     }
 }
 
-pub(crate) fn cell_from_parts(pct: Option<f64>, reset: Option<&str>) -> Cell {
+fn cell_from_parts(pct: Option<f64>, reset: Option<&str>) -> Cell {
     Cell {
         pct,
         resets_at: reset

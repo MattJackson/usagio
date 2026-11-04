@@ -20,7 +20,7 @@ use super::{tokenize, ItemKind, LedgerError, LedgerItem};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
+pub(crate) fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     let mut items = Vec::new();
     let Some(home) = crate::paths::user_home() else {
         return Ok(items);

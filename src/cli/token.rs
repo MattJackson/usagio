@@ -16,7 +16,7 @@ use crate::{logging, providers};
 // ---------------------------------------------------------------------------
 
 /// `usagio token` is Claude-only: accept `claude:<x>`, reject other qualifiers.
-pub(crate) fn token_selector(sel: &str) -> Result<&str> {
+fn token_selector(sel: &str) -> Result<&str> {
     match sel.split_once(':') {
         Some((q, rest)) if q.eq_ignore_ascii_case(CLAUDE_SLUG) => Ok(rest),
         Some((q, _)) => bail!("`usagio token` is Claude-only; '{q}:' accounts are not supported"),
@@ -49,7 +49,7 @@ pub(crate) fn poll_active_cas(
 /// slot is unreadable the stored token is returned rather than POST. Returns
 /// `None` once the account is no longer active. Runs under the state lock
 /// (`active_refresh_cas` may write the slot), like `claim_refresh_token`.
-pub(crate) fn token_active_cas(
+fn token_active_cas(
     provider: &dyn Provider,
     email: &str,
 ) -> Result<Option<(ActiveRefreshOutcome, Account)>> {

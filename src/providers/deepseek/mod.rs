@@ -13,15 +13,13 @@
 //!  - Usage: DeepSeek's balance / usage endpoint wiring lands in a later
 //!    phase.
 
-#![allow(dead_code)]
-
 use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
-pub fn new() -> Box<dyn Provider> {
+pub(crate) fn new() -> Box<dyn Provider> {
     Box::new(DeepSeekProvider)
 }
 
-pub struct DeepSeekProvider;
+struct DeepSeekProvider;
 
 // Not wired yet (no capability exposed):
 // TODO: derive account_id = `<nickname>-<last-4-of-key>`, persist

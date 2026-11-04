@@ -13,15 +13,13 @@
 //!  - Note: new signups end 2026-05-15, full end-of-support 2027-04-30
 //!    (Kiro migration) — flag as sunsetting.
 
-#![allow(dead_code)]
-
 use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
-pub fn new() -> Box<dyn Provider> {
+pub(crate) fn new() -> Box<dyn Provider> {
     Box::new(AmazonQProvider)
 }
 
-pub struct AmazonQProvider;
+struct AmazonQProvider;
 
 // Not wired yet (no capability exposed):
 // TODO: open the SQLite DB at

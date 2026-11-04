@@ -46,8 +46,8 @@ use {
 
 pub(crate) mod actions;
 pub(crate) mod backup;
-pub(crate) mod binding;
-pub(crate) mod cross_platform;
+mod binding;
+mod cross_platform;
 pub(crate) mod model;
 pub(crate) mod poller;
 #[cfg(all(target_os = "macos", feature = "custom-popup"))]
@@ -66,12 +66,12 @@ pub(crate) mod tray;
 /// `platform::MenuBackend` trait instead (`cross_platform::run`, near the end
 /// of this file).
 #[cfg(not(target_os = "macos"))]
-pub fn run() -> Result<()> {
+pub(crate) fn run() -> Result<()> {
     cross_platform::run()
 }
 
 #[cfg(target_os = "macos")]
-pub fn run() -> Result<()> {
+pub(crate) fn run() -> Result<()> {
     // Register providers on the main thread before anything else — the poll
     // thread and menu build both dispatch through `providers::get`.
     providers::init();

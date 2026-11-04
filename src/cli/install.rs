@@ -12,7 +12,7 @@ pub(crate) const AUTOSTART_LABEL: &str = "com.mattjackson.usagio.menubar";
 /// Previous launchd label (pre-v0.4.0). Referenced only by the one-shot
 /// migration in `cmd_install` — unload + remove the old plist before
 /// registering the new label so upgraded users don't run two agents.
-pub(crate) const LEGACY_AUTOSTART_LABEL: &str = "com.claude-usage.menubar";
+const LEGACY_AUTOSTART_LABEL: &str = "com.claude-usage.menubar";
 
 // ---------------------------------------------------------------------------
 // Autostart install / uninstall — delegate to the platform Autostart backend
@@ -57,7 +57,7 @@ pub(crate) fn launch_agent_exe_path() -> std::path::PathBuf {
 
 /// [`launch_agent_exe_path`] over an injected `current_exe` and stable-path
 /// resolver, so the bundle-preference rules are testable.
-pub(crate) fn resolve_launch_agent_exe(
+fn resolve_launch_agent_exe(
     current: std::path::PathBuf,
     stable: impl FnOnce() -> std::path::PathBuf,
 ) -> std::path::PathBuf {
@@ -91,7 +91,7 @@ pub(crate) fn resolve_launch_agent_exe(
 ///      (`../usagio.app/Contents/MacOS/usagio` from `bin/`). Not upgrade-
 ///      stable for brew but doesn't apply to brew installs.
 ///   3. Otherwise, `None` — callers fall back to the bare `stable_exe_path()`.
-pub(crate) fn sibling_app_bundle_exe(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+fn sibling_app_bundle_exe(exe: &std::path::Path) -> Option<std::path::PathBuf> {
     // (1) Homebrew stable opt-path — the correct answer for a brew install.
     if let Some(bin_dir) = exe.parent() {
         if let Some(prefix) = bin_dir.parent() {
@@ -167,7 +167,7 @@ pub(crate) fn cmd_uninstall() -> Result<()> {
 /// `com.claude-usage.menubar.plist` still exists in `~/Library/LaunchAgents/`,
 /// unload it (best-effort) and remove the file so it doesn't run in parallel
 /// with the new `com.mattjackson.usagio.menubar` agent.
-pub(crate) fn migrate_launchd_if_needed() {
+fn migrate_launchd_if_needed() {
     let Some(home) = std::env::var_os("HOME") else {
         return;
     };
@@ -226,7 +226,7 @@ pub(crate) fn migrate_launchd_if_needed() {
 /// unconditional call is a no-op there without needing an explicit gate.
 /// Also a no-op if the login item is already absent on macOS — `osascript`
 /// exiting non-zero in that case is the expected, swallowed outcome.
-pub(crate) fn purge_legacy_login_items() {
+fn purge_legacy_login_items() {
     for name in ["usagio", "claude-usage"] {
         let mut cmd = std::process::Command::new("/usr/bin/osascript");
         cmd.args([
@@ -241,7 +241,7 @@ pub(crate) fn purge_legacy_login_items() {
 
 /// Run `cmd`, killing it if it outlives `deadline` (no dependency on
 /// `timeout(1)`, which stock macOS does not ship). `Ok(true)` on exit 0.
-pub(crate) fn run_with_deadline(
+fn run_with_deadline(
     mut cmd: std::process::Command,
     deadline: std::time::Duration,
 ) -> std::io::Result<bool> {

@@ -73,10 +73,10 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_LINE_BYTES: u64 = 1 << 20;
 
 #[derive(Debug)]
-pub struct McpSummary {
-    pub tool_count: usize,
-    pub token_count: usize,
-    pub byte_count: usize,
+pub(crate) struct McpSummary {
+    pub(crate) tool_count: usize,
+    pub(crate) token_count: usize,
+    pub(crate) byte_count: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,17 +91,18 @@ struct StdioConfig {
 /// A fully resolved stdio server launch: exactly what gets spawned.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Launch {
-    pub command: String,
-    pub args: Vec<String>,
-    pub env: Vec<(String, String)>,
+    pub(crate) command: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) env: Vec<(String, String)>,
     /// Start from an empty environment (Codex) instead of inheriting ours.
-    pub clear_env: bool,
-    pub cwd: Option<std::path::PathBuf>,
+    pub(crate) clear_env: bool,
+    pub(crate) cwd: Option<std::path::PathBuf>,
 }
 
 /// Probe a Claude-Code-shaped server config (`{type?, command, args, env}`).
-#[cfg(test)]
-pub fn fetch_tools(config: &Value) -> Result<McpSummary, String> {
+/// Test-only, and only the unix test suite (which spawns `sh` servers) uses it.
+#[cfg(all(test, unix))]
+pub(crate) fn fetch_tools(config: &Value) -> Result<McpSummary, String> {
     fetch_launch(&claude_launch(config)?)
 }
 

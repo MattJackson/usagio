@@ -36,14 +36,14 @@ pub(super) fn shared_swap_guard() -> std::sync::Arc<std::sync::Mutex<SwapGuards>
 
 /// Settle margin (seconds) after a window's reset instant before the poller
 /// wakes to refresh it — the vendor's usage counter needs a beat to roll over.
-pub(super) const RESET_SETTLE_SECS: u64 = 5;
+const RESET_SETTLE_SECS: u64 = 5;
 
 /// Seconds until the soonest upcoming session/weekly reset across all accounts,
 /// plus [`RESET_SETTLE_SECS`]. `None` when no account has a known future reset.
 /// Lets `poll_loop` wake at the reset boundary (refresh + swap immediately)
 /// rather than waiting out the cadence — the reason a just-reset account showed
 /// a stale near-100% instead of its fresh 0%.
-pub(super) fn next_reset_wake_secs() -> Option<u64> {
+fn next_reset_wake_secs() -> Option<u64> {
     let now = now_utc();
     build_snapshot()
         .sections
@@ -60,19 +60,19 @@ pub(super) fn next_reset_wake_secs() -> Option<u64> {
 /// than this is slept in chunks no bigger than this so the loop re-evaluates
 /// promptly after a system suspend/resume rather than riding out a stale
 /// reading for the rest of a long interval. 30s = the backstop cadence.
-pub(super) const SLEEP_CHUNK_SECS: u64 = 30;
+const SLEEP_CHUNK_SECS: u64 = 30;
 
 /// If the wall clock advances by more than the chunk we asked to sleep plus
 /// this slack, the machine was suspended across the chunk (system sleep, lid
 /// close, battery-death). We compare wall-clock deltas, not the monotonic
 /// sleep return, because that gap is the whole signal.
-pub(super) const SUSPEND_GAP_SLACK_SECS: u64 = 8;
+const SUSPEND_GAP_SLACK_SECS: u64 = 8;
 
 /// Whether a chunk's *wall-clock* elapsed indicates the machine was suspended
 /// mid-sleep (so the poller should refresh immediately on resume instead of
 /// finishing a now-stale interval). Pure + testable; the sleep mechanics call
 /// it with real deltas.
-pub(super) fn is_suspend_gap(intended_chunk_secs: u64, actual_elapsed_secs: u64) -> bool {
+fn is_suspend_gap(intended_chunk_secs: u64, actual_elapsed_secs: u64) -> bool {
     actual_elapsed_secs > intended_chunk_secs.saturating_add(SUSPEND_GAP_SLACK_SECS)
 }
 
@@ -83,7 +83,7 @@ pub(super) fn is_suspend_gap(intended_chunk_secs: u64, actual_elapsed_secs: u64)
 /// staleness). Returns `false` on an ordinary, uninterrupted sleep. Uses
 /// `SystemTime` wall-clock deltas since the monotonic sleep timer can itself
 /// pause across a suspend.
-pub(super) fn sleep_bounded_detecting_suspend(total: u64) -> bool {
+fn sleep_bounded_detecting_suspend(total: u64) -> bool {
     let mut remaining = total;
     while remaining > 0 {
         let chunk = remaining.min(SLEEP_CHUNK_SECS);
@@ -108,11 +108,11 @@ pub(super) fn sleep_bounded_detecting_suspend(total: u64) -> bool {
 
 /// Delay before refreshing a newly active account after an auto-swap — just
 /// long enough for Claude Code to pick up the new credentials.
-pub(super) const POST_SWITCH_REFRESH_SECS: u64 = 5;
+const POST_SWITCH_REFRESH_SECS: u64 = 5;
 
 /// Set by [`request_poll_now`]; the poller's sleep waits on the condvar so a
 /// request cuts the current sleep short.
-pub(super) static POLL_REQUEST: (std::sync::Mutex<bool>, std::sync::Condvar) =
+static POLL_REQUEST: (std::sync::Mutex<bool>, std::sync::Condvar) =
     (std::sync::Mutex::new(false), std::sync::Condvar::new());
 
 /// Ask the poller to run its next cycle now. Called after a switch so the new
@@ -131,7 +131,7 @@ pub(super) static ENGINE_DISPLAY_ONLY: std::sync::atomic::AtomicBool =
 
 /// Wait up to `timeout` for a [`request_poll_now`]; returns (and clears) the
 /// request flag. Behaves like `thread::sleep(timeout)` when nothing is asked.
-pub(super) fn wait_for_poll_request(timeout: Duration) -> bool {
+fn wait_for_poll_request(timeout: Duration) -> bool {
     let (lock, cv) = &POLL_REQUEST;
     let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let (mut guard, _) = cv
@@ -145,11 +145,11 @@ pub(super) fn wait_for_poll_request(timeout: Duration) -> bool {
 /// command-line overrides. One loop for both, so they can't drift.
 pub(crate) struct LoopOpts {
     /// Overrides the configured trigger (`usagio watch --trigger`).
-    pub trigger: Option<f64>,
+    pub(crate) trigger: Option<f64>,
     /// Lowers the swap-target session ceiling (`usagio watch --ceiling`).
-    pub ceiling: Option<f64>,
+    pub(crate) ceiling: Option<f64>,
     /// Base cadence (`usagio watch --interval`).
-    pub base: u64,
+    pub(crate) base: u64,
 }
 
 impl Default for LoopOpts {
@@ -232,7 +232,7 @@ pub(crate) fn poll_loop_with(opts: &LoopOpts) {
 /// on a panic, before the supervisor's respawn backoff) releases the flock, so
 /// it also marks this process display-only: another process may take the lock
 /// in that window, and a manual refresh here must not run a second engine.
-pub(super) struct EngineLock {
+struct EngineLock {
     pub(super) _file: Option<std::fs::File>,
 }
 
@@ -247,7 +247,7 @@ impl Drop for EngineLock {
 /// open file (the lock lives as long as it does); it holds no file if the lock
 /// file can't be used at all — then this process runs the engine anyway rather
 /// than never polling.
-pub(super) fn acquire_engine_lock() -> EngineLock {
+fn acquire_engine_lock() -> EngineLock {
     use fs2::FileExt;
     let mut logged = false;
     loop {

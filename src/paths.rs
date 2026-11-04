@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 // -------------------------------------------------------------------------
 
 #[derive(Debug)]
-pub enum MigrationResult {
+pub(crate) enum MigrationResult {
     /// Neither the old nor new config directory existed. Fresh install.
     FreshInstall,
     /// The new directory already exists; nothing to do.
@@ -34,7 +34,7 @@ pub enum MigrationResult {
 // new tree as populated. Suppress the "field never read" lint file-locally.
 #[allow(dead_code)]
 #[derive(Debug)]
-pub enum MigrationError {
+pub(crate) enum MigrationError {
     /// Neither `$XDG_CONFIG_HOME` nor `$HOME` resolved to a usable base dir.
     NoConfigBase,
     /// Creating the parent config base (usually `~/.config/`) failed.
@@ -61,7 +61,7 @@ pub enum MigrationError {
 /// so `migrate_between` will observe `(false, ...)` for the old dir and
 /// return `FreshInstall` / `AlreadyMigrated`. No false "config migration
 /// FAILED" message can fire from a stock Windows install without `$HOME` set.
-pub fn migrate_config_dir_if_needed() -> Result<MigrationResult, MigrationError> {
+pub(crate) fn migrate_config_dir_if_needed() -> Result<MigrationResult, MigrationError> {
     // Route through the Platform trait so each OS's real config dir is used —
     // NOT a hardcoded `$HOME/.config`. Both dirs share the same parent (the
     // `parent()` of the new-slug config dir is the base we'd have joined
@@ -86,7 +86,7 @@ fn migrate_for_config_dir(new_dir: PathBuf) -> Result<MigrationResult, Migration
 }
 
 /// Test-friendly form: caller supplies the exact old and new paths.
-pub fn migrate_between(old: &Path, new: &Path) -> Result<MigrationResult, MigrationError> {
+fn migrate_between(old: &Path, new: &Path) -> Result<MigrationResult, MigrationError> {
     // Use symlink_metadata so a symlink at `old` is treated as the entity
     // being moved (we rename the link itself, not chase its target).
     let old_exists = old.symlink_metadata().is_ok();
@@ -288,7 +288,7 @@ pub(crate) const APP_SLUG: &str = "usagio";
 /// Previous slug (pre-v0.4.0). Referenced only by the one-shot migration
 /// in `paths::migrate_config_dir_if_needed` — do not use for any live
 /// path construction.
-pub(crate) const LEGACY_APP_SLUG: &str = "claude-usage";
+const LEGACY_APP_SLUG: &str = "claude-usage";
 
 #[cfg(test)]
 mod tests {

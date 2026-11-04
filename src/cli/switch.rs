@@ -106,12 +106,7 @@ pub(crate) fn cmd_switch(selector: Option<&str>, launch: Option<Launch>) -> Resu
     finish_claude_switch(&email, launch, false)
 }
 
-pub(crate) fn finish_provider_switch(
-    slug: &str,
-    key: &str,
-    launch: Option<Launch>,
-    hold: bool,
-) -> Result<()> {
+fn finish_provider_switch(slug: &str, key: &str, launch: Option<Launch>, hold: bool) -> Result<()> {
     let provider = provider_by_slug(slug)?;
     if launch.is_some() && !provider.capabilities().supports_launch {
         bail!("launching {} is not supported", provider.display_name());
@@ -134,7 +129,7 @@ pub(crate) fn finish_provider_switch(
 /// Re-drive the queued switch to `key` until it leaves the queue, calling
 /// `pause(secs)` between attempts. Each re-drive probes the client (a
 /// subprocess for Codex), so back off from 1s to 5s while it is still busy.
-pub(crate) fn wait_for_queued_provider_switch(
+fn wait_for_queued_provider_switch(
     slug: &str,
     key: &str,
     hold: bool,
@@ -153,7 +148,7 @@ pub(crate) fn wait_for_queued_provider_switch(
 
 /// After waiting out a queued switch: bail unless `key` really became active
 /// (the queue may have been superseded or cancelled instead).
-pub(crate) fn ensure_switch_landed(slug: &str, key: &str, label: &str) -> Result<()> {
+fn ensure_switch_landed(slug: &str, key: &str, label: &str) -> Result<()> {
     let active = State::load()?
         .provider_accounts(slug)
         .and_then(|pa| pa.active.clone());
@@ -163,10 +158,7 @@ pub(crate) fn ensure_switch_landed(slug: &str, key: &str, label: &str) -> Result
     bail!("the queued switch to {label} ({slug}) did not complete; it is not the active login")
 }
 
-pub(crate) fn launch_selected_client(
-    provider: &dyn Provider,
-    launch: Option<Launch>,
-) -> Result<()> {
+fn launch_selected_client(provider: &dyn Provider, launch: Option<Launch>) -> Result<()> {
     let Some(launch) = launch else {
         return Ok(());
     };
@@ -184,7 +176,7 @@ pub(crate) fn launch_selected_client(
 
 /// Shared tail of `cmd_switch` for a resolved Claude email: perform the
 /// switch, print the confirmation, and optionally launch `claude`.
-pub(crate) fn finish_claude_switch(email: &str, launch: Option<Launch>, hold: bool) -> Result<()> {
+fn finish_claude_switch(email: &str, launch: Option<Launch>, hold: bool) -> Result<()> {
     let label = switch_to(email, hold)?;
 
     println!("Active login is now {label}.");

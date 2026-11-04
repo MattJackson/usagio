@@ -37,7 +37,7 @@ pub(crate) fn resolve_codex_dir(
     }
 }
 
-pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
+pub(crate) fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     let mut items = Vec::new();
     let Some(codex_dir) = codex_dir() else {
         return Ok(items);

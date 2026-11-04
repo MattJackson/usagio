@@ -31,16 +31,20 @@ use crate::providers::trait_def::{LoginSpec, Provider, TokenRequestStyle};
 mod tests;
 
 /// How long the user has to finish signing in before the attempt is dropped.
-pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// An account whose login dies within this window is offered "Renew login…".
 /// Matches Claude Code's own "Your login expires in N days" warning (3 days).
-pub const RENEW_WINDOW_SECS: i64 = 3 * 24 * 60 * 60;
+pub(crate) const RENEW_WINDOW_SECS: i64 = 3 * 24 * 60 * 60;
 
 /// Whether to warn now that a login expiring at `expires_at` is about to die:
 /// inside the renew window, not yet dead, and not already warned for this
 /// exact expiry. Pure.
-pub fn should_warn_expiry(expires_at: Option<i64>, now_ms: i64, warned: Option<i64>) -> bool {
+pub(crate) fn should_warn_expiry(
+    expires_at: Option<i64>,
+    now_ms: i64,
+    warned: Option<i64>,
+) -> bool {
     let Some(at) = expires_at else {
         return false;
     };
@@ -51,13 +55,13 @@ pub fn should_warn_expiry(expires_at: Option<i64>, now_ms: i64, warned: Option<i
 // PKCE + authorize URL
 // ---------------------------------------------------------------------------
 
-pub struct Pkce {
-    pub verifier: String,
-    pub challenge: String,
+struct Pkce {
+    verifier: String,
+    challenge: String,
 }
 
 /// RFC 7636 S256: a 256-bit random verifier and its SHA-256 challenge.
-pub fn pkce() -> Pkce {
+fn pkce() -> Pkce {
     let verifier = random_token(32);
     let challenge = challenge_for(&verifier);
     Pkce {
@@ -67,7 +71,7 @@ pub fn pkce() -> Pkce {
 }
 
 /// `BASE64URL(SHA256(verifier))`, RFC 7636 §4.2.
-pub fn challenge_for(verifier: &str) -> String {
+fn challenge_for(verifier: &str) -> String {
     b64url(&Sha256::digest(verifier.as_bytes()))
 }
 
@@ -81,7 +85,7 @@ fn b64url(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-pub fn authorize_url(
+pub(crate) fn authorize_url(
     spec: &LoginSpec,
     challenge: &str,
     state: &str,
@@ -115,7 +119,7 @@ pub fn authorize_url(
 
 /// What one request to the loopback listener carried.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Callback {
+enum Callback {
     /// The authorization code for our `state`.
     Code(String),
     /// The vendor redirected back with an OAuth error (user denied, …).
@@ -125,7 +129,7 @@ pub enum Callback {
 }
 
 /// Classify a request target (`/callback?code=…&state=…`). Pure.
-pub fn parse_callback(target: &str, path: &str, state: &str) -> Callback {
+fn parse_callback(target: &str, path: &str, state: &str) -> Callback {
     let Ok(url) = url::Url::parse(&format!("http://localhost{target}")) else {
         return Callback::Ignore;
     };
@@ -198,13 +202,13 @@ fn bind_redirect_listener(
     bail!("sign-in redirect port {port} is already in use")
 }
 
-pub struct Loopback {
+struct Loopback {
     /// `127.0.0.1:port`, plus `[::1]:port` when the redirect host is the name
     /// `localhost`: the browser may resolve that to either address, and an
     /// address we left unbound could be taken by another local process to
     /// receive the redirect (code + state) instead of us.
     listeners: Vec<TcpListener>,
-    pub redirect_uri: String,
+    redirect_uri: String,
     path: &'static str,
 }
 
@@ -212,7 +216,7 @@ pub struct Loopback {
 const DUAL_BIND_ATTEMPTS: usize = 8;
 
 impl Loopback {
-    pub fn bind(spec: &LoginSpec) -> Result<Self> {
+    pub(crate) fn bind(spec: &LoginSpec) -> Result<Self> {
         let fixed = spec.redirect_port;
         let both = spec.redirect_host.eq_ignore_ascii_case("localhost");
         let attempts = if fixed.is_some() || !both {
@@ -261,18 +265,13 @@ impl Loopback {
 
     /// The port the redirect comes back to.
     #[cfg(test)]
-    pub fn port(&self) -> u16 {
+    fn port(&self) -> u16 {
         self.listeners[0].local_addr().unwrap().port()
     }
 
     /// Serve the redirect until it brings back a code for `state`, the user
     /// gives up (`cancel`), or `timeout` passes.
-    pub fn wait_for_code(
-        &self,
-        state: &str,
-        timeout: Duration,
-        cancel: &AtomicBool,
-    ) -> Result<String> {
+    fn wait_for_code(&self, state: &str, timeout: Duration, cancel: &AtomicBool) -> Result<String> {
         let deadline = Instant::now() + timeout;
         loop {
             if cancel.load(Ordering::SeqCst) {
@@ -412,7 +411,7 @@ fn page(title: &str, text: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Trade the authorization code for tokens at the provider's token endpoint.
-pub fn exchange(
+fn exchange(
     spec: &LoginSpec,
     code: &str,
     verifier: &str,
@@ -459,7 +458,7 @@ pub fn exchange(
 
 /// Shared between the engine's worker thread and whatever shows the page.
 #[derive(Default)]
-pub struct Progress {
+pub(crate) struct Progress {
     finished: AtomicBool,
     cancelled: AtomicBool,
     superseded: AtomicBool,
@@ -467,54 +466,54 @@ pub struct Progress {
 
 impl Progress {
     /// The flow ended (success or failure) — close the sign-in page.
-    pub fn is_finished(&self) -> bool {
+    pub(crate) fn is_finished(&self) -> bool {
         self.finished.load(Ordering::SeqCst)
     }
     /// Mark the flow ended, as its worker does on exit.
     #[cfg(test)]
-    pub fn mark_finished(&self) {
+    pub(crate) fn mark_finished(&self) {
         self.finished.store(true, Ordering::SeqCst);
     }
     /// The sign-in page was closed, or a newer login superseded this flow.
     #[cfg(test)]
-    pub fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
     /// A newer login for the same provider replaced this flow.
-    pub fn is_superseded(&self) -> bool {
+    pub(crate) fn is_superseded(&self) -> bool {
         self.superseded.load(Ordering::SeqCst)
     }
     /// Stop this flow because a newer one is starting: like [`cancel`](Self::cancel),
     /// but the flow ends quietly (no failure notification).
-    pub fn supersede(&self) {
+    pub(crate) fn supersede(&self) {
         self.superseded.store(true, Ordering::SeqCst);
         self.cancel();
     }
     /// The user closed the sign-in page — stop waiting.
-    pub fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
     }
 }
 
 /// A saved login.
 #[derive(Debug, Clone)]
-pub struct Renewed {
-    pub key: String,
+pub(crate) struct Renewed {
+    pub(crate) key: String,
     /// When the new login dies (unix millis), if the provider says.
-    pub login_expires_at: Option<i64>,
+    pub(crate) login_expires_at: Option<i64>,
     /// The account was active, so the vendor CLI's live login was rewritten.
-    pub made_live: bool,
+    pub(crate) made_live: bool,
 }
 
 /// A flow waiting for the user. Show `url`, then `progress` says when to stop.
-pub struct Started {
-    pub url: String,
-    pub progress: Arc<Progress>,
+pub(crate) struct Started {
+    pub(crate) url: String,
+    pub(crate) progress: Arc<Progress>,
 }
 
 /// What a login is for.
 #[derive(Clone, Debug)]
-pub enum Target {
+pub(crate) enum Target {
     /// Renew this account; a sign-in as anyone else is refused (nothing saved).
     Renew(String),
     /// Add whichever account signs in. `store` is the fresh sign-in window
@@ -540,7 +539,7 @@ impl Target {
 }
 
 /// A never-used sign-in store key for "Sign in to a new account…".
-pub fn new_store_key() -> String {
+pub(crate) fn new_store_key() -> String {
     format!("new:{}", random_token(12))
 }
 
@@ -560,7 +559,7 @@ fn wait_and_release(
 
 /// Begin a login for `provider`. `on_done` runs on the worker thread once the
 /// flow ends.
-pub fn start(
+pub(crate) fn start(
     provider: &'static dyn Provider,
     target: Target,
     on_done: impl FnOnce(Result<Renewed>) + Send + 'static,
@@ -626,7 +625,7 @@ pub fn start(
 
 /// Refuse a sign-in as anyone but the account being renewed: the window's
 /// cookie store could hold another account's session.
-pub fn check_signed_in_as(key: &str, expected: Option<&str>) -> Result<()> {
+fn check_signed_in_as(key: &str, expected: Option<&str>) -> Result<()> {
     use crate::providers::trait_def::{key_email, WORKSPACE_KEY_SEP};
     match expected {
         // A legacy email-only key (its workspace was never recorded) is
@@ -649,7 +648,7 @@ pub fn check_signed_in_as(key: &str, expected: Option<&str>) -> Result<()> {
 
 /// Stable per-account identity for the sign-in window's cookie store, so each
 /// account keeps its own vendor session across renewals.
-pub fn store_id(slug: &str, key: &str) -> [u8; 16] {
+pub(crate) fn store_id(slug: &str, key: &str) -> [u8; 16] {
     let digest = Sha256::digest(format!("usagio-login:{slug}:{}", key.to_ascii_lowercase()));
     let mut id = [0u8; 16];
     id.copy_from_slice(&digest[..16]);
@@ -659,7 +658,7 @@ pub fn store_id(slug: &str, key: &str) -> [u8; 16] {
 /// Per-account web data folder (Windows/Linux; macOS uses [`store_id`]).
 // WKWebView stores are keyed by `store_id` instead, so unused on macOS.
 #[allow(dead_code)]
-pub fn store_dir(slug: &str, key: &str) -> Result<PathBuf> {
+pub(crate) fn store_dir(slug: &str, key: &str) -> Result<PathBuf> {
     let hex: String = store_id(slug, key)
         .iter()
         .map(|b| format!("{b:02x}"))

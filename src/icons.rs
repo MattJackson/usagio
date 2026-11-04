@@ -16,13 +16,13 @@
 /// status-item icon beside the `%` title; Windows/Linux use it as the fallback
 /// tray icon when there is no target agent (otherwise the tray shows the
 /// target agent's icon via `png16_for`).
-pub fn usagio_tray_icon() -> &'static [u8] {
+pub(crate) fn usagio_tray_icon() -> &'static [u8] {
     include_bytes!("../assets/icons/usagio.png").as_slice()
 }
 
 /// Bytes of the 16px PNG for the provider identified by `slug`. Returns `None`
 /// if no icon is bundled for that slug. Pure function — safe to call from tests.
-pub fn png16_for(slug: &str) -> Option<&'static [u8]> {
+pub(crate) fn png16_for(slug: &str) -> Option<&'static [u8]> {
     match slug {
         "claude" => Some(include_bytes!("../assets/icons/16/claude-code.png").as_slice()),
         "codex" => Some(include_bytes!("../assets/icons/16/codex.png").as_slice()),

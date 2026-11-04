@@ -126,7 +126,7 @@ pub(crate) fn capture_current() -> Result<(String, bool)> {
 /// The cached usage to keep when (re)capturing an account: the snapshot we
 /// already had for this email, if any (capture only refreshes identity/tokens; a
 /// freshly captured account has no snapshot of its own). Pure, for tests.
-pub(crate) fn merged_cached_usage(existing: Option<&Account>) -> Option<CachedUsage> {
+fn merged_cached_usage(existing: Option<&Account>) -> Option<CachedUsage> {
     existing.and_then(|a| a.cached_usage.clone())
 }
 
@@ -314,7 +314,7 @@ pub(crate) fn persist_login(
     })
 }
 
-pub(crate) fn persist_claude_login(
+fn persist_claude_login(
     provider: &dyn providers::trait_def::Provider,
     email: String,
     captured: providers::trait_def::CapturedAccount,

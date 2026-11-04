@@ -9,7 +9,7 @@ use crate::providers::CLAUDE_SLUG;
 use crate::store::State;
 
 #[derive(serde::Deserialize)]
-pub(crate) struct Sample {
+struct Sample {
     pub(crate) ts: i64,
     #[serde(default)]
     pub(crate) account: Option<String>,
@@ -28,7 +28,7 @@ pub(crate) struct Sample {
 
 /// Swap events `cmd_report` counts. Its usage samples are Claude-only
 /// (`watch_cycle`), so swaps of other providers stay out of its verdict.
-pub(crate) fn report_swap_count(samples: &[Sample]) -> usize {
+fn report_swap_count(samples: &[Sample]) -> usize {
     samples
         .iter()
         .filter(|s| s.event.as_deref() == Some("swap"))
@@ -40,7 +40,7 @@ pub(crate) fn report_swap_count(samples: &[Sample]) -> usize {
 /// the quantity `cmd_report` buckets by weekday/hour. A delta across an account
 /// switch would subtract two unrelated accounts' percentages, so those are
 /// skipped; only increases count. Returns `(timestamp, delta)`. Pure, for tests.
-pub(crate) fn consumption_deltas(active: &[&Sample]) -> Vec<(i64, f64)> {
+fn consumption_deltas(active: &[&Sample]) -> Vec<(i64, f64)> {
     let mut out = Vec::new();
     let mut prev: Option<&Sample> = None;
     for s in active {
@@ -165,7 +165,7 @@ pub(crate) fn cmd_report(args: &[String]) -> Result<()> {
 
 /// `(slug, key)` of every captured account `report --pace` covers: Claude's
 /// (those with an email) then every other provider's.
-pub(crate) fn pace_targets(state: &State) -> Vec<(String, String)> {
+fn pace_targets(state: &State) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = state
         .accounts
         .iter()
@@ -180,7 +180,7 @@ pub(crate) fn pace_targets(state: &State) -> Vec<(String, String)> {
     out
 }
 
-pub(crate) fn cmd_report_pace() -> Result<()> {
+fn cmd_report_pace() -> Result<()> {
     use crate::providers::trait_def::Window;
     use crate::usage_log::AccountKey;
     let state = State::load()?;

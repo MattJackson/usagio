@@ -12,15 +12,13 @@
 //!    the nickname + last-4 disambiguator carries.
 //!  - Usage: Cloud Billing / quota wiring lands in a later phase.
 
-#![allow(dead_code)]
-
 use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
-pub fn new() -> Box<dyn Provider> {
+pub(crate) fn new() -> Box<dyn Provider> {
     Box::new(VertexAiProvider)
 }
 
-pub struct VertexAiProvider;
+struct VertexAiProvider;
 
 // Not wired yet (no capability exposed):
 // TODO: derive account_id = `<nickname>-<last-4-of-key>`, persist

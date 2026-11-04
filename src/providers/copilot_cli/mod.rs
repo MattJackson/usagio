@@ -11,15 +11,13 @@
 //!  - No documented Copilot-CLI usage endpoint; premium-request consumption
 //!    surfaces inline with chat responses (headers-only).
 
-#![allow(dead_code)]
-
 use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
-pub fn new() -> Box<dyn Provider> {
+pub(crate) fn new() -> Box<dyn Provider> {
     Box::new(CopilotCliProvider)
 }
 
-pub struct CopilotCliProvider;
+struct CopilotCliProvider;
 
 // Not wired yet (no capability exposed):
 // TODO: read the `copilot-cli` macOS Keychain entry (or the plaintext

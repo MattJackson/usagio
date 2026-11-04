@@ -16,7 +16,7 @@ use crate::{autoswap, logging};
 /// close" case and can breathe.
 pub(crate) const WATCH_INTERVAL_SECS: u64 = 180;
 /// Upper bound for the poll interval when backing off after a 429.
-pub(crate) const WATCH_MAX_INTERVAL_SECS: u64 = 1200;
+const WATCH_MAX_INTERVAL_SECS: u64 = 1200;
 /// Swap away from the active account when it reaches this utilization.
 pub(crate) const TRIGGER_PCT: f64 = 95.0;
 
@@ -81,12 +81,12 @@ pub(crate) fn cadence_max_pct(rows: &[Row], active: Option<&str>) -> Option<f64>
 /// that prevents any single account from being pinged faster than its tier
 /// allows, regardless of how tight the loop cadence gets for other accounts.
 pub(crate) const WATCH_TIGHT_BAND: f64 = 5.0;
-pub(crate) const WATCH_MIDDLE_BAND: f64 = 10.0;
-pub(crate) const WATCH_RELAXED_BAND: f64 = 20.0;
-pub(crate) const WATCH_TIGHT_INTERVAL_SECS: u64 = 30;
-pub(crate) const WATCH_MIDDLE_INTERVAL_SECS: u64 = 60;
-pub(crate) const WATCH_RELAXED_INTERVAL_SECS: u64 = 120;
-pub(crate) const WATCH_BACKSTOP_INTERVAL_SECS: u64 = 30;
+const WATCH_MIDDLE_BAND: f64 = 10.0;
+const WATCH_RELAXED_BAND: f64 = 20.0;
+const WATCH_TIGHT_INTERVAL_SECS: u64 = 30;
+const WATCH_MIDDLE_INTERVAL_SECS: u64 = 60;
+const WATCH_RELAXED_INTERVAL_SECS: u64 = 120;
+const WATCH_BACKSTOP_INTERVAL_SECS: u64 = 30;
 
 /// Compute the next poll interval. Priority order:
 ///   1. Rate-limited from Anthropic → exponential backoff, doubling the
@@ -117,7 +117,7 @@ pub(crate) const WATCH_BACKSTOP_INTERVAL_SECS: u64 = 30;
 /// weekly-aware: a weekly window pinned at 99% with a healthy session is just
 /// as "about to lock" as the reverse. `actionable` (v0.5.17) gates the
 /// backstop so a maxed account with nowhere to swap doesn't over-poll.
-pub(crate) fn next_interval(
+fn next_interval(
     current: u64,
     base: u64,
     rate_limited: bool,
@@ -148,7 +148,7 @@ pub(crate) fn next_interval(
 pub(crate) struct Cadence {
     pub(crate) base: u64,
     pub(crate) current: std::collections::HashMap<String, u64>,
-    pub(crate) last_active: std::collections::HashMap<String, Option<String>>,
+    last_active: std::collections::HashMap<String, Option<String>>,
 }
 
 impl Cadence {

@@ -60,7 +60,7 @@ pub(crate) fn switch_to_if_still_active(
 
 /// Phase 1 of a switch (no lock): refresh the token and resolve the identity
 /// over the network, returning what the locked commit phase needs.
-pub(crate) fn prepare_switch(
+fn prepare_switch(
     provider: &'static dyn Provider,
     email: &str,
 ) -> Result<(Account, serde_json::Value, bool)> {
@@ -146,7 +146,7 @@ pub(crate) fn ensure_fresh_with_fallback(
 /// Get a usable bearer for a reset claim. The ACTIVE account's token belongs
 /// to Claude Code: adopt the slot's current one (never POST /token, like
 /// `cmd_token`/`prepare_switch`); any other account refreshes normally.
-pub(crate) fn claim_refresh_token(
+fn claim_refresh_token(
     provider: &'static dyn Provider,
     email: &str,
     acct: &mut Account,
@@ -381,7 +381,7 @@ pub(crate) fn switch_to_guarded(
 /// never captured) — the caller then does NOT switch, rather than half-applying
 /// one. `provider` is threaded through so later phases can dispatch off it; the
 /// v1 body still uses the Claude-specific profile endpoint (behavior-preserving).
-pub(crate) fn resolve_identity(
+fn resolve_identity(
     provider: &'static dyn Provider,
     acct: &Account,
 ) -> Result<(serde_json::Value, bool)> {
