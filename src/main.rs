@@ -2488,6 +2488,19 @@ fn sync_active_from_keychain(provider: &'static dyn Provider, state: &mut State)
         ));
         return;
     }
+    // A renewal whose live write failed left a marker naming the stored grant
+    // the slot never received: the slot is older, not fresher (same rule as
+    // `lifecycle::active_refresh_cas`).
+    if acct.live_write_pending.as_deref()
+        == Some(logging::token_fingerprint(&acct.refresh_token).as_str())
+        && acct.refresh_token != fresh.refresh_token
+    {
+        logging::log(&format!(
+            "event=sync_active_from_keychain account={active} outcome=skipped \
+             reason=pending_live_write"
+        ));
+        return;
+    }
     logging::log(&format!(
         "event=sync_active_from_keychain account={active} outcome=adopted \
          at_prefix={} rt_prefix={}",

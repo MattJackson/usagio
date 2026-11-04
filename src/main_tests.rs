@@ -7630,3 +7630,34 @@ fn unqualified_selector_matching_several_providers_must_be_qualified() {
     let err = resolve_account_selector(&codex_only, "dev").unwrap_err();
     assert!(err.to_string().contains("more than one"), "{err}");
 }
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "reads or writes the OS secret store, which is only hermetic (in-memory) on macOS"
+)]
+fn switch_away_keeps_a_renewal_whose_live_write_failed() {
+    with_claude_home("a@e.com", |_home| {
+        // A was renewed, but publishing the fresh grant to the slot failed:
+        // the slot still holds A's old login.
+        let mut a = claude_account_with_identity("a@e.com", 3_600_000);
+        a.live_write_pending = Some(crate::logging::token_fingerprint(&a.refresh_token));
+        let renewed_rt = a.refresh_token.clone();
+        seed_claude_state(
+            vec![a, claude_account_with_identity("b@e.com", 3_600_000)],
+            Some("a@e.com"),
+        );
+        prime_active_slot(&mock_claude_blob("old-at", "old-rt", 9_999_999_999_999));
+        let provider = providers::get(CLAUDE_SLUG).unwrap();
+        let acct = State::load().unwrap().find("b@e.com").cloned().unwrap();
+        let identity = acct.oauth_account.clone().unwrap();
+        switch_to_guarded(provider, "b@e.com", &acct, &identity, false, None, false).unwrap();
+        let after = State::load().unwrap();
+        assert_eq!(after.active.as_deref(), Some("b@e.com"));
+        assert_eq!(
+            after.find("a@e.com").unwrap().refresh_token,
+            renewed_rt,
+            "the renewed grant was overwritten by the old slot login"
+        );
+    });
+}
