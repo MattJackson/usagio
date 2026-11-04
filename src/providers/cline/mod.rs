@@ -6,8 +6,9 @@
 //!  - No first-party subscription and no first-party quota endpoint — a real
 //!    integration would parse the per-provider keys and hit each vendor's
 //!    own usage endpoint (Cline hub excepted, which has its own usage API).
-//!  - Included in v1 as a stub so the "Capture current login" submenu lists
-//!    it and users understand the scope; no real capture logic wired yet.
+//!  - Included in v1 as a stub (hidden from the "Capture current login"
+//!    submenu while `supports_usage` is false) so the scope is documented; no
+//!    real capture logic wired yet.
 
 #![allow(dead_code)]
 

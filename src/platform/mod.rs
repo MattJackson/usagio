@@ -139,8 +139,8 @@ pub trait Platform: Send + Sync + 'static {
 /// Opaque handle to a live status-bar item / tray icon. Dropping it removes
 /// the item from the bar.
 pub trait MenuHandle: Send {
-    /// Replace the icon (16pt template PNG bytes on macOS; ICO/BMP on Windows;
-    /// PNG on Linux via ksni).
+    /// Replace the icon (PNG bytes on every platform: a 16pt template on
+    /// macOS; decoded via `MuriIcon::from_png` on Windows; ksni on Linux).
     fn set_icon(&self, png_bytes: &[u8]) -> Result<()>;
     /// Replace the tooltip / title shown next to the icon.
     fn set_title(&self, title: &str) -> Result<()>;

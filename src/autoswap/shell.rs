@@ -409,12 +409,7 @@ pub(crate) fn manual_pick_of(state: &State, slug: &str) -> Option<ManualPick> {
         } else {
             Tier::Ready
         });
-    Some(ManualPick {
-        at: state.manual_pick_at.get(slug).copied().unwrap_or(0),
-        settled_by_fresh: !state.manual_pick_at.contains_key(slug),
-        key,
-        settled,
-    })
+    Some(ManualPick { key, settled })
 }
 
 /// `build_snapshot` (§8.1): the switchable-filtered rows of `slug` plus the

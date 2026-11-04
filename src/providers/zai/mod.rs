@@ -1,7 +1,8 @@
 //! Z.AI (Zhipu / GLM) provider — API-KEY STUB.
 //!
-//! Registered so the "Paste API key" submenu can list it, but the real
-//! `capture_api_key` flow is deferred. Nothing here reads credentials or
+//! Registered, but hidden from the "Paste API key" submenu (stubs report
+//! `supports_usage: false`, which `partition_capture_providers` drops) until
+//! the real `capture_api_key` flow lands. Nothing here reads credentials or
 //! hits the network yet.
 //!
 //! Onboarding plan (locked, see workflow context):

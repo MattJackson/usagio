@@ -9,7 +9,9 @@
 //! Menu wiring iterates `providers::all()` and emits one `ProviderSection` per
 //! provider — but only if that provider has at least one captured account in
 //! state (see `build_snapshot`). The "Capture current login ▸" submenu always
-//! shows, with one row per REGISTERED provider (installed or not).
+//! shows, with one row per registered provider that can capture a login
+//! (`supports_usage == false` stubs are hidden; see
+//! `partition_capture_providers`).
 
 use anyhow::Result;
 #[cfg(target_os = "macos")]
@@ -211,16 +213,13 @@ pub(crate) struct ProviderSection {
     accounts: Vec<AcctView>,
 }
 
-/// One row directly under "Capture current login ▸". `installed` is a
-/// best-effort probe used to grey out rows whose
-/// credential store isn't present on this host; the row stays clickable so
-/// errors surface honestly. `capture_mode` decides the click-id prefix
+/// One row directly under "Capture current login ▸". Every row stays
+/// clickable so errors surface honestly. `capture_mode` decides the click-id prefix
 /// (`capture:` vs `apikey:`) that routes to the right handler in
 /// `handle_click`, and orders creds-on-disk providers before API-key ones.
 struct RegisteredProvider {
     provider_id: &'static str,
     display_name: &'static str,
-    installed: bool,
     capture_mode: CaptureMode,
 }
 
@@ -1811,10 +1810,7 @@ fn launchd_managed_from_env(xpc_service_name: Option<&str>) -> bool {
     xpc_service_name == Some(crate::AUTOSTART_LABEL)
 }
 
-/// Run one poll+auto-swap cycle with the configured trigger (Settings ▸
-/// Auto-swap, or `opts.trigger`), returning its outcome and the trigger used
-/// so the caller's cadence math matches what `watch_cycle` dispatched on.
-/// [`run_cycle`], keeping the failure (logged either way) so an explicit
+/// Like [`run_cycle`], keeping the failure (logged either way) so an explicit
 /// Refresh click can say it failed.
 fn run_cycle_checked(
     guards: &mut SwapGuards,
@@ -1839,6 +1835,9 @@ fn run_cycle_checked(
     }
 }
 
+/// Run one poll+auto-swap cycle with the configured trigger (Settings ▸
+/// Auto-swap, or `opts.trigger`), returning its outcome and the trigger used
+/// so the caller's cadence math matches what `watch_cycle` dispatched on.
 fn run_cycle(guards: &mut SwapGuards, force: bool, opts: &LoopOpts) -> (CycleOutcome, f64) {
     let (res, trigger) = run_cycle_checked(guards, force, opts);
     let outcome = res.unwrap_or(CycleOutcome {
@@ -2075,10 +2074,10 @@ fn build_snapshot() -> Snapshot {
     // API-key providers (the click-id prefix differs), but v0.5.2 item 8
     // flattened their RENDERING into one direct child list under "Capture
     // current login ▸" (creds first, then API-key) instead of an API-key-only
-    // "Paste API key ▸" sub-submenu. Either way, a provider stops appearing
-    // here once it has a captured account (i.e. a section above) — that
-    // account now renders in the main list instead (item 9 of the original
-    // redesign: capture is for NEW accounts only once one exists).
+    // "Paste API key ▸" sub-submenu. An API-key provider stops appearing here
+    // once it has a captured account (i.e. a section above) — that account now
+    // renders in the main list instead (item 9 of the original redesign).
+    // Creds-on-disk providers stay listed so a second account can be added.
     let captured_provider_ids: Vec<&str> = sections.iter().map(|s| s.provider_id).collect();
     let (creds_providers, api_key_providers) = capture_menu_providers(&captured_provider_ids);
     let capture_creds: Vec<RegisteredProvider> =
@@ -2109,10 +2108,6 @@ fn register_provider(p: &'static dyn Provider) -> RegisteredProvider {
     RegisteredProvider {
         provider_id: p.provider_id(),
         display_name: p.display_name(),
-        // v1 only knows how to probe the Claude keychain. Everything else
-        // is assumed installed; wrong guesses just surface a real error
-        // on the capture attempt instead of pre-emptively greying out.
-        installed: probe_installed(p.provider_id()),
         capture_mode: p.capabilities().capture_mode,
     }
 }
@@ -2170,17 +2165,6 @@ fn partition_capture_providers<'a>(
     (creds, api_key)
 }
 
-/// Best-effort per-provider "is the credential store present on this host?"
-/// probe used to grey out capture rows. Cheap enough for the 0.75s tick — for
-/// Claude it does an mtime-cached keychain lookup only when state.json changes
-/// (via `cached_state`). Non-Claude providers default to `true` so a stub
-/// provider's row stays enabled and its click reports a real error.
-fn probe_installed(_slug: &str) -> bool {
-    // v1: don't do anything expensive per tick. A future phase can front this
-    // with a TTL cache once real stub providers land.
-    true
-}
-
 /// Identity of one version of state.json: mtime, length and (on unix) inode.
 /// Every save is a tmp+rename, so a new inode tells two saves apart even when
 /// a coarse filesystem clock gives them the same mtime.
@@ -2197,7 +2181,9 @@ fn state_file_key(path: &std::path::Path) -> StateFileKey {
 
 /// Return the parsed state, re-reading state.json only when the file changed
 /// (see [`state_file_key`]). The 0.75s UI tick would otherwise read+parse the
-/// file every tick forever. A Mutex keeps the shared cache sound.
+/// file every tick forever. Called from the main thread, the poller thread
+/// (`next_reset_wake_secs` -> `build_snapshot`) and, on Linux/Windows, the
+/// `redraw_loop` thread, so the Mutex is required.
 fn cached_state() -> State {
     use std::sync::{Mutex, OnceLock};
     struct C {
@@ -2243,14 +2229,6 @@ fn cached_state() -> State {
 // Menu building
 // ---------------------------------------------------------------------------
 
-/// One window's line inside an account submenu, and whether it's a lock.
-/// Percentages live on the account row, so these lines answer only what the
-/// row's bare countdown can't: WHICH window binds and WHEN it frees. The two
-/// states use different verbs so the words alone say which is which: a maxed
-/// window is `<Label> locked · unlocks in <X>` (rendered red, like the row's
-/// countdown); a healthy one `<Label> renews in <X>` ("resets in" beside a
-/// lock read as if that window were locked too). `None` for a healthy window
-/// with no known reset — nothing useful to say.
 /// Whether the window `id` of `a` is `StaleAfterReset`: still at/above the lock
 /// threshold in the cache, but its reset passed and the reading predates it.
 fn window_is_stale_after_reset(a: &AcctView, id: &str, now: DateTime<Utc>) -> bool {
@@ -2282,6 +2260,15 @@ fn at_risk_checked(snap: &Snapshot) -> bool {
     }
 }
 
+/// One window's line inside an account submenu, and whether it's a lock.
+/// Percentages live on the account row, so these lines answer only what the
+/// row's bare countdown can't: WHICH window binds and WHEN it frees. The two
+/// states use different verbs so the words alone say which is which: a maxed
+/// window is `<Label> locked · unlocks in <X>` (rendered red, like the row's
+/// countdown); a healthy one `<Label> renews in <X>` ("resets in" beside a
+/// lock read as if that window were locked too). `None` for a healthy window
+/// with no known reset — nothing useful to say.
+///
 /// `stale`: the window's reset already passed and the cached reading predates
 /// it (`DisplayState::StaleAfterReset`), so it is not locked, just unrefreshed.
 fn window_status_row_at(w: &WindowView, stale: bool) -> Option<(String, bool)> {
@@ -2515,12 +2502,12 @@ fn account_extra_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
         // The burn-rate row forecasts when the WEEKLY window empties ("Weekly ·
         // N% · ~X"). Once the weekly window is already locked (100%),
         // that reads as a redundant "· 100% · ~0m" — skip it; the
-        // "Weekly limit reached" status row already conveys the lock.
+        // "Weekly locked · unlocks in X" status row already conveys the lock.
         let weekly_locked = a.windows.iter().any(|w| {
             w.id == "weekly" && w.pct.is_some_and(|p| p >= countdown::LOCKED_THRESHOLD_PCT)
         });
         if !weekly_locked {
-            if let Some(row) = empty_in_row(&account_key, a, Utc::now()) {
+            if let Some(row) = empty_in_row(&account_key, a, now_utc()) {
                 rows.push(row);
             }
         }
@@ -2699,19 +2686,19 @@ fn menu_signature(snap: &Snapshot) -> String {
         s.push_str("] ");
     }
     // Capture-submenu contents also affect the redraw: adding a new registered
-    // provider (or a change in its installed-probe answer) must show up. Both
+    // provider must show up. Both
     // buckets fold into the signature so moving a provider between them (e.g.
     // a capture-mode change) also triggers a redraw.
     for reg in &snap.capture_creds {
         s.push_str(&format!(
-            "REG[{}|{}|{}|creds] ",
-            reg.provider_id, reg.display_name, reg.installed
+            "REG[{}|{}|creds] ",
+            reg.provider_id, reg.display_name
         ));
     }
     for reg in &snap.capture_api_key {
         s.push_str(&format!(
-            "REG[{}|{}|{}|apikey] ",
-            reg.provider_id, reg.display_name, reg.installed
+            "REG[{}|{}|apikey] ",
+            reg.provider_id, reg.display_name
         ));
     }
     let nc = &snap.notification_config;
@@ -2766,7 +2753,7 @@ fn recovery_status(
         }
     }
     if matches!(state, DisplayState::Usage { .. })
-        && !blocking_pct(active).is_some_and(|p| p >= 99.5)
+        && !blocking_pct(active).is_some_and(|p| p >= countdown::LOCKED_THRESHOLD_PCT)
     {
         return None;
     }
@@ -2786,13 +2773,7 @@ fn recovery_status(
         let usage = account_usage_for(account);
         // A known reset for one limit cannot establish availability if the
         // other exhausted limit has no reset time.
-        if [
-            (usage.session_pct, usage.session_reset),
-            (usage.weekly_pct, usage.weekly_reset),
-        ]
-        .iter()
-        .any(|(pct, reset)| pct.is_some_and(|p| p >= 99.5) && reset.is_none())
-        {
+        if countdown::has_indefinite_block(&usage) {
             continue;
         }
         match countdown::compute_display(&usage, now) {
@@ -2803,7 +2784,7 @@ fn recovery_status(
             }
             DisplayState::StaleAfterReset { .. } => pending = Some(account),
             DisplayState::Usage { .. } => {
-                if blocking_pct(account).is_some_and(|p| p < 99.5) {
+                if blocking_pct(account).is_some_and(|p| p < countdown::LOCKED_THRESHOLD_PCT) {
                     return Some((
                         "Switch".into(),
                         format!("{} · Usage available", account.display),
@@ -3489,8 +3470,8 @@ fn try_start_refresh(spawn: impl FnOnce()) {
 
 /// Capture the current login for `slug`. For Claude, use the full v1 flow
 /// (persists into state.json + preserves cached usage). For every other
-/// provider, dispatch through the trait — the result is only surfaced via
-/// notification since v1 state has no bucket to persist non-Claude accounts.
+/// provider, dispatch through the trait (`capture_current_generic`), which
+/// persists the account into `State::providers[slug]`.
 fn handle_capture(slug: &str) {
     if slug != CLAUDE_SLUG && providers::get(slug).is_none() {
         notify(&format!(
@@ -3568,9 +3549,6 @@ fn capture_serialized(slug: &str) {
     }
 }
 
-/// "Renew login…": run the provider's own login in usagio's sign-in window —
-/// the default browser where no window can be shown — and save the result
-/// (see `crate::login`). Runs on the UI thread; the wait happens off it.
 /// Sign-in window store for a renew. `State::find` searches Claude accounts
 /// only, so its `login_store` applies only to a Claude renew; any other
 /// provider keys its store by the account key.
@@ -3583,6 +3561,9 @@ fn renew_login_store(st: &State, slug: &str, key: &str) -> String {
     key.to_string()
 }
 
+/// "Renew login…": run the provider's own login in usagio's sign-in window —
+/// the default browser where no window can be shown — and save the result
+/// (see `crate::login`). Runs on the UI thread; the wait happens off it.
 fn handle_renew(slug: &str, key: &str) {
     if providers::get(slug).is_none() {
         return;
@@ -4323,9 +4304,9 @@ mod cross_platform {
     /// and the Linux/Windows redraw pump both call this, then hand the result
     /// to `platform::render::render_menu`). Same click ids `handle_click`
     /// parses regardless of renderer. v0.5.3 menu redesign: provider grouping
-    /// — each provider with captured accounts contributes a static (or
-    /// env-override submenu) header row, followed by one `PMenuItem::Submenu`
-    /// per account whose children are the details + action rows.
+    /// — each provider with captured accounts contributes a static
+    /// header row (an env override rides inline in its label), followed by one
+    /// `PMenuItem::Submenu` per account whose children are the details + action rows.
     /// `PMenuItem::Separator` sits between provider groups, not between
     /// individual accounts.
     pub(super) fn menu_tree_from_snapshot(snap: &Snapshot) -> MenuTree {
@@ -4357,11 +4338,7 @@ mod cross_platform {
             capture_items.push(action("noop", "(no providers registered)", false));
         } else {
             for reg in snap.capture_creds.iter().chain(snap.capture_api_key.iter()) {
-                let title = if reg.installed {
-                    reg.display_name.to_string()
-                } else {
-                    format!("{} (not installed)", reg.display_name)
-                };
+                let title = reg.display_name.to_string();
                 let prefix = match reg.capture_mode {
                     CaptureMode::CredsOnDisk => "capture",
                     CaptureMode::ApiKey => "apikey",
@@ -4476,11 +4453,9 @@ mod cross_platform {
 
     /// 16x16 PNG bytes for the initial tray icon. `MenuBackend::create_status_item`
     /// requires real, decodable icon bytes on Linux/Windows (unlike macOS,
-    /// which is happy with a text-only title) — there's no dedicated app icon
-    /// asset yet (only per-provider 16px icons under `assets/icons/16/`), so
-    /// this reuses the active account's provider icon, falling back to
-    /// Claude's (always bundled, regardless of which provider Cargo features
-    /// are enabled — see `icons::png16_for`).
+    /// which is happy with a text-only title). This follows `tray_target`
+    /// (the at-risk or pinned provider's icon), falling back to the bundled
+    /// usagio mark when there is no target — see `tray_icon_bytes`.
     #[cfg(not(target_os = "macos"))]
     fn initial_icon_bytes(snap: &Snapshot) -> &'static [u8] {
         // The tray icon reflects the current `tray_target` agent (Settings ▸
@@ -4721,7 +4696,6 @@ mod tests {
             capture_creds: vec![RegisteredProvider {
                 provider_id: CLAUDE_SLUG,
                 display_name: "Claude",
-                installed: true,
                 capture_mode: CaptureMode::CredsOnDisk,
             }],
             capture_api_key: Vec::new(),
@@ -7536,7 +7510,7 @@ mod tests {
         // The usage-log reader is mtime-cached process-wide; drop entries other
         // tests (or the empty read above) left behind so ours is parsed fresh.
         crate::usage_log::evict_recent_months();
-        let rows = account_extra_info_rows(&sec, &a);
+        let rows = with_now(now, || account_extra_info_rows(&sec, &a));
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows[0].starts_with("Weekly · "), "{rows:?}");
         assert_ne!(
@@ -8046,8 +8020,6 @@ mod tests {
             "Codex's active comes from its own slot"
         );
         assert_eq!(snap.account_order.len(), 4);
-        assert!(snap.capture_creds.iter().all(|r| r.installed));
-        assert!(probe_installed("claude"));
 
         // Auto-swap switched off in Settings is reflected.
         st.autoswap_disabled = true;

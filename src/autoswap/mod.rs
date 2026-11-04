@@ -141,10 +141,8 @@ pub enum Evidence {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ManualPick {
     pub key: String,
-    pub at: i64,
     /// Tier from the switch-time reading, re-settled by the first fresh one.
     pub settled: Tier,
-    pub settled_by_fresh: bool,
 }
 
 /// Everything `decide` needs.

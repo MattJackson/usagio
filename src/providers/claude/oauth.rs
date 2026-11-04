@@ -1,5 +1,6 @@
-//! OAuth refresh-token grant. We only ever refresh here; new accounts are
-//! onboarded by capturing a real `claude` login from the keychain.
+//! OAuth refresh-token grant. We only ever refresh here; new accounts come
+//! from the provider's own browser login (`ClaudeProvider::login_spec` /
+//! `complete_login`) or from capturing a real `claude` login.
 
 use serde::Deserialize;
 
@@ -63,8 +64,8 @@ impl std::fmt::Display for RefreshError {
 
 impl std::error::Error for RefreshError {}
 
-/// Refresh an account's access token in place, keeping the keychain blob in
-/// sync. Returns true (it always changes the tokens on success).
+/// Refresh an account's access token in place (not persisted; see below).
+/// Returns true (it always changes the tokens on success).
 ///
 /// Errors are typed so the caller can decide policy: `InvalidGrant` means the
 /// account needs a fresh `/login` (flag `needs_relogin` in state); anything

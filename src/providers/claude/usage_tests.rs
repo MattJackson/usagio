@@ -558,3 +558,13 @@ fn claim_outcome_from_status_only_reset_is_applied() {
         );
     }
 }
+
+#[test]
+fn prepaid_bare_amount_uses_the_currency_minor_unit_exponent() {
+    let jpy = prepaid_balance(&serde_json::json!({ "amount": 5000, "currency": "JPY" })).unwrap();
+    assert_eq!((jpy.amount_minor, jpy.exponent), (5000, 0));
+    let kwd = prepaid_balance(&serde_json::json!({ "amount": 5000, "currency": "KWD" })).unwrap();
+    assert_eq!(kwd.exponent, 3);
+    let usd = prepaid_balance(&serde_json::json!({ "amount": 5000, "currency": "USD" })).unwrap();
+    assert_eq!(usd.exponent, 2);
+}
