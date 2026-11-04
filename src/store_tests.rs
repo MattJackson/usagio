@@ -1610,7 +1610,8 @@ fn upsert_and_remove_drop_the_stale_raw_entry() {
     seed_state_with_bad_codex_entry();
     let mut st = State::load().unwrap();
     assert!(st.remove_provider_account("codex", "bad@e.com"));
-    st.save().expect("authorised removal of a raw entry must save");
+    st.save()
+        .expect("authorised removal of a raw entry must save");
     let on_disk = std::fs::read_to_string(config_dir().unwrap().join("state.json")).unwrap();
     assert!(!on_disk.contains("bad@e.com"), "{on_disk}");
 }

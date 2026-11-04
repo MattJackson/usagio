@@ -101,24 +101,60 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     let mut sources: Vec<(PathBuf, Vec<(String, serde_json::Value)>)> = Vec::new();
     let user_json = home.join(".claude.json");
     let user_val = read_json_logged(&user_json);
-    if let Some(val) = &user_val {
-        if let Some(proj) = project {
-            let key = proj.to_string_lossy();
-            if let Some(local) = val
-                .get("projects")
-                .and_then(|p| p.get(key.as_ref()))
-                .and_then(|p| p.get("mcpServers"))
-                .and_then(|m| m.as_object())
-            {
-                sources.push((user_json.clone(), object_entries(local)));
+    // Claude Code keys projects by absolute path.
+    let proj_abs: Option<PathBuf> = project.map(|p| {
+        fs::canonicalize(p).unwrap_or_else(|_| {
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map(|c| c.join(p))
+                    .unwrap_or_else(|_| p.to_path_buf())
+            }
+        })
+    });
+    let local_proj = match (&user_val, &proj_abs) {
+        (Some(val), Some(proj)) => val
+            .get("projects")
+            .and_then(|p| p.get(proj.to_string_lossy().as_ref()))
+            .cloned(),
+        _ => None,
+    };
+    if let Some(local) = local_proj
+        .as_ref()
+        .and_then(|p| p.get("mcpServers"))
+        .and_then(|m| m.as_object())
+    {
+        sources.push((user_json.clone(), object_entries(local)));
+    }
+    let mut approval = McpApproval::default();
+    if let Some(lp) = &local_proj {
+        approval.absorb(lp, true);
+    }
+    let settings_val = read_json_logged(&settings);
+    if let Some(v) = &settings_val {
+        approval.absorb(v, false);
+    }
+    if let Some(proj) = &proj_abs {
+        for f in ["settings.json", "settings.local.json"] {
+            if let Some(v) = read_json_logged(&proj.join(".claude").join(f)) {
+                approval.absorb(&v, false);
             }
         }
-    }
-    if let Some(proj) = project {
         let mcp_json = proj.join(".mcp.json");
         if let Some(val) = read_json_logged(&mcp_json) {
             if let Some(m) = val.get("mcpServers").and_then(|m| m.as_object()) {
-                sources.push((mcp_json, object_entries(m)));
+                let mut approved = Vec::new();
+                for (name, cfg) in m {
+                    if approval.project_server_approved(name) {
+                        approved.push((name.clone(), cfg.clone()));
+                    } else {
+                        // Never execute repo-controlled commands Claude Code
+                        // itself would not start.
+                        eprintln!("mcp {}: not approved (not started)", name);
+                    }
+                }
+                sources.push((mcp_json, approved));
             }
         }
     }
@@ -127,7 +163,7 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
             sources.push((user_json.clone(), object_entries(m)));
         }
     }
-    if let Some(val) = read_json_logged(&settings) {
+    if let Some(val) = &settings_val {
         if let Some(m) = val.get("mcpServers").and_then(|m| m.as_object()) {
             sources.push((settings.clone(), object_entries(m)));
         }
@@ -137,6 +173,10 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     let mut origin = std::collections::HashMap::new();
     for (path, entries) in sources {
         for (name, cfg) in entries {
+            if approval.disabled.contains(&name) {
+                eprintln!("mcp {}: disabled for this project (not started)", name);
+                continue;
+            }
             if seen.insert(name.clone()) {
                 origin.insert(name.clone(), path.clone());
                 servers.push((name, cfg));
@@ -166,6 +206,46 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     }
 
     Ok(items)
+}
+
+/// Claude Code's approval state for project-scope `.mcp.json` servers.
+#[derive(Default)]
+struct McpApproval {
+    enable_all: bool,
+    enabled: std::collections::HashSet<String>,
+    disabled: std::collections::HashSet<String>,
+}
+
+impl McpApproval {
+    /// Fold in a settings object (or a `~/.claude.json` `projects.<path>`
+    /// entry, which additionally carries `disabledMcpServers`).
+    fn absorb(&mut self, v: &serde_json::Value, project_entry: bool) {
+        let strs = |k: &str| -> Vec<String> {
+            v.get(k)
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        if v.get("enableAllProjectMcpServers")
+            .and_then(|b| b.as_bool())
+            == Some(true)
+        {
+            self.enable_all = true;
+        }
+        self.enabled.extend(strs("enabledMcpjsonServers"));
+        self.disabled.extend(strs("disabledMcpjsonServers"));
+        if project_entry {
+            self.disabled.extend(strs("disabledMcpServers"));
+        }
+    }
+
+    fn project_server_approved(&self, name: &str) -> bool {
+        !self.disabled.contains(name) && (self.enable_all || self.enabled.contains(name))
+    }
 }
 
 fn object_entries(
@@ -214,7 +294,7 @@ fn injected_frontmatter(text: &str) -> Option<String> {
         let continuation = line.starts_with([' ', '\t']) || line.trim().is_empty();
         if !continuation {
             let key = line.split(':').next().unwrap_or("").trim();
-            keep = key == "name" || key == "description";
+            keep = matches!(key, "name" | "description" | "when_to_use");
         }
         if keep {
             out.push_str(line);

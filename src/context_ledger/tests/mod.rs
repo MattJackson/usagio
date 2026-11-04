@@ -540,6 +540,12 @@ fn claude_mcp_servers_read_from_dot_claude_json_and_project_mcp_json() {
             .unwrap(),
         )
         .unwrap();
+        fs::create_dir_all(proj.path().join(".claude")).unwrap();
+        fs::write(
+            proj.path().join(".claude").join("settings.json"),
+            r#"{"enableAllProjectMcpServers": true}"#,
+        )
+        .unwrap();
         let l = build_ledger("claude", Some(proj.path())).unwrap();
         let mut names: Vec<_> = l
             .items
@@ -642,5 +648,77 @@ fn cli_run_fails_when_no_provider_could_be_built() {
     with_home(|_| {
         assert!(cli::run(Some("nope".into()), None).is_err());
         assert!(cli::run(Some("codex".into()), None).is_ok());
+    });
+}
+
+fn mcp_marker_server(marker: &std::path::Path) -> serde_json::Value {
+    let script = format!(
+        "echo ran > '{}'; read a; echo '{INIT_OK}'; read b; read c; echo '{TOOLS_OK}'; sleep 5",
+        marker.display()
+    );
+    serde_json::json!({ "command": "/bin/sh", "args": ["-c", script] })
+}
+
+#[test]
+fn unapproved_project_mcp_json_server_is_never_executed() {
+    with_home(|_home| {
+        let proj = tempdir().unwrap();
+        let marker = proj.path().join("ran");
+        fs::write(
+            proj.path().join(".mcp.json"),
+            serde_json::json!({ "mcpServers": { "evil": mcp_marker_server(&marker) } }).to_string(),
+        )
+        .unwrap();
+        let l = build_ledger("claude", Some(proj.path())).unwrap();
+        assert!(!marker.exists(), "unapproved server command was executed");
+        assert!(l.items.iter().all(|i| i.kind != ItemKind::McpTools));
+    });
+}
+
+#[test]
+fn approved_project_mcp_json_server_runs_unless_disabled() {
+    with_home(|home| {
+        let proj = tempdir().unwrap();
+        let canon = fs::canonicalize(proj.path()).unwrap();
+        let (m1, m2) = (canon.join("ran1"), canon.join("ran2"));
+        fs::write(
+            canon.join(".mcp.json"),
+            serde_json::json!({ "mcpServers": {
+                "ok": mcp_marker_server(&m1), "off": mcp_marker_server(&m2) } })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            home.join(".claude.json"),
+            serde_json::json!({ "projects": { canon.to_string_lossy(): {
+                "enabledMcpjsonServers": ["ok", "off"],
+                "disabledMcpjsonServers": ["off"] } } })
+            .to_string(),
+        )
+        .unwrap();
+        // relative/odd spelling of the same project must still resolve
+        let spelled = canon.join(".");
+        let l = build_ledger("claude", Some(&spelled)).unwrap();
+        let names: Vec<_> = l.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["mcp: ok"]);
+        assert!(m1.exists() && !m2.exists());
+    });
+}
+
+#[test]
+fn claude_skill_when_to_use_is_counted() {
+    with_home(|home| {
+        let dir = home.join(".claude").join("skills").join("s");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: s\nwhen_to_use: always\n---\nbody",
+        )
+        .unwrap();
+        let l = build_ledger("claude", None).unwrap();
+        assert_eq!(
+            l.items[0].content_bytes,
+            "name: s\nwhen_to_use: always\n".len()
+        );
     });
 }
