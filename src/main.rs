@@ -492,6 +492,7 @@ pub(crate) fn capture_current_generic(slug: &str) -> Result<(String, bool)> {
 
     let existed = with_state_lock(|| {
         let mut state = State::load()?;
+        state.adopt_legacy_provider_key(slug, &key);
         let existing = state.find_provider_account(slug, &key).cloned();
         let existed = existing.is_some();
         let acct = ProviderAccount {
@@ -551,6 +552,7 @@ pub(crate) fn persist_login(
     let expires_at = Utc::now().timestamp() + captured.tokens.expires_in_secs;
     let active = with_state_lock(|| {
         let mut state = State::load()?;
+        state.adopt_legacy_provider_key(slug, &key);
         let existing = state.find_provider_account(slug, &key).cloned();
         let acct = ProviderAccount {
             key: key.clone(),
@@ -1151,7 +1153,20 @@ fn provider_selector_matches(state: &State, selector: &str) -> Vec<(String, Stri
 /// resolution step the way Claude's identity backfill does). `hold` marks a
 /// manual choice auto-swap must respect; `false` clears any earlier hold.
 pub(crate) fn switch_to_provider_account(slug: &str, key: &str, hold: bool) -> Result<String> {
-    switch_provider_with_intent(slug, key, hold)
+    let key = switch_provider_with_intent(slug, key, hold)?;
+    Ok(provider_account_label(slug, &key))
+}
+
+/// The human label for `slug`'s account `key` (see
+/// `trait_def::account_label`): its email, with a workspace tag only when
+/// another captured account shares that email.
+pub(crate) fn provider_account_label(slug: &str, key: &str) -> String {
+    let siblings: Vec<String> = State::load()
+        .ok()
+        .and_then(|st| st.provider_accounts(slug).cloned())
+        .map(|pa| pa.accounts.into_iter().map(|a| a.key).collect())
+        .unwrap_or_default();
+    providers::trait_def::account_label(key, siblings.iter().map(String::as_str))
 }
 
 fn switch_provider_with_intent(slug: &str, key: &str, manual: bool) -> Result<String> {
@@ -6070,6 +6085,12 @@ fn render_table(rows: &[Row], active: Option<&str>) {
     println!("{}", "-".repeat(header.len()));
 
     for r in rows {
+        let label = providers::trait_def::account_label(
+            &r.email,
+            rows.iter()
+                .filter(|o| o.provider_id == r.provider_id)
+                .map(|o| o.email.as_str()),
+        );
         let marker = if active == Some(r.email.as_str()) {
             "▶"
         } else {
@@ -6078,7 +6099,7 @@ fn render_table(rows: &[Row], active: Option<&str>) {
         if r.no_subscription {
             println!(
                 "{marker}  {:<28} no subscription (Free plan) — usage paused; re-checked every {}m",
-                truncate(&r.email, 28),
+                truncate(&label, 28),
                 SUBSCRIPTION_RECHECK_SECS / 60,
             );
             continue;
@@ -6086,13 +6107,13 @@ fn render_table(rows: &[Row], active: Option<&str>) {
         if !r.has_data() {
             println!(
                 "{marker}  {:<28} no data yet (run the menu-bar app or `usagio watch`)",
-                truncate(&r.email, 28),
+                truncate(&label, 28),
             );
             continue;
         }
         let mut line = format!(
             "{marker}  {:<28} {:<22} {:<11}",
-            truncate(&r.email, 28),
+            truncate(&label, 28),
             bar(r.session.pct),
             r.session.resets_in(),
         );

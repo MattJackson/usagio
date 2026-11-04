@@ -420,6 +420,50 @@ impl Provider for CodexProvider {
         &["session", "weekly"]
     }
 
+    /// One email can sign into several ChatGPT workspaces, each with its own
+    /// account_id, credentials and limits: key by both (`email#account_id`).
+    fn account_identifier(&self, id: &IdentitySnapshot) -> String {
+        match &id.email {
+            Some(email) => crate::providers::trait_def::workspace_key(email, id.uuid.as_deref()),
+            // Same fallbacks as the default identifier.
+            None => id.uuid.clone().unwrap_or_else(|| {
+                format!(
+                    "anon-{}",
+                    crate::providers::trait_def::short_hash(&id.native_blob)
+                )
+            }),
+        }
+    }
+
+    /// Older builds keyed Codex accounts by email alone. Derive the
+    /// workspace from the stored identity, else from the stored auth blob;
+    /// an entry with neither keeps its key until it is next captured.
+    fn upgraded_account_key(&self, account: &crate::store::ProviderAccount) -> Option<String> {
+        if account
+            .key
+            .contains(crate::providers::trait_def::WORKSPACE_KEY_SEP)
+        {
+            return None;
+        }
+        let email = account.identity_email.as_deref().unwrap_or(&account.key);
+        if !email.eq_ignore_ascii_case(&account.key) {
+            return None; // not an email key (uuid/anon fallback): leave it
+        }
+        let workspace = account
+            .identity_uuid
+            .clone()
+            .filter(|w| !w.trim().is_empty())
+            .or_else(|| {
+                parse_codex_blob(&account.secret_blob)
+                    .ok()
+                    .and_then(|p| blob_account_id(&p))
+            })?;
+        Some(crate::providers::trait_def::workspace_key(
+            email,
+            Some(&workspace),
+        ))
+    }
+
     /// Codex's refresh grant is a plain, programmatic HTTPS POST (no vendor
     /// CLI / browser step) — see `oauth.rs`'s module doc for the endpoint
     /// research. `oauth::active_refresh_cas` is the CAS-safe entry point a
@@ -752,7 +796,11 @@ impl Provider for CodexProvider {
                     .and_then(|x| x.as_str())
                     .map(String::from)
             })?;
-        Some(AccountKey::new(self.provider_id(), email))
+        let workspace = blob_account_id(&parsed);
+        Some(AccountKey::new(
+            self.provider_id(),
+            crate::providers::trait_def::workspace_key(&email, workspace.as_deref()),
+        ))
     }
 
     fn credential_freshness(&self, blob: &str) -> CredentialFreshness {
@@ -2143,12 +2191,13 @@ mod tests {
             st.save()
         })
         .unwrap();
-        let k = AccountKey::new("codex", "user@example.com");
+        // Loading the email-keyed entry upgrades it to email#workspace.
+        let k = AccountKey::new("codex", "user@example.com#ws-personal");
         let team = blob_for("ws-team", 5_000_000_000);
         assert!(CodexProvider.absorb_credential(&k, &team).is_err());
         let st = crate::store::State::load().unwrap();
         let a = st
-            .find_provider_account("codex", "user@example.com")
+            .find_provider_account("codex", "user@example.com#ws-personal")
             .unwrap();
         assert_eq!(a.refresh_token, "old-rt", "other workspace must not absorb");
         // Same workspace still absorbs.
@@ -2156,7 +2205,7 @@ mod tests {
         CodexProvider.absorb_credential(&k, &same).unwrap();
         let st = crate::store::State::load().unwrap();
         let a = st
-            .find_provider_account("codex", "user@example.com")
+            .find_provider_account("codex", "user@example.com#ws-personal")
             .unwrap();
         assert_eq!(a.refresh_token, "rt-new");
     }

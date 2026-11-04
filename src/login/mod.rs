@@ -456,7 +456,10 @@ pub fn start(
         &pkce.challenge,
         &state,
         &loopback.redirect_uri,
-        target.expected(),
+        // The vendor knows the email, not usagio's workspace-qualified key.
+        target
+            .expected()
+            .map(crate::providers::trait_def::key_email),
     )?;
     let redirect_uri = loopback.redirect_uri.clone();
     let progress = Arc::new(Progress::default());
@@ -500,7 +503,15 @@ pub fn start(
 /// Refuse a sign-in as anyone but the account being renewed: the window's
 /// cookie store could hold another account's session.
 pub fn check_signed_in_as(key: &str, expected: Option<&str>) -> Result<()> {
+    use crate::providers::trait_def::{key_email, WORKSPACE_KEY_SEP};
     match expected {
+        // A legacy email-only key (its workspace was never recorded) is
+        // renewed by any workspace of that email, which then upgrades it.
+        Some(want)
+            if !want.contains(WORKSPACE_KEY_SEP) && key_email(key).eq_ignore_ascii_case(want) =>
+        {
+            Ok(())
+        }
         Some(want) if !key.eq_ignore_ascii_case(want) => {
             bail!("signed in as {key}, not {want} — nothing was changed")
         }

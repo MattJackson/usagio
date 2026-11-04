@@ -332,7 +332,8 @@ impl Account {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderAccount {
     /// The provider's own identifier for this account (email, or a UUID/hash
-    /// fallback — see `Provider::account_identifier`).
+    /// fallback — see `Provider::account_identifier`). Codex qualifies the
+    /// email with the ChatGPT workspace: `email#account_id`.
     pub key: String,
     /// Verbatim provider credential blob (e.g. Codex's `auth.json` bytes).
     pub secret_blob: String,
@@ -687,6 +688,12 @@ pub struct State {
     /// times, latches, cooldown, stuck notice).
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub swap_memory: std::collections::HashMap<String, crate::autoswap::SwapMemory>,
+    /// Usage-history aliases, keyed by provider slug: account key (lowercase)
+    /// → the key its older history rows were written under, for accounts
+    /// renamed by a keying upgrade (Codex: email → `email#account_id`).
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub history_aliases:
+        std::collections::HashMap<String, std::collections::BTreeMap<String, String>>,
     /// Emails this in-memory state has explicitly requested be dropped via
     /// `remove()`. NOT serialized — transient authorization consumed by
     /// `save_state_safe`, so `save()` can distinguish "the caller meant to
@@ -999,7 +1006,7 @@ impl State {
             })
             .unwrap_or_default();
 
-        State {
+        let mut state = State {
             schema_version: STATE_SCHEMA_VERSION,
             accounts,
             active,
@@ -1051,8 +1058,124 @@ impl State {
                         .collect()
                 })
                 .unwrap_or_default(),
+            history_aliases: parse_field_or_warn(v, "history_aliases"),
             pending_removals: HashSet::new(),
             pending_provider_removals: HashSet::new(),
+        };
+        state.upgrade_provider_keys();
+        state.register_history_aliases();
+        state
+    }
+
+    /// Rename every provider account whose provider now keys it differently
+    /// (see `Provider::upgraded_account_key`).
+    fn upgrade_provider_keys(&mut self) {
+        let mut renames = Vec::new();
+        for (slug, pa) in &self.providers {
+            let Some(provider) = crate::providers::get(slug) else {
+                continue;
+            };
+            for a in &pa.accounts {
+                if let Some(to) = provider.upgraded_account_key(a) {
+                    renames.push((slug.clone(), a.key.clone(), to));
+                }
+            }
+        }
+        for (slug, from, to) in renames {
+            if self.rename_provider_account(&slug, &from, &to) {
+                crate::logging::log(&format!(
+                    "event=account_key_upgraded provider={slug} from={from} to={to}"
+                ));
+            }
+        }
+    }
+
+    /// If `key` has no account in `slug` but its email-only (pre-workspace)
+    /// form does, rename that account to `key`: a capture of a legacy entry
+    /// whose workspace could not be derived on load.
+    pub fn adopt_legacy_provider_key(&mut self, slug: &str, key: &str) {
+        let email = crate::providers::trait_def::key_email(key);
+        if email.len() == key.len() || self.find_provider_account(slug, key).is_some() {
+            return;
+        }
+        if self.find_provider_account(slug, email).is_some() {
+            self.rename_provider_account(slug, email, key);
+        }
+    }
+
+    /// Rename `slug`'s account `from` to `to` everywhere state refers to it
+    /// (active, queued switch, manual pick/hold, swap memory), authorise the
+    /// old key's disappearance for the save guard, and keep its usage
+    /// history reachable. Refuses when `to` already exists.
+    pub fn rename_provider_account(&mut self, slug: &str, from: &str, to: &str) -> bool {
+        if from.eq_ignore_ascii_case(to) || self.find_provider_account(slug, to).is_some() {
+            return false;
+        }
+        let Some(pa) = self.providers.get_mut(slug) else {
+            return false;
+        };
+        let Some(acct) = pa.find_mut(from) else {
+            return false;
+        };
+        let old = std::mem::replace(&mut acct.key, to.to_string());
+        let same = |k: &str| k.eq_ignore_ascii_case(&old);
+        let fix = |k: &mut String| {
+            if same(k) {
+                *k = to.to_string();
+            }
+        };
+        if let Some(active) = pa.active.as_mut() {
+            fix(active);
+        }
+        if let Some(pending) = pa.pending_switch.as_mut() {
+            fix(&mut pending.key);
+            if let Some(from) = pending.from.as_mut() {
+                fix(from);
+            }
+            if let Some(renewed) = pending.renewed_account.as_mut() {
+                fix(&mut renewed.key);
+            }
+        }
+        for map in [&mut self.manual_holds, &mut self.manual_picks] {
+            if let Some(k) = map.get_mut(slug) {
+                fix(k);
+            }
+        }
+        if let Some(memory) = self.swap_memory.get_mut(slug) {
+            let (old_lc, new_lc) = (old.to_ascii_lowercase(), to.to_ascii_lowercase());
+            if let Some(v) = memory.left_at.remove(&old_lc) {
+                memory.left_at.insert(new_lc.clone(), v);
+            }
+            if let Some(v) = memory.trigger_left.remove(&old_lc) {
+                memory.trigger_left.insert(new_lc.clone(), v);
+            }
+            if let Some(v) = memory.drained.remove(&old_lc) {
+                memory.drained.insert(new_lc.clone(), v);
+            }
+            for k in [&mut memory.last_seen_active, &mut memory.draining]
+                .into_iter()
+                .flatten()
+            {
+                fix(k);
+            }
+        }
+        self.pending_provider_removals
+            .insert((slug.to_lowercase(), old.to_lowercase()));
+        let aliases = self.history_aliases.entry(slug.to_string()).or_default();
+        // A chain of renames keeps pointing at the original history key.
+        let history = aliases
+            .remove(&old.to_ascii_lowercase())
+            .unwrap_or_else(|| old.clone());
+        aliases.insert(to.to_ascii_lowercase(), history);
+        self.register_history_aliases();
+        true
+    }
+
+    fn register_history_aliases(&self) {
+        for (slug, aliases) in &self.history_aliases {
+            for (key, legacy) in aliases {
+                crate::usage_log::register_history_alias(slug, key, legacy);
+            }
         }
     }
 

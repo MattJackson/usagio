@@ -2030,9 +2030,16 @@ fn build_snapshot() -> Snapshot {
         } else {
             st.providers.get(slug).and_then(|p| p.active.clone())
         };
+        let keys: Vec<&str> = provider_rows.iter().map(|r| r.email.as_str()).collect();
         let mut accounts: Vec<AcctView> = provider_rows
-            .into_iter()
-            .map(|r| acctview_from_row(r, &active_for_slug, slug, provider.window_order()))
+            .iter()
+            .map(|r| {
+                let mut view =
+                    acctview_from_row(r, &active_for_slug, slug, provider.window_order());
+                view.display =
+                    crate::providers::trait_def::account_label(&r.email, keys.iter().copied());
+                view
+            })
             .collect();
         // The ONE canonical order (v0.5.18 "1 order only"): soonest WEEKLY
         // reset first (use credits top-down so no weekly is left behind),
@@ -3580,7 +3587,9 @@ fn renew_login_store(st: &State, slug: &str, key: &str) -> String {
             return store;
         }
     }
-    key.to_string()
+    // Workspaces of one email share its vendor session (the sign-in page
+    // picks the workspace), and keys from before workspace keying keep theirs.
+    crate::providers::trait_def::key_email(key).to_string()
 }
 
 fn handle_renew(slug: &str, key: &str) {
@@ -3601,7 +3610,7 @@ fn begin_renew(slug: &str, key: &str, browser_only: bool) {
     let store = State::load()
         .ok()
         .map(|st| renew_login_store(&st, slug, key))
-        .unwrap_or_else(|| key.to_string());
+        .unwrap_or_else(|| crate::providers::trait_def::key_email(key).to_string());
     let target = crate::login::Target::Renew(key.to_string());
     let started = crate::login::start(provider, target, |result| match result {
         Ok(r) => {
@@ -3612,7 +3621,10 @@ fn begin_renew(slug: &str, key: &str, browser_only: bool) {
     });
     match started {
         Ok(s) => show_sign_in(
-            &format!("Renew {key} — usagio"),
+            &format!(
+                "Renew {} — usagio",
+                crate::providers::trait_def::key_email(key)
+            ),
             slug,
             &store,
             &s,
