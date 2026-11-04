@@ -4069,15 +4069,16 @@ fn confirm_with_button(question: &str, button: &str) -> bool {
         ))
         .show();
     // Both buttons are custom, so a non-button result means the dialog was
-    // dismissed without one or could not be shown at all (Linux without
-    // zenity). Still fail closed, but say so instead of doing nothing.
+    // dismissed without one (Esc or close on Windows) or could not be shown at
+    // all (Linux without zenity). Still fail closed, and say nothing changed
+    // without claiming either cause.
     confirm_answer(result, button).unwrap_or_else(|| {
         crate::logging::log(&format!(
             "event=confirm_dialog_no_answer button={button:?} ; nothing changed"
         ));
         notify(
-            "No answer from the confirmation dialog — nothing was changed \
-             (on Linux this dialog needs zenity installed)",
+            "Nothing was changed — the confirmation closed without a choice \
+             (if no dialog appeared on Linux, install zenity)",
         );
         false
     })
