@@ -5179,11 +5179,19 @@ pub(crate) fn stable_exe_path() -> std::path::PathBuf {
 /// 3. Fall back to the bare [`stable_exe_path`] if no bundle is found (a
 ///    from-source install, or a brew formula version predating the bundle).
 pub(crate) fn launch_agent_exe_path() -> std::path::PathBuf {
-    let current = std::env::current_exe().unwrap_or_default();
+    resolve_launch_agent_exe(std::env::current_exe().unwrap_or_default(), stable_exe_path)
+}
+
+/// [`launch_agent_exe_path`] over an injected `current_exe` and stable-path
+/// resolver, so the bundle-preference rules are testable.
+fn resolve_launch_agent_exe(
+    current: std::path::PathBuf,
+    stable: impl FnOnce() -> std::path::PathBuf,
+) -> std::path::PathBuf {
     if current.to_string_lossy().contains(".app/Contents/MacOS/") {
         return current;
     }
-    let stable = stable_exe_path();
+    let stable = stable();
     sibling_app_bundle_exe(&stable).unwrap_or(stable)
 }
 
