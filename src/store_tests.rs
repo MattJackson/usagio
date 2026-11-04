@@ -1739,3 +1739,43 @@ fn tokenless_claude_entry_is_superseded_by_a_capture() {
     assert_eq!(st.accounts.len(), 1);
     assert!(st.unparsed_accounts.is_empty());
 }
+
+#[test]
+fn routine_saves_do_not_rotate_the_backup_history() {
+    let g = ScopedConfigDir::new();
+    let backups_dir = g.home().join(".config/usagio/backups");
+    let count = || {
+        std::fs::read_dir(&backups_dir)
+            .map(|rd| rd.count())
+            .unwrap_or(0)
+    };
+    let mut st = make_state_with(&["a@e.com"]);
+    st.save().unwrap();
+    // A membership change is always backed up.
+    st.accounts.push(acct("b@e.com"));
+    st.save().unwrap();
+    assert_eq!(count(), 1);
+    // An identical save is a no-op: no rewrite, no backup.
+    st.save().unwrap();
+    assert_eq!(count(), 1);
+    // A same-accounts change within the interval writes the file but not a
+    // fresh backup.
+    st.trigger_pct = Some(80.0);
+    st.save().unwrap();
+    assert_eq!(count(), 1);
+    assert_eq!(State::load().unwrap().trigger_pct, Some(80.0));
+    // Once the newest backup is older than the interval, the next one lands.
+    let old =
+        std::time::SystemTime::now() - BACKUP_MIN_INTERVAL - std::time::Duration::from_secs(5);
+    for e in std::fs::read_dir(&backups_dir).unwrap().flatten() {
+        std::fs::File::options()
+            .write(true)
+            .open(e.path())
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+    st.trigger_pct = Some(70.0);
+    st.save().unwrap();
+    assert_eq!(count(), 2);
+}

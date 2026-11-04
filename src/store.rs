@@ -1357,6 +1357,40 @@ fn set_or_clear(
 /// each backup is a few KB even with a dozen accounts.
 pub(crate) const BACKUP_KEEP_COUNT: usize = 20;
 
+/// Minimum spacing between rolling backups for saves that keep the same set
+/// of accounts. Without it every poll (each rewrites usage snapshots) rotated
+/// the whole 20-file history out within minutes.
+pub(crate) const BACKUP_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Whether a routine (same-accounts) save should write a rolling backup: no
+/// backup yet, the newest is at least [`BACKUP_MIN_INTERVAL`] old, or it is
+/// dated in the future (the clock went back), so its age can't be trusted.
+fn backup_due(backups_dir: &Path, now: std::time::SystemTime) -> bool {
+    let Ok(rd) = std::fs::read_dir(backups_dir) else {
+        return true;
+    };
+    let newest = rd
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("state-")
+                && name.ends_with(".json")
+                && !name.starts_with("state-rejected-")
+        })
+        .filter_map(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .max();
+    match newest {
+        None => true,
+        Some(m) => match now.duration_since(m) {
+            Ok(age) => age >= BACKUP_MIN_INTERVAL,
+            // Slack for filesystem timestamp rounding; beyond it, a future
+            // mtime means the clock moved back.
+            Err(e) => e.duration() > std::time::Duration::from_secs(60),
+        },
+    }
+}
+
 /// Persist `state` to `state.json` with two guards on top of the atomic
 /// tmp+rename write path:
 ///
@@ -1384,7 +1418,13 @@ pub fn save_state_safe(state: &State) -> Result<()> {
     // so the situation is diagnosable (the rolling backup still preserves the old
     // bytes in the parse-fail case, so the accounts are recoverable from
     // backups/, but the operator needs to know the safety net was bypassed).
+    let json = serde_json::to_vec_pretty(state)?;
     let existing = std::fs::read(&path);
+    // Nothing to do when the file already holds exactly these bytes: no
+    // rewrite, and no rolling backup that would push real history out.
+    if existing.as_deref().is_ok_and(|old| old == json.as_slice()) {
+        return Ok(());
+    }
     if let Err(ref e) = existing {
         if e.kind() != std::io::ErrorKind::NotFound {
             crate::logging::log(&format!(
@@ -1394,6 +1434,10 @@ pub fn save_state_safe(state: &State) -> Result<()> {
         }
     }
     if let Ok(old_bytes) = existing {
+        // Whether the set of accounts differs from the file's: such a save is
+        // always backed up; other changes (usage snapshots, token refreshes)
+        // are backed up at most once per BACKUP_MIN_INTERVAL.
+        let mut membership_changed = true;
         let parsed = serde_json::from_slice::<serde_json::Value>(&old_bytes);
         if let Err(ref e) = parsed {
             crate::logging::log(&format!(
@@ -1442,6 +1486,16 @@ pub fn save_state_safe(state: &State) -> Result<()> {
                     unauthorized_provider.push(format!("{slug_lc}:{k}"));
                 }
             }
+            let old_keys: HashSet<String> = old
+                .accounts
+                .iter()
+                .map(|a| a.key().to_string())
+                .chain(old.unparsed_accounts.iter().filter_map(raw_account_key))
+                .map(|k| k.to_lowercase())
+                .collect();
+            let old_provider_keys: HashSet<(String, String)> =
+                raw_provider_account_keys(&v).into_iter().collect();
+            membership_changed = old_keys != new_keys || old_provider_keys != new_provider_keys;
             if !unauthorized.is_empty() || !unauthorized_provider.is_empty() {
                 // Dump a REDACTED diagnostic (account keys/emails only, no
                 // tokens) into config_dir/backups/ with owner-only permissions.
@@ -1495,12 +1549,13 @@ pub fn save_state_safe(state: &State) -> Result<()> {
         // (2) Rolling backup of the (still-current) state.json. Best-effort:
         // a backup failure logs but does NOT block the save — losing a backup
         // is far less bad than blocking a legitimate write.
-        if let Err(e) = write_rolling_backup(&dir, &path, &old_bytes) {
-            crate::logging::log(&format!("backup: rolling copy failed: {e:#}"));
+        if membership_changed || backup_due(&dir.join("backups"), std::time::SystemTime::now()) {
+            if let Err(e) = write_rolling_backup(&dir, &path, &old_bytes) {
+                crate::logging::log(&format!("backup: rolling copy failed: {e:#}"));
+            }
         }
     }
 
-    let json = serde_json::to_vec_pretty(state)?;
     let tmp = path.with_extension("json.tmp");
     // Create the temp file owner-only from the start (no umask window), then
     // rename it into place; clean up the temp file on any failure.
