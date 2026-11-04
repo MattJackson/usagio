@@ -107,23 +107,28 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)]
     fn scoped_env_var_none_unsets_then_restores() {
-        // Seed an outer value (guarded by the crate-wide lock) so the
-        // unset/restore round-trip is observable. We can't nest scoped calls
-        // because ENV_LOCK is a std Mutex (non-reentrant) — so seed with a
-        // scoped call, read the previous, then run a second scoped call that
-        // asserts the unset and restores to the seeded value.
+        // Seed the key as SET before the scoped call (directly, under the
+        // crate lock — scoped calls can't nest), so the None arm has a real
+        // value to unset and a real previous value to restore.
         let key = "USAGIO_ENV_LOCK_TEST_KEY";
-        scoped_env_var(key, Some("seed"), || {
-            // Nothing here — the seed is visible while the guard is live.
-            assert_eq!(
-                std::env::var_os(key),
-                Some(std::ffi::OsString::from("seed"))
-            );
-        });
-        // Now exercise the None (unset) path from a fresh outer state.
+        {
+            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var(key, "seed");
+        }
         scoped_env_var(key, None, || {
-            assert!(std::env::var_os(key).is_none(), "None unsets the key");
+            assert!(std::env::var_os(key).is_none(), "None unsets a set key");
         });
+        let after = std::env::var_os(key);
+        {
+            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::remove_var(key);
+        }
+        assert_eq!(
+            after,
+            Some(OsString::from("seed")),
+            "previously-set value restored after a None scope"
+        );
     }
 }
