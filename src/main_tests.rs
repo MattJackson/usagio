@@ -709,6 +709,7 @@ fn sample(account: &str, session: f64, ts: i64) -> Sample {
         session: Some(session),
         weekly: None,
         event: None,
+        provider: None,
     }
 }
 
@@ -7561,4 +7562,252 @@ fn failed_live_write_leaves_a_marker_and_the_poll_republishes_it() {
     a.live_write_pending = Some("x".into());
     a.adopt_login(&Account::from_keychain_blob(&mock_claude_blob("m-at", "m-rt", 6)).unwrap());
     assert_eq!(a.live_write_pending, None);
+}
+
+#[test]
+fn cli_wait_loop_does_not_replay_its_pick_over_a_newer_queued_one() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+        let (a, b) = ("a@e.com", "b@e.com");
+        let fresh = |key: &str| {
+            let mut acct = codex_account(key, None);
+            acct.expires_at = Utc::now().timestamp() + 86_400;
+            acct
+        };
+        let pending = |key: &str| crate::store::PendingSwitch {
+            renewal: false,
+            key: key.into(),
+            manual: true,
+            from: None,
+            drain_token: None,
+            credentials_written: false,
+            leave_latch: None,
+            renewed_account: None,
+        };
+        let mut state = State::default();
+        state.upsert_provider_account("codex", fresh(a));
+        state.upsert_provider_account("codex", fresh(b));
+        state.provider_accounts_mut("codex").pending_switch = Some(pending(a));
+        state.save().unwrap();
+        // While the CLI sleeps, the user picks B in the menu.
+        let _ = wait_for_queued_provider_switch("codex", a, true, |_| {
+            let mut st = State::load().unwrap();
+            st.provider_accounts_mut("codex").pending_switch = Some(pending(b));
+            st.save().unwrap();
+        });
+        let after = State::load().unwrap();
+        let now = after.provider_accounts("codex").unwrap();
+        assert_ne!(
+            now.active.as_deref(),
+            Some(a),
+            "stale CLI pick replaced the newer one"
+        );
+        assert_eq!(now.pending_switch.as_ref().map(|p| p.key.as_str()), Some(b));
+    });
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "reads or writes the OS secret store, which is only hermetic (in-memory) on macOS"
+)]
+fn guarded_switch_refuses_a_target_removed_during_phase_one() {
+    with_claude_home("a@e.com", |_home| {
+        seed_claude_state(
+            vec![
+                claude_account_with_identity("a@e.com", 3_600_000),
+                claude_account_with_identity("b@e.com", 3_600_000),
+            ],
+            Some("a@e.com"),
+        );
+        let provider = providers::get(CLAUDE_SLUG).unwrap();
+        prime_active_slot(&mock_claude_blob("at-a@e.com", "rt-a", 9_999_999_999_999));
+        let acct = State::load().unwrap().find("b@e.com").cloned().unwrap();
+        let identity = acct.oauth_account.clone().unwrap();
+        // `usagio rm b` lands while prepare_switch is on the network.
+        let mut st = State::load().unwrap();
+        assert!(st.remove("b@e.com"));
+        st.save().unwrap();
+        let _ = switch_to_guarded(provider, "b@e.com", &acct, &identity, false, None, false);
+        assert_eq!(State::load().unwrap().active.as_deref(), Some("a@e.com"));
+        assert_ne!(
+            keychain_access_token().as_deref(),
+            Some(acct.access_token.as_str())
+        );
+    });
+}
+
+#[test]
+fn unqualified_selector_matching_several_providers_must_be_qualified() {
+    let mut state = State::default();
+    state.upsert(claude_account("dev@a.com", 3_600_000));
+    state.upsert_provider_account("codex", codex_account("dev@b.com", None));
+    state.upsert_provider_account("codex", codex_account("dev@c.com", None));
+    // `rm dev` matched three accounts in two providers.
+    let err = resolve_account_selector(&state, "dev").unwrap_err();
+    assert!(err.to_string().contains("qualify"), "{err}");
+    // No Claude match, two Codex matches: ambiguous, not "no account".
+    let mut codex_only = State::default();
+    codex_only.upsert_provider_account("codex", codex_account("dev@b.com", None));
+    codex_only.upsert_provider_account("codex", codex_account("dev@c.com", None));
+    let err = resolve_account_selector(&codex_only, "dev").unwrap_err();
+    assert!(err.to_string().contains("more than one"), "{err}");
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "reads or writes the OS secret store, which is only hermetic (in-memory) on macOS"
+)]
+fn switch_away_keeps_a_renewal_whose_live_write_failed() {
+    with_claude_home("a@e.com", |_home| {
+        // A was renewed, but publishing the fresh grant to the slot failed:
+        // the slot still holds A's old login.
+        let mut a = claude_account_with_identity("a@e.com", 3_600_000);
+        a.live_write_pending = Some(crate::logging::token_fingerprint(&a.refresh_token));
+        let renewed_rt = a.refresh_token.clone();
+        seed_claude_state(
+            vec![a, claude_account_with_identity("b@e.com", 3_600_000)],
+            Some("a@e.com"),
+        );
+        prime_active_slot(&mock_claude_blob("old-at", "old-rt", 9_999_999_999_999));
+        let provider = providers::get(CLAUDE_SLUG).unwrap();
+        let acct = State::load().unwrap().find("b@e.com").cloned().unwrap();
+        let identity = acct.oauth_account.clone().unwrap();
+        switch_to_guarded(provider, "b@e.com", &acct, &identity, false, None, false).unwrap();
+        let after = State::load().unwrap();
+        assert_eq!(after.active.as_deref(), Some("b@e.com"));
+        assert_eq!(
+            after.find("a@e.com").unwrap().refresh_token,
+            renewed_rt,
+            "the renewed grant was overwritten by the old slot login"
+        );
+    });
+}
+
+#[test]
+fn a_hold_survives_a_cycle_run_with_auto_swap_off() {
+    // Auto-swap off runs the cycle at the 101% sentinel; the hold was decided
+    // against the saved 95% trigger and must be judged against it.
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let mut state = State {
+        trigger_pct: Some(95.0),
+        ..State::default()
+    };
+    let mut a = acct_with_cache(Some(usage_at(97.0)));
+    a.email = Some("pick@e.com".to_string());
+    state.upsert(a);
+    state.active = Some("pick@e.com".to_string());
+    state.set_manual_pick(CLAUDE_SLUG, Some("pick@e.com"));
+    state.set_manual_hold(CLAUDE_SLUG, Some("pick@e.com"));
+    state.manual_pick_at.clear(); // the first reading already settled it
+    state.save().unwrap();
+    // The cycle ran at the auto-swap-off sentinel (101%).
+    settle_manual_picks();
+    assert_eq!(
+        State::load().unwrap().manual_hold(CLAUDE_SLUG),
+        Some("pick@e.com")
+    );
+}
+
+#[test]
+fn a_just_switched_to_locked_codex_account_is_refetched() {
+    // Locked in its (pre-switch) cache, but it reset early and the user just
+    // switched to it: the active account is never skipped by the lock guard.
+    let k = uniq("codex-active-locked");
+    reset_usage_fetch_tracker(&fetch_tracker_key("codex", &k));
+    note_polled_provider_active("codex", Some("someone-else"));
+    assert_eq!(codex_one(&k, cu_locked(2 * 3600), true, false), 1);
+    reset_usage_fetch_tracker(&fetch_tracker_key("codex", &k));
+}
+
+#[test]
+fn token_for_a_no_longer_active_account_never_rewrites_the_slot() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    // The slot still holds A's old grant; A carries a failed-publish marker.
+    let provider = MockActiveSlotProvider::new(&mock_claude_blob("old-at", "old-rt", 5));
+    let mut a = Account::from_keychain_blob(&mock_claude_blob("new-at", "new-rt", 6)).unwrap();
+    a.email = Some(provider.email.clone());
+    a.live_write_pending = Some(crate::logging::token_fingerprint(&a.refresh_token));
+    let mut b = claude_account("b@e.com", 3_600_000);
+    b.email = Some("b@e.com".into());
+    // `usagio token A` saw A active; a switch to B committed since.
+    seed_claude_state(vec![a, b], Some("b@e.com"));
+    let _ = token_active_cas(&provider, &provider.email.clone());
+    assert_eq!(
+        provider.writes.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "reverted the committed switch in the slot"
+    );
+}
+
+#[test]
+fn report_counts_only_claude_swaps() {
+    let swap = |provider: Option<&str>| Sample {
+        event: Some("swap".into()),
+        provider: provider.map(str::to_string),
+        ..sample("a@e.com", 0.0, 1)
+    };
+    let samples = [swap(Some("codex")), swap(Some("claude")), swap(None)];
+    assert_eq!(
+        report_swap_count(&samples),
+        2,
+        "codex swaps entered the Claude report"
+    );
+}
+
+#[test]
+fn an_in_sync_active_cas_does_not_rewrite_state() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let blob = mock_claude_blob("live-at", "live-rt", 9_999_999_999_999);
+    let provider = MockActiveSlotProvider::new(&blob);
+    let mut a = Account::from_keychain_blob(&blob).unwrap();
+    a.email = Some(provider.email.clone());
+    seed_claude_state(vec![a], Some(&provider.email.clone()));
+    let backups = || {
+        std::fs::read_dir(crate::store::config_dir().unwrap().join("backups"))
+            .map(|d| d.count())
+            .unwrap_or(0)
+    };
+    // First pass may normalise; an idle repeat must not rotate a backup.
+    let _ = poll_active_cas(&provider, &provider.email.clone()).unwrap();
+    let before = backups();
+    let (outcome, _) = poll_active_cas(&provider, &provider.email.clone()).unwrap();
+    assert!(matches!(outcome, Some(ActiveRefreshOutcome::Adopted)));
+    assert_eq!(backups(), before, "an idle CAS rewrote state.json");
+}
+
+#[test]
+fn an_unchanged_plan_does_not_rewrite_state() {
+    let _g = crate::store::ScopedConfigDir::new();
+    let mut st = State::default();
+    st.upsert_provider_account("codex", codex_account("c@e.com", None));
+    st.save().unwrap();
+    persist_plan("codex", "c@e.com", &plan("Plus", true), None);
+    let backups = || {
+        std::fs::read_dir(crate::store::config_dir().unwrap().join("backups"))
+            .map(|d| d.count())
+            .unwrap_or(0)
+    };
+    let before = backups();
+    persist_plan("codex", "c@e.com", &plan("Plus", true), None);
+    assert_eq!(backups(), before, "an unchanged plan rotated a backup");
+}
+
+#[test]
+fn provider_slugs_are_case_insensitive_on_capture_and_renew() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    State::default().save().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let err = format!("{:#}", cmd_capture(&args(&["Codex"])).unwrap_err());
+        assert!(!err.contains("not registered"), "{err}");
+        let err = format!(
+            "{:#}",
+            cmd_renew(&args(&["nobody@e.com", "--provider", "Codex"])).unwrap_err()
+        );
+        assert!(!err.contains("not registered"), "{err}");
+    });
 }
