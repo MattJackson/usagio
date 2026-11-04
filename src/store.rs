@@ -1284,7 +1284,7 @@ pub(crate) const BACKUP_KEEP_COUNT: usize = 20;
 ///    a 0700 dir), then prunes so at most [`BACKUP_KEEP_COUNT`] survive.
 pub fn save_state_safe(state: &State) -> Result<()> {
     let dir = config_dir()?;
-    std::fs::create_dir_all(&dir).context("creating ~/.config/usagio")?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = state_path()?;
 
     // (1) Overwrite protection.

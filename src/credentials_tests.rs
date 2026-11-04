@@ -1359,3 +1359,26 @@ fn relogin_alert_fires_once_per_account_and_refresh_token() {
         "other account alerts"
     );
 }
+
+fn backup_count() -> usize {
+    let dir = crate::store::config_dir().unwrap().join("backups");
+    std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0)
+}
+
+#[test]
+fn absorb_that_changes_nothing_does_not_save() {
+    with_isolated_home(|| {
+        crate::store::State::default().save().unwrap();
+        crate::store::State::default().save().unwrap();
+        let before = backup_count();
+        with_state_lock_absorb(|_| Ok(())).unwrap();
+        assert_eq!(backup_count(), before, "no-op absorb must not save");
+        with_state_lock_absorb(|st| {
+            st.autoswap_disabled = true;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(backup_count(), before + 1, "a real change must save");
+        assert!(crate::store::State::load().unwrap().autoswap_disabled);
+    });
+}
