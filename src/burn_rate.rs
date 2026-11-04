@@ -49,7 +49,16 @@ pub fn estimate(
         Window::Session => 1, // 5h fits in 1 day
         Window::Weekly => 8,
     };
-    let mut samples = usage_log::last_n_days(account, lookback_days);
+    let samples = usage_log::last_n_days(account, lookback_days);
+    estimate_from(samples, window, now)
+}
+
+/// The fit over already-loaded samples (testable without the log).
+fn estimate_from(
+    mut samples: Vec<Snapshot>,
+    window: Window,
+    now: DateTime<Utc>,
+) -> Option<BurnRateEstimate> {
     // Keep only the ones whose target-window pct is Some, ordered by ts asc.
     samples.retain(|s| pct_for(s, window).is_some());
     samples.sort_by_key(|s| s.ts);
@@ -61,6 +70,21 @@ pub fn estimate(
     };
     let cutoff = now - horizon;
     samples.retain(|s| s.ts >= cutoff);
+
+    // The log does no reset filtering: keep only samples after the last
+    // significant drop (a reset), as `usage_log::pace_from_snaps` does.
+    let mut start = 0usize;
+    for i in 1..samples.len() {
+        if let (Some(prev), Some(cur)) = (
+            pct_for(&samples[i - 1], window),
+            pct_for(&samples[i], window),
+        ) {
+            if cur + 5.0 < prev {
+                start = i;
+            }
+        }
+    }
+    samples.drain(..start);
 
     if samples.len() < MIN_SAMPLES {
         return None;
@@ -77,8 +101,10 @@ pub fn estimate(
         now + Duration::hours(MAX_EMPTY_IN_HOURS)
     } else {
         // hours_from_now = (100 - current_pct) / slope
-        let hours_to_empty = ((100.0 - current_pct) / slope_per_hour).max(0.0) as i64;
-        now + Duration::hours(hours_to_empty.min(MAX_EMPTY_IN_HOURS))
+        let hours_to_empty = ((100.0 - current_pct) / slope_per_hour)
+            .max(0.0)
+            .min(MAX_EMPTY_IN_HOURS as f32);
+        now + Duration::seconds((hours_to_empty * 3600.0) as i64)
     };
 
     // Silence unused-var lint on intercept — kept for debug/logging clarity.
@@ -119,12 +145,10 @@ fn pct_for(s: &Snapshot, w: Window) -> Option<f32> {
 }
 
 fn reset_for(s: &Snapshot, w: Window) -> Option<DateTime<Utc>> {
-    // Snapshot doesn't carry reset time today; the caller (renderer) supplies it from
-    // the account's cached usage.  We keep the field on BurnRateEstimate so the
-    // renderer can populate it after `estimate`.  Return None here so the module is
-    // testable standalone.
-    let _ = (s, w);
-    None
+    match w {
+        Window::Session => s.session_reset,
+        Window::Weekly => s.weekly_reset,
+    }
 }
 
 /// Weighted linear fit of pct vs hours-from-now.  Weights: exponential decay, most
@@ -504,7 +528,7 @@ mod tests {
     }
 
     /// 10 pct/hr climb ending at 35% (one minute ago): 65 points left -> 6.5h,
-    /// truncated to 6h.
+    /// 6.5h (no truncation to whole hours).
     fn climbing_rows() -> Vec<(i64, f32)> {
         (0..7)
             .map(|k| (1 + k * 30, 35.0 - 5.0 * k as f32))
@@ -521,7 +545,7 @@ mod tests {
             "{}",
             est.rate_pct_per_hour
         );
-        assert_eq!(est.empty_at - now, Duration::hours(6));
+        assert_eq!(est.empty_at - now, Duration::minutes(390));
         assert!(est.reset_at.is_none());
     }
 
@@ -537,7 +561,7 @@ mod tests {
             "{}",
             est.rate_pct_per_hour
         );
-        assert_eq!(est.empty_at - now, Duration::hours(6));
+        assert_eq!(est.empty_at - now, Duration::minutes(390));
     }
 
     #[test]
@@ -568,5 +592,73 @@ mod tests {
     fn estimate_via_public_api() {
         let key = AccountKey::default();
         let _ = estimate(&key, Window::Weekly, Utc::now());
+    }
+
+    fn mk_series(window: Window, pcts: &[f32], step_min: i64, now: DateTime<Utc>) -> Vec<Snapshot> {
+        let n = pcts.len() as i64;
+        pcts.iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let ts = now - Duration::minutes((n - 1 - i as i64) * step_min);
+                let mut sn = Snapshot {
+                    ts,
+                    provider: "claude".into(),
+                    account: "matt@example.com".into(),
+                    ..Default::default()
+                };
+                match window {
+                    Window::Session => sn.session_pct = Some(*p),
+                    Window::Weekly => sn.weekly_pct = Some(*p),
+                }
+                sn
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sub_hour_projection_is_not_truncated_to_now() {
+        // 15 pct/h, 90% now: ~40 minutes to empty, not 0.
+        let now = Utc::now();
+        let pcts = [75.0, 77.5, 80.0, 82.5, 85.0, 87.5, 90.0];
+        let est = estimate_from(
+            mk_series(Window::Session, &pcts, 10, now),
+            Window::Session,
+            now,
+        )
+        .unwrap();
+        let mins = (est.empty_at - now).num_minutes();
+        assert!((30..=50).contains(&mins), "~40m expected, got {mins}m");
+    }
+
+    #[test]
+    fn pre_reset_samples_do_not_flatten_the_fit() {
+        let now = Utc::now();
+        let pcts = [90.0, 92.0, 95.0, 1.0, 3.0, 5.0, 7.0, 9.0, 11.0];
+        let est = estimate_from(
+            mk_series(Window::Session, &pcts, 10, now),
+            Window::Session,
+            now,
+        )
+        .unwrap();
+        assert!(
+            est.rate_pct_per_hour > FLAT_SLOPE_THRESHOLD_PCT_PER_HOUR,
+            "rate {}",
+            est.rate_pct_per_hour
+        );
+    }
+
+    #[test]
+    fn estimate_carries_the_latest_reset() {
+        let now = Utc::now();
+        let mut v = mk_series(
+            Window::Weekly,
+            &[10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
+            30,
+            now,
+        );
+        let r = now + Duration::hours(3);
+        v.last_mut().unwrap().weekly_reset = Some(r);
+        let est = estimate_from(v, Window::Weekly, now).unwrap();
+        assert_eq!(est.reset_at, Some(r));
     }
 }
