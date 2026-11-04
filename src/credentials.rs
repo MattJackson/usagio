@@ -399,7 +399,7 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
     // `$HOME`) is picked up by the periodic `absorb_all_lagging` poll every
     // watch cycle instead. Latency goes from ~2s to ~30s for that one file;
     // capture still works.
-    let home_dir = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let home_dir = crate::paths::user_home();
     let root_dir = std::path::PathBuf::from("/");
 
     let mut any_watched = false;

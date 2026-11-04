@@ -167,8 +167,17 @@ pub(crate) fn probe() -> Result<Option<ClientState>> {
     if !path.exists() {
         return Ok(None);
     }
+    // Pin the token before AND after inspect(): if the daemon restarted in
+    // between, busy/email describe one instance and the token another.
+    let before = read_instance_token(&home);
     let mut state = with_control("ws://localhost/", inspect)?;
-    state.instance_token = ["daemon.pid", "app-server.pid"]
+    let after = read_instance_token(&home);
+    state.instance_token = stable_instance_token(before, after)?;
+    Ok(Some(state))
+}
+
+fn read_instance_token(home: &Path) -> Option<String> {
+    ["daemon.pid", "app-server.pid"]
         .into_iter()
         .find_map(|name| {
             let bytes = std::fs::read(home.join("app-server-daemon").join(name)).ok()?;
@@ -179,8 +188,20 @@ pub(crate) fn probe() -> Result<Option<ClientState>> {
                 .and_then(|id| u32::try_from(id).ok())?;
             let start = record.get("processStartTime").and_then(Value::as_str)?;
             Some(json!({"pid":pid,"start":start}).to_string())
-        });
-    Ok(Some(state))
+        })
+}
+
+const UNSTABLE_DAEMON_MSG: &str = "Codex daemon changed while being inspected; retry next cycle";
+
+fn is_unstable_daemon(e: &anyhow::Error) -> bool {
+    e.to_string() == UNSTABLE_DAEMON_MSG
+}
+
+fn stable_instance_token(before: Option<String>, after: Option<String>) -> Result<Option<String>> {
+    if before != after {
+        bail!("{UNSTABLE_DAEMON_MSG}");
+    }
+    Ok(after)
 }
 
 fn with_control<T: Send + 'static>(
@@ -301,7 +322,18 @@ pub(crate) fn start_and_verify(expected: &crate::providers::IdentitySnapshot) ->
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    let actual = probe()?.context("Codex daemon did not return after restart")?;
+    // The pid file can land mid-probe; retry the token-mismatch error within
+    // the handoff deadline instead of failing a verification that never uses
+    // the token.
+    let actual = loop {
+        match probe() {
+            Ok(state) => break state.context("Codex daemon did not return after restart")?,
+            Err(e) if is_unstable_daemon(&e) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(e) => return Err(e),
+        }
+    };
     if !identity_matches(&actual, email, expected.uuid.as_ref()) {
         bail!("Codex daemon did not load the selected account");
     }
@@ -362,6 +394,16 @@ mod tests {
             "a@x.com",
             Some(&u)
         ));
+    }
+
+    #[test]
+    fn instance_token_must_match_before_and_after_inspect() {
+        let a = Some("a".to_string());
+        assert_eq!(stable_instance_token(a.clone(), a.clone()).unwrap(), a);
+        assert!(stable_instance_token(a, Some("b".into())).is_err());
+        assert_eq!(stable_instance_token(None, None).unwrap(), None);
+        let e = stable_instance_token(None, Some("b".into())).unwrap_err();
+        assert!(is_unstable_daemon(&e));
     }
 
     /// Hold a synthetic Responses stream open until the test releases it.

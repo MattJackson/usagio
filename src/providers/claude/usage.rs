@@ -493,15 +493,21 @@ pub fn fetch_email(access_token: &str) -> Option<String> {
 
 /// Fetch the raw profile JSON (`account`, `organization`, ...).
 pub fn fetch_profile(access_token: &str) -> Option<serde_json::Value> {
-    super::http_agent()
+    let resp = super::http_agent()
         .get(config::PROFILE_URL)
         .set("Authorization", &format!("Bearer {access_token}"))
         .set("anthropic-beta", config::OAUTH_BETA)
         .set("anthropic-version", "2023-06-01")
-        .call()
-        .ok()?
-        .into_json()
-        .ok()
+        .call();
+    match resp {
+        Ok(r) => r.into_json().ok(),
+        Err(e) => {
+            // Never log the request (it carries the bearer token); ureq's
+            // error text names only the URL and status.
+            crate::logging::log(&format!("event=profile_fetch result=err:{e}"));
+            None
+        }
+    }
 }
 
 #[cfg(test)]

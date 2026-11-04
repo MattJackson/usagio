@@ -55,7 +55,6 @@ use store::{Account, CachedUsage, ProviderAccount, State};
 /// the constant with a per-account lookup keyed on the containing bucket.
 const CLAUDE_SLUG: &str = "claude";
 
-const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 /// App slug used everywhere we ask the platform for a per-app directory
 /// (`~/.config/usagio` on macOS, `$XDG_CONFIG_HOME/usagio` on Linux,
 /// `%APPDATA%\usagio` on Windows). The one-shot rename from `claude-usage`
@@ -2751,6 +2750,9 @@ fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
 // Keychain helpers — delegate to the platform SecretStore
 // ---------------------------------------------------------------------------
 
+// Only the keychain-account unit test uses this now; the live slot logic is
+// `providers::claude::active_slot_{read,write}`.
+#[cfg(test)]
 fn keychain_account() -> String {
     std::env::var("USER").unwrap_or_else(|_| "claude".to_string())
 }
@@ -2764,21 +2766,15 @@ fn keychain_account() -> String {
 // single-user threat model. TODO: switch back to security-framework once we
 // ship a code-signed (Developer ID) build, where "Always Allow" persists.
 fn keychain_read() -> Option<String> {
-    platform()
-        .secrets()
-        .get(KEYCHAIN_SERVICE, &keychain_account())
-        .ok()
-        .flatten()
+    providers::claude::active_slot_read().ok().flatten()
 }
 
 fn keychain_write(blob: &str) -> Result<()> {
-    let result = platform()
-        .secrets()
-        .set(KEYCHAIN_SERVICE, &keychain_account(), blob);
+    let result = providers::claude::active_slot_write(blob).map_err(|e| anyhow!("{e}"));
     // Feed the keychain-write health signal the watchdog watches: a run of
     // consecutive failures is the fingerprint of the fd-exhaustion EMFILE that
-    // silently broke account switching (see `src/watchdog.rs`). A success
-    // resets the counter.
+    // silently broke account switching (see `src/watchdog.rs`). File writes
+    // hit EMFILE the same way. A success resets the counter.
     watchdog::record_keychain_result(result.is_ok());
     result
 }
@@ -2856,8 +2852,8 @@ fn cmd_secrets_selftest(args: &[String]) -> Result<()> {
 }
 
 fn claude_json_path() -> Result<std::path::PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(std::path::PathBuf::from(home).join(".claude.json"))
+    let home = crate::paths::user_home().context("HOME/USERPROFILE is not set")?;
+    Ok(home.join(".claude.json"))
 }
 
 /// Read the current `oauthAccount` + `userID` from `~/.claude.json`.
@@ -2937,29 +2933,49 @@ fn write_bytes_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> R
 /// `cachedUsageUtilization`. Atomic, preserves the file mode, cleans the tmp on
 /// failure.
 fn write_claude_identity(oauth_account: &serde_json::Value, user_id: Option<&str>) -> Result<()> {
+    write_claude_identity_with(oauth_account, user_id, || {})
+}
+
+/// Read-modify-write `~/.claude.json`. The Claude CLI rewrites this file
+/// continually, so re-read just before committing and redo the patch if the
+/// bytes moved (bounded). `before_commit` is a test seam.
+fn write_claude_identity_with(
+    oauth_account: &serde_json::Value,
+    user_id: Option<&str>,
+    mut before_commit: impl FnMut(),
+) -> Result<()> {
     let path = claude_json_path()?;
-    let bytes = std::fs::read(&path).context("reading ~/.claude.json")?;
-    let mut v: serde_json::Value =
-        serde_json::from_slice(&bytes).context("parsing ~/.claude.json")?;
-    let obj = v
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("~/.claude.json is not a JSON object"))?;
-    obj.insert("oauthAccount".into(), oauth_account.clone());
-    match user_id {
-        Some(uid) => {
-            obj.insert("userID".into(), serde_json::Value::String(uid.to_string()));
+    for attempt in 0..3 {
+        let bytes = std::fs::read(&path).context("reading ~/.claude.json")?;
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&bytes).context("parsing ~/.claude.json")?;
+        let obj = v
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("~/.claude.json is not a JSON object"))?;
+        obj.insert("oauthAccount".into(), oauth_account.clone());
+        match user_id {
+            Some(uid) => {
+                obj.insert("userID".into(), serde_json::Value::String(uid.to_string()));
+            }
+            // Don't leave the previous account's userID paired with a new identity.
+            None => {
+                obj.remove("userID");
+            }
         }
-        // Don't leave the previous account's userID paired with a new identity.
-        None => {
-            obj.remove("userID");
+        obj.remove("cachedUsageUtilization");
+        let json = serde_json::to_vec_pretty(&v)?;
+        // Preserve the file's existing mode; the shared writer creates the temp
+        // owner-only first, so tokens are never briefly world-readable.
+        let mode = claude_json_mode(&path);
+        before_commit();
+        let unchanged = std::fs::read(&path)
+            .map(|now| now == bytes)
+            .unwrap_or(false);
+        if unchanged || attempt == 2 {
+            return write_bytes_atomic_mode(&path, &json, mode).context("replacing ~/.claude.json");
         }
     }
-    obj.remove("cachedUsageUtilization");
-    let json = serde_json::to_vec_pretty(&v)?;
-    // Preserve the file's existing mode; the shared writer creates the temp
-    // owner-only first, so tokens are never briefly world-readable.
-    let mode = claude_json_mode(&path);
-    write_bytes_atomic_mode(&path, &json, mode).context("replacing ~/.claude.json")
+    unreachable!("loop returns on the last attempt")
 }
 
 // ---------------------------------------------------------------------------
