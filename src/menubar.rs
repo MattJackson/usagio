@@ -4049,6 +4049,15 @@ fn confirm(question: &str) -> bool {
     confirm_with_button(question, "Remove")
 }
 
+/// What the user answered: `Some(true)` for `button`, `Some(false)` for any
+/// other button, `None` when the dialog produced no button at all.
+fn confirm_answer(result: rfd::MessageDialogResult, button: &str) -> Option<bool> {
+    match result {
+        rfd::MessageDialogResult::Custom(label) => Some(label == button),
+        _ => None,
+    }
+}
+
 fn confirm_with_button(question: &str, button: &str) -> bool {
     let result = rfd::MessageDialog::new()
         .set_title("usagio")
@@ -4059,7 +4068,19 @@ fn confirm_with_button(question: &str, button: &str) -> bool {
             "Cancel".to_string(),
         ))
         .show();
-    matches!(result, rfd::MessageDialogResult::Custom(label) if label == button)
+    // Both buttons are custom, so a non-button result means the dialog was
+    // dismissed without one or could not be shown at all (Linux without
+    // zenity). Still fail closed, but say so instead of doing nothing.
+    confirm_answer(result, button).unwrap_or_else(|| {
+        crate::logging::log(&format!(
+            "event=confirm_dialog_no_answer button={button:?} ; nothing changed"
+        ));
+        notify(
+            "No answer from the confirmation dialog — nothing was changed \
+             (on Linux this dialog needs zenity installed)",
+        );
+        false
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -8611,6 +8632,23 @@ mod tests {
     }
 
     #[test]
+    fn confirm_tells_a_dialog_failure_from_a_cancel() {
+        use rfd::MessageDialogResult as R;
+        assert_eq!(
+            confirm_answer(R::Custom("Remove".into()), "Remove"),
+            Some(true)
+        );
+        assert_eq!(
+            confirm_answer(R::Custom("Cancel".into()), "Remove"),
+            Some(false)
+        );
+        assert_eq!(
+            confirm_answer(R::Cancel, "Remove"),
+            None,
+            "a non-button result means the dialog could not be shown"
+        );
+    }
+
     #[test]
     fn a_new_browser_login_cancels_the_previous_one_for_that_provider() {
         let old = std::sync::Arc::new(crate::login::Progress::default());
