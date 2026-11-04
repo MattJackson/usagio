@@ -43,14 +43,30 @@ impl Drop for Job {
 }
 
 fn bounded_command(command: &mut Command, deadline: Instant) -> Result<ExitStatus> {
+    bounded_command_stderr(command, deadline).map(|(status, _)| status)
+}
+
+/// Like `bounded_command`, but also returns the child's (trimmed) stderr so a
+/// failure can say why. stderr is read only after the child exits; launchctl's
+/// diagnostics are a line or two, far below the pipe buffer.
+fn bounded_command_stderr(
+    command: &mut Command,
+    deadline: Instant,
+) -> Result<(ExitStatus, String)> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
+            Ok(Some(status)) => {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = std::io::Read::read_to_string(&mut pipe, &mut stderr);
+                }
+                return Ok((status, stderr.trim().to_string()));
+            }
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(25));
             }
@@ -162,7 +178,7 @@ pub(super) fn run(
         target: format!("{domain}/{label}"),
         _directory: directory,
     };
-    let status = bounded_command(
+    let (status, stderr) = bounded_command_stderr(
         Command::new("/bin/launchctl")
             .args(["bootstrap", &domain])
             .arg(&plist),
@@ -170,7 +186,7 @@ pub(super) fn run(
     )?;
     anyhow::ensure!(
         status.success(),
-        "independent launchd bootstrap failed: {status}"
+        "independent launchd bootstrap failed: {status}: {stderr}"
     );
     loop {
         match std::fs::read_to_string(&result) {

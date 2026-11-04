@@ -101,20 +101,21 @@ impl Platform for LinuxPlatform {
 
 pub struct LinuxPaths;
 
-/// `$XDG_CONFIG_HOME`, or `~/.config` if unset/empty.
+/// `$XDG_CONFIG_HOME`, or `~/.config` if unset/empty/relative.
 fn xdg_config_home() -> PathBuf {
     if let Some(v) = std::env::var_os("XDG_CONFIG_HOME") {
-        if !v.is_empty() {
+        // XDG spec: a relative path is invalid and must be ignored.
+        if !v.is_empty() && Path::new(&v).is_absolute() {
             return PathBuf::from(v);
         }
     }
     home_dir().join(".config")
 }
 
-/// `$XDG_CACHE_HOME`, or `~/.cache` if unset/empty.
+/// `$XDG_CACHE_HOME`, or `~/.cache` if unset/empty/relative.
 fn xdg_cache_home() -> PathBuf {
     if let Some(v) = std::env::var_os("XDG_CACHE_HOME") {
-        if !v.is_empty() {
+        if !v.is_empty() && Path::new(&v).is_absolute() {
             return PathBuf::from(v);
         }
     }
@@ -168,22 +169,31 @@ impl LinuxAutostart {
 /// Quote one `Exec=` argument per the freedesktop Desktop Entry spec: an
 /// argument containing whitespace or a reserved shell metacharacter must be
 /// wrapped in double quotes, with `\`, `"`, `` ` ``, and `$` backslash-escaped
-/// inside the quotes. Same class of bug as macOS's plist `xml_escape` guards
-/// against — a path or arg breaking the generated file.
+/// inside the quotes. The spec applies the general string-value escape rule
+/// on top of that, so each of those escapes is itself written with a doubled
+/// backslash (`"` -> `\\"`, literal `\` -> `\\\\`, `$` -> `\\$`). A literal `%`
+/// is written `%%` (a bare `%x` is a field code), quoted or not. Same class of
+/// bug as macOS's plist `xml_escape` guards against — a path or arg breaking
+/// the generated file.
 fn desktop_exec_quote(s: &str) -> String {
     let needs_quoting = s.is_empty()
         || s.chars()
             .any(|c| c.is_whitespace() || "\"'\\$`><|&;()#*?[]!{}~".contains(c));
     if !needs_quoting {
-        return s.to_string();
+        return s.replace('%', "%%");
     }
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
-        if matches!(c, '"' | '\\' | '`' | '$') {
-            out.push('\\');
+        match c {
+            '"' | '`' | '$' => {
+                out.push_str("\\\\");
+                out.push(c);
+            }
+            '\\' => out.push_str("\\\\\\\\"),
+            '%' => out.push_str("%%"),
+            _ => out.push(c),
         }
-        out.push(c);
     }
     out.push('"');
     out
@@ -199,39 +209,65 @@ fn desktop_exec_quote(s: &str) -> String {
 /// `desktop_exec_quote` itself never produces that shape — this just doesn't
 /// assume otherwise.
 fn desktop_exec_split(line: &str) -> Result<Vec<String>> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
     let mut tokens = Vec::new();
-    let mut chars = line.chars().peekable();
     loop {
-        while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
-            chars.next();
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
         }
-        if chars.peek().is_none() {
+        if i >= chars.len() {
             break;
         }
         let mut tok = String::new();
-        while let Some(&c) = chars.peek() {
-            if c.is_whitespace() {
-                break;
-            }
+        while i < chars.len() && !chars[i].is_whitespace() {
+            let c = chars[i];
+            i += 1;
             if c == '"' {
-                chars.next(); // consume opening quote
                 loop {
-                    match chars.next() {
-                        Some('"') => break,
-                        Some('\\') => match chars.next() {
-                            Some(next) if matches!(next, '"' | '\\' | '`' | '$') => tok.push(next),
-                            Some(next) => {
+                    let Some(&c) = chars.get(i) else {
+                        bail!("unterminated quote in Exec= line: {line:?}");
+                    };
+                    i += 1;
+                    match c {
+                        '"' => break,
+                        '\\' => {
+                            let Some(&next) = chars.get(i) else {
+                                bail!("unterminated escape in Exec= line: {line:?}");
+                            };
+                            i += 1;
+                            if next == '\\' {
+                                // String-level pair: one Exec-level backslash.
+                                match chars.get(i) {
+                                    Some(&e) if matches!(e, '"' | '`' | '$') => {
+                                        i += 1;
+                                        tok.push(e);
+                                    }
+                                    Some('\\') if chars.get(i + 1) == Some(&'\\') => {
+                                        i += 2;
+                                        tok.push('\\');
+                                    }
+                                    _ => tok.push('\\'),
+                                }
+                            } else if matches!(next, '"' | '`' | '$') {
+                                // Legacy single-backslash form (older installs).
+                                tok.push(next);
+                            } else {
                                 tok.push('\\');
                                 tok.push(next);
                             }
-                            None => bail!("unterminated escape in Exec= line: {line:?}"),
-                        },
-                        Some(other) => tok.push(other),
-                        None => bail!("unterminated quote in Exec= line: {line:?}"),
+                        }
+                        '%' if chars.get(i) == Some(&'%') => {
+                            i += 1;
+                            tok.push('%');
+                        }
+                        other => tok.push(other),
                     }
                 }
+            } else if c == '%' && chars.get(i) == Some(&'%') {
+                i += 1;
+                tok.push('%');
             } else {
-                chars.next();
                 tok.push(c);
             }
         }
@@ -318,7 +354,19 @@ impl Autostart for LinuxAutostart {
             .and_then(|s| s.to_str())
             .unwrap_or(&bin);
         // Best-effort: absence of `pkill`, or nothing running, is fine.
-        let _ = Command::new("pkill").args(["-f", bin_name]).status();
+        // Exact process-name match (`-x`), not `-f`: `-f` regex-matches full
+        // command lines, which includes this very process (and any editor or
+        // shell with the name in its argv). Skip our own pid regardless.
+        let me = std::process::id();
+        if let Ok(out) = Command::new("pgrep").args(["-x", bin_name]).output() {
+            for pid in String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .filter_map(|p| p.parse::<u32>().ok())
+                .filter(|p| *p != me)
+            {
+                let _ = Command::new("kill").arg(pid.to_string()).status();
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         Command::new(&bin)
@@ -423,15 +471,60 @@ fn fallback_set(dir: &Path, service: &str, account: &str, secret: &str) -> Resul
         fallback_key(service, account),
         Value::String(secret.to_string()),
     );
+    fallback_set_pending(&mut map, &fallback_key(service, account), true);
     fallback_write(dir, &map)
 }
 
 fn fallback_delete(dir: &Path, service: &str, account: &str) -> Result<()> {
     let mut map = fallback_load(dir)?;
-    if map.remove(&fallback_key(service, account)).is_some() {
+    let removed = map.remove(&fallback_key(service, account)).is_some();
+    let unmarked = fallback_set_pending(&mut map, &fallback_key(service, account), false);
+    if removed || unmarked {
         fallback_write(dir, &map)?;
     }
     Ok(())
+}
+
+/// Top-level key (not matching any `service\u{1}` prefix, so `fallback_list`
+/// ignores it) holding the set of entries written by `fallback_set`, i.e.
+/// while the keyring was unreachable. Only those are known to be newer than
+/// the keyring copy.
+const PENDING_KEY: &str = "\u{2}pending";
+
+/// Mark/unmark `key` as pending. Returns true if the map changed.
+fn fallback_set_pending(map: &mut Map<String, Value>, key: &str, pending: bool) -> bool {
+    let mut set = map
+        .get(PENDING_KEY)
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    let changed = if pending {
+        set.insert(key.to_string(), Value::Bool(true)).is_none()
+    } else {
+        set.remove(key).is_some()
+    };
+    if changed {
+        if set.is_empty() {
+            map.remove(PENDING_KEY);
+        } else {
+            map.insert(PENDING_KEY.to_string(), Value::Object(set));
+        }
+    }
+    changed
+}
+
+/// Like `fallback_get`, but only for entries marked pending.
+fn fallback_get_pending(dir: &Path, service: &str, account: &str) -> Result<Option<String>> {
+    let map = fallback_load(dir)?;
+    let key = fallback_key(service, account);
+    let pending = map
+        .get(PENDING_KEY)
+        .and_then(|v| v.get(&key))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !pending {
+        return Ok(None);
+    }
+    Ok(map.get(&key).and_then(|v| v.as_str()).map(String::from))
 }
 
 fn fallback_list(dir: &Path, service: &str) -> Result<Vec<String>> {
@@ -453,6 +546,14 @@ fn get_impl(
     service: &str,
     account: &str,
 ) -> Result<Option<String>> {
+    // An entry the file fallback marked as written while the keyring was
+    // unreachable is newer than any keyring copy: prefer it. (A successful
+    // keyring `set` clears it.) Legacy unmarked entries (older versions never
+    // cleared them) keep the old keyring-first order, and an unreadable
+    // fallback file just defers to the keyring.
+    if let Ok(Some(v)) = fallback_get_pending(dir, service, account) {
+        return Ok(Some(v));
+    }
     match keyring_get() {
         Ok(s) => Ok(Some(s)),
         Err(keyring::Error::NoEntry) => fallback_get(dir, service, account),
@@ -469,7 +570,16 @@ fn set_impl(
     secret: &str,
 ) -> Result<()> {
     match keyring_set() {
-        Ok(()) => Ok(()),
+        // Drop any older fallback copy so `get` can't return it over this
+        // newer keyring value. Best-effort: the keyring write succeeded.
+        Ok(()) => {
+            if let Err(e) = fallback_delete(dir, service, account) {
+                crate::logging::log(&format!(
+                    "event=secrets_fallback_cleanup svc={service} acct={account} result=err:{e:#}"
+                ));
+            }
+            Ok(())
+        }
         Err(e) if is_daemon_unavailable(&e) => fallback_set(dir, service, account, secret),
         Err(e) => bail!("keyring set failed for service={service} account={account}: {e}"),
     }
@@ -582,7 +692,7 @@ pub struct LinuxMenu {
     /// discarded (there's no `glib::MainLoop` yet to call `.quit()` on).
     /// `run_event_loop` checks this on entry and returns immediately if set,
     /// so a quit requested during startup is still honored.
-    should_quit_early: std::sync::atomic::AtomicBool,
+    should_quit_early: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LinuxMenu {
@@ -591,7 +701,7 @@ impl LinuxMenu {
             click_cb: Arc::new(Mutex::new(None)),
             main_loop: Arc::new(Mutex::new(None)),
             gtk_init: OnceLock::new(),
-            should_quit_early: std::sync::atomic::AtomicBool::new(false),
+            should_quit_early: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -714,10 +824,30 @@ impl MenuBackend for LinuxMenu {
         }
         self.ensure_gtk_init()?;
         let main_loop = gtk::glib::MainLoop::new(None, false);
-        *self.main_loop.lock().unwrap() = Some(main_loop.clone());
+        {
+            // `request_quit` sets the flag while holding this same lock, so
+            // re-checking the flag under it closes the window between the
+            // swap above and publishing the loop.
+            let mut slot = self.main_loop.lock().unwrap();
+            if self
+                .should_quit_early
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(());
+            }
+            *slot = Some(main_loop.clone());
+        }
 
         let click_cb = Arc::clone(&self.click_cb);
+        let quit_flag = Arc::clone(&self.should_quit_early);
+        let loop_for_quit = main_loop.clone();
         gtk::glib::source::timeout_add_local(std::time::Duration::from_millis(100), move || {
+            // A `request_quit` that landed after the loop was published but
+            // before `run()` started is wiped by `g_main_loop_run`; the flag
+            // is re-checked here, from inside the running loop, so it sticks.
+            if quit_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                loop_for_quit.quit();
+            }
             // Menu-item clicks arrive on tray-icon's own global channel.
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 if let Some(cb) = click_cb.lock().unwrap().as_ref() {
@@ -738,18 +868,22 @@ impl MenuBackend for LinuxMenu {
         });
 
         main_loop.run();
+        // Consume the flag so a quit that was also delivered directly doesn't
+        // make a future `run_event_loop` return immediately.
+        self.should_quit_early
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
     fn request_quit(&self) {
-        if let Some(ml) = self.main_loop.lock().unwrap().as_ref() {
+        let slot = self.main_loop.lock().unwrap();
+        // Always record the request: if the loop is published but not yet
+        // inside `run()`, `ml.quit()` is lost and the loop's own poll honors
+        // the flag instead. `run_event_loop` clears it after `run()` returns.
+        self.should_quit_early
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(ml) = slot.as_ref() {
             ml.quit();
-        } else {
-            // run_event_loop hasn't populated main_loop yet — remember the
-            // request so run_event_loop can honor it on entry instead of
-            // this call being a silent no-op.
-            self.should_quit_early
-                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
@@ -907,7 +1041,78 @@ mod tests {
             desktop_exec_quote("/path with spaces/usagio"),
             "\"/path with spaces/usagio\""
         );
-        assert_eq!(desktop_exec_quote("has\"quote"), "\"has\\\"quote\"");
+        assert_eq!(desktop_exec_quote("has\"quote"), "\"has\\\\\"quote\"");
+    }
+
+    /// desktop-exec-escaping: `$`, `\`, `"` and `%` round-trip, and the
+    /// emitted text follows the spec's double-escape / `%%` rules.
+    #[test]
+    fn desktop_exec_quote_follows_spec_double_escaping() {
+        assert_eq!(desktop_exec_quote("a$b"), "\"a\\\\$b\"");
+        assert_eq!(desktop_exec_quote("a\\b"), "\"a\\\\\\\\b\"");
+        assert_eq!(
+            desktop_exec_quote("/home/me/100%/usagio"),
+            "/home/me/100%%/usagio"
+        );
+        for raw in [
+            "/opt/a$b/usagio",
+            "/o/a\\b c",
+            "/q\"x y",
+            "/home/me/100%/u",
+            "/b`t k",
+        ] {
+            let toks = desktop_exec_split(&desktop_exec_quote(raw)).unwrap();
+            assert_eq!(toks, vec![raw.to_string()], "round trip of {raw:?}");
+        }
+    }
+
+    // --- XDG: relative values are ignored ----------------------------------
+
+    #[test]
+    fn xdg_relative_values_are_ignored() {
+        // Not nested: `scoped_env_var` is not reentrant. The relative value
+        // must be ignored in favor of the HOME-derived default.
+        crate::env_lock::scoped_env_var("XDG_CONFIG_HOME", Some("cfg"), || {
+            assert_eq!(xdg_config_home(), home_dir().join(".config"));
+            assert!(xdg_config_home().is_absolute());
+        });
+        crate::env_lock::scoped_env_var("XDG_CACHE_HOME", Some("cache"), || {
+            assert_eq!(xdg_cache_home(), home_dir().join(".cache"));
+            assert!(xdg_cache_home().is_absolute());
+        });
+    }
+
+    /// A legacy (unmarked) file entry must NOT beat the keyring.
+    #[test]
+    fn linux_secrets_legacy_unmarked_file_entry_loses_to_keyring() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut map = Map::new();
+        map.insert(
+            fallback_key("svc", "acct"),
+            Value::String("stale".to_string()),
+        );
+        fallback_write(tmp.path(), &map).unwrap();
+        let got = get_impl(|| Ok("fresh".to_string()), tmp.path(), "svc", "acct").unwrap();
+        assert_eq!(got.as_deref(), Some("fresh"));
+    }
+
+    // --- Secrets: split store ----------------------------------------------
+
+    /// linux-secrets-split-store: a value written to the file while the
+    /// daemon was down wins over the older keyring copy, and a later
+    /// successful keyring set clears the file copy.
+    #[test]
+    fn linux_secrets_fallback_value_wins_and_keyring_set_clears_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let down = || keyring::Error::NoStorageAccess(Box::new(std::io::Error::other("no daemon")));
+        set_impl(|| Err(down()), tmp.path(), "svc", "acct", "B").unwrap();
+        let got = get_impl(|| Ok("A".to_string()), tmp.path(), "svc", "acct").unwrap();
+        assert_eq!(got.as_deref(), Some("B"), "newer fallback must win");
+
+        set_impl(|| Ok(()), tmp.path(), "svc", "acct", "C").unwrap();
+        assert!(fallback_get(tmp.path(), "svc", "acct").unwrap().is_none());
+        let got = get_impl(|| Ok("C".to_string()), tmp.path(), "svc", "acct").unwrap();
+        assert_eq!(got.as_deref(), Some("C"));
     }
 
     // --- Exec= quote-aware split ------------------------------------------
@@ -950,10 +1155,8 @@ mod tests {
         // path + args, `desktop_exec_split` must parse back into the exact
         // (bin, args) pair `restart()` needs.
         let mut exec = desktop_exec_quote("/home/user/My Apps/usagio");
-        for a in ["menubar"] {
-            exec.push(' ');
-            exec.push_str(&desktop_exec_quote(a));
-        }
+        exec.push(' ');
+        exec.push_str(&desktop_exec_quote("menubar"));
         let mut tokens = desktop_exec_split(&exec).unwrap().into_iter();
         let bin = tokens.next().unwrap();
         let rest: Vec<String> = tokens.collect();
