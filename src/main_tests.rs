@@ -7546,3 +7546,269 @@ fn failed_live_write_leaves_a_marker_and_the_poll_republishes_it() {
     a.adopt_login(&Account::from_keychain_blob(&mock_claude_blob("m-at", "m-rt", 6)).unwrap());
     assert_eq!(a.live_write_pending, None);
 }
+
+#[test]
+fn provider_selector_refuses_a_shared_prefix_and_a_key_in_two_providers() {
+    // Two Codex accounts share the prefix "dev": a bare "dev" is ambiguous and
+    // must not resolve to whichever comes first. The exact key still wins.
+    let mut state = State::default();
+    let codex = state.provider_accounts_mut("codex");
+    codex.accounts.push(codex_account("dev@example.com", None));
+    codex.accounts.push(codex_account("dev2@example.com", None));
+    assert_eq!(resolve_provider_selector(&state, "dev"), None);
+    assert_eq!(
+        resolve_provider_selector(&state, "dev@example.com"),
+        Some(("codex".to_string(), "dev@example.com".to_string()))
+    );
+    assert_eq!(
+        resolve_provider_selector(&state, "dev2"),
+        Some(("codex".to_string(), "dev2@example.com".to_string()))
+    );
+
+    // The same key under two providers is ambiguous too.
+    let mut two = State::default();
+    two.provider_accounts_mut("codex")
+        .accounts
+        .push(codex_account("same@example.com", None));
+    two.provider_accounts_mut("opencode")
+        .accounts
+        .push(codex_account("same@example.com", None));
+    assert_eq!(resolve_provider_selector(&two, "same@example.com"), None);
+    assert_eq!(resolve_provider_selector(&two, "same"), None);
+}
+
+#[test]
+fn rm_refuses_a_prefix_shared_by_two_codex_accounts() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let mut state = State::default();
+    let codex = state.provider_accounts_mut("codex");
+    codex.accounts.push(codex_account("dev@example.com", None));
+    codex.accounts.push(codex_account("dev2@example.com", None));
+    state.save().unwrap();
+    let err = cmd_rm(Some("dev")).unwrap_err();
+    assert!(format!("{err}").contains("no account matches"), "{err}");
+    let err = cmd_rm(Some("codex:dev")).unwrap_err();
+    assert!(
+        format!("{err}").contains("no unique codex account"),
+        "{err}"
+    );
+    let after = State::load().unwrap();
+    assert_eq!(
+        after.provider_accounts("codex").map(|p| p.accounts.len()),
+        Some(2),
+        "an ambiguous selector deleted nothing"
+    );
+}
+
+#[test]
+fn drained_renewal_keeps_the_users_pick_hold_and_swap_memory() {
+    // A renewal of the active login must not touch the pick, hold or swap
+    // memory, even when it waits for a running client to drain.
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let mut provider = MockActiveSlotProvider::new("old-live-login");
+    provider.client_running = true;
+    let slug = provider.provider_id();
+    let key = "active@example.com";
+    let mut old = codex_account(key, None);
+    old.identity_email = Some(key.into());
+    let mut state = State::default();
+    state.upsert_provider_account(slug, old);
+    state.provider_accounts_mut(slug).active = Some(key.into());
+    state.set_manual_pick(slug, Some(key));
+    state.set_manual_hold(slug, Some(key));
+    state
+        .swap_memory
+        .entry(slug.to_string())
+        .or_default()
+        .last_switch_at = Some(1_000);
+    state.save().unwrap();
+    let seeded = State::load().unwrap();
+    let memory_before = seeded.swap_memory.get(slug).cloned();
+    assert_eq!(seeded.manual_pick(slug), Some(key));
+    assert_eq!(seeded.manual_hold(slug), Some(key));
+
+    let captured = providers::codex::CodexProvider
+        .complete_login(&codex_login_response(key, "account-a"))
+        .unwrap();
+    let result = persist_login(&provider, captured, None).unwrap();
+    assert!(!result.made_live);
+    provider
+        .process_alive
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut st = State::load().unwrap();
+    let staged = st.provider_accounts(slug).unwrap().pending_switch.clone();
+    let manual = staged.as_ref().unwrap().manual;
+    assert!(lifecycle::prepare_handoff(
+        &provider,
+        &providers::ClientStatus::default(),
+        &mut st,
+        key,
+        manual,
+    )
+    .unwrap());
+    // Commit with the flags production reads after the drain.
+    let pending = State::load()
+        .unwrap()
+        .provider_accounts(slug)
+        .unwrap()
+        .pending_switch
+        .clone()
+        .unwrap();
+    assert!(!pending.manual && pending.renewal, "{pending:?}");
+    commit_provider_switch(&provider, slug, key, pending.manual, pending.manual).unwrap();
+    let after = State::load().unwrap();
+    assert_eq!(
+        after.manual_pick(slug),
+        Some(key),
+        "renewal cleared the pick"
+    );
+    assert_eq!(
+        after.manual_hold(slug),
+        Some(key),
+        "renewal cleared the hold"
+    );
+    assert_eq!(
+        after.swap_memory.get(slug).cloned(),
+        memory_before,
+        "renewal rewrote swap memory"
+    );
+}
+
+/// A Claude-slug provider whose live credential write always fails.
+struct FailingClaudeSlot;
+
+impl crate::providers::Provider for FailingClaudeSlot {
+    fn provider_id(&self) -> &'static str {
+        CLAUDE_SLUG
+    }
+    fn display_name(&self) -> &'static str {
+        "Failing Claude slot"
+    }
+    fn capabilities(&self) -> crate::providers::trait_def::Capabilities {
+        crate::providers::trait_def::Capabilities {
+            supports_usage: false,
+            supports_switching: false,
+            supports_launch: false,
+            supports_remove: false,
+            supports_email_capture: false,
+            secret_backend: crate::providers::trait_def::SecretBackend::Keychain,
+            capture_mode: crate::providers::trait_def::CaptureMode::CredsOnDisk,
+        }
+    }
+    fn capture_current_login(
+        &self,
+    ) -> crate::providers::trait_def::PResult<Option<crate::providers::trait_def::CapturedAccount>>
+    {
+        Ok(None)
+    }
+    fn parse_stored_blob(
+        &self,
+        _blob: &str,
+    ) -> crate::providers::trait_def::PResult<crate::providers::trait_def::TokenGrant> {
+        Err(crate::providers::trait_def::ProviderError::Unsupported)
+    }
+    fn patch_stored_blob(
+        &self,
+        _blob: &str,
+        _grant: &crate::providers::trait_def::TokenGrant,
+    ) -> crate::providers::trait_def::PResult<String> {
+        Err(crate::providers::trait_def::ProviderError::Unsupported)
+    }
+    fn write_active_account(
+        &self,
+        _blob: &str,
+        _identity: &providers::IdentitySnapshot,
+    ) -> providers::PResult<()> {
+        Err(providers::ProviderError::Other(
+            "keychain write refused".into(),
+        ))
+    }
+}
+
+#[test]
+fn failed_live_write_of_a_claude_renewal_sets_the_marker_the_poll_republishes() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let key = "active@example.com";
+    let old_blob = mock_claude_blob("old-at", "old-rt", 1_000);
+    let mut old = Account::from_keychain_blob(&old_blob).unwrap();
+    old.email = Some(key.into());
+    let mut state = State::default();
+    state.upsert(old);
+    state.active = Some(key.into());
+    state.save().unwrap();
+
+    let new_blob = mock_claude_blob("new-at", "new-rt", 2_000);
+    let captured = crate::providers::trait_def::CapturedAccount {
+        identity: providers::IdentitySnapshot {
+            email: Some(key.into()),
+            uuid: None,
+            display_name: None,
+            native_blob: serde_json::Value::Null,
+        },
+        secret_blob: new_blob,
+        tokens: crate::providers::trait_def::TokenGrant {
+            access: "new-at".into(),
+            refresh: Some("new-rt".into()),
+            expires_in_secs: 3_600,
+        },
+    };
+    let err = persist_login(&FailingClaudeSlot, captured, None).unwrap_err();
+    assert!(format!("{err}").contains("making it live failed"), "{err}");
+
+    let saved = State::load().unwrap();
+    let a = saved.find(key).unwrap();
+    assert_eq!(a.refresh_token, "new-rt", "the renewal was saved");
+    assert_eq!(
+        a.live_write_pending.as_deref(),
+        Some(crate::logging::token_fingerprint("new-rt").as_str()),
+        "the failed live write left no marker for the renewed grant"
+    );
+
+    // The next poll's CAS republishes the renewal over the old slot.
+    let slot = MockActiveSlotProvider::new(&old_blob);
+    let mut acct = a.clone();
+    let outcome = active_refresh_cas(&slot, &mut acct);
+    assert!(
+        matches!(outcome, ActiveRefreshOutcome::Adopted),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        acct.refresh_token, "new-rt",
+        "old slot adopted over renewal"
+    );
+    let live = Account::from_keychain_blob(&slot.slot.lock().unwrap().clone().unwrap()).unwrap();
+    assert_eq!(live.refresh_token, "new-rt");
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "reads or writes the OS secret store, which is only hermetic (in-memory) on macOS"
+)]
+fn a_single_switch_clears_the_outgoing_and_the_incoming_live_write_markers() {
+    // Each clear in switch_to_guarded is pinned on its own: one switch, with a
+    // marker on the outgoing account AND on the incoming one.
+    with_claude_home("a@e.com", |_home| {
+        let mut a = claude_account_with_identity("a@e.com", 3_600_000);
+        a.live_write_pending = Some(crate::logging::token_fingerprint(&a.refresh_token));
+        let mut b = claude_account_with_identity("b@e.com", 3_600_000);
+        b.live_write_pending = Some(crate::logging::token_fingerprint(&b.refresh_token));
+        seed_claude_state(vec![a, b], Some("a@e.com"));
+        let provider = providers::get(CLAUDE_SLUG).unwrap();
+        let acct = State::load().unwrap().find("b@e.com").cloned().unwrap();
+        let identity = acct.oauth_account.clone().unwrap();
+        switch_to_guarded(provider, "b@e.com", &acct, &identity, false, None, false).unwrap();
+        let st = State::load().unwrap();
+        assert_eq!(st.active.as_deref(), Some("b@e.com"));
+        assert_eq!(
+            st.find("a@e.com").unwrap().live_write_pending,
+            None,
+            "the outgoing account kept its marker"
+        );
+        assert_eq!(
+            st.find("b@e.com").unwrap().live_write_pending,
+            None,
+            "the incoming account kept its marker"
+        );
+    });
+}
