@@ -277,12 +277,16 @@ fn with_control_timeout<T: Send + 'static>(
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .context("cannot resolve Codex home")?;
     let path = home.join("app-server-control/app-server-control.sock");
-    let mut child = Command::new(binary(&home))
+    let mut command = Command::new(binary(&home));
+    command
         .args(["app-server", "proxy", "--sock"])
         .arg(path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    // A bare `codex` may be a launcher shim whose real proxy is a
+    // grandchild: spawn a group so a timeout reaches it too.
+    let mut child = crate::platform::own_process_group(&mut command)
         .spawn()
         .context("starting Codex control connection")?;
     let proxy = Proxy {
@@ -301,8 +305,7 @@ fn with_control_timeout<T: Send + 'static>(
     let result = receive
         .recv_timeout(timeout)
         .map_err(|_| anyhow!("Codex control request timed out"));
-    let _ = child.kill();
-    let _ = child.wait();
+    crate::platform::kill_tree(&mut child);
     result?
 }
 

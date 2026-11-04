@@ -51,21 +51,21 @@ pub trait Platform: Send + Sync + 'static {
         environment: &[(&str, &std::ffi::OsStr)],
         timeout: std::time::Duration,
     ) -> Result<std::process::ExitStatus> {
-        let mut child = std::process::Command::new(program)
+        let mut command = std::process::Command::new(program);
+        command
             .args(args)
             .envs(environment.iter().copied())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
+            .stderr(std::process::Stdio::null());
+        let mut child = own_process_group(&mut command).spawn()?;
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if let Some(status) = child.try_wait()? {
                 return Ok(status);
             }
             if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_tree(&mut child);
                 anyhow::bail!("independent process start timed out");
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
@@ -475,6 +475,39 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn kill_tree_kills_a_grandchild_too() {
+        use std::io::BufRead;
+        let mut command = std::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 30 & echo $!; wait"])
+            .stdout(std::process::Stdio::piped());
+        let mut child = super::own_process_group(&mut command).spawn().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let grandchild: libc::pid_t = line.trim().parse().unwrap();
+        super::kill_tree(&mut child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Gone, or an exited zombie awaiting reaping by init.
+        let alive = || {
+            let out = std::process::Command::new("ps")
+                .args(["-p", &grandchild.to_string(), "-o", "stat="])
+                .output()
+                .unwrap();
+            let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            !stat.is_empty() && !stat.starts_with('Z')
+        };
+        while alive() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild {grandchild} survived kill_tree"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    #[test]
     fn daemon_pid_guard_rejects_group_and_wrapping_pids() {
         // 0 and 1 would signal our process group / init; anything above
         // i32::MAX wraps to a negative pid_t (kill(-n) signals a group).
@@ -590,6 +623,43 @@ mod tests {
             "error should identify the operation: {msg}"
         );
     }
+}
+
+/// Spawn `command`'s child as the leader of its own process group, so
+/// [`kill_tree`] can reach any descendant it starts (a `codex` launcher shim
+/// runs the real binary as a grandchild). Windows has no group to set up:
+/// `kill_tree` walks the tree there instead.
+pub(crate) fn own_process_group(command: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command
+}
+
+/// Kill `child` and its descendants, then reap `child`. Precondition: the
+/// child was spawned through [`own_process_group`], so on Unix its group id
+/// is its own pid and no unrelated group can be signalled. The child is not
+/// reaped before the group kill, so its pid cannot have been reused.
+pub(crate) fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    // SAFETY: plain syscall on the child's own group; ESRCH is harmless.
+    unsafe {
+        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        // Before the parent dies, so the tree is still linked to it.
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Request a bounded Codex restart after checking the PID generation.
