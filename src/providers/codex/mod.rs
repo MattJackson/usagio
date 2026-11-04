@@ -1885,7 +1885,7 @@ mod tests {
                     identity_native_blob: Value::Null,
                     cached_usage: None,
                     notif_state: Default::default(),
-                    needs_relogin: false,
+                    needs_relogin: true,
                     no_subscription: false,
                     plan: None,
                 },
@@ -1905,6 +1905,12 @@ mod tests {
             .find_provider_account("codex", "user@example.com")
             .unwrap();
         assert_eq!(a.refresh_token, "old-rt");
+        // The refresh-token-less event is not a re-login: the flag, access
+        // token and stored blob are all left alone.
+        assert!(a.needs_relogin, "must not clear needs_relogin");
+        assert_eq!(a.access_token, "old-at");
+        assert_eq!(a.secret_blob, make_blob("user@example.com", 1000));
+        assert_eq!(a.expires_at, 1000);
     }
 
     #[test]
