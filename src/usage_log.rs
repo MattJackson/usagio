@@ -613,6 +613,10 @@ impl Drop for Appender {
 // Directory helpers (pure / dir-parameterized for tests)
 // ---------------------------------------------------------------------------
 
+/// How old the newest kept history file must be before an idle-gap prune is
+/// trusted (see `rotate_files`).
+const CLOCK_SETTLE_DAYS: i64 = 1;
+
 /// Prune history files under `dir` whose mtime is older than `RETAIN_DAYS`
 /// days before `now`. Non-history files and unparsable names are left alone.
 fn rotate_files(dir: &Path, now: DateTime<Utc>) -> Result<()> {
@@ -643,8 +647,22 @@ fn rotate_files(dir: &Path, now: DateTime<Utc>) -> Result<()> {
         .filter(|(_, t, _)| *t >= cutoff)
         .map(|(_, _, m)| *m)
         .collect();
+    // After a genuine long idle gap no kept file is near the old ones, so the
+    // bridge rule alone would keep them forever. When the newest kept file is
+    // not ahead of `now` and has outlived the settling period, the clock has
+    // been consistent for a while, so retention applies normally. A transient
+    // forward jump (file written under the bad clock: brand new, then ahead of
+    // the corrected clock) never satisfies this.
+    let clock_settled = found
+        .iter()
+        .filter(|(_, t, _)| *t >= cutoff)
+        .map(|(_, t, _)| *t)
+        .max()
+        .is_some_and(|newest| newest <= now - Duration::days(CLOCK_SETTLE_DAYS));
     for (path, mt_utc, month) in &found {
-        if *mt_utc < cutoff && kept.iter().any(|k| (*month..=*month + 7).contains(k)) {
+        if *mt_utc < cutoff
+            && (clock_settled || kept.iter().any(|k| (*month..=*month + 7).contains(k)))
+        {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -1218,6 +1236,39 @@ mod tests {
             a.exists() && d.exists(),
             "a clock jump must not wipe history"
         );
+    }
+
+    #[test]
+    fn rotate_prunes_after_a_long_idle_gap_once_the_clock_has_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2027, 3, 1, 0, 0, 0).unwrap();
+        let old = dir.path().join("history.2026-01.ndjson");
+        touch_with_mtime(
+            &old,
+            SystemTime::from(Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).unwrap()),
+        );
+        let recent = dir.path().join("history.2027-02.ndjson");
+        touch_with_mtime(&recent, SystemTime::from(now - Duration::days(2)));
+        rotate_files(dir.path(), now).unwrap();
+        assert!(!old.exists(), "pre-gap history must age out");
+        assert!(recent.exists());
+    }
+
+    #[test]
+    fn rotate_keeps_history_when_the_newest_file_is_ahead_of_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2027, 3, 1, 0, 0, 0).unwrap();
+        let old = dir.path().join("history.2026-01.ndjson");
+        touch_with_mtime(
+            &old,
+            SystemTime::from(Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).unwrap()),
+        );
+        touch_with_mtime(
+            &dir.path().join("history.2027-03.ndjson"),
+            SystemTime::from(now + Duration::days(2)),
+        );
+        rotate_files(dir.path(), now).unwrap();
+        assert!(old.exists(), "clock went backwards: do not prune");
     }
 
     #[test]
