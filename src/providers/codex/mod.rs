@@ -506,6 +506,8 @@ impl Provider for CodexProvider {
                 "api.connectors.invoke",
             ],
             redirect_port: Some(1455),
+            // Codex's registered fallback for a busy 1455.
+            fallback_redirect_port: Some(1457),
             redirect_host: "127.0.0.1",
             redirect_path: "/auth/callback",
             extra_authorize_params: &[

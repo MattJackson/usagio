@@ -9,6 +9,7 @@ fn spec(token_url: &'static str, style: TokenRequestStyle) -> LoginSpec {
         client_id: "client-123",
         scopes: &["user:profile", "user:inference"],
         redirect_port: None,
+        fallback_redirect_port: None,
         redirect_host: "localhost",
         redirect_path: "/callback",
         extra_authorize_params: &[("code", "true")],
@@ -432,4 +433,49 @@ fn a_sign_in_nobody_completes_times_out() {
         .recv_timeout(Duration::from_secs(2))
         .expect("wait_for_code never re-checked its deadline: accept() blocked");
     assert!(format!("{}", r.unwrap_err()).contains("timed out"));
+}
+
+/// Two loopback ports that were free a moment ago.
+fn two_free_ports() -> (u16, u16) {
+    let a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    (
+        a.local_addr().unwrap().port(),
+        b.local_addr().unwrap().port(),
+    )
+}
+
+#[test]
+fn a_busy_redirect_port_falls_back_to_the_registered_one() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let (preferred, fallback) = two_free_ports();
+    let _held = std::net::TcpListener::bind(("127.0.0.1", preferred)).unwrap();
+    let mut s = spec("http://127.0.0.1:1/token", TokenRequestStyle::Form);
+    s.redirect_port = Some(preferred);
+    s.fallback_redirect_port = Some(fallback);
+    s.redirect_host = "127.0.0.1";
+    s.redirect_path = "/auth/callback";
+    let loopback = Loopback::bind(&s).unwrap();
+    assert_eq!(
+        loopback.redirect_uri,
+        format!("http://127.0.0.1:{fallback}/auth/callback"),
+        "the redirect_uri must name the port actually bound"
+    );
+    // Both busy: an error, not some other port.
+    let _held_fallback = loopback;
+    let err =
+        bind_redirect_listener(preferred, Some(fallback), 2, Duration::from_millis(1)).unwrap_err();
+    assert!(err.to_string().contains("in use"), "{err}");
+    // Preferred free: it wins.
+    drop(_held);
+    let l = bind_redirect_listener(preferred, Some(fallback), 2, Duration::from_millis(1)).unwrap();
+    assert_eq!(l.local_addr().unwrap().port(), preferred);
+}
+
+#[cfg(feature = "codex")]
+#[test]
+fn codex_registers_1457_as_its_fallback_redirect_port() {
+    let spec = crate::providers::codex::new().login_spec().unwrap();
+    assert_eq!(spec.redirect_port, Some(1455));
+    assert_eq!(spec.fallback_redirect_port, Some(1457));
 }

@@ -472,6 +472,9 @@ pub struct LoginSpec {
     /// Loopback redirect port; `None` = any free port. Some vendors register
     /// one fixed port (Codex: 1455).
     pub redirect_port: Option<u16>,
+    /// A second registered port, used when `redirect_port` stays busy
+    /// (Codex: 1457, as in openai/codex `login/src/server.rs`).
+    pub fallback_redirect_port: Option<u16>,
     /// Registered loopback host (localhost or the IPv4 loopback literal).
     pub redirect_host: &'static str,
     /// Loopback redirect path, e.g. `/callback`.

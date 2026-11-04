@@ -149,6 +149,55 @@ pub fn parse_callback(target: &str, path: &str, state: &str) -> Callback {
     }
 }
 
+/// Tries per port while it is in use, and the pause between them (as
+/// openai/codex `login/src/server.rs` `bind_server`: 10 × 200 ms).
+const BIND_ATTEMPTS: u32 = 10;
+const BIND_RETRY_DELAY: Duration = Duration::from_millis(200);
+
+/// Bind the loopback redirect listener the way the Codex client does: retry
+/// `port` while it is in use, then move to the registered `fallback` port
+/// (retried the same way). Any other bind error fails at once. Unlike the
+/// Codex client, no `/cancel` is sent to the port's holder: that may be the
+/// user's own `codex login`, which usagio must not end.
+fn bind_redirect_listener(
+    port: u16,
+    fallback: Option<u16>,
+    attempts: u32,
+    delay: Duration,
+) -> Result<TcpListener> {
+    let try_port = |port: u16| -> Result<Option<TcpListener>> {
+        for attempt in 1..=attempts.max(1) {
+            match TcpListener::bind(("127.0.0.1", port)) {
+                Ok(listener) => return Ok(Some(listener)),
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    if attempt < attempts {
+                        std::thread::sleep(delay);
+                    }
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("listening on localhost:{port} for the sign-in redirect")
+                    })
+                }
+            }
+        }
+        Ok(None)
+    };
+    if let Some(listener) = try_port(port)? {
+        return Ok(listener);
+    }
+    if let Some(fallback) = fallback.filter(|f| port != 0 && *f != port) {
+        crate::logging::log(&format!(
+            "login: redirect port {port} is in use; using registered fallback port {fallback}"
+        ));
+        if let Some(listener) = try_port(fallback)? {
+            return Ok(listener);
+        }
+        bail!("sign-in redirect ports {port} and {fallback} are both in use");
+    }
+    bail!("sign-in redirect port {port} is already in use")
+}
+
 pub struct Loopback {
     listener: TcpListener,
     pub redirect_uri: String,
@@ -157,9 +206,13 @@ pub struct Loopback {
 
 impl Loopback {
     pub fn bind(spec: &LoginSpec) -> Result<Self> {
-        let port = spec.redirect_port.unwrap_or(0);
-        let listener = TcpListener::bind(("127.0.0.1", port))
-            .with_context(|| format!("listening on localhost:{port} for the sign-in redirect"))?;
+        let listener = bind_redirect_listener(
+            spec.redirect_port.unwrap_or(0),
+            spec.fallback_redirect_port,
+            BIND_ATTEMPTS,
+            BIND_RETRY_DELAY,
+        )?;
+        // The redirect_uri names whichever registered port was bound.
         let port = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
         Ok(Loopback {

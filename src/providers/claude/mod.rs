@@ -206,6 +206,7 @@ impl Provider for ClaudeProvider {
             client_id: config::CLIENT_ID,
             scopes: config::LOGIN_SCOPES,
             redirect_port: None,
+            fallback_redirect_port: None,
             redirect_host: "localhost",
             redirect_path: "/callback",
             extra_authorize_params: &[("code", "true")],
