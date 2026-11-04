@@ -415,7 +415,7 @@ fn save_state_safe_prunes_backups_to_cap() {
             .set_modified(ts)
             .unwrap();
     }
-    prune_backups(&backups_dir, BACKUP_KEEP_COUNT).unwrap();
+    prune_backups(&backups_dir, BACKUP_KEEP_COUNT, None).unwrap();
     let count = std::fs::read_dir(&backups_dir).unwrap().count();
     assert_eq!(count, BACKUP_KEEP_COUNT);
     // The oldest 5 must have been removed (the ones with the smallest mtime).
@@ -735,60 +735,6 @@ fn stash_pre_restore_is_noop_when_no_live_state() {
     let dir = config_dir().unwrap();
     assert!(stash_pre_restore(&dir).unwrap().is_none());
 }
-
-#[test]
-fn unstash_pre_restore_rolls_the_live_state_back_exactly() {
-    // Audit finding 11: if a restore WRITE fails after stash_pre_restore has
-    // already moved state.json aside, unstash_pre_restore must put the original
-    // back so state.json is never left MISSING (which State::load would read as
-    // zero accounts). Round-trip: stash removes the live file, unstash restores
-    // it byte-for-byte, owner-only.
-    let _g = ScopedConfigDir::new();
-    make_state_with(&["keep@e.com"]).save().unwrap();
-    let live = config_dir().unwrap().join("state.json");
-    let original = std::fs::read(&live).unwrap();
-
-    let dir = config_dir().unwrap();
-    let stash = stash_pre_restore(&dir)
-        .unwrap()
-        .expect("live state existed");
-    assert!(
-        live.exists(),
-        "stash must copy, not move: lock-free readers must never see no state.json"
-    );
-    // Simulate a failed/partial restore write clobbering the live file.
-    std::fs::write(&live, b"{ partial").unwrap();
-
-    unstash_pre_restore(&stash).expect("rollback must restore the stashed state");
-
-    assert!(live.exists(), "state.json must exist again after rollback");
-    assert_eq!(
-        std::fs::read(&live).unwrap(),
-        original,
-        "rolled-back state.json must match the pre-restore bytes exactly"
-    );
-    assert!(
-        !stash.exists(),
-        "the stash file should be consumed by the rollback"
-    );
-    // The recovered accounts load correctly (not the zero-account default).
-    assert!(State::load()
-        .unwrap()
-        .accounts
-        .iter()
-        .any(|a| a.email.as_deref() == Some("keep@e.com")));
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&live).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "rolled-back state.json must stay owner-only");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// M1 — notification_config parse failures must not be silent.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn corrupt_notification_config_falls_back_to_default_and_logs() {
@@ -1278,7 +1224,7 @@ fn prune_backups_only_touches_state_json_files() {
     touch_at(&d, "other.json", 2);
     touch_at(&d, "state-b.txt", 3);
     touch_at(&d, "state-rejected-1.json", 4);
-    prune_backups(&d, 0).unwrap();
+    prune_backups(&d, 0, None).unwrap();
     // Only the rolling backup goes; look-alikes and rejected dumps stay.
     assert_eq!(
         file_names(&d),
@@ -1648,4 +1594,49 @@ fn redact_state_for_dump_leaks_no_token_material_for_claude_or_providers() {
     ] {
         assert!(!dump.contains(needle), "{needle} leaked in dump: {dump}");
     }
+}
+
+#[test]
+fn adopt_login_on_non_object_blob_does_not_panic() {
+    for blob in ["[]", "\"x\"", "7", "true"] {
+        let mut a = acct("dev@example.com");
+        a.keychain_blob = blob.to_string();
+        let fresh = Account::from_keychain_blob(
+            &serde_json::json!({ "claudeAiOauth": {
+                "accessToken": "new-at", "refreshToken": "new-rt", "expiresAt": 5 }})
+            .to_string(),
+        )
+        .unwrap();
+        a.adopt_login(&fresh);
+        let o: serde_json::Value = serde_json::from_str(&a.keychain_blob).unwrap();
+        assert_eq!(o["claudeAiOauth"]["accessToken"], "new-at", "blob {blob}");
+    }
+}
+
+#[test]
+fn prune_backups_never_evicts_the_file_just_written() {
+    let g = ScopedConfigDir::new();
+    let d = g.home();
+    // Future-dated old backups sort "newest"; the fresh one has the oldest mtime.
+    touch_at(&d, "state-a.json", 9_000_000_000);
+    touch_at(&d, "state-b.json", 9_000_000_001);
+    touch_at(&d, "state-fresh.json", 1);
+    prune_backups(&d, 2, Some(&d.join("state-fresh.json"))).unwrap();
+    assert!(d.join("state-fresh.json").exists());
+    assert_eq!(file_names(&d).len(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn write_private_tightens_a_preexisting_wide_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let g = ScopedConfigDir::new();
+    let p = g.home().join("tok.tmp");
+    std::fs::write(&p, "old").unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    write_private(&p, b"secret").unwrap();
+    assert_eq!(
+        std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }

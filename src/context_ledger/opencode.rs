@@ -42,7 +42,10 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     );
 
     if let Some(config_path) = chosen_config {
-        match fs::read_to_string(&config_path) {
+        let read = super::read_capped_max(&config_path, super::MAX_CONFIG_FILE_BYTES)
+            .ok_or_else(|| "not a regular file or unreadable".to_string())
+            .and_then(|b| String::from_utf8(b).map_err(|e| e.to_string()));
+        match read {
             Err(e) => eprintln!("could not read {}: {}", config_path.display(), e),
             Ok(raw) => {
                 let stripped = strip_jsonc_trailing_commas(&strip_jsonc_comments(&raw));

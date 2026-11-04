@@ -40,7 +40,14 @@ where
 {
     with_state_lock(|| {
         let mut st = State::load()?;
+        // Skip the (fsync-heavy, backup-rotating) save when the closure left
+        // the state untouched: the steady-state absorb rewrites identical
+        // credentials every cycle.
+        let before = serde_json::to_value(&st).ok();
         f(&mut st)?;
+        if before.is_some() && before == serde_json::to_value(&st).ok() {
+            return Ok(());
+        }
         st.save()
     })
     .map_err(|e| ProviderError::Other(format!("state lock: {e:#}")))
@@ -88,7 +95,7 @@ pub fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
         return f();
     }
     let dir = store::config_dir()?;
-    std::fs::create_dir_all(&dir).context("creating ~/.config/usagio")?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let lock_path = dir.join("lock");
     let file = std::fs::OpenOptions::new()
         .create(true)

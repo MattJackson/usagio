@@ -2,7 +2,9 @@
 //!
 //! Claude loads context from a well-documented set of locations:
 //! - ~/.claude/CLAUDE.md — global instructions
-//! - <project>/CLAUDE.md — project instructions
+//! - <project>/CLAUDE.md, <project>/.claude/CLAUDE.md, <project>/CLAUDE.local.md,
+//!   and CLAUDE.md / CLAUDE.local.md in every ancestor directory — project
+//!   instructions
 //! - ~/.claude/skills/*/SKILL.md — skill definitions; only the frontmatter
 //!   `name`/`description` is injected per turn (the body loads on use)
 //! - ~/.claude/agents/*.md — subagent definitions (likewise frontmatter only)
@@ -22,7 +24,10 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
         None => return Ok(items),
     };
     let claude_dir = home.join(".claude");
-    let settings = claude_dir.join("settings.json");
+    let (user_json, settings) = user_config_paths(
+        &home,
+        std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
+    );
 
     // Global CLAUDE.md
     push_file_if_exists(
@@ -32,14 +37,35 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
         "Global CLAUDE.md",
     );
 
-    // Project CLAUDE.md
-    if let Some(proj) = project {
-        push_file_if_exists(
-            &mut items,
-            proj.join("CLAUDE.md"),
-            ItemKind::ProjectInstructions,
-            "Project CLAUDE.md",
-        );
+    // Claude Code keys projects by absolute path.
+    let proj_abs: Option<PathBuf> =
+        project.map(|p| fs::canonicalize(p).unwrap_or_else(|_| absolute_path(p)));
+
+    // Project instructions: ./CLAUDE.md, ./.claude/CLAUDE.md, ./CLAUDE.local.md,
+    // plus CLAUDE.md / CLAUDE.local.md in every ancestor directory.
+    if let Some(proj) = &proj_abs {
+        for (rel, label) in [
+            ("CLAUDE.md", "Project CLAUDE.md"),
+            (".claude/CLAUDE.md", "Project .claude/CLAUDE.md"),
+            ("CLAUDE.local.md", "Project CLAUDE.local.md"),
+        ] {
+            push_file_if_exists(
+                &mut items,
+                proj.join(rel),
+                ItemKind::ProjectInstructions,
+                label,
+            );
+        }
+        for dir in proj.ancestors().skip(1) {
+            for f in ["CLAUDE.md", "CLAUDE.local.md"] {
+                push_file_if_exists(
+                    &mut items,
+                    dir.join(f),
+                    ItemKind::ProjectInstructions,
+                    &format!("{f} ({})", dir.display()),
+                );
+            }
+        }
     }
 
     // Skills — ~/.claude/skills/<name>/SKILL.md
@@ -99,27 +125,24 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     // `mcpServers` is only a legacy fallback. First definition of a name wins
     // (local > project > user > legacy).
     let mut sources: Vec<(PathBuf, Vec<(String, serde_json::Value)>)> = Vec::new();
-    let user_json = home.join(".claude.json");
     let user_val = read_json_logged(&user_json);
     // Claude Code keys projects by absolute path.
-    let proj_abs: Option<PathBuf> = project.map(|p| {
-        fs::canonicalize(p).unwrap_or_else(|_| {
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                std::env::current_dir()
-                    .map(|c| c.join(p))
-                    .unwrap_or_else(|_| p.to_path_buf())
-            }
-        })
-    });
-    let local_proj = match (&user_val, &proj_abs) {
-        (Some(val), Some(proj)) => val
-            .get("projects")
-            .and_then(|p| p.get(proj.to_string_lossy().as_ref()))
+    let proj_abs: Option<PathBuf> =
+        project.map(|p| fs::canonicalize(p).unwrap_or_else(|_| absolute_path(p)));
+    let local_proj = match (&user_val, project) {
+        (Some(val), Some(given)) => project_keys(proj_abs.as_deref(), given)
+            .iter()
+            .find_map(|k| val.get("projects").and_then(|p| p.get(k.as_str())))
             .cloned(),
         _ => None,
     };
+    // Repo-controlled settings may approve .mcp.json servers only when the
+    // user has trusted this folder in Claude Code.
+    let trusted = local_proj
+        .as_ref()
+        .and_then(|p| p.get("hasTrustDialogAccepted"))
+        .and_then(|b| b.as_bool())
+        == Some(true);
     if let Some(local) = local_proj
         .as_ref()
         .and_then(|p| p.get("mcpServers"))
@@ -129,16 +152,16 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     }
     let mut approval = McpApproval::default();
     if let Some(lp) = &local_proj {
-        approval.absorb(lp, true);
+        approval.absorb(lp, true, true);
     }
     let settings_val = read_json_logged(&settings);
     if let Some(v) = &settings_val {
-        approval.absorb(v, false);
+        approval.absorb(v, false, true);
     }
     if let Some(proj) = &proj_abs {
         for f in ["settings.json", "settings.local.json"] {
             if let Some(v) = read_json_logged(&proj.join(".claude").join(f)) {
-                approval.absorb(&v, false);
+                approval.absorb(&v, false, trusted);
             }
         }
         let mcp_json = proj.join(".mcp.json");
@@ -146,12 +169,17 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
             if let Some(m) = val.get("mcpServers").and_then(|m| m.as_object()) {
                 let mut approved = Vec::new();
                 for (name, cfg) in m {
-                    if approval.project_server_approved(name) {
+                    if trusted && approval.project_server_approved(name) {
                         approved.push((name.clone(), cfg.clone()));
+                    } else if !trusted {
+                        eprintln!(
+                            "mcp {}: not started (folder not trusted in Claude Code)",
+                            printable(name)
+                        );
                     } else {
                         // Never execute repo-controlled commands Claude Code
                         // itself would not start.
-                        eprintln!("mcp {}: not approved (not started)", name);
+                        eprintln!("mcp {}: not approved (not started)", printable(name));
                     }
                 }
                 sources.push((mcp_json, approved));
@@ -173,8 +201,11 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     let mut origin = std::collections::HashMap::new();
     for (path, entries) in sources {
         for (name, cfg) in entries {
-            if approval.disabled.contains(&name) {
-                eprintln!("mcp {}: disabled for this project (not started)", name);
+            if approval.project_disabled.contains(&name) {
+                eprintln!(
+                    "mcp {}: disabled for this project (not started)",
+                    printable(&name)
+                );
                 continue;
             }
             if seen.insert(name.clone()) {
@@ -189,7 +220,7 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
             Ok(summary) => {
                 items.push(LedgerItem {
                     kind: ItemKind::McpTools,
-                    name: format!("mcp: {}", name),
+                    name: format!("mcp: {}", printable(&name)),
                     mtime: file_mtime(&path),
                     path,
                     token_count: summary.token_count,
@@ -200,7 +231,7 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
             Err(err) => {
                 // Skip failed MCP servers — timeout / crash / bad config.
                 // In a follow-up we surface a "?" row with the error.
-                eprintln!("mcp {} skipped: {}", name, err);
+                eprintln!("mcp {} skipped: {}", printable(&name), err);
             }
         }
     }
@@ -213,13 +244,19 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
 struct McpApproval {
     enable_all: bool,
     enabled: std::collections::HashSet<String>,
+    /// `disabledMcpjsonServers`: rejects `.mcp.json` servers only.
     disabled: std::collections::HashSet<String>,
+    /// `projects.<path>.disabledMcpServers`: applies across every source.
+    project_disabled: std::collections::HashSet<String>,
 }
 
 impl McpApproval {
     /// Fold in a settings object (or a `~/.claude.json` `projects.<path>`
     /// entry, which additionally carries `disabledMcpServers`).
-    fn absorb(&mut self, v: &serde_json::Value, project_entry: bool) {
+    ///
+    /// `allow_approvals` is false for repo-controlled files in an untrusted
+    /// folder: those may only add to the disabled lists, never approve.
+    fn absorb(&mut self, v: &serde_json::Value, project_entry: bool, allow_approvals: bool) {
         let strs = |k: &str| -> Vec<String> {
             v.get(k)
                 .and_then(|x| x.as_array())
@@ -230,22 +267,98 @@ impl McpApproval {
                 })
                 .unwrap_or_default()
         };
-        if v.get("enableAllProjectMcpServers")
-            .and_then(|b| b.as_bool())
-            == Some(true)
-        {
-            self.enable_all = true;
+        if allow_approvals {
+            if v.get("enableAllProjectMcpServers")
+                .and_then(|b| b.as_bool())
+                == Some(true)
+            {
+                self.enable_all = true;
+            }
+            self.enabled.extend(strs("enabledMcpjsonServers"));
         }
-        self.enabled.extend(strs("enabledMcpjsonServers"));
         self.disabled.extend(strs("disabledMcpjsonServers"));
         if project_entry {
-            self.disabled.extend(strs("disabledMcpServers"));
+            self.project_disabled.extend(strs("disabledMcpServers"));
         }
     }
 
     fn project_server_approved(&self, name: &str) -> bool {
         !self.disabled.contains(name) && (self.enable_all || self.enabled.contains(name))
     }
+}
+
+/// Server names can come from a cloned repo's `.mcp.json`: escape control
+/// characters (ESC/OSC sequences) before they reach the terminal.
+fn printable(name: &str) -> String {
+    name.chars()
+        .flat_map(|c| {
+            if c.is_control() {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+
+/// `.claude.json` and `settings.json` locations. Claude Code relocates both
+/// under `$CLAUDE_CONFIG_DIR` when it is set (non-empty).
+fn user_config_paths(home: &Path, config_dir: Option<PathBuf>) -> (PathBuf, PathBuf) {
+    match config_dir.filter(|d| !d.as_os_str().is_empty()) {
+        Some(d) => (d.join(".claude.json"), d.join("settings.json")),
+        None => (
+            home.join(".claude.json"),
+            home.join(".claude").join("settings.json"),
+        ),
+    }
+}
+
+/// An absolute spelling of `p` without touching the filesystem.
+fn absolute_path(p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|c| c.join(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    }
+}
+
+/// Strip the Windows verbatim prefix (`\\?\C:\x` -> `C:\x`,
+/// `\\?\UNC\h\s` -> `\\h\s`); other paths are returned unchanged.
+fn strip_verbatim(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Candidate `~/.claude.json` `projects.<path>` keys for a project, most
+/// specific first: the canonical path, its non-verbatim form (Windows
+/// `canonicalize` yields `\\?\C:\...`, which Claude Code never writes), the
+/// forward-slash spelling Claude Code also uses on Windows, and the path as
+/// given.
+fn project_keys(canonical: Option<&Path>, given: &Path) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    let mut push = |k: String| {
+        if !keys.contains(&k) {
+            keys.push(k);
+        }
+    };
+    let abs = absolute_path(given);
+    for p in canonical.into_iter().chain(std::iter::once(abs.as_path())) {
+        let plain = strip_verbatim(&p.to_string_lossy());
+        push(p.to_string_lossy().into_owned());
+        push(plain.clone());
+        if plain.contains('\\') {
+            push(plain.replace('\\', "/"));
+        }
+    }
+    push(given.to_string_lossy().into_owned());
+    keys
 }
 
 fn object_entries(
@@ -346,3 +459,45 @@ fn push_file_if_exists(items: &mut Vec<LedgerItem>, path: PathBuf, kind: ItemKin
 }
 
 use super::file_mtime;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_config_dir_relocates_user_json_and_settings() {
+        let home = Path::new("/h");
+        assert_eq!(
+            user_config_paths(home, Some(PathBuf::from("/c"))),
+            (
+                PathBuf::from("/c/.claude.json"),
+                PathBuf::from("/c/settings.json")
+            )
+        );
+        for unset in [None, Some(PathBuf::new())] {
+            assert_eq!(
+                user_config_paths(home, unset),
+                (
+                    PathBuf::from("/h/.claude.json"),
+                    PathBuf::from("/h/.claude/settings.json")
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn printable_escapes_terminal_control_sequences() {
+        assert_eq!(printable("a\u{1b}]52;c;x\u{7}b"), "a\\u{1b}]52;c;x\\u{7}b");
+        assert_eq!(printable("plain-name_1"), "plain-name_1");
+    }
+
+    #[test]
+    fn windows_verbatim_project_path_maps_to_plain_keys() {
+        assert_eq!(strip_verbatim(r"\\?\C:\Users\me\proj"), r"C:\Users\me\proj");
+        assert_eq!(strip_verbatim(r"\\?\UNC\host\share\p"), r"\\host\share\p");
+        assert_eq!(strip_verbatim("/home/me/p"), "/home/me/p");
+        let keys = project_keys(Some(Path::new(r"\\?\C:\Users\me\proj")), Path::new("proj"));
+        assert!(keys.contains(&r"C:\Users\me\proj".to_string()), "{keys:?}");
+        assert!(keys.contains(&"C:/Users/me/proj".to_string()), "{keys:?}");
+    }
+}

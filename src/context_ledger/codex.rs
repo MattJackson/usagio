@@ -2,11 +2,12 @@
 //!
 //! Codex context sources (from openai/codex repo inspection):
 //! The Codex home is `$CODEX_HOME` (non-empty), defaulting to `~/.codex`.
-//! - <codex home>/AGENTS.md — global instructions
+//! - <codex home>/AGENTS.override.md, else AGENTS.md — global instructions
 //! - <codex home>/instructions.md — global instructions (older name; only
 //!   used when AGENTS.md is absent)
 //! - <codex home>/config.toml → any [mcp_servers.*] blocks
-//! - <project>/AGENTS.md — project-scoped instructions
+//! - AGENTS.override.md, else AGENTS.md in each directory from the git root
+//!   down to <project> — project-scoped instructions, capped at 32 KiB total
 //!
 //! Codex evolves quickly — recheck paths against upstream when re-verifying.
 
@@ -15,9 +16,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Codex's home directory: `$CODEX_HOME` if set and non-empty, else
-/// `~/.codex` (matches the Codex credential-store resolver).
+/// `~/.codex`, with `~` resolved by the same `paths::user_home()` the Codex
+/// credential-store resolver uses. (An empty `$CODEX_HOME` is treated as unset
+/// here, as Codex itself does.)
 fn codex_dir() -> Option<PathBuf> {
-    resolve_codex_dir(std::env::var_os("CODEX_HOME"), dirs::home_dir())
+    resolve_codex_dir(std::env::var_os("CODEX_HOME"), crate::paths::user_home())
 }
 
 pub(crate) fn resolve_codex_dir(
@@ -36,41 +39,72 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
         return Ok(items);
     };
 
-    // Global AGENTS.md / instructions.md — whichever exists (AGENTS.md first;
-    // instructions.md is the older name and only a fallback).
-    for (fname, kind, display) in [
-        (
-            "AGENTS.md",
-            ItemKind::GlobalInstructions,
-            "Global AGENTS.md",
-        ),
-        (
-            "instructions.md",
-            ItemKind::GlobalInstructions,
-            "Global instructions.md",
-        ),
+    // Global instructions — the first non-empty of AGENTS.override.md,
+    // AGENTS.md, instructions.md (the older name, only a fallback).
+    for (fname, display) in [
+        ("AGENTS.override.md", "Global AGENTS.override.md"),
+        ("AGENTS.md", "Global AGENTS.md"),
+        ("instructions.md", "Global instructions.md"),
     ] {
         let before = items.len();
-        push_file_if_exists(&mut items, codex_dir.join(fname), kind, display);
+        push_file_if_exists(
+            &mut items,
+            codex_dir.join(fname),
+            ItemKind::GlobalInstructions,
+            display,
+            None,
+        );
         if items.len() > before {
             break;
         }
     }
 
-    // Project AGENTS.md
+    // Project instructions: walk from the git root down to the project,
+    // taking AGENTS.override.md else AGENTS.md per directory, until the
+    // combined size reaches Codex's project_doc_max_bytes (32 KiB default).
     if let Some(proj) = project {
-        push_file_if_exists(
-            &mut items,
-            proj.join("AGENTS.md"),
-            ItemKind::ProjectInstructions,
-            "Project AGENTS.md",
-        );
+        let proj = fs::canonicalize(proj).unwrap_or_else(|_| proj.to_path_buf());
+        let root = proj
+            .ancestors()
+            .find(|d| d.join(".git").exists())
+            .unwrap_or(&proj);
+        let mut dirs: Vec<&Path> = proj.ancestors().take_while(|d| *d != root).collect();
+        dirs.push(root);
+        dirs.reverse();
+        let mut remaining = PROJECT_DOC_MAX_BYTES;
+        for dir in dirs {
+            if remaining == 0 {
+                break;
+            }
+            let label = if dir == proj {
+                "Project AGENTS.md".to_string()
+            } else {
+                format!("AGENTS.md ({})", dir.display())
+            };
+            let before = items.len();
+            for fname in ["AGENTS.override.md", "AGENTS.md"] {
+                push_file_if_exists(
+                    &mut items,
+                    dir.join(fname),
+                    ItemKind::ProjectInstructions,
+                    &label,
+                    Some(remaining),
+                );
+                if items.len() > before {
+                    remaining = remaining.saturating_sub(items[before].content_bytes);
+                    break;
+                }
+            }
+        }
     }
 
     // MCP servers from config.toml
     let config = codex_dir.join("config.toml");
     if config.exists() {
-        match fs::read_to_string(&config) {
+        let read = super::read_capped_max(&config, super::MAX_CONFIG_FILE_BYTES)
+            .ok_or_else(|| "not a regular file or unreadable".to_string())
+            .and_then(|b| String::from_utf8(b).map_err(|e| e.to_string()));
+        match read {
             Err(e) => eprintln!("could not read {}: {}", config.display(), e),
             Ok(text) => match toml::from_str::<toml::Value>(&text) {
                 Err(e) => eprintln!("could not parse {}: {}", config.display(), e),
@@ -80,6 +114,10 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
                         // Convert TOML to JSON for the mcp module's uniform interface.
                         let servers = mcp_servers
                             .iter()
+                            // `enabled = false` servers are never started by Codex.
+                            .filter(|(_, cfg)| {
+                                cfg.get("enabled").and_then(|e| e.as_bool()) != Some(false)
+                            })
                             .map(|(name, cfg)| {
                                 (
                                     name.clone(),
@@ -110,10 +148,27 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     Ok(items)
 }
 
-fn push_file_if_exists(items: &mut Vec<LedgerItem>, path: PathBuf, kind: ItemKind, name: &str) {
-    let Some(bytes) = super::read_capped(&path) else {
+/// Codex's default `project_doc_max_bytes`.
+const PROJECT_DOC_MAX_BYTES: usize = 32 * 1024;
+
+/// Push `path` as an item unless missing/empty; `limit` truncates the counted
+/// bytes (Codex stops adding project docs at its size cap).
+fn push_file_if_exists(
+    items: &mut Vec<LedgerItem>,
+    path: PathBuf,
+    kind: ItemKind,
+    name: &str,
+    limit: Option<usize>,
+) {
+    let Some(mut bytes) = super::read_capped(&path) else {
         return;
     };
+    if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+        return;
+    }
+    if let Some(l) = limit {
+        bytes.truncate(l);
+    }
     let text = String::from_utf8_lossy(&bytes);
     let token_count = tokenize::count_tokens(&text, tokenize::TokenizerHint::OpenAi);
     items.push(LedgerItem {

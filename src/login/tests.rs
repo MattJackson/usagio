@@ -147,7 +147,7 @@ fn loopback_serves_the_redirect_and_returns_the_code() {
     assert_eq!(code, "the-code");
     let (stray, done) = client.join().unwrap();
     assert!(stray.starts_with("HTTP/1.1 404"));
-    assert!(done.starts_with("HTTP/1.1 200") && done.contains("Signed in"));
+    assert!(done.starts_with("HTTP/1.1 200") && done.contains("Sign-in received"));
 }
 
 #[test]

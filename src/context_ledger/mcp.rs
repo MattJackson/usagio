@@ -190,6 +190,9 @@ pub fn fetch_tools(config: &Value) -> Result<McpSummary, String> {
         });
         writeln!(&mut stdin, "{}", tools_req).map_err(|e| format!("write tools/list: {}", e))?;
         let parsed = read_response(&rx, start, id)?;
+        if let Some(err) = parsed.get("error") {
+            return Err(format!("tools/list failed: {}", err));
+        }
         let page_tools = parsed
             .get("result")
             .and_then(|r| r.get("tools"))

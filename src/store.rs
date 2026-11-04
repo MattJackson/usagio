@@ -241,6 +241,10 @@ impl Account {
         };
         let mut blob = serde_json::from_str::<serde_json::Value>(&self.keychain_blob)
             .unwrap_or_else(|_| serde_json::json!({}));
+        if !blob.is_object() {
+            // IndexMut panics on arrays/strings/numbers.
+            blob = serde_json::json!({});
+        }
         if !blob.get("claudeAiOauth").is_some_and(|x| x.is_object()) {
             blob["claudeAiOauth"] = serde_json::json!({});
         }
@@ -1315,7 +1319,7 @@ pub(crate) const BACKUP_KEEP_COUNT: usize = 20;
 ///    a 0700 dir), then prunes so at most [`BACKUP_KEEP_COUNT`] survive.
 pub fn save_state_safe(state: &State) -> Result<()> {
     let dir = config_dir()?;
-    std::fs::create_dir_all(&dir).context("creating ~/.config/usagio")?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = state_path()?;
 
     // (1) Overwrite protection.
@@ -1398,7 +1402,16 @@ pub fn save_state_safe(state: &State) -> Result<()> {
                 }
                 let redacted = redact_state_for_dump(state);
                 let dump_bytes = serde_json::to_vec_pretty(&redacted).unwrap_or_default();
-                let _ = write_private(&dump_path, &dump_bytes);
+                let dump_note = match write_private(&dump_path, &dump_bytes) {
+                    Ok(()) => format!(
+                        "Redacted (token-free) diagnostic written to {}",
+                        dump_path.display()
+                    ),
+                    Err(e) => format!(
+                        "Redacted diagnostic could NOT be written to {} ({e})",
+                        dump_path.display()
+                    ),
+                };
                 // R2-1: cap the rejected-dump family separately so a run of
                 // consecutive refusals cannot grow unbounded, and cannot
                 // dilute the BACKUP_KEEP_COUNT cap shared with real backups
@@ -1407,13 +1420,12 @@ pub fn save_state_safe(state: &State) -> Result<()> {
                 let msg = format!(
                     "REFUSED save_state: would drop {} claude account(s) without an explicit \
                      remove(): {:?}, and {} provider account(s) without an explicit \
-                     remove_provider_account(): {:?}. Redacted (token-free) diagnostic written \
-                     to {}. On-disk state.json is UNCHANGED.",
+                     remove_provider_account(): {:?}. {}. On-disk state.json is UNCHANGED.",
                     unauthorized.len(),
                     unauthorized,
                     unauthorized_provider.len(),
                     unauthorized_provider,
-                    dump_path.display(),
+                    dump_note,
                 );
                 crate::logging::log(&msg);
                 return Err(anyhow!("{msg}"));
@@ -1584,29 +1596,6 @@ pub fn stash_pre_restore(config_dir: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(dst))
 }
 
-/// Roll back a [`stash_pre_restore`]: move the stashed pre-restore file back to
-/// the live `state.json` path. Used when the restore *write* fails after the
-/// stash already renamed the live file aside — without this, `state.json` is
-/// left MISSING and `State::load` would silently treat the user as having zero
-/// accounts (audit finding 11). Overwrites any partial `state.json` a failed
-/// write may have left behind, and re-enforces `0600`.
-pub fn unstash_pre_restore(stash: &Path) -> Result<()> {
-    let live = state_path()?;
-    let bytes = std::fs::read(stash).context("reading pre-restore stash for rollback")?;
-    // Atomic replace so readers never see a truncated state.json.
-    let tmp = live.with_extension("json.tmp");
-    if let Err(e) = write_private(&tmp, &bytes) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).context("restoring live state.json from stash");
-    }
-    if let Err(e) = std::fs::rename(&tmp, &live) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).context("renaming restored state.json into place");
-    }
-    let _ = std::fs::remove_file(stash);
-    Ok(())
-}
-
 /// Number of `pre-restore-*.json` stashes kept under `backups/`.
 const PRE_RESTORE_KEEP_COUNT: usize = 5;
 
@@ -1726,13 +1715,16 @@ fn write_rolling_backup(dir: &Path, _state_path: &Path, current_bytes: &[u8]) ->
         let _ = std::fs::remove_file(&dst);
         return Err(e).context("writing backup file");
     }
-    prune_backups(&backups_dir, BACKUP_KEEP_COUNT)?;
+    prune_backups(&backups_dir, BACKUP_KEEP_COUNT, Some(&dst))?;
     Ok(())
 }
 
 /// Enumerate `state-*.json` under `dir`, sort by mtime ascending, and delete
 /// the oldest until at most `keep` survive.
-pub(crate) fn prune_backups(dir: &Path, keep: usize) -> Result<()> {
+///
+/// Never evicts `just_written` (a skewed clock can make the newest backup
+/// sort as the oldest).
+pub(crate) fn prune_backups(dir: &Path, keep: usize, just_written: Option<&Path>) -> Result<()> {
     let mut entries: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
     for e in std::fs::read_dir(dir).context("read backups dir")? {
         let e = match e {
@@ -1756,8 +1748,13 @@ pub(crate) fn prune_backups(dir: &Path, keep: usize) -> Result<()> {
         entries.push((e.path(), mtime));
     }
     entries.sort_by_key(|(_, m)| *m);
-    while entries.len() > keep {
-        let (p, _) = entries.remove(0);
+    let mut i = 0;
+    while entries.len() > keep && i < entries.len() {
+        if Some(entries[i].0.as_path()) == just_written {
+            i += 1;
+            continue;
+        }
+        let (p, _) = entries.remove(i);
         let _ = std::fs::remove_file(&p);
     }
     Ok(())
@@ -1857,6 +1854,11 @@ pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Re
         .truncate(true)
         .mode(0o600)
         .open(path)?;
+    // `mode` only applies on creation; tighten a pre-existing wider file.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     f.write_all(bytes)?;
     // Flush the data to disk before the handle drops. For the state.json
     // atomic-replace path this is what makes the tmp file's contents durable
