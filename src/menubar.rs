@@ -4527,8 +4527,12 @@ mod tests {
         let initial = State::load().unwrap().notification_config.threshold_enabled;
 
         const ITERATIONS: usize = 100;
-        let handles: Vec<_> = (0..2)
-            .map(|_| {
+        // Two threads toggle; a third bumps a counter field under the same
+        // lock. A toggle that skips the lock reads a stale counter and writes
+        // it back, so lost updates show up as an exact count shortfall instead
+        // of only (maybe) flipping the parity of the bool.
+        let handles: Vec<_> = (0..3)
+            .map(|worker| {
                 let home = home.clone();
                 std::thread::spawn(move || {
                     // HOME_OVERRIDE is thread-local (see store::ScopedConfigDir);
@@ -4536,7 +4540,16 @@ mod tests {
                     // the parent test set up.
                     crate::store::set_home_override(Some(home));
                     for _ in 0..ITERATIONS {
-                        toggle_notification_trigger("threshold");
+                        if worker == 2 {
+                            with_state_lock(|| {
+                                let mut st = State::load()?;
+                                st.trigger_pct = Some(st.trigger_pct.unwrap_or(0.0) + 1.0);
+                                st.save()
+                            })
+                            .unwrap();
+                        } else {
+                            toggle_notification_trigger("threshold");
+                        }
                     }
                 })
             })
@@ -4546,6 +4559,11 @@ mod tests {
         }
 
         let total_toggles = 2 * ITERATIONS;
+        assert_eq!(
+            State::load().unwrap().trigger_pct,
+            Some(ITERATIONS as f64),
+            "every locked counter bump must survive the concurrent toggles"
+        );
         let expected = if total_toggles % 2 == 1 {
             !initial
         } else {
