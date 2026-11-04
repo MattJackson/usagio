@@ -3794,21 +3794,47 @@ fn wait_released(prev: &crate::login::Progress) {
     }
 }
 
+/// Latest sign-in click per provider, so a worker still waiting for an old
+/// listener never starts (and then supersedes) a flow begun by a newer click.
+static LOGIN_GEN: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
+
+fn login_gen(slug: &str, bump: bool) -> u64 {
+    let mut m = LOGIN_GEN.lock().unwrap_or_else(|e| e.into_inner());
+    let g = m
+        .get_or_insert_with(Default::default)
+        .entry(slug.to_string())
+        .or_insert(0);
+    if bump {
+        *g += 1;
+    }
+    *g
+}
+
 /// Run `begin(browser_only)` for a new sign-in on `slug`. With nothing to
 /// supersede it runs inline (the UI thread, window allowed). Otherwise the
 /// wait for the old listener happens on a worker, and since no window can be
-/// opened off the main thread, the new flow uses the browser.
+/// opened off the main thread, the new flow uses the browser. A newer click
+/// made during that wait wins: the worker then starts nothing.
 fn begin_login_after_superseding(slug: &str, begin: impl FnOnce(bool) + Send + 'static) {
+    let gen = login_gen(slug, true);
     match supersede_previous_login(slug) {
         None => begin(false),
         Some(prev) => {
+            let slug = slug.to_string();
             #[cfg(test)]
             let home = crate::store::home_override();
             std::thread::spawn(move || {
                 #[cfg(test)]
                 crate::store::set_home_override(home);
                 wait_released(&prev);
-                begin(true);
+                if login_gen(&slug, false) == gen {
+                    begin(true);
+                } else {
+                    crate::logging::log(&format!(
+                        "event=login_superseded_while_waiting provider={slug}"
+                    ));
+                }
             });
         }
     }
@@ -8651,6 +8677,51 @@ mod tests {
             None,
             "a non-button result means the dialog could not be shown"
         );
+    }
+
+    #[test]
+    fn a_newer_sign_in_click_wins_over_a_worker_still_waiting() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let wait_for = |flag: &AtomicBool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !flag.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            flag.load(Ordering::SeqCst)
+        };
+        // Click 2 supersedes A and waits on a worker; click 3 finds nothing
+        // tracked and starts inline. The waiting worker must not start B.
+        let a = Arc::new(crate::login::Progress::default());
+        track_browser_login("t-login-gen", a.clone());
+        let started_b = Arc::new(AtomicBool::new(false));
+        let b = Arc::clone(&started_b);
+        begin_login_after_superseding("t-login-gen", move |_| b.store(true, Ordering::SeqCst));
+        let started_c = Arc::new(AtomicBool::new(false));
+        let c = Arc::clone(&started_c);
+        begin_login_after_superseding("t-login-gen", move |browser_only| {
+            assert!(!browser_only, "nothing to supersede: runs inline");
+            c.store(true, Ordering::SeqCst);
+        });
+        assert!(started_c.load(Ordering::SeqCst));
+        a.mark_finished();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !started_b.load(Ordering::SeqCst),
+            "an older click's worker started after a newer click"
+        );
+        // Control: with no newer click the worker does start its flow.
+        let d = Arc::new(crate::login::Progress::default());
+        track_browser_login("t-login-gen", d.clone());
+        let started_e = Arc::new(AtomicBool::new(false));
+        let e = Arc::clone(&started_e);
+        begin_login_after_superseding("t-login-gen", move |browser_only| {
+            assert!(browser_only);
+            e.store(true, Ordering::SeqCst);
+        });
+        d.mark_finished();
+        assert!(wait_for(&started_e), "the only waiting click never started");
+        supersede_previous_login("t-login-gen");
     }
 
     #[test]
