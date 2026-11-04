@@ -4062,9 +4062,12 @@ fn refresh_provider_usage_caches_with(
             // the Claude path; the reset-boundary wake brings us back). A manual
             // refresh (`force`) never skips, and past MAX_LOCKED_STALENESS we
             // refresh anyway so an early/unexpected reset can't freeze it.
+            // The ACTIVE account is never skipped here (as in the Claude
+            // path): `v2_active_fetch_skip` below decides it.
             if let Some(cu) = &acct.cached_usage {
                 let stale = Utc::now().timestamp() - cu.fetched_at > MAX_LOCKED_STALENESS_SECS;
                 if !force
+                    && !is_active
                     && !recheck_subscription
                     && !stale
                     && countdown::is_locked_until_reset(&cached_to_account_usage(cu), Utc::now())

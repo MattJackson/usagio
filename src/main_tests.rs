@@ -7686,3 +7686,14 @@ fn a_hold_survives_a_cycle_run_with_auto_swap_off() {
         Some("pick@e.com")
     );
 }
+
+#[test]
+fn a_just_switched_to_locked_codex_account_is_refetched() {
+    // Locked in its (pre-switch) cache, but it reset early and the user just
+    // switched to it: the active account is never skipped by the lock guard.
+    let k = uniq("codex-active-locked");
+    reset_usage_fetch_tracker(&fetch_tracker_key("codex", &k));
+    note_polled_provider_active("codex", Some("someone-else"));
+    assert_eq!(codex_one(&k, cu_locked(2 * 3600), true, false), 1);
+    reset_usage_fetch_tracker(&fetch_tracker_key("codex", &k));
+}
