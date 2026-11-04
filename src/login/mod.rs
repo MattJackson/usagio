@@ -150,23 +150,65 @@ pub fn parse_callback(target: &str, path: &str, state: &str) -> Callback {
 }
 
 pub struct Loopback {
-    listener: TcpListener,
+    /// `127.0.0.1:port`, plus `[::1]:port` when the redirect host is the name
+    /// `localhost`: the browser may resolve that to either address, and an
+    /// address we left unbound could be taken by another local process to
+    /// receive the redirect (code + state) instead of us.
+    listeners: Vec<TcpListener>,
     pub redirect_uri: String,
     path: &'static str,
 }
 
+/// Attempts at finding an ephemeral port free on both loopback addresses.
+const DUAL_BIND_ATTEMPTS: usize = 8;
+
 impl Loopback {
     pub fn bind(spec: &LoginSpec) -> Result<Self> {
-        let port = spec.redirect_port.unwrap_or(0);
-        let listener = TcpListener::bind(("127.0.0.1", port))
-            .with_context(|| format!("listening on localhost:{port} for the sign-in redirect"))?;
-        let port = listener.local_addr()?.port();
-        listener.set_nonblocking(true)?;
-        Ok(Loopback {
-            listener,
-            redirect_uri: format!("http://{}:{port}{}", spec.redirect_host, spec.redirect_path),
-            path: spec.redirect_path,
-        })
+        let fixed = spec.redirect_port;
+        let both = spec.redirect_host.eq_ignore_ascii_case("localhost");
+        let attempts = if fixed.is_some() || !both {
+            1
+        } else {
+            DUAL_BIND_ATTEMPTS
+        };
+        let mut last_err = None;
+        for _ in 0..attempts {
+            let want = fixed.unwrap_or(0);
+            let v4 = TcpListener::bind(("127.0.0.1", want)).with_context(|| {
+                format!("listening on localhost:{want} for the sign-in redirect")
+            })?;
+            let port = v4.local_addr()?.port();
+            let mut listeners = vec![v4];
+            if both {
+                match bind_v6_loopback(port) {
+                    Ok(Some(v6)) => listeners.push(v6),
+                    Ok(None) => {}
+                    Err(e) => {
+                        // Someone holds [::1]:port. An ephemeral port can be
+                        // picked again; a fixed one cannot.
+                        last_err = Some(anyhow::Error::new(e).context(format!(
+                            "listening on [::1]:{port} for the sign-in redirect"
+                        )));
+                        continue;
+                    }
+                }
+            }
+            for l in &listeners {
+                l.set_nonblocking(true)?;
+            }
+            return Ok(Loopback {
+                listeners,
+                redirect_uri: format!("http://{}:{port}{}", spec.redirect_host, spec.redirect_path),
+                path: spec.redirect_path,
+            });
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("no free loopback port for the sign-in redirect")))
+    }
+
+    /// The port the redirect comes back to.
+    #[cfg(test)]
+    pub fn port(&self) -> u16 {
+        self.listeners[0].local_addr().unwrap().port()
     }
 
     /// Serve the redirect until it brings back a code for `state`, the user
@@ -185,16 +227,23 @@ impl Loopback {
             if Instant::now() >= deadline {
                 bail!("timed out waiting for sign-in");
             }
-            match self.listener.accept() {
-                Ok((stream, _)) => match self.answer(stream, state, cancel) {
-                    Callback::Code(code) => return Ok(code),
-                    Callback::Denied(why) => bail!("sign-in was not authorized: {why}"),
-                    Callback::Ignore => {}
-                },
-                Err(e) if is_transient_accept_error(e.kind()) => {
-                    std::thread::sleep(Duration::from_millis(100));
+            let mut idle = true;
+            for listener in &self.listeners {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        idle = false;
+                        match self.answer(stream, state, cancel) {
+                            Callback::Code(code) => return Ok(code),
+                            Callback::Denied(why) => bail!("sign-in was not authorized: {why}"),
+                            Callback::Ignore => {}
+                        }
+                    }
+                    Err(e) if is_transient_accept_error(e.kind()) => {}
+                    Err(e) => return Err(e).context("accepting the sign-in redirect"),
                 }
-                Err(e) => return Err(e).context("accepting the sign-in redirect"),
+            }
+            if idle {
+                std::thread::sleep(Duration::from_millis(100));
             }
         }
     }
@@ -225,6 +274,23 @@ impl Loopback {
         let _ = stream.shutdown(std::net::Shutdown::Write);
         result
     }
+}
+
+/// Bind `[::1]:port`. `Ok(None)` when this machine has no IPv6 loopback (so
+/// `localhost` cannot resolve there and nothing can squat it); `Err` when the
+/// address exists but is taken (`AddrInUse`, or refused to us).
+fn bind_v6_loopback(port: u16) -> std::io::Result<Option<TcpListener>> {
+    match TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)) {
+        Ok(l) => Ok(Some(l)),
+        Err(e) if v6_absent(e.kind()) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Bind errors that mean "no IPv6 loopback here", not "somebody has it".
+fn v6_absent(kind: std::io::ErrorKind) -> bool {
+    use std::io::ErrorKind::*;
+    !matches!(kind, AddrInUse | PermissionDenied)
 }
 
 /// `accept()` errors on the nonblocking loopback listener that mean "try

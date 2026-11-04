@@ -357,7 +357,7 @@ fn transient_accept_errors_are_retried_not_fatal() {
 #[test]
 fn a_cancelled_flow_frees_its_port_before_it_returns() {
     let lb = Loopback::bind(&spec("http://unused", TokenRequestStyle::Form)).unwrap();
-    let port = lb.listener.local_addr().unwrap().port();
+    let port = lb.port();
     let cancel = AtomicBool::new(true);
     let r = wait_and_release(lb, "st", Duration::from_secs(5), &cancel);
     assert!(r.is_err());
@@ -380,7 +380,7 @@ fn an_idle_connection_does_not_delay_cancel() {
     // A browser preconnect that never sends a request must not hold the
     // listener (and its fixed port) past a supersede/cancel.
     let lb = Loopback::bind(&spec("http://unused", TokenRequestStyle::Form)).unwrap();
-    let port = lb.listener.local_addr().unwrap().port();
+    let port = lb.port();
     let idle = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
     let cancel = std::sync::Arc::new(AtomicBool::new(false));
     let c = std::sync::Arc::clone(&cancel);
@@ -515,4 +515,72 @@ fn start_releases_the_redirect_port_before_on_done_runs() {
     assert!(failed, "a cancelled flow reports an error");
     assert!(free, "the redirect port was still bound when on_done ran");
     assert!(started.progress.is_finished());
+}
+
+#[test]
+fn a_localhost_redirect_owns_both_loopback_addresses() {
+    // "localhost" may resolve to ::1: nobody else may hold [::1]:port.
+    let lb = Loopback::bind(&spec("http://unused", TokenRequestStyle::Form)).unwrap();
+    let port = lb.port();
+    assert!(TcpListener::bind(("127.0.0.1", port)).is_err());
+    if lb.listeners.len() == 2 {
+        assert!(
+            TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).is_err(),
+            "[::1]:{port} left free for another process to squat"
+        );
+    } else {
+        assert!(
+            TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).is_err(),
+            "IPv6 loopback exists but was not bound"
+        );
+    }
+}
+
+#[test]
+fn a_squatted_ipv6_port_is_never_used() {
+    // Hold [::1]:P first; a fixed-port login on P must refuse, not listen on
+    // IPv4 alone while the squatter receives the redirect.
+    let Ok(squat) = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)) else {
+        return; // no IPv6 loopback on this machine: nothing to squat
+    };
+    let port = squat.local_addr().unwrap().port();
+    let mut s = spec("http://unused", TokenRequestStyle::Form);
+    s.redirect_port = Some(port);
+    let Err(e) = Loopback::bind(&s) else {
+        panic!("bound beside a squatter on [::1]:{port}");
+    };
+    assert!(format!("{e:#}").contains("[::1]"), "{e:#}");
+    // An ephemeral-port login just picks another port.
+    let lb = Loopback::bind(&spec("http://unused", TokenRequestStyle::Form)).unwrap();
+    assert_ne!(lb.port(), port);
+}
+
+#[test]
+fn a_literal_ipv4_redirect_binds_only_ipv4() {
+    let mut s = spec("http://unused", TokenRequestStyle::Form);
+    s.redirect_host = "127.0.0.1";
+    let lb = Loopback::bind(&s).unwrap();
+    assert_eq!(lb.listeners.len(), 1);
+}
+
+#[test]
+fn the_redirect_is_served_on_ipv6_loopback_too() {
+    let lb = Loopback::bind(&spec("http://unused", TokenRequestStyle::Form)).unwrap();
+    if lb.listeners.len() < 2 {
+        return; // no IPv6 loopback here
+    }
+    let port = lb.port();
+    let client = std::thread::spawn(move || {
+        let mut s = std::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port)).unwrap();
+        s.write_all(b"GET /callback?code=c6&state=S HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out
+    });
+    let code = lb
+        .wait_for_code("S", Duration::from_secs(5), &AtomicBool::new(false))
+        .unwrap();
+    assert_eq!(code, "c6");
+    assert!(client.join().unwrap().starts_with("HTTP/1.1 200"));
 }
