@@ -809,6 +809,17 @@ fn acct_max_pct(a: &AcctView) -> Option<f64> {
         .fold(None, |acc, p| Some(acc.map_or(p, |m: f64| m.max(p))))
 }
 
+/// Highest of the session/weekly percentages only — the windows
+/// `compute_display` locks on. Unlike [`acct_max_pct`] it ignores scoped
+/// windows (e.g. Opus), which can be maxed while the account stays usable.
+fn blocking_pct(a: &AcctView) -> Option<f64> {
+    let (s, w) = summary_pcts(a);
+    match (s, w) {
+        (Some(s), Some(w)) => Some(s.max(w)),
+        (s, w) => s.or(w),
+    }
+}
+
 /// The account the tray icon/title should reflect, honoring
 /// `State.tray_icon_mode` (carried on the snapshot):
 ///   - `None` — "at risk" (the default): across every provider's ACTIVE
@@ -837,12 +848,27 @@ fn tray_target<'a>(
     // At risk: the active account that blocks soonest (its binding window's
     // time to block at its own pace), falling back to the highest pct.
     let now = now_utc();
-    let actives: Vec<(&ProviderSection, &AcctView)> = snap
+    let all_actives: Vec<(&ProviderSection, &AcctView)> = snap
         .sections
         .iter()
         .filter_map(|sec| Some((sec, sec.accounts.iter().find(|a| a.active)?)))
+        .collect();
+    let actives: Vec<(&ProviderSection, &AcctView)> = all_actives
+        .iter()
+        .copied()
         .filter(|(_, a)| locked_countdown_for(a, now).is_none())
         .collect();
+    if actives.is_empty() {
+        // Every active account is locked: show the one that unlocks soonest
+        // (its lock countdown) rather than a blank "no active account".
+        let unlock = |a: &AcctView| match countdown::compute_display(&account_usage_for(a), now) {
+            DisplayState::Locked { until, .. } => Some(until),
+            _ => None,
+        };
+        return all_actives
+            .into_iter()
+            .min_by_key(|(_, a)| unlock(a).unwrap_or(DateTime::<Utc>::MAX_UTC));
+    }
     let ttb = |a: &AcctView| binding_for(a, now).and_then(|b| b.time_to_block);
     if actives.iter().any(|(_, a)| ttb(a).is_some()) {
         return actives.into_iter().min_by(|(_, a), (_, b)| {
@@ -2508,7 +2534,7 @@ fn recovery_status(
         }
     }
     if matches!(state, DisplayState::Usage { .. })
-        && !acct_max_pct(active).is_some_and(|p| p >= 99.5)
+        && !blocking_pct(active).is_some_and(|p| p >= 99.5)
     {
         return None;
     }
@@ -2545,7 +2571,7 @@ fn recovery_status(
             }
             DisplayState::StaleAfterReset { .. } => pending = Some(account),
             DisplayState::Usage { .. } => {
-                if acct_max_pct(account).is_some_and(|p| p < 99.5) {
+                if blocking_pct(account).is_some_and(|p| p < 99.5) {
                     return Some((
                         "Switch".into(),
                         format!("{} · Usage available", account.display),
@@ -6879,6 +6905,41 @@ mod tests {
         let mut sec = claude_section();
         sec.accounts = vec![locked_for("active@x.com", now, true), alt];
         recovery_status(&sec, &active, now)
+    }
+
+    #[test]
+    fn recovery_ignores_a_maxed_opus_only_window() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let mk = || {
+            let mut a = acct("solo@x.com", Some(10.0), Some(30.0), true);
+            a.windows.push(WindowView {
+                id: "opus".into(),
+                label: "Opus 7d".into(),
+                pct: Some(100.0),
+                reset: "2d".into(),
+            });
+            a
+        };
+        let a = mk();
+        let mut sec = claude_section();
+        sec.accounts = vec![mk()];
+        assert_eq!(
+            recovery_status(&sec, &a, now),
+            None,
+            "session/weekly have headroom: the account is usable"
+        );
+    }
+
+    #[test]
+    fn at_risk_tray_falls_back_to_locked_active_when_nothing_else_is_active() {
+        let mut a = acct("solo@x.com", Some(10.0), Some(100.0), true);
+        a.weekly_reset_at = Some(now_utc() + chrono::Duration::days(2));
+        let snap = one_section_snap(a);
+        assert!(
+            tray_target(&snap, None).is_some(),
+            "a locked sole active account must still be the tray target"
+        );
+        assert_ne!(title_for(&snap), "—");
     }
 
     #[test]
