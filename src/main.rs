@@ -367,7 +367,11 @@ fn cmd_capture(args: &[String]) -> Result<()> {
     // dedicated `state.accounts` bucket; every other registered provider uses
     // the generic `state.providers[slug]` slot. No arg defaults to Claude
     // (back-compat with the original Claude-only `usagio capture`).
-    let slug = args.first().map(String::as_str).unwrap_or(CLAUDE_SLUG);
+    // Slugs are lowercase; match a `Codex` the way a `Codex:` qualifier is.
+    let slug = args
+        .first()
+        .map_or_else(|| CLAUDE_SLUG.to_string(), |s| s.to_ascii_lowercase());
+    let slug = slug.as_str();
     if slug == CLAUDE_SLUG {
         let (email, existed) = capture_current()?;
         println!(
@@ -783,7 +787,7 @@ fn cmd_renew(args: &[String]) -> Result<()> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--provider" | "-p" => slug = it.next().context(USAGE)?.clone(),
+            "--provider" | "-p" => slug = it.next().context(USAGE)?.to_ascii_lowercase(),
             other => selector = Some(other.to_string()),
         }
     }

@@ -7778,3 +7778,20 @@ fn an_unchanged_plan_does_not_rewrite_state() {
     persist_plan("codex", "c@e.com", &plan("Plus", true), None);
     assert_eq!(backups(), before, "an unchanged plan rotated a backup");
 }
+
+#[test]
+fn provider_slugs_are_case_insensitive_on_capture_and_renew() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    State::default().save().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let err = format!("{:#}", cmd_capture(&args(&["Codex"])).unwrap_err());
+        assert!(!err.contains("not registered"), "{err}");
+        let err = format!(
+            "{:#}",
+            cmd_renew(&args(&["nobody@e.com", "--provider", "Codex"])).unwrap_err()
+        );
+        assert!(!err.contains("not registered"), "{err}");
+    });
+}
