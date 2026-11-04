@@ -3100,24 +3100,11 @@ fn handle_backup_restore_dialog_with(dialog: &dyn crate::platform::FileDialog) {
             anyhow::bail!("accounts changed while the confirmation was open; try Restore again");
         }
         let dir = crate::store::config_dir()?;
-        let stash = crate::store::stash_pre_restore(&dir)?;
-        if let Err(e) = crate::store::save_state_restore(new_state.clone()) {
-            // The stash renamed the live state.json aside; a failed write here
-            // would leave state.json MISSING → State::load reads zero accounts
-            // (audit finding 11). Roll the stash back so the pre-restore state
-            // is preserved exactly, then surface the original error.
-            if let Some(stash_path) = stash {
-                if let Err(re) = crate::store::unstash_pre_restore(&stash_path) {
-                    return Err(e.context(format!(
-                        "restore write failed and rollback also failed; your \
-                         previous accounts are preserved at {} — move it back to \
-                         state.json to recover (rollback error: {re})",
-                        stash_path.display()
-                    )));
-                }
-            }
-            return Err(e);
-        }
+        // The stash is a copy and `save_state_restore` writes atomically, so
+        // a failed restore leaves the live state.json untouched; the stash is
+        // kept as an extra pre-restore copy.
+        crate::store::stash_pre_restore(&dir)?;
+        crate::store::save_state_restore(new_state.clone())?;
         Ok(true)
     });
 
