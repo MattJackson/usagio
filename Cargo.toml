@@ -72,6 +72,9 @@ serde_json = { version = "1", features = ["preserve_order"] }
 chrono = { version = "0.4", features = ["clock", "serde"], default-features = false }
 ureq = { version = "2", features = ["json", "tls"] }
 sha2 = "0.10"
+# NFC for Claude Code's per-config-dir keychain service name (it hashes the
+# NFC form). Already in the tree via url -> idna; no new crates.
+icu_normalizer = { version = "2", default-features = false, features = ["compiled_data"] }
 base64 = "0.22"
 rand = "0.8"
 fs2 = "0.4"

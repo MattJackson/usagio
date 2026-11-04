@@ -398,7 +398,9 @@ impl Provider for ClaudeProvider {
     }
 
     fn read_active_identity(&self) -> PResult<Option<IdentitySnapshot>> {
-        let (oauth_account, user_id) = read_claude_identity();
+        // Strict: a missing file is "no identity", but an unreadable or
+        // unparseable one is an error callers can report.
+        let (oauth_account, user_id) = read_claude_identity_strict()?;
         let Some(oa) = oauth_account else {
             return Ok(None);
         };
@@ -438,10 +440,10 @@ impl Provider for ClaudeProvider {
     /// Claude Code actually reads its credentials from on this OS. Claude
     /// Code only uses the OS keychain on macOS (via the `security` CLI,
     /// hence `keychain_write` routing through `Platform::secrets()` with the
-    /// exact `"Claude Code-credentials"` service name Claude Code itself
-    /// uses); on Linux and Windows it reads a plaintext
+    /// exact service name Claude Code itself uses, see `keychain_service`); on
+    /// Linux and Windows it reads a plaintext
     /// `~/.claude/.credentials.json` (`%USERPROFILE%\.claude\.credentials.json`
-    /// on Windows) instead. Branch on `Platform::os_display_name()` (a
+    /// on Windows, or under `CLAUDE_CONFIG_DIR`) instead. Branch on `Platform::os_display_name()` (a
     /// runtime check through the trait) rather than `cfg(target_os)`, per the
     /// strict-cfg rule that OS forks outside `src/platform/` must route
     /// through `Platform`.
@@ -453,9 +455,12 @@ impl Provider for ClaudeProvider {
     fn mirror_rotated_token(&self, blob: &str) -> PResult<()> {
         parse_claude_blob(blob)?;
         let to = if slot_is_keychain() {
-            "keychain:Claude Code-credentials"
+            format!("keychain:{}", keychain_service())
         } else {
-            "file:~/.claude/.credentials.json"
+            claude_credentials_json_path().map_or_else(
+                || "file:<no HOME>".to_string(),
+                |p| format!("file:{}", p.display()),
+            )
         };
         let result = active_slot_write(blob);
         // The blob is claudeAiOauth-only (no identity); the caller logs the
@@ -749,10 +754,36 @@ fn keychain_account() -> String {
     std::env::var("USER").unwrap_or_else(|_| "claude".to_string())
 }
 
+/// The keychain service name Claude Code uses for the active config root.
+fn keychain_service() -> String {
+    let var = |k| crate::paths::path_env_var(k).map(|v| v.to_string_lossy().into_owned());
+    keychain_service_for(
+        var("CLAUDE_SECURESTORAGE_CONFIG_DIR").as_deref(),
+        var("CLAUDE_CONFIG_DIR").as_deref(),
+    )
+}
+
+/// Claude Code (2.1.318, `qz` in its bundled JS) suffixes the service with
+/// `-` + the first 8 hex digits of sha256(NFC(dir)) when a config dir is set:
+/// `CLAUDE_SECURESTORAGE_CONFIG_DIR` if defined (empty = no suffix), else
+/// `CLAUDE_CONFIG_DIR` as given (no trimming or path normalisation). With
+/// neither set the name is the plain `KEYCHAIN_SERVICE`.
+fn keychain_service_for(securestorage_dir: Option<&str>, config_dir: Option<&str>) -> String {
+    use sha2::Digest;
+    let dir = securestorage_dir.or(config_dir).unwrap_or("");
+    if dir.is_empty() {
+        return KEYCHAIN_SERVICE.to_string();
+    }
+    let nfc = icu_normalizer::ComposingNormalizerBorrowed::new_nfc().normalize(dir);
+    let digest = sha2::Sha256::digest(nfc.as_bytes());
+    let hex: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{KEYCHAIN_SERVICE}-{hex}")
+}
+
 fn keychain_read() -> Option<String> {
     crate::platform()
         .secrets()
-        .get(KEYCHAIN_SERVICE, &keychain_account())
+        .get(&keychain_service(), &keychain_account())
         .ok()
         .flatten()
 }
@@ -760,7 +791,7 @@ fn keychain_read() -> Option<String> {
 fn keychain_write(blob: &str) -> PResult<()> {
     crate::platform()
         .secrets()
-        .set(KEYCHAIN_SERVICE, &keychain_account(), blob)
+        .set(&keychain_service(), &keychain_account(), blob)
         .map_err(|e| ProviderError::Other(format!("{e:#}")))
 }
 
@@ -841,8 +872,8 @@ pub(crate) fn claude_json_path() -> Option<std::path::PathBuf> {
 /// (`~/.claude/.credentials.json` / `%USERPROFILE%\.claude\.credentials.json`,
 /// or `$CLAUDE_CONFIG_DIR/.credentials.json` when that is set). Not
 /// `cfg(target_os)`-gated; only the caller (which checks `os_display_name()`)
-/// decides whether to use it. The macOS keychain service name is NOT varied
-/// by `CLAUDE_CONFIG_DIR` (unverified upstream).
+/// decides whether to use it. On macOS the keychain service name varies with
+/// the config dir instead (see `keychain_service`).
 fn claude_credentials_json_path() -> Option<std::path::PathBuf> {
     if let Some(dir) = claude_config_dir_override() {
         return Some(dir.join(".credentials.json"));
@@ -852,21 +883,6 @@ fn claude_credentials_json_path() -> Option<std::path::PathBuf> {
             .join(".claude")
             .join(".credentials.json"),
     )
-}
-
-fn read_claude_identity() -> (Option<Value>, Option<String>) {
-    let Some(path) = claude_json_path() else {
-        return (None, None);
-    };
-    let Ok(bytes) = std::fs::read(&path) else {
-        return (None, None);
-    };
-    let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
-        return (None, None);
-    };
-    let oauth = v.get("oauthAccount").cloned().filter(|x| !x.is_null());
-    let uid = v.get("userID").and_then(|u| u.as_str()).map(String::from);
-    (oauth, uid)
 }
 
 fn read_claude_json_raw() -> Option<(Vec<u8>, u32)> {
@@ -953,7 +969,8 @@ fn read_claude_identity_strict() -> PResult<(Option<Value>, Option<String>)> {
     };
     let v = serde_json::from_slice::<Value>(&bytes).map_err(|e| {
         ProviderError::Other(format!(
-            "~/.claude.json is not valid JSON right now ({e}); try capture again"
+            "{} is not valid JSON right now ({e}); try again",
+            path.display()
         ))
     })?;
     let oauth = v.get("oauthAccount").cloned().filter(|x| !x.is_null());
@@ -1641,6 +1658,43 @@ mod tests {
     }
 
     #[test]
+    fn keychain_service_follows_claude_codes_config_dir_suffix() {
+        // Vectors from Claude Code 2.1.318's own naming (`qz` in its bundled
+        // JS): "-" + first 8 hex of sha256(NFC(dir)) when a dir is set.
+        let base = "Claude Code-credentials";
+        assert_eq!(keychain_service_for(None, None), base);
+        assert_eq!(keychain_service_for(None, Some("")), base);
+        let work = "Claude Code-credentials-be865d75";
+        assert_eq!(
+            keychain_service_for(None, Some("/Users/alice/.claude-work")),
+            work
+        );
+        // CLAUDE_SECURESTORAGE_CONFIG_DIR wins, even when empty.
+        assert_eq!(keychain_service_for(Some(""), Some("/x")), base);
+        assert_eq!(
+            keychain_service_for(Some("/Users/alice/.claude-work"), Some("/x")),
+            work
+        );
+        // The hash input is NFC-normalised: decomposed and composed agree.
+        let nfc = "Claude Code-credentials-57dfd6dd";
+        assert_eq!(
+            keychain_service_for(None, Some("/Users/re\u{301}sume\u{301}")),
+            nfc
+        );
+        assert_eq!(
+            keychain_service_for(None, Some("/Users/r\u{e9}sum\u{e9}")),
+            nfc
+        );
+        crate::env_lock::scoped_env_var(
+            "CLAUDE_CONFIG_DIR",
+            Some("/Users/alice/.claude-work"),
+            || {
+                assert_eq!(keychain_service(), work);
+            },
+        );
+    }
+
+    #[test]
     fn keychain_read_of_an_unknown_account_is_none() {
         crate::env_lock::scoped_env_var("USER", Some("usagio-test-no-such-account-8f3a1c"), || {
             assert_eq!(keychain_read(), None);
@@ -1931,10 +1985,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join(".claude.json");
         crate::env_lock::scoped_env_var("HOME", Some(dir.path().to_str().unwrap()), || {
-            // Missing file and garbage both read as "no identity".
-            assert_eq!(read_claude_identity(), (None, None));
-            std::fs::write(&file, "not json").unwrap();
-            assert_eq!(read_claude_identity(), (None, None));
+            assert_eq!(read_claude_identity_strict().unwrap(), (None, None));
 
             std::fs::write(
                 &file,
@@ -1942,7 +1993,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                read_claude_identity(),
+                read_claude_identity_strict().unwrap(),
                 (
                     Some(serde_json::json!({"emailAddress":"a@example.com"})),
                     Some("uid-1".to_string())
@@ -1951,7 +2002,26 @@ mod tests {
 
             // An explicit null oauthAccount is "no account", not Some(null).
             std::fs::write(&file, r#"{"oauthAccount":null,"userID":"uid-2"}"#).unwrap();
-            assert_eq!(read_claude_identity(), (None, Some("uid-2".to_string())));
+            assert_eq!(
+                read_claude_identity_strict().unwrap(),
+                (None, Some("uid-2".to_string()))
+            );
+        });
+    }
+
+    #[test]
+    fn read_active_identity_surfaces_an_unreadable_claude_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".claude.json");
+        crate::env_lock::scoped_env_var("HOME", Some(dir.path().to_str().unwrap()), || {
+            // Missing file: genuinely no identity.
+            assert!(ClaudeProvider.read_active_identity().unwrap().is_none());
+            // Present but unparseable: an error, not a silent "no identity".
+            std::fs::write(&file, "not json").unwrap();
+            assert!(ClaudeProvider.read_active_identity().is_err());
+            std::fs::write(&file, r#"{"oauthAccount":{"emailAddress":"a@e.com"}}"#).unwrap();
+            let id = ClaudeProvider.read_active_identity().unwrap().unwrap();
+            assert_eq!(id.email.as_deref(), Some("a@e.com"));
         });
     }
 
