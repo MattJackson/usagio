@@ -278,7 +278,11 @@ impl Watchdog {
                 }
             }
             WatchdogAction::Warn => {
-                self.already_respawned = false;
+                // Like `None`: an fd count in the warn band says nothing about
+                // an unproven keychain episode.
+                if !self.keychain_unproven {
+                    self.already_respawned = false;
+                }
                 let n = fd_count.unwrap_or(0);
                 effects.log(&format!("event=fd_watchdog level=warn count={n}"));
             }
@@ -294,6 +298,9 @@ impl Watchdog {
                          action=watcher_respawn"
                     ));
                 }
+                // Baseline before the respawn, so a keychain write that
+                // succeeds meanwhile counts as proof of recovery.
+                let ok_before = KEYCHAIN_OK_TOTAL.load(Ordering::Relaxed);
                 let (before, after) = effects.respawn_watcher();
                 effects.log(&format!(
                     "event=fd_watchdog action=watcher_respawn before={} after={}",
@@ -305,7 +312,7 @@ impl Watchdog {
                 self.already_respawned = true;
                 if keychain_failures >= KEYCHAIN_FAILURE_THRESHOLD {
                     self.keychain_unproven = true;
-                    self.ok_total_at_respawn = KEYCHAIN_OK_TOTAL.load(Ordering::Relaxed);
+                    self.ok_total_at_respawn = ok_before;
                 }
             }
             WatchdogAction::SelfRestart => {
@@ -594,6 +601,50 @@ mod tests {
         wd.run_check(Some(40), KEYCHAIN_FAILURE_THRESHOLD, &mut fx);
         assert_eq!(fx.respawns, 1, "must not respawn a second time");
         assert_eq!(fx.self_restarts, 1, "persisting failures self-restart");
+    }
+
+    /// A warn-band fd count is not proof the keychain recovered: the ladder
+    /// must still escalate to SelfRestart while no write has succeeded.
+    #[test]
+    fn run_check_warn_does_not_reset_an_unproven_keychain_episode() {
+        let mut wd = Watchdog::default();
+        let mut fx = MockEffects::default();
+        wd.run_check(Some(40), KEYCHAIN_FAILURE_THRESHOLD, &mut fx);
+        assert_eq!(fx.respawns, 1);
+        wd.run_check(Some(FD_WARN_THRESHOLD), 0, &mut fx); // warn band, quiet
+        wd.run_check(Some(FD_WARN_THRESHOLD), KEYCHAIN_FAILURE_THRESHOLD, &mut fx);
+        assert_eq!(fx.respawns, 1, "must not respawn a second time");
+        assert_eq!(fx.self_restarts, 1, "persisting failures self-restart");
+    }
+
+    /// A keychain success that lands while the respawn runs counts as proof
+    /// of recovery: the baseline is taken before the respawn.
+    #[test]
+    fn run_check_takes_the_keychain_baseline_before_the_respawn() {
+        struct SuccessDuringRespawn;
+        impl WatchdogEffects for SuccessDuringRespawn {
+            fn log(&mut self, _: &str) {}
+            fn respawn_watcher(&mut self) -> (Option<usize>, Option<usize>) {
+                record_keychain_result(true);
+                (None, None)
+            }
+            fn self_restart(&mut self) -> bool {
+                false
+            }
+        }
+        let _kc = KC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut wd = Watchdog::default();
+        wd.run_check(
+            Some(40),
+            KEYCHAIN_FAILURE_THRESHOLD,
+            &mut SuccessDuringRespawn,
+        );
+        assert!(wd.keychain_unproven);
+        assert_ne!(
+            KEYCHAIN_OK_TOTAL.load(Ordering::Relaxed),
+            wd.ok_total_at_respawn,
+            "the mid-respawn success must be visible to maybe_run"
+        );
     }
 
     /// A self_restart that fails to issue (bare foreground watch: returns
