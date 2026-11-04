@@ -325,7 +325,14 @@ fn purge_login_item(program: &str, name: &str) -> Result<()> {
         .process_group(0)
         .spawn()
         .with_context(|| format!("spawning `{program}`"))?;
-    run_with_timeout(child, LOGIN_ITEM_PURGE_TIMEOUT).map(|_| ())
+    let run = run_with_timeout(child, LOGIN_ITEM_PURGE_TIMEOUT)?;
+    if run.timed_out {
+        bail!(
+            "`{program}` timed out after {}s; the login item was not deleted",
+            LOGIN_ITEM_PURGE_TIMEOUT.as_secs()
+        );
+    }
+    Ok(())
 }
 
 /// Run `security(1)` with `args` under the native hang guard. stdout/stderr
@@ -558,26 +565,36 @@ fn real_set_with(
             Ok(out) => out,
             Err(e) => {
                 // Spawn / wait failure after the delete already succeeded.
-                restore_prior_secret(run, service, account, prior.as_deref());
-                return Err(e.context("running `security add-generic-password`"));
+                let restored = restore_prior_secret(run, service, account, prior.as_deref());
+                return Err(anyhow::anyhow!(
+                    "running `security add-generic-password`: {e:#}{}",
+                    restore_note(restored)
+                ));
             }
         };
-        if out.timed_out || !out.success() {
-            restore_prior_secret(run, service, account, prior.as_deref());
-        }
+        let restore_note = if out.timed_out || !out.success() {
+            restore_note(restore_prior_secret(
+                run,
+                service,
+                account,
+                prior.as_deref(),
+            ))
+        } else {
+            ""
+        };
         if out.timed_out {
             timed_out = true;
             bail!(
                 "`security add-generic-password` timed out after {SECURITY_TIMEOUT_SECS}s \
                  (locked keychain or an unattended SecurityAgent dialog) for \
-                 service={service} account={account}",
+                 service={service} account={account}{restore_note}",
             );
         }
         if !out.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             bail!(
                 "`security add-generic-password` failed (exit {:?}) for \
-                 service={service} account={account}: {}",
+                 service={service} account={account}: {}{restore_note}",
                 out.code(),
                 stderr.trim(),
             );
@@ -628,8 +645,8 @@ fn restore_prior_secret(
     service: &str,
     account: &str,
     prior: Option<&str>,
-) {
-    let Some(prior) = prior else { return };
+) -> bool {
+    let Some(prior) = prior else { return true };
     let ok = run(&[
         "add-generic-password",
         "-s",
@@ -645,6 +662,17 @@ fn restore_prior_secret(
         "event=keychain_write_restore svc={service} acct={account} result={}",
         if ok { "ok" } else { "failed" }
     ));
+    ok
+}
+
+/// Suffix for the add error when restoring the deleted item also failed.
+fn restore_note(restored: bool) -> &'static str {
+    if restored {
+        ""
+    } else {
+        " (restoring the previous credential also failed; the keychain item is now \
+         absent, run `usagio switch` again)"
+    }
 }
 
 /// Run `launchctl bootout` and return its output (stderr included).
@@ -1270,6 +1298,23 @@ mod tests {
         calls.iter().map(|c| c[0].as_str()).collect()
     }
 
+    /// keychain-restore-failure-unreported: when the add fails and the restore
+    /// add fails too, the error must say the item is now absent.
+    #[test]
+    fn real_set_reports_when_the_restore_also_fails() {
+        let _cfg = crate::store::ScopedConfigDir::new();
+        let runner = |args: &[&str]| -> Result<SecurityRun> {
+            match args[0] {
+                "find-generic-password" => Ok(run(Some(0), false, "prior-secret\n")),
+                "delete-generic-password" => Ok(run(Some(0), false, "")),
+                _ => Ok(run(Some(36), false, "")),
+            }
+        };
+        let err = real_set_with(&runner, "svc", "acct", "new-secret").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("now absent"), "{msg}");
+    }
+
     #[test]
     fn real_set_aborts_before_delete_when_the_backup_read_fails() {
         for find in [
@@ -1476,13 +1521,15 @@ mod tests {
         assert!(got.contains("delete login item \"usagio\""), "{got}");
     }
 
-    /// The purge is bounded: a hung osascript is killed at the deadline.
+    /// The purge is bounded: a hung osascript is killed at the deadline, and
+    /// the overrun is reported (so uninstall logs it) rather than swallowed.
     #[test]
     fn purge_login_item_is_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let prog = fake_osascript(dir.path(), "sleep 30");
         let start = Instant::now();
-        purge_login_item(&prog, "usagio").expect("purge");
+        let err = purge_login_item(&prog, "usagio").expect_err("timeout must be an error");
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
         assert!(start.elapsed() < Duration::from_secs(10));
     }
 
