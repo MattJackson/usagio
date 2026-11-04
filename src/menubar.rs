@@ -3428,11 +3428,27 @@ fn login_message(mut msg: String, r: &crate::login::Renewed) -> String {
     msg
 }
 
+/// Run `work` on a worker thread while holding the shared swap guard. The
+/// poller holds that guard for a whole `run_cycle` (network fetches, token
+/// refreshes), so taking it on the UI thread would freeze the tray; the
+/// worker waits instead, keeping the serialization with the poller.
+fn spawn_serialized_with_poller(work: impl FnOnce(&mut SwapGuards) + Send + 'static) {
+    let shared = shared_swap_guard();
+    std::thread::spawn(move || {
+        let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+        work(&mut guard);
+    });
+}
+
 fn handle_switch(slug: &str, key: &str) {
     // Explicit user choice may select an exhausted account. Serialize with the
-    // poller so it cannot immediately undo the choice with an older decision.
-    let shared = shared_swap_guard();
-    let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+    // poller so it cannot immediately undo the choice with an older decision;
+    // off the UI thread, since the guard can be held across network fetches.
+    let (slug, key) = (slug.to_string(), key.to_string());
+    spawn_serialized_with_poller(move |guard| switch_serialized(guard, &slug, &key));
+}
+
+fn switch_serialized(guard: &mut SwapGuards, slug: &str, key: &str) {
     // State v2 (codex-switch-e2e): dispatch by provider slug instead of
     // hard-gating on Claude — `capabilities().supports_switching` already
     // keeps the "Switch to this account" row from being built for a
@@ -4354,6 +4370,23 @@ mod tests {
 
         // Clean up so later tests in this binary see the flag cleared.
         REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn serialized_work_does_not_block_the_caller_while_poller_holds_guard() {
+        let shared = shared_swap_guard();
+        let held = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_serialized_with_poller(move |_| {
+            let _ = tx.send(());
+        });
+        // We got here without blocking; the work must not run until released.
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("work runs once the guard is free");
     }
 
     #[test]
