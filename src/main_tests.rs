@@ -709,6 +709,7 @@ fn sample(account: &str, session: f64, ts: i64) -> Sample {
         session: Some(session),
         weekly: None,
         event: None,
+        provider: None,
     }
 }
 
@@ -7716,4 +7717,15 @@ fn token_for_a_no_longer_active_account_never_rewrites_the_slot() {
         0,
         "reverted the committed switch in the slot"
     );
+}
+
+#[test]
+fn report_counts_only_claude_swaps() {
+    let swap = |provider: Option<&str>| Sample {
+        event: Some("swap".into()),
+        provider: provider.map(str::to_string),
+        ..sample("a@e.com", 0.0, 1)
+    };
+    let samples = [swap(Some("codex")), swap(Some("claude")), swap(None)];
+    assert_eq!(report_swap_count(&samples), 2, "codex swaps entered the Claude report");
 }

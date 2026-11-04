@@ -5439,6 +5439,19 @@ struct Sample {
     weekly: Option<f64>,
     #[serde(default)]
     event: Option<String>,
+    /// Provider of a swap event (absent on older Claude-only events).
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+/// Swap events `cmd_report` counts. Its usage samples are Claude-only
+/// (`watch_cycle`), so swaps of other providers stay out of its verdict.
+fn report_swap_count(samples: &[Sample]) -> usize {
+    samples
+        .iter()
+        .filter(|s| s.event.as_deref() == Some("swap"))
+        .filter(|s| s.provider.as_deref().is_none_or(|p| p == CLAUDE_SLUG))
+        .count()
 }
 
 /// Positive session-% deltas between consecutive SAME-account active samples —
@@ -5551,10 +5564,7 @@ fn cmd_report(args: &[String]) -> Result<()> {
             }
         }
     }
-    let swaps = samples
-        .iter()
-        .filter(|s| s.event.as_deref() == Some("swap"))
-        .count();
+    let swaps = report_swap_count(&samples);
     let span_start = samples
         .first()
         .and_then(|s| Local.timestamp_opt(s.ts, 0).single());
@@ -5562,7 +5572,7 @@ fn cmd_report(args: &[String]) -> Result<()> {
         .last()
         .and_then(|s| Local.timestamp_opt(s.ts, 0).single());
 
-    println!("\nUsage report");
+    println!("\nUsage report (Claude accounts)");
     if let (Some(a), Some(b)) = (span_start, span_end) {
         println!(
             "  period: {} → {}",
