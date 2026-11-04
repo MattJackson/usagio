@@ -757,3 +757,7 @@ pub(crate) fn cache_crossed_reset(cu: &CachedUsage, now: DateTime<Utc>) -> bool 
         .filter_map(|s| DateTime::parse_from_rfc3339(s).ok())
         .any(|reset| cu.fetched_at < reset.timestamp() && reset <= now)
 }
+
+#[cfg(test)]
+#[path = "claude_tests.rs"]
+mod tests;

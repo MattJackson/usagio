@@ -348,5 +348,7 @@ fn raise_nofile_limit() {
 }
 
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 #[path = "main_tests.rs"]
 mod tests;

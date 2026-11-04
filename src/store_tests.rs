@@ -1780,3 +1780,55 @@ fn routine_saves_do_not_rotate_the_backup_history() {
     st.save().unwrap();
     assert_eq!(count(), 2);
 }
+
+use crate::test_support::mock_claude_blob;
+
+#[test]
+fn manual_holds_migrate_to_the_v2_pick_tier() {
+    let v = serde_json::json!({
+        "accounts": [],
+        "manual_holds": {"claude": "held@e.com", "codex": "stale@e.com"},
+        "manual_picks": {"claude": "held@e.com", "codex": "newer@e.com"},
+    });
+    let st = State::from_value(&v);
+    assert_eq!(
+        st.manual_pick_tier.get("claude").map(String::as_str),
+        Some("draining")
+    );
+    assert!(
+        !st.manual_pick_tier.contains_key("codex"),
+        "the hold no longer matches the pick"
+    );
+    // An explicit tier wins over the legacy hold.
+    let v = serde_json::json!({
+        "manual_holds": {"claude": "a@e.com"},
+        "manual_pick_tier": {"claude": "blocked"},
+    });
+    assert_eq!(
+        State::from_value(&v)
+            .manual_pick_tier
+            .get("claude")
+            .map(String::as_str),
+        Some("blocked")
+    );
+}
+
+#[test]
+fn legacy_classic_setting_is_ignored_on_load() {
+    let state = State::from_value(&serde_json::json!({"accounts": [], "autoswap_engine": "v1"}));
+    assert!(serde_json::to_value(state)
+        .unwrap()
+        .get("autoswap_engine")
+        .is_none());
+}
+
+#[test]
+fn failed_live_write_leaves_a_marker_and_the_poll_republishes_it() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    // Marker bookkeeping on the account itself; the write path is covered by
+    // the CAS test above.
+    let mut a = Account::from_keychain_blob(&mock_claude_blob("n-at", "n-rt", 5)).unwrap();
+    a.live_write_pending = Some("x".into());
+    a.adopt_login(&Account::from_keychain_blob(&mock_claude_blob("m-at", "m-rt", 6)).unwrap());
+    assert_eq!(a.live_write_pending, None);
+}

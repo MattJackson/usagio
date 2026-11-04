@@ -288,3 +288,7 @@ pub(crate) fn tier_interval_for_pct(pct: f64, trigger: f64, base: u64) -> u64 {
         base
     }
 }
+
+#[cfg(test)]
+#[path = "cadence_tests.rs"]
+mod tests;

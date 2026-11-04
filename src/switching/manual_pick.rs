@@ -144,3 +144,7 @@ pub(crate) fn settle_manual_picks() {
         logging::log(&format!("settling manual pick failed: {e:#}"));
     }
 }
+
+#[cfg(test)]
+#[path = "manual_pick_tests.rs"]
+mod tests;

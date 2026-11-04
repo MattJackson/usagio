@@ -71,3 +71,7 @@ pub(crate) fn provider_active(state: &State, slug: &str) -> Option<String> {
 pub(crate) fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     credentials::with_state_lock(f)
 }
+
+#[cfg(test)]
+#[path = "state_ops_tests.rs"]
+mod tests;

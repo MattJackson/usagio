@@ -2313,4 +2313,87 @@ mod tests {
             .count();
         assert_eq!(leftovers, 0);
     }
+
+    use crate::providers;
+    use crate::providers::Provider;
+    use crate::test_support::codex_login_response;
+
+    #[test]
+    fn codex_browser_login_uses_vendor_contract_and_rejects_missing_identity() {
+        let provider = providers::codex::CodexProvider;
+        let spec = provider.login_spec().unwrap();
+        assert_eq!(spec.redirect_port, Some(1455));
+        assert_eq!(spec.redirect_host, "127.0.0.1");
+        assert_eq!(spec.redirect_path, "/auth/callback");
+        assert_eq!(
+            spec.token_request,
+            providers::trait_def::TokenRequestStyle::Form
+        );
+        let captured = provider
+            .complete_login(&codex_login_response("b@example.com", "account-b"))
+            .unwrap();
+        assert_eq!(captured.identity.email.as_deref(), Some("b@example.com"));
+        assert_eq!(captured.identity.uuid.as_deref(), Some("account-b"));
+        let blob: serde_json::Value = serde_json::from_str(&captured.secret_blob).unwrap();
+        assert_eq!(blob["tokens"]["account_id"], "account-b");
+        assert_eq!(
+            blob["tokens"]["oauth_provenance"]["client_id"],
+            providers::codex::oauth::CLIENT_ID
+        );
+        assert!(provider
+            .complete_login(&serde_json::json!({"access_token": "at", "refresh_token": "rt"}))
+            .is_err());
+        assert!(provider
+            .complete_login(
+                &serde_json::json!({"access_token": "at", "refresh_token": "rt", "id_token": "invalid"})
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn codex_non_file_backend_is_rejected_before_drain_or_write() {
+        let _cfg = crate::store::ScopedConfigDir::new();
+        let dir = tempfile::tempdir().unwrap();
+        crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+            let provider = providers::codex::CodexProvider;
+            let captured = provider
+                .complete_login(&codex_login_response("a@example.com", "a"))
+                .unwrap();
+            let path = dir.path().join("auth.json");
+            std::fs::write(&path, "stale-fallback").unwrap();
+            for mode in ["keyring", "auto", "ephemeral"] {
+                std::fs::write(
+                    dir.path().join("config.toml"),
+                    format!("cli_auth_credentials_store = \"{mode}\"\n"),
+                )
+                .unwrap();
+                assert!(provider.client_status().is_err());
+                assert!(provider.capture_current_login().is_err());
+                assert!(provider.read_active_slot().is_err());
+                assert!(provider.credential_paths().is_empty());
+                assert!(provider
+                    .write_active_account(&captured.secret_blob, &captured.identity)
+                    .is_err());
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "stale-fallback");
+            }
+            std::fs::write(
+                dir.path().join("config.toml"),
+                "cli_auth_credentials_store = \"file\"\n",
+            )
+            .unwrap();
+            provider
+                .write_active_account(&captured.secret_blob, &captured.identity)
+                .unwrap();
+            assert_eq!(
+                provider
+                    .capture_current_login()
+                    .unwrap()
+                    .unwrap()
+                    .identity
+                    .email
+                    .as_deref(),
+                Some("a@example.com")
+            );
+        });
+    }
 }

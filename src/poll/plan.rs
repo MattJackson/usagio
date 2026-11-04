@@ -128,3 +128,7 @@ pub(crate) fn notify_subscription_change(slug: &str, key: &str, lapsed: bool) {
         format!("{key} ({slug}) subscription is back")
     });
 }
+
+#[cfg(test)]
+#[path = "plan_tests.rs"]
+mod tests;

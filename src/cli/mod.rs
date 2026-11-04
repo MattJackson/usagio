@@ -11,3 +11,6 @@ pub(crate) mod rm;
 pub(crate) mod switch;
 pub(crate) mod token;
 pub(crate) mod watch;
+
+#[cfg(test)]
+mod tests;

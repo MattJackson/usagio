@@ -19,3 +19,7 @@ pub(crate) fn cmd_rm(selector: Option<&str>) -> Result<()> {
     println!("Removed {key}.");
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "rm_tests.rs"]
+mod tests;

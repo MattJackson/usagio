@@ -71,3 +71,7 @@ pub(crate) fn append_history(rows: &[Row], active: Option<&str>) {
         }));
     }
 }
+
+#[cfg(test)]
+#[path = "history_tests.rs"]
+mod tests;

@@ -75,3 +75,7 @@ pub(crate) fn cmd_secrets_selftest(args: &[String]) -> Result<()> {
     println!("OK");
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "internal_tests.rs"]
+mod tests;

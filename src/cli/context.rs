@@ -40,3 +40,7 @@ pub(crate) fn parse_context_args(
     }
     Ok((provider, project))
 }
+
+#[cfg(test)]
+#[path = "context_tests.rs"]
+mod tests;

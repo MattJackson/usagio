@@ -339,3 +339,7 @@ pub(crate) fn persist_provider_observation(
         Ok(true)
     })
 }
+
+#[cfg(test)]
+#[path = "providers_tests.rs"]
+mod tests;

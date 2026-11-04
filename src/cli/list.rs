@@ -160,3 +160,7 @@ pub(crate) fn render_table(rows: &[Row], active: Option<&str>) {
          Run `usagio list --refresh` to fetch now.\n"
     );
 }
+
+#[cfg(test)]
+#[path = "list_tests.rs"]
+mod tests;

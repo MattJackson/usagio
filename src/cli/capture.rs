@@ -417,3 +417,7 @@ pub(crate) fn warn_expiring_logins() {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "capture_tests.rs"]
+mod tests;

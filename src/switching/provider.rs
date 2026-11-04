@@ -479,3 +479,7 @@ pub(crate) fn provider_supports_swap(slug: &str) -> bool {
         None => false,
     }
 }
+
+#[cfg(test)]
+#[path = "provider_tests.rs"]
+mod tests;

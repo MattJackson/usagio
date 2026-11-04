@@ -133,3 +133,7 @@ pub(crate) fn auto_pick_v2(
     println!("Auto-picked {} — {runway}.{note}", pick.key);
     Ok(pick.key.clone())
 }
+
+#[cfg(test)]
+#[path = "picking_tests.rs"]
+mod tests;

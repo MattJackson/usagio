@@ -57,3 +57,7 @@ pub(crate) fn cmd_watch(args: &[String]) -> Result<()> {
     menubar::poll_loop_with(&opts);
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "watch_tests.rs"]
+mod tests;

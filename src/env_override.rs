@@ -69,3 +69,7 @@ where
     let _g = Guard(prev);
     f()
 }
+
+#[cfg(test)]
+#[path = "env_override_tests.rs"]
+mod tests;

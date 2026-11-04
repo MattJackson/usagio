@@ -113,3 +113,7 @@ pub(crate) fn write_claude_identity_with(
     crate::providers::claude::write_claude_identity_with(oauth_account, user_id, before_commit)
         .map_err(|e| anyhow!("{e}"))
 }
+
+#[cfg(test)]
+#[path = "claude_local_tests.rs"]
+mod tests;

@@ -87,3 +87,7 @@ pub(crate) fn cmd_renew(args: &[String]) -> Result<()> {
     println!("Signed in {}{until}{live}", renewed.key);
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "renew_tests.rs"]
+mod tests;

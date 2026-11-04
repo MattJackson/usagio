@@ -683,7 +683,7 @@ stream_max_retries = 0
             let _cleanup = Cleanup;
             let provider = super::super::CodexProvider;
             let first = provider
-                .complete_login(&crate::tests::codex_login_response(
+                .complete_login(&crate::test_support::codex_login_response(
                     "a@example.com",
                     "account-a",
                 ))
@@ -729,7 +729,7 @@ stream_max_retries = 0
             assert!(unchanged.busy);
             assert_eq!(unchanged.instance_token, before.instance_token);
             let second = provider
-                .complete_login(&crate::tests::codex_login_response(
+                .complete_login(&crate::test_support::codex_login_response(
                     "b@example.com",
                     "account-b",
                 ))

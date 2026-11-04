@@ -2078,4 +2078,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(claude_json_mode(&dir.path().join("missing.json")), 0o600);
     }
+
+    use crate::providers::Provider;
+
+    // --- write_bytes_atomic_mode (rollback mode preservation) ---
+
+    #[cfg(unix)]
+    #[test]
+    fn write_bytes_atomic_mode_applies_requested_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // Use a mode DISTINCT from write_private's hardcoded 0o600 default, so this
+        // proves the `mode` argument controls the final mode (not write_private's
+        // default) — deleting the set_permissions call would make this fail.
+        let path = dir.path().join("claude.json");
+        crate::providers::claude::write_bytes_atomic_mode(&path, b"{\"x\":1}", 0o640).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"x\":1}");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o640,
+            "the requested mode must be applied to the final file"
+        );
+        // No temp file left behind.
+        assert!(!path.with_extension("json.usagio.tmp").exists());
+    }
 }

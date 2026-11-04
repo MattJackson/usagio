@@ -219,7 +219,7 @@ fn metadata_profile_request_handles_http_and_parse_failures() {
         (500, "{}"),
         (200, "not-json"),
     ] {
-        let (url, _) = crate::tests::spawn_mock_usage_server(status, body.into());
+        let (url, _) = crate::test_support::spawn_mock_usage_server(status, body.into());
         set_profile_url_override(Some(&format!("{url}/api/oauth/profile")));
         assert!(
             fetch_profile_metadata("test-access").is_none(),
@@ -228,7 +228,7 @@ fn metadata_profile_request_handles_http_and_parse_failures() {
     }
     let mut expected = sample_profile();
     expected["organization"]["plan_display_name"] = "Ultra".into();
-    let (url, _) = crate::tests::spawn_mock_usage_server(200, expected.to_string());
+    let (url, _) = crate::test_support::spawn_mock_usage_server(200, expected.to_string());
     set_profile_url_override(Some(&format!("{url}/api/oauth/profile")));
     let actual = fetch_profile_metadata("test-access").unwrap();
     set_profile_url_override(None);
@@ -242,7 +242,7 @@ fn fetch_profile_uses_only_the_test_mock() {
     set_profile_url_override(None);
     assert!(fetch_profile("test-access").is_none());
     let expected = sample_profile();
-    let (url, _) = crate::tests::spawn_mock_usage_server(200, expected.to_string());
+    let (url, _) = crate::test_support::spawn_mock_usage_server(200, expected.to_string());
     set_profile_url_override(Some(&format!("{url}/api/oauth/profile")));
     let actual = fetch_profile("test-access");
     set_profile_url_override(None);

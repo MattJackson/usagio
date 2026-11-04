@@ -721,3 +721,7 @@ pub(crate) fn prepare_handoff(
     }
     Ok(false)
 }
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod tests;

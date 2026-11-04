@@ -256,3 +256,7 @@ pub(crate) fn sync_active_from_keychain_with(
     acct.expires_at = fresh.expires_at;
     acct.keychain_blob = fresh.keychain_blob;
 }
+
+#[cfg(test)]
+#[path = "identity_tests.rs"]
+mod tests;

@@ -110,3 +110,7 @@ pub(crate) fn ambiguous_provider_selector(sel: &str, matches: &[(String, String)
         list.join(", ")
     )
 }
+
+#[cfg(test)]
+#[path = "selectors_tests.rs"]
+mod tests;

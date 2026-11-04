@@ -192,3 +192,7 @@ pub(crate) fn finish_claude_switch(email: &str, launch: Option<Launch>, hold: bo
 
     launch_selected_client(provider_by_slug(CLAUDE_SLUG)?, launch)
 }
+
+#[cfg(test)]
+#[path = "switch_tests.rs"]
+mod tests;

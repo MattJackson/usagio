@@ -410,3 +410,7 @@ pub(crate) fn provider_swap_cycle(
         Ok((r.swapped, r.actionable))
     }
 }
+
+#[cfg(test)]
+#[path = "cycle_tests.rs"]
+mod tests;

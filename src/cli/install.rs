@@ -259,3 +259,7 @@ pub(crate) fn run_with_deadline(
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
+
+#[cfg(test)]
+#[path = "install_tests.rs"]
+mod tests;

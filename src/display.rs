@@ -63,3 +63,7 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
         t
     }
 }
+
+#[cfg(test)]
+#[path = "display_tests.rs"]
+mod tests;

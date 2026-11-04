@@ -325,4 +325,34 @@ mod tests {
             assert_eq!(fingerprint.len(), 19);
         }
     }
+
+    // --- rotate_if_large (shared log rotation) ---
+
+    #[test]
+    fn rotate_if_large_rotates_over_threshold_with_correct_name() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, rotated) in [
+            ("usagio.log", "usagio.log.1"),
+            ("history.jsonl", "history.jsonl.1"),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"0123456789").unwrap();
+            rotate_if_large(&path, 5); // 10 bytes > 5 -> rotate
+            assert!(!path.exists(), "{name} should have been moved aside");
+            assert!(
+                dir.path().join(rotated).exists(),
+                "expected rotated file {rotated}"
+            );
+        }
+    }
+
+    #[test]
+    fn rotate_if_large_leaves_small_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usagio.log");
+        std::fs::write(&path, b"tiny").unwrap();
+        rotate_if_large(&path, 1_000_000);
+        assert!(path.exists());
+        assert!(!dir.path().join("usagio.log.1").exists());
+    }
 }

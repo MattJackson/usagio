@@ -150,3 +150,7 @@ pub(crate) fn cmd_token(selector: Option<&str>) -> Result<()> {
     println!("{token}");
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "token_tests.rs"]
+mod tests;

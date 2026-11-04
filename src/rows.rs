@@ -375,3 +375,7 @@ pub(crate) fn cached_to_account_usage(cu: &CachedUsage) -> countdown::AccountUsa
         fetched_at: DateTime::from_timestamp(cu.fetched_at, 0),
     }
 }
+
+#[cfg(test)]
+#[path = "rows_tests.rs"]
+mod tests;

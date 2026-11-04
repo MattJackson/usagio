@@ -473,3 +473,7 @@ pub(crate) fn apply_account(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "claude_tests.rs"]
+mod tests;

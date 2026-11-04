@@ -217,3 +217,7 @@ pub(crate) fn print_bars(labels: &[String], values: &[f64]) {
         println!("  {label:<4} |{b}| {v:>5.1}");
     }
 }
+
+#[cfg(test)]
+#[path = "report_tests.rs"]
+mod tests;

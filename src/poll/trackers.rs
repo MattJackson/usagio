@@ -275,3 +275,7 @@ pub(crate) fn reset_usage_fetch_tracker(email: &str) {
 pub(crate) fn get_usage_fetch_tracker(email: &str) -> UsageFetchTracker {
     with_fetch_trackers(|t| t.get(email).copied().unwrap_or_default())
 }
+
+#[cfg(test)]
+#[path = "trackers_tests.rs"]
+mod tests;
