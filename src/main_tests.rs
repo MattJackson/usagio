@@ -6917,6 +6917,22 @@ fn poll_merge_keeps_newer_usage_and_expiry_warning() {
 }
 
 #[test]
+fn poll_merge_replaces_a_reading_stamped_in_the_future() {
+    // Stored under a clock that was 3 h ahead, then corrected: a genuine new
+    // reading must replace it, not be refused for the whole offset.
+    let now = chrono::Utc::now().timestamp();
+    let mut stored = claude_account("m@e.com", 3_600_000);
+    let mut future = cu(10.0, 10.0, 2000);
+    future.fetched_at = now + 3 * 3600;
+    stored.cached_usage = Some(future);
+    let snap = claude_account("m@e.com", 3_600_000);
+    let mut fresh = cu(50.0, 50.0, 2000);
+    fresh.fetched_at = now;
+    merge_poll_update(&mut stored, &snap, Some(&fresh), None);
+    assert_eq!(stored.cached_usage.as_ref().unwrap().fetched_at, now);
+}
+
+#[test]
 fn failed_fetch_keeps_a_plan_restored_earlier_in_the_cycle() {
     let restored = plan("Pro", true);
     let kept = plan_after_failed_fetch(Some(restored.clone()), None);
