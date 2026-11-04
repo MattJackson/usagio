@@ -712,7 +712,14 @@ stream_max_retries = 0
     #[test]
     #[ignore = "explicit read-only inspection of the installed Codex daemon"]
     fn inspect_installed_daemon() {
-        let result = probe().unwrap();
+        // Read-only on purpose: resolve the real Codex home (test builds only
+        // see scoped variables), and keep usagio's own log in a temp dir.
+        let _cfg = crate::store::ScopedConfigDir::new();
+        let (key, real) = match std::env::var("CODEX_HOME") {
+            Ok(h) if !h.is_empty() => ("CODEX_HOME", h),
+            _ => ("HOME", std::env::var("HOME").expect("HOME is set")),
+        };
+        let result = crate::env_lock::scoped_env_var(key, Some(&real), || probe().unwrap());
         assert!(result.is_some());
         eprintln!("Codex daemon metadata: {result:?}");
     }
