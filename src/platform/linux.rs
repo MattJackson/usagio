@@ -744,13 +744,23 @@ fn decode_tray_icon(bytes: &[u8]) -> MuriIcon {
     MuriIcon::from_png(bytes.to_vec())
 }
 
+/// Tray tooltip / SNI title: always names usagio, then the usage summary.
+fn linux_tooltip(title: &str) -> String {
+    let t = title.trim();
+    if t.is_empty() {
+        "usagio".to_string()
+    } else {
+        format!("usagio — {t}")
+    }
+}
+
 fn apply_handle_msg(tray: &TrayHandle, msg: HandleMsg) {
     match msg {
         HandleMsg::SetIcon(bytes) => tray.set_icon(decode_tray_icon(&bytes)),
         HandleMsg::SetTitle(title) => {
-            // The status-item title (shown next to the icon) is the Linux analog
-            // of a tooltip.
-            tray.set_title(Some(title));
+            // muri's SNI backend takes both the item Title and ToolTip from the
+            // tooltip; `set_title` has no host-visible effect on Linux.
+            tray.set_tooltip(Some(linux_tooltip(&title)));
         }
         HandleMsg::SetMenu(tree) => {
             tray.set_menu(crate::platform::render::render_menu(&tree));
@@ -789,6 +799,7 @@ impl MenuBackend for LinuxMenu {
         self.ensure_gtk_init()?;
         let mut tray = Tray::new(decode_tray_icon(initial_icon))
             .title(initial_title)
+            .tooltip(linux_tooltip(initial_title))
             .options(crate::menubar::tray_options());
         if let Some(theme) = crate::menubar::forced_theme() {
             tray = tray.theme(theme);
@@ -953,6 +964,12 @@ pub fn launch_claude_in_terminal() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tray_tooltip_names_usagio_and_summary() {
+        assert_eq!(linux_tooltip("56% / 64%"), "usagio — 56% / 64%");
+        assert_eq!(linux_tooltip("  "), "usagio");
+    }
 
     // --- Paths ---------------------------------------------------------
 
