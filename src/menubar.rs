@@ -4430,8 +4430,13 @@ mod tests {
             });
         }
         drop(held);
+        // Wait generously for the surviving switch (other tests hold the
+        // process-global guard), then briefly confirm nothing else arrives.
         let mut ran = Vec::new();
-        while let Ok(n) = rx.recv_timeout(std::time::Duration::from_millis(500)) {
+        if let Ok(n) = rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            ran.push(n);
+        }
+        while let Ok(n) = rx.recv_timeout(std::time::Duration::from_millis(300)) {
             ran.push(n);
         }
         assert_eq!(ran, ["B"], "superseded switch must not run");

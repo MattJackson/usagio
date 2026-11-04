@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Credits in different non-dominant currencies are no longer ranked by raw amounts, the blind projection applies only to windows that were near the threshold, an out-of-range usage value can no longer crash scheduling, and a failed watcher respawn no longer clears the keychain failure count.
 - A malformed provider account entry in `state.json` no longer drops the provider's other accounts; it is preserved as `unparsed_accounts` and re-parsed on each load. Downgrading to an older build that does not know `unparsed_accounts` will discard those preserved entries on its next save (a rolling backup under `backups/` still holds them).
 
+### Changed
+
+- `usagio rm` now removes Codex accounts as well as Claude accounts, and accepts `claude:` and `codex:` selectors (for example `usagio rm codex:me@x.com`). An unqualified selector that matches accounts in more than one provider, such as the same email on Claude and Codex, is refused with a prompt to qualify it with a provider prefix instead of removing one of them.
+
 ## [1.0.8] - 2026-10-31
 
 ### Fixed
