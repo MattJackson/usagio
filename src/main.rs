@@ -2895,16 +2895,64 @@ fn cached_from_usage(u: &usage::Usage) -> CachedUsage {
     }
 }
 
+/// How long a prepaid wallet reading is reused before `prepaid/credits` is
+/// asked again. The balance only moves on top-ups and credit spend, so one
+/// request per account every few minutes is plenty; without this every poll
+/// (down to 30 s) cost an extra request per credits-enabled account.
+const PREPAID_REFRESH_SECS: i64 = 10 * 60;
+
+/// Per-account `(attempted_at, fetched balance)` of the last `prepaid/credits`
+/// request. A failed attempt is recorded too (as `None`), so an erroring
+/// endpoint is not retried every poll.
+static PREPAID_CACHE: std::sync::Mutex<
+    Option<std::collections::HashMap<String, (i64, Option<providers::trait_def::Money>)>>,
+> = std::sync::Mutex::new(None);
+
 /// Fill in the real prepaid wallet balance for an account with credits on.
 /// `/usage` reports `spend.balance: null` even when the wallet holds money, so
-/// the balance comes from the org's `prepaid/credits` endpoint. Best-effort: on
-/// a failed fetch keep the balance from the previous snapshot rather than
-/// blanking it.
+/// the balance comes from the org's `prepaid/credits` endpoint, at most once
+/// per [`PREPAID_REFRESH_SECS`] per account. Best-effort: on a failed fetch
+/// keep the balance from the previous snapshot rather than blanking it.
 fn attach_prepaid_balance(cu: &mut CachedUsage, acct: &Account) {
+    attach_prepaid_balance_with(cu, acct, Utc::now().timestamp(), |token, org| {
+        usage::fetch_prepaid_balance(token, org)
+    });
+}
+
+fn attach_prepaid_balance_with(
+    cu: &mut CachedUsage,
+    acct: &Account,
+    now: i64,
+    fetch: impl FnOnce(&str, &str) -> Option<providers::trait_def::Money>,
+) {
     let Some(credits) = cu.reported.credits.as_mut() else {
         return;
     };
+    // Credits off: no wallet to show. A balance `/usage` reported itself
+    // needs no second request.
     if !credits.enabled || credits.balance.is_some() {
+        return;
+    }
+    let key = acct.key().to_ascii_lowercase();
+    let previous = || {
+        acct.cached_usage
+            .as_ref()?
+            .reported
+            .credits
+            .as_ref()?
+            .balance
+            .clone()
+    };
+    let recent = {
+        let guard = PREPAID_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        guard
+            .as_ref()
+            .and_then(|m| m.get(&key))
+            .filter(|(at, _)| (0..PREPAID_REFRESH_SECS).contains(&(now - at)))
+            .map(|(_, m)| m.clone())
+    };
+    if let Some(cached) = recent {
+        credits.balance = cached.or_else(previous);
         return;
     }
     let org = acct
@@ -2913,16 +2961,17 @@ fn attach_prepaid_balance(cu: &mut CachedUsage, acct: &Account) {
         .and_then(|o| o.get("organizationUuid"))
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
-    let fetched = org.and_then(|org| usage::fetch_prepaid_balance(&acct.access_token, org));
-    credits.balance = fetched.or_else(|| {
-        acct.cached_usage
-            .as_ref()?
-            .reported
-            .credits
-            .as_ref()?
-            .balance
-            .clone()
-    });
+    let Some(org) = org else {
+        credits.balance = previous();
+        return;
+    };
+    let fetched = fetch(&acct.access_token, org);
+    PREPAID_CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(key, (now, fetched.clone()));
+    credits.balance = fetched.or_else(previous);
 }
 
 /// Use the shared display priority; active status never changes account order.
