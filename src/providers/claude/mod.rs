@@ -498,14 +498,12 @@ impl Provider for ClaudeProvider {
     // --- Credential sync ---------------------------------------------------
 
     fn credential_paths(&self) -> Vec<PathBuf> {
-        let Some(home) = std::env::var_os("HOME") else {
+        let Some(home) = crate::paths::user_home() else {
             return Vec::new();
         };
         vec![
-            PathBuf::from(&home).join(".claude.json"),
-            PathBuf::from(&home)
-                .join(".claude")
-                .join(".credentials.json"),
+            home.join(".claude.json"),
+            home.join(".claude").join(".credentials.json"),
         ]
     }
 
@@ -762,8 +760,7 @@ fn keychain_write(blob: &str) -> PResult<()> {
 // ---- ~/.claude.json identity read/write (mirrors main.rs helpers) --------
 
 fn claude_json_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(std::path::PathBuf::from(home).join(".claude.json"))
+    Some(crate::paths::user_home()?.join(".claude.json"))
 }
 
 /// Where Claude Code writes its plaintext credentials on Linux and Windows
@@ -773,9 +770,8 @@ fn claude_json_path() -> Option<std::path::PathBuf> {
 /// target; only the caller (which checks `os_display_name()`) decides
 /// whether to use it.
 fn claude_credentials_json_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
     Some(
-        std::path::PathBuf::from(home)
+        crate::paths::user_home()?
             .join(".claude")
             .join(".credentials.json"),
     )
@@ -1444,6 +1440,24 @@ mod tests {
         });
         crate::env_lock::scoped_env_var("HOME", None, || {
             assert_eq!(claude_json_path(), None);
+        });
+    }
+
+    #[test]
+    fn empty_home_is_treated_as_unset_for_claude_paths() {
+        crate::env_lock::scoped_env_var("HOME", Some(""), || {
+            // Must never degrade to a cwd-relative `.claude.json`.
+            assert_ne!(
+                claude_json_path(),
+                Some(std::path::PathBuf::from(".claude.json"))
+            );
+            assert_ne!(
+                claude_credentials_json_path(),
+                Some(std::path::PathBuf::from(".claude").join(".credentials.json"))
+            );
+            for p in ClaudeProvider.credential_paths() {
+                assert!(p.is_absolute(), "relative credential path: {p:?}");
+            }
         });
     }
 

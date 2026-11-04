@@ -935,8 +935,7 @@ pub(super) fn auth_json_path() -> Option<PathBuf> {
     if let Some(h) = std::env::var_os("CODEX_HOME") {
         return Some(PathBuf::from(h).join("auth.json"));
     }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".codex").join("auth.json"))
+    Some(crate::paths::user_home()?.join(".codex").join("auth.json"))
 }
 
 /// Map a filesystem `io::Result` into `PResult`, naming the operation and

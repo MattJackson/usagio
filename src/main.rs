@@ -2743,8 +2743,8 @@ fn cmd_secrets_selftest(args: &[String]) -> Result<()> {
 }
 
 fn claude_json_path() -> Result<std::path::PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(std::path::PathBuf::from(home).join(".claude.json"))
+    let home = crate::paths::user_home().context("HOME/USERPROFILE is not set")?;
+    Ok(home.join(".claude.json"))
 }
 
 /// Read the current `oauthAccount` + `userID` from `~/.claude.json`.

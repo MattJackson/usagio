@@ -122,6 +122,28 @@ pub fn migrate_between(old: &Path, new: &Path) -> Result<MigrationResult, Migrat
     }
 }
 
+/// The user's home directory: `$HOME`, else `%USERPROFILE%`. An empty value
+/// counts as unset (an empty `HOME` would otherwise yield cwd-relative paths
+/// and block the `USERPROFILE` fallback). Deliberately env-only and cfg-free
+/// so tests that scope `$HOME` stay hermetic on every OS.
+///
+/// Known residual on Windows: Claude Code (libuv `os.homedir()`) and Codex
+/// (`dirs`) ignore `HOME`; if `HOME` is set and differs from `USERPROFILE`
+/// (e.g. an MSYS2 shell), these paths diverge from the vendors'. This matches
+/// the pre-existing `.credentials.json` rule.
+pub(crate) fn user_home() -> Option<PathBuf> {
+    home_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+}
+
+fn home_from(
+    home: Option<std::ffi::OsString>,
+    userprofile: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    home.filter(|h| !h.is_empty())
+        .or_else(|| userprofile.filter(|h| !h.is_empty()))
+        .map(PathBuf::from)
+}
+
 // -------------------------------------------------------------------------
 // Internals
 // -------------------------------------------------------------------------
@@ -437,6 +459,26 @@ mod tests {
     fn is_cross_device_false_for_other_errors() {
         assert!(!is_cross_device(&io::Error::from_raw_os_error(2)));
         assert!(!is_cross_device(&io::Error::other("boom")));
+    }
+
+    // --- user_home ---
+
+    #[test]
+    fn home_from_prefers_home_then_userprofile_and_treats_empty_as_unset() {
+        use std::ffi::OsString;
+        let o = |s: &str| Some(OsString::from(s));
+        assert_eq!(home_from(o("/h"), o("/u")), Some(PathBuf::from("/h")));
+        assert_eq!(home_from(None, o("/u")), Some(PathBuf::from("/u")));
+        assert_eq!(home_from(o(""), o("/u")), Some(PathBuf::from("/u")));
+        assert_eq!(home_from(o(""), o("")), None);
+        assert_eq!(home_from(None, None), None);
+    }
+
+    #[test]
+    fn user_home_with_empty_home_is_not_cwd_relative() {
+        crate::env_lock::scoped_env_var("HOME", Some(""), || {
+            assert_ne!(user_home(), Some(PathBuf::from("")));
+        });
     }
 
     // --- config_base (XDG-first resolution) ---
