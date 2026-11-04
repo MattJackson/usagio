@@ -6560,3 +6560,42 @@ fn pace_report_covers_non_claude_accounts() {
         vec![("codex".to_string(), "dev@example.com".to_string())]
     );
 }
+
+#[test]
+fn auto_commit_aborts_when_a_renewal_was_staged_after_the_cas() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let provider = MockActiveSlotProvider::new("outgoing");
+    let slug = provider.provider_id();
+    let (k, j) = ("active@example.com", "target@example.com");
+    let mut state = State::default();
+    for key in [k, j] {
+        let mut a = codex_account(key, None);
+        a.identity_email = Some(key.into());
+        state.provider_accounts_mut(slug).accounts.push(a);
+    }
+    state.provider_accounts_mut(slug).active = Some(k.into());
+    // The renewal staged by persist_login between the CAS and the commit.
+    state.provider_accounts_mut(slug).pending_switch = Some(store::PendingSwitch {
+        key: k.into(),
+        manual: true,
+        from: Some(k.into()),
+        drain_token: None,
+        credentials_written: false,
+        renewed_account: Some(codex_account(k, None)),
+        leave_latch: None,
+    });
+    state.save().unwrap();
+    let out = commit_provider_switch_guarded(&provider, slug, j, false, false, Some(k)).unwrap();
+    assert!(out.is_none());
+    assert_eq!(provider.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let state = State::load().unwrap();
+    let pa = state.provider_accounts(slug).unwrap();
+    assert_eq!(pa.pending_switch.as_ref().unwrap().key, k);
+    assert!(pa
+        .pending_switch
+        .as_ref()
+        .unwrap()
+        .renewed_account
+        .is_some());
+    assert_eq!(pa.active.as_deref(), Some(k));
+}

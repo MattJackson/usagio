@@ -1181,7 +1181,23 @@ fn commit_provider_switch(
     hold: bool,
     manual: bool,
 ) -> Result<String> {
-    let (acct, identity, drain_token) = with_state_lock(|| {
+    commit_provider_switch_guarded(provider, slug, key, hold, manual, None)?
+        .ok_or_else(|| anyhow!("switch intent changed before commit"))
+}
+
+/// `commit_provider_switch` with an optional auto-swap guard: when
+/// `expect_active` is set, the CAS precondition (that account still active, and
+/// no switch queued for a DIFFERENT key, e.g. a renewal staged meanwhile) is
+/// re-checked in the first locked phase; `Ok(None)` if it no longer holds.
+fn commit_provider_switch_guarded(
+    provider: &dyn Provider,
+    slug: &str,
+    key: &str,
+    hold: bool,
+    manual: bool,
+    expect_active: Option<&str>,
+) -> Result<Option<String>> {
+    let Some((acct, identity, drain_token)) = with_state_lock(|| {
         // Absorb any lagging on-disk rotation for the OUTGOING account BEFORE we
         // overwrite the vendor's credential file — the same guard Claude's
         // `switch_to_guarded` applies (main.rs, `absorb_before_switch`). Without
@@ -1192,6 +1208,18 @@ fn commit_provider_switch(
         // under the reentrant lock, so load AFTER it to pick up the rotation.
         credentials::absorb_before_switch(provider);
         let mut state = State::load()?;
+        if let Some(expect) = expect_active {
+            let pa = state.provider_accounts(slug);
+            let still_active = pa
+                .and_then(|pa| pa.active.as_deref())
+                .is_some_and(|c| c.eq_ignore_ascii_case(expect));
+            let other_queued = pa
+                .and_then(|pa| pa.pending_switch.as_ref())
+                .is_some_and(|p| !p.key.eq_ignore_ascii_case(key));
+            if !still_active || other_queued {
+                return Ok(None);
+            }
+        }
         let renewed_account = state
             .provider_accounts(slug)
             .and_then(|accounts| accounts.pending_switch.as_ref())
@@ -1246,8 +1274,11 @@ fn commit_provider_switch(
                 .renewed_account = None;
             state.save()?;
         }
-        Ok((acct, identity, drain_token))
-    })?;
+        Ok(Some((acct, identity, drain_token)))
+    })?
+    else {
+        return Ok(None);
+    };
     // Starting a daemon can take seconds. Keep state reads, usage persistence,
     // and account management responsive while the refresh lock owns this switch.
     provider
@@ -1315,7 +1346,7 @@ fn commit_provider_switch(
         if let Some(prev) = prev.filter(|p| !p.eq_ignore_ascii_case(&acct.key)) {
             reset_usage_fetch_tracker(&fetch_tracker_key(slug, &prev));
         }
-        Ok(acct.key)
+        Ok(Some(acct.key))
     })
 }
 
@@ -1552,7 +1583,7 @@ fn switch_provider_if_still_active(
     if !ready {
         return Ok(None);
     }
-    commit_provider_switch(provider, slug, target, false, false).map(Some)
+    commit_provider_switch_guarded(provider, slug, target, false, false, Some(expect_active))
 }
 
 /// `switch_if_still_active`, writing the engine's leave latch for the account
