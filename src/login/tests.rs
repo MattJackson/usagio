@@ -327,3 +327,14 @@ fn an_add_never_reuses_an_existing_store_or_expects_an_account() {
     assert_eq!(renew.expected(), Some("dev@example.com"));
     assert_eq!(renew.new_store(), None);
 }
+
+#[test]
+fn transient_accept_errors_are_retried_not_fatal() {
+    use std::io::ErrorKind::*;
+    for k in [WouldBlock, Interrupted, ConnectionAborted, ConnectionReset] {
+        assert!(is_transient_accept_error(k), "{k:?} must be retried");
+    }
+    for k in [PermissionDenied, AddrInUse, InvalidInput] {
+        assert!(!is_transient_accept_error(k), "{k:?} must stay fatal");
+    }
+}

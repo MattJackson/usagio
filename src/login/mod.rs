@@ -191,7 +191,7 @@ impl Loopback {
                     Callback::Denied(why) => bail!("sign-in was not authorized: {why}"),
                     Callback::Ignore => {}
                 },
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(e) if is_transient_accept_error(e.kind()) => {
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 Err(e) => return Err(e).context("accepting the sign-in redirect"),
@@ -219,6 +219,17 @@ impl Loopback {
         let _ = stream.shutdown(std::net::Shutdown::Write);
         result
     }
+}
+
+/// `accept()` errors on the nonblocking loopback listener that mean "try
+/// again" rather than "the listener is broken": nothing pending, a signal
+/// interrupted the call, or a client reset before we accepted it.
+fn is_transient_accept_error(kind: std::io::ErrorKind) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        kind,
+        WouldBlock | Interrupted | ConnectionAborted | ConnectionReset
+    )
 }
 
 /// The request line of one request, read under an overall deadline and size
