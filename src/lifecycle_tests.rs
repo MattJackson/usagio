@@ -20,7 +20,6 @@ use chrono::Utc;
 // which is the read-loop-until-\r\n\r\n fix the old TODO called for.
 #[test]
 fn active_refresh_never_posts_token_for_active_account() {
-    use crate::providers::claude::oauth;
     use crate::store::ScopedConfigDir;
 
     // `active_refresh_cas` logs via `logging::log`, which resolves
@@ -32,7 +31,10 @@ fn active_refresh_never_posts_token_for_active_account() {
     // (a POST would rotate Anthropic's single-use refresh token and burn the
     // copy Claude Code holds → /login). So this server must receive ZERO hits.
     let (base_url, hits) = spawn_mock_token_server();
-    oauth::set_token_url_override(Some(&format!("{base_url}/v1/oauth/token")));
+    crate::endpoints::set_test_override(
+        crate::endpoints::Endpoint::ClaudeToken,
+        Some(&format!("{base_url}/v1/oauth/token")),
+    );
 
     let blob = mock_claude_blob("active-at", "active-rt", 0);
     let provider = MockActiveSlotProvider::new(&blob);
@@ -41,7 +43,7 @@ fn active_refresh_never_posts_token_for_active_account() {
 
     let outcome = locked_active_refresh_cas(&provider, &mut acct);
 
-    oauth::set_token_url_override(None);
+    crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeToken, None);
 
     assert!(
         matches!(outcome, ActiveRefreshOutcome::Adopted),
@@ -369,11 +371,11 @@ fn failed_refresh_lock_never_sends_a_single_use_refresh_grant() {
     let _cfg = crate::store::ScopedConfigDir::new();
     std::fs::create_dir_all(store::config_dir().unwrap().join("refresh.lock")).unwrap();
     let (url, hits) = spawn_mock_usage_server(500, "{}".into());
-    oauth::set_token_url_override(Some(&url));
+    crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeToken, Some(&url));
     let mut account =
         Account::from_keychain_blob(&mock_claude_blob("expired", "single-use", 1)).unwrap();
     let result = ensure_claude_fresh(&mut account, 60);
-    oauth::set_token_url_override(None);
+    crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeToken, None);
     assert!(matches!(result, Err(oauth::RefreshError::Transient(_))));
     assert_eq!(hit_count(&hits), 0);
     assert_eq!(account.refresh_token, "single-use");
@@ -385,11 +387,11 @@ fn unreadable_state_never_sends_a_single_use_refresh_grant() {
     std::fs::create_dir_all(store::config_dir().unwrap()).unwrap();
     std::fs::write(store::config_dir().unwrap().join("state.json"), "{corrupt").unwrap();
     let (url, hits) = spawn_mock_usage_server(500, "{}".into());
-    oauth::set_token_url_override(Some(&url));
+    crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeToken, Some(&url));
     let mut account =
         Account::from_keychain_blob(&mock_claude_blob("expired", "single-use", 1)).unwrap();
     let result = ensure_claude_fresh(&mut account, 60);
-    oauth::set_token_url_override(None);
+    crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeToken, None);
     assert!(matches!(result, Err(oauth::RefreshError::Transient(_))));
     assert_eq!(hit_count(&hits), 0);
 }

@@ -157,17 +157,19 @@ fn resolve_identity_prefers_the_stored_identity_without_the_network() {
 
 #[test]
 fn ensure_fresh_with_fallback_reports_whether_it_refreshed() {
-    use crate::providers::claude::oauth;
     let _g = crate::store::ScopedConfigDir::new();
     let (base_url, hits) = spawn_mock_token_server();
-    oauth::set_token_url_override(Some(&format!("{base_url}/v1/oauth/token")));
+    crate::endpoints::set_test_override(
+        crate::endpoints::Endpoint::ClaudeToken,
+        Some(&format!("{base_url}/v1/oauth/token")),
+    );
     let provider = providers::get(CLAUDE_SLUG).unwrap();
     let mut fresh = claude_account("f@e.com", 3_600_000);
     let r1 = ensure_fresh_with_fallback(provider, "f@e.com", &mut fresh);
     let after_fresh = hit_count(&hits);
     let mut expired = claude_account("x@e.com", -60_000);
     let r2 = ensure_fresh_with_fallback(provider, "x@e.com", &mut expired);
-    oauth::set_token_url_override(None);
+    crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeToken, None);
     assert!(matches!(r1, Ok(false)));
     assert_eq!(after_fresh, 0);
     assert!(matches!(r2, Ok(true)));
@@ -181,10 +183,12 @@ fn ensure_fresh_with_fallback_reports_whether_it_refreshed() {
     ignore = "reads or writes the OS secret store, which is only hermetic (in-memory) on macOS"
 )]
 fn switching_refreshes_an_inactive_account_but_adopts_for_the_active_one() {
-    use crate::providers::claude::oauth;
     with_claude_home("a@e.com", |_home| {
         let (base_url, hits) = spawn_mock_token_server();
-        oauth::set_token_url_override(Some(&format!("{base_url}/v1/oauth/token")));
+        crate::endpoints::set_test_override(
+            crate::endpoints::Endpoint::ClaudeToken,
+            Some(&format!("{base_url}/v1/oauth/token")),
+        );
         let a = claude_account_with_identity("a@e.com", -60_000);
         let b = claude_account_with_identity("b@e.com", -60_000);
         prime_active_slot(&a.keychain_blob);
@@ -207,7 +211,7 @@ fn switching_refreshes_an_inactive_account_but_adopts_for_the_active_one() {
         st.find_mut("b@e.com").unwrap().expires_at = Utc::now().timestamp_millis() - 60_000;
         st.save().unwrap();
         switch_to("b@e.com", false).unwrap();
-        oauth::set_token_url_override(None);
+        crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeToken, None);
         assert_eq!(hit_count(&hits), 1, "the active account is never refreshed");
     });
 }
@@ -525,9 +529,10 @@ fn claim_for_the_active_account_does_not_save_state_when_nothing_changed() {
 fn claim_for_the_active_account_uses_the_slot_token_without_posting() {
     let _g = crate::store::ScopedConfigDir::new();
     let (base_url, hits) = spawn_mock_token_server();
-    crate::providers::claude::oauth::set_token_url_override(Some(&format!(
-        "{base_url}/v1/oauth/token"
-    )));
+    crate::endpoints::set_test_override(
+        crate::endpoints::Endpoint::ClaudeToken,
+        Some(&format!("{base_url}/v1/oauth/token")),
+    );
     let cc_blob = mock_claude_blob("cc-at", "cc-rt", 9_999_999_999_999);
     let provider: &'static MockActiveSlotProvider =
         Box::leak(Box::new(MockActiveSlotProvider::new(&cc_blob)));
@@ -539,7 +544,7 @@ fn claim_for_the_active_account_uses_the_slot_token_without_posting() {
     st.active = Some("active@example.com".into());
     st.save().unwrap();
     claim_refresh_token(provider, "active@example.com", &mut acct, true).unwrap();
-    crate::providers::claude::oauth::set_token_url_override(None);
+    crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeToken, None);
     assert_eq!(
         acct.access_token, "cc-at",
         "claim used the stale stored token"

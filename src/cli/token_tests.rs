@@ -9,11 +9,13 @@ use crate::test_support::{
 
 #[test]
 fn token_command_prints_a_refreshed_inactive_token_and_adopts_for_the_active_one() {
-    use crate::providers::claude::oauth;
     let _poll = POLL_ACTIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     with_claude_home("scratch-json@e.com", |_| {
         let (base_url, hits) = spawn_mock_token_server();
-        oauth::set_token_url_override(Some(&format!("{base_url}/v1/oauth/token")));
+        crate::endpoints::set_test_override(
+            crate::endpoints::Endpoint::ClaudeToken,
+            Some(&format!("{base_url}/v1/oauth/token")),
+        );
         // No accounts / several accounts without a selector are errors.
         assert!(format!("{}", cmd_token(None).unwrap_err()).contains("no accounts"));
         seed_claude_state(vec![claude_expired("solo@e.com")], None);
@@ -51,7 +53,7 @@ fn token_command_prints_a_refreshed_inactive_token_and_adopts_for_the_active_one
                 .access_token,
             "slot-at"
         );
-        oauth::set_token_url_override(None);
+        crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeToken, None);
     });
 }
 

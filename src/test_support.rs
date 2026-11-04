@@ -684,14 +684,19 @@ impl Fx {
 /// `$HOME`; `check` sees the outcome, the usage-endpoint hit count and the
 /// token-endpoint hit count while the scratch state still exists.
 pub(crate) fn run_refresh<R>(fx: Fx, check: impl FnOnce(&RefreshOutcome, usize, usize) -> R) -> R {
-    use crate::providers::claude::{oauth, usage};
     let _poll = POLL_ACTIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     with_claude_home("scratch-json@e.com", |_| {
         let (url, hits) = spawn_mock_usage_server(fx.status, fx.body.clone());
-        usage::set_usage_url_override(Some(&format!("{url}/api/oauth/usage")));
+        crate::endpoints::set_test_override(
+            crate::endpoints::Endpoint::ClaudeUsage,
+            Some(&format!("{url}/api/oauth/usage")),
+        );
         let token = fx.token.clone().map(|(s, b)| spawn_mock_usage_server(s, b));
         if let Some((u, _)) = &token {
-            oauth::set_token_url_override(Some(&format!("{u}/v1/oauth/token")));
+            crate::endpoints::set_test_override(
+                crate::endpoints::Endpoint::ClaudeToken,
+                Some(&format!("{u}/v1/oauth/token")),
+            );
         }
         let now = Utc::now().timestamp();
         for a in &fx.accounts {
@@ -713,8 +718,8 @@ pub(crate) fn run_refresh<R>(fx: Fx, check: impl FnOnce(&RefreshOutcome, usize, 
             note_polled_active(fx.active.as_deref());
         }
         let out = refresh_usage_cache(fx.force);
-        usage::set_usage_url_override(None);
-        oauth::set_token_url_override(None);
+        crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeUsage, None);
+        crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeToken, None);
         let token_hits = token.as_ref().map(|(_, h)| hit_count(h)).unwrap_or(0);
         check(&out, hit_count(&hits), token_hits)
     })

@@ -130,31 +130,8 @@ pub(crate) fn refresh_lock() -> anyhow::Result<crate::lifecycle::RefreshGuard> {
 #[cfg(test)]
 use crate::lifecycle::needs_refresh;
 
-#[cfg(test)]
-thread_local! {
-    /// Test-only override for the OAuth token endpoint, so integration tests
-    /// (`main_tests.rs::refresh_usage_cache_does_not_touch_the_active_account`)
-    /// can point `post_token` at an in-process mock HTTP server instead of the
-    /// real Anthropic endpoint, and count exactly how many POSTs land.
-    static TOKEN_URL_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Install (or clear) the current thread's token-URL override. Test-only.
-#[cfg(test)]
-pub(crate) fn set_token_url_override(url: Option<&str>) {
-    TOKEN_URL_OVERRIDE.with(|c| *c.borrow_mut() = url.map(String::from));
-}
-
-#[cfg(test)]
 fn token_url() -> String {
-    TOKEN_URL_OVERRIDE
-        .with(|c| c.borrow().clone())
-        .unwrap_or_else(|| config::TOKEN_URL.to_string())
-}
-
-#[cfg(not(test))]
-fn token_url() -> String {
-    config::TOKEN_URL.to_string()
+    crate::endpoints::url(crate::endpoints::Endpoint::ClaudeToken)
 }
 
 fn post_token(body: &serde_json::Value) -> Result<TokenResponse, RefreshError> {

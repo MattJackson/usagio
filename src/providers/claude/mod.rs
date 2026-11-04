@@ -887,16 +887,16 @@ pub(crate) fn active_slot_read() -> PResult<Option<String>> {
 /// (keychain on macOS, 0600 `~/.claude/.credentials.json` elsewhere).
 pub(crate) fn active_slot_write(blob: &str) -> PResult<()> {
     let _guard = ACTIVE_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if slot_is_keychain() {
-        return keychain_write(blob);
-    }
-    // Test-only failure seam (shared one-shot with `SecretStore::set`) so the
-    // apply_account rollback stays exercised off macOS.
+    // The one test seam for a failed slot write, before either backend is
+    // touched, so the apply_account rollback is exercised on every OS.
     #[cfg(test)]
     if crate::platform::test_secret_seam::take_set_failure() {
         return Err(ProviderError::Other(
             "injected active-slot write failure".into(),
         ));
+    }
+    if slot_is_keychain() {
+        return keychain_write(blob);
     }
     let path = claude_credentials_json_path()
         .ok_or_else(|| ProviderError::Other("could not resolve HOME".into()))?;

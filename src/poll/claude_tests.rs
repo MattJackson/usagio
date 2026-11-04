@@ -20,13 +20,19 @@ use chrono::{Duration, Utc};
 #[test]
 fn refresh_usage_cache_still_refreshes_inactive_accounts() {
     let _poll = POLL_ACTIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    use crate::providers::claude::{oauth, usage};
+
     use crate::store::{Account, ScopedConfigDir};
 
     let _g = ScopedConfigDir::new();
     let (base_url, hits) = spawn_mock_token_server();
-    oauth::set_token_url_override(Some(&format!("{base_url}/v1/oauth/token")));
-    usage::set_usage_url_override(Some(&format!("{base_url}/api/oauth/usage")));
+    crate::endpoints::set_test_override(
+        crate::endpoints::Endpoint::ClaudeToken,
+        Some(&format!("{base_url}/v1/oauth/token")),
+    );
+    crate::endpoints::set_test_override(
+        crate::endpoints::Endpoint::ClaudeUsage,
+        Some(&format!("{base_url}/api/oauth/usage")),
+    );
 
     let expired = Utc::now().timestamp_millis() - 1_000;
     let mut inactive = Account::from_keychain_blob(&format!(
@@ -42,8 +48,8 @@ fn refresh_usage_cache_still_refreshes_inactive_accounts() {
     seed.save().unwrap();
 
     refresh_usage_cache(false);
-    oauth::set_token_url_override(None);
-    usage::set_usage_url_override(None);
+    crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeToken, None);
+    crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeUsage, None);
 
     assert_eq!(
         hits.load(std::sync::atomic::Ordering::SeqCst),

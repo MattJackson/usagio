@@ -46,9 +46,21 @@ pub(crate) fn home_override() -> Option<PathBuf> {
 /// `ScopedConfigDir` (in `store_tests`) is currently the only caller, but
 /// keeping the helper `pub(crate)` avoids a new caller having to duplicate
 /// the thread-local API on top of it.
-#[allow(dead_code)]
 pub(crate) fn set_home_override(p: Option<PathBuf>) {
     HOME_OVERRIDE.with(|c| *c.borrow_mut() = p);
+}
+
+/// Spawn a worker thread that resolves the config dir the way the calling
+/// thread does. In the app no thread has an override, so this is a plain
+/// spawn; a unit test's thread-scoped config dir (`ScopedConfigDir`) is
+/// carried to the worker, so the worker's state and log writes land in the
+/// test's tempdir too, never the real one.
+pub(crate) fn spawn_in_config_scope(f: impl FnOnce() + Send + 'static) {
+    let home = home_override();
+    std::thread::spawn(move || {
+        set_home_override(home);
+        f();
+    });
 }
 
 /// The last usage snapshot fetched for an account. Written only by the

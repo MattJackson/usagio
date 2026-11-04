@@ -268,31 +268,8 @@ pub(crate) fn reported_usage(u: &Usage) -> ReportedUsage {
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Test-only override for the usage endpoint — see
-    /// `oauth::TOKEN_URL_OVERRIDE` for the rationale (an in-process mock
-    /// server standing in for the real Anthropic endpoint so tests never
-    /// depend on outbound network access).
-    static USAGE_URL_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Install (or clear) the current thread's usage-URL override. Test-only.
-#[cfg(test)]
-pub(crate) fn set_usage_url_override(url: Option<&str>) {
-    USAGE_URL_OVERRIDE.with(|c| *c.borrow_mut() = url.map(String::from));
-}
-
-#[cfg(test)]
 fn usage_url() -> String {
-    USAGE_URL_OVERRIDE
-        .with(|c| c.borrow().clone())
-        .unwrap_or_else(|| config::USAGE_URL.to_string())
-}
-
-#[cfg(not(test))]
-fn usage_url() -> String {
-    config::USAGE_URL.to_string()
+    crate::endpoints::url(crate::endpoints::Endpoint::ClaudeUsage)
 }
 
 /// Usage fields usagio doesn't read yet, all `null` so far; logged when they
@@ -507,14 +484,9 @@ pub(crate) fn fetch_email(access_token: &str) -> Option<String> {
         account: Option<Account>,
     }
     // Tests must never contact Anthropic: no mock URL means no request.
-    #[cfg(test)]
-    let mock_url = PROFILE_URL_OVERRIDE.with(|value| value.borrow().clone())?;
-    #[cfg(test)]
-    let url = mock_url.as_str();
-    #[cfg(not(test))]
-    let url = config::PROFILE_URL;
+    let url = crate::endpoints::mocked_url(crate::endpoints::Endpoint::ClaudeProfile)?;
     let resp = super::http_agent()
-        .get(url)
+        .get(&url)
         .set("Authorization", &format!("Bearer {access_token}"))
         .set("anthropic-beta", config::OAUTH_BETA)
         .set("anthropic-version", "2023-06-01")
@@ -528,14 +500,9 @@ pub(crate) fn fetch_email(access_token: &str) -> Option<String> {
 /// Fetch the raw profile JSON (`account`, `organization`, ...).
 pub(crate) fn fetch_profile(access_token: &str) -> Option<serde_json::Value> {
     // Tests must never contact Anthropic: no mock URL means no request.
-    #[cfg(test)]
-    let mock_url = PROFILE_URL_OVERRIDE.with(|value| value.borrow().clone())?;
-    #[cfg(test)]
-    let url = mock_url.as_str();
-    #[cfg(not(test))]
-    let url = config::PROFILE_URL;
+    let url = crate::endpoints::mocked_url(crate::endpoints::Endpoint::ClaudeProfile)?;
     let resp = super::http_agent()
-        .get(url)
+        .get(&url)
         .set("Authorization", &format!("Bearer {access_token}"))
         .set("anthropic-beta", config::OAUTH_BETA)
         .set("anthropic-version", "2023-06-01")
@@ -551,27 +518,12 @@ pub(crate) fn fetch_profile(access_token: &str) -> Option<serde_json::Value> {
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    static PROFILE_URL_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) fn set_profile_url_override(url: Option<&str>) {
-    PROFILE_URL_OVERRIDE.with(|value| *value.borrow_mut() = url.map(String::from));
-}
-
 /// A bounded metadata-only request. Tests require an explicit mock endpoint;
 /// watch-cycle tests must never contact Anthropic for incidental plan checks.
 pub(crate) fn fetch_profile_metadata(access_token: &str) -> Option<serde_json::Value> {
-    #[cfg(test)]
-    let mock_url = PROFILE_URL_OVERRIDE.with(|value| value.borrow().clone())?;
-    #[cfg(test)]
-    let url = mock_url.as_str();
-    #[cfg(not(test))]
-    let url = config::PROFILE_URL;
+    let url = crate::endpoints::mocked_url(crate::endpoints::Endpoint::ClaudeProfile)?;
     super::http_agent()
-        .get(url)
+        .get(&url)
         .timeout(std::time::Duration::from_secs(5))
         .set("Authorization", &format!("Bearer {access_token}"))
         .set("anthropic-beta", config::OAUTH_BETA)

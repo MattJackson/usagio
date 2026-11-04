@@ -194,7 +194,6 @@ fn cli_output_probe() {
             cmd_list(&[]).unwrap();
         }
         "token" => {
-            use crate::providers::claude::oauth;
             let home = _cfg.home();
             crate::env_lock::scoped_env_var("HOME", Some(home.to_str().unwrap()), || {
                 std::fs::write(
@@ -205,7 +204,10 @@ fn cli_output_probe() {
                 )
                 .unwrap();
                 let (base_url, _) = spawn_mock_token_server();
-                oauth::set_token_url_override(Some(&format!("{base_url}/v1/oauth/token")));
+                crate::endpoints::set_test_override(
+                    crate::endpoints::Endpoint::ClaudeToken,
+                    Some(&format!("{base_url}/v1/oauth/token")),
+                );
                 // Inactive + expired: refreshed, and the NEW token is printed.
                 seed_claude_state(vec![claude_expired("solo@e.com")], None);
                 cmd_token(None).unwrap();

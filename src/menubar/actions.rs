@@ -384,12 +384,7 @@ pub(crate) fn run_ui_tasks() {
 /// worker waits instead, keeping the serialization with the poller.
 fn spawn_serialized_with_poller(work: impl FnOnce(&mut SwapGuards) + Send + 'static) {
     let shared = shared_swap_guard();
-    // Unit tests scope the config dir per thread; carry it to the worker.
-    #[cfg(test)]
-    let home = crate::store::home_override();
-    std::thread::spawn(move || {
-        #[cfg(test)]
-        crate::store::set_home_override(home);
+    crate::store::spawn_in_config_scope(move || {
         let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
         work(&mut guard);
     });

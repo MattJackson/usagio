@@ -203,11 +203,12 @@ fn capture_refuses_a_token_whose_profile_email_differs_from_claude_json() {
             200,
             r#"{"account":{"email":"someone-else@e.com"}}"#.into(),
         );
-        crate::providers::claude::usage::set_profile_url_override(Some(&format!(
-            "{url}/api/oauth/profile"
-        )));
+        crate::endpoints::set_test_override(
+            crate::endpoints::Endpoint::ClaudeProfile,
+            Some(&format!("{url}/api/oauth/profile")),
+        );
         let res = capture_current();
-        crate::providers::claude::usage::set_profile_url_override(None);
+        crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeProfile, None);
         let err = res.expect_err("mismatched identity must not be captured");
         assert!(format!("{err:#}").contains("someone-else@e.com"), "{err:#}");
         assert!(State::load().unwrap().accounts.is_empty());

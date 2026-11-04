@@ -584,12 +584,8 @@ pub(crate) fn start(
     let redirect_uri = loopback.redirect_uri.clone();
     let progress = Arc::new(Progress::default());
     let worker = Arc::clone(&progress);
-    // Unit tests scope the config dir per thread; the worker logs through it.
-    #[cfg(test)]
-    let home = crate::store::home_override();
-    std::thread::spawn(move || {
-        #[cfg(test)]
-        crate::store::set_home_override(home);
+    // The worker logs through the config dir.
+    crate::store::spawn_in_config_scope(move || {
         let result = (|| {
             let code = wait_and_release(loopback, &state, LOGIN_TIMEOUT, &worker.cancelled)?;
             let tokens = exchange(&spec, &code, &pkce.verifier, &state, &redirect_uri)?;

@@ -151,24 +151,10 @@ pub(crate) struct CodexProvider;
 
 /// Codex rate-limit / usage endpoint. The ChatGPT backend variant works for
 /// tokens issued by the standard ChatGPT-plan OAuth flow the CLI uses.
-const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
-
-#[cfg(test)]
-thread_local! {
-    static USAGE_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) fn set_usage_url_override(url: Option<String>) {
-    USAGE_OVERRIDE.with(|value| *value.borrow_mut() = url);
-}
+pub(crate) const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
 fn usage_url() -> String {
-    #[cfg(test)]
-    if let Some(url) = USAGE_OVERRIDE.with(|value| value.borrow().clone()) {
-        return url;
-    }
-    USAGE_URL.to_string()
+    crate::endpoints::url(crate::endpoints::Endpoint::CodexUsage)
 }
 
 /// Parse the ChatGPT usage endpoint body into rate-limit windows. Pure (no
@@ -2022,9 +2008,9 @@ mod tests {
             }
         })
         .to_string();
-        set_usage_url_override(Some(url));
+        crate::endpoints::set_test_override(crate::endpoints::Endpoint::CodexUsage, Some(&url));
         let result = CodexProvider.fetch_account_usage("at", &blob);
-        set_usage_url_override(None);
+        crate::endpoints::set_test_override(crate::endpoints::Endpoint::CodexUsage, None);
         result.unwrap();
         let headers = server.join().unwrap();
         assert!(

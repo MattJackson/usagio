@@ -8,12 +8,14 @@ use crate::test_support::{
 
 #[test]
 fn list_with_a_refresh_flag_fetches_once_and_without_it_never_does() {
-    use crate::providers::claude::usage;
     let _poll = POLL_ACTIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let email = uniq("list");
     with_claude_home("scratch-json@e.com", |_| {
         let (url, hits) = spawn_mock_usage_server(200, usage_body(10.0, 10.0));
-        usage::set_usage_url_override(Some(&format!("{url}/api/oauth/usage")));
+        crate::endpoints::set_test_override(
+            crate::endpoints::Endpoint::ClaudeUsage,
+            Some(&format!("{url}/api/oauth/usage")),
+        );
         seed_claude_state(
             vec![account_with_cache(&email, Some(cu(10.0, 10.0, 2000)))],
             None,
@@ -27,7 +29,7 @@ fn list_with_a_refresh_flag_fetches_once_and_without_it_never_does() {
         // The short flag is the same request, and it forces a fetch even
         // though the cache is now fresh.
         cmd_list(&["-r".to_string()]).unwrap();
-        usage::set_usage_url_override(None);
+        crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeUsage, None);
         assert_eq!(hit_count(&hits), 2);
     });
     reset_usage_fetch_tracker(&email);

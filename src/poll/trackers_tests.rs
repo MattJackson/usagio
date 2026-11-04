@@ -99,12 +99,15 @@ fn spawn_mock_429_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicU
 #[test]
 fn inactive_429_does_not_rate_limit_loop_and_backs_off_that_account() {
     let _poll = POLL_ACTIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    use crate::providers::claude::usage;
+
     use crate::store::{Account, ScopedConfigDir};
 
     let _g = ScopedConfigDir::new();
     let (base_url, hits) = spawn_mock_429_server();
-    usage::set_usage_url_override(Some(&format!("{base_url}/api/oauth/usage")));
+    crate::endpoints::set_test_override(
+        crate::endpoints::Endpoint::ClaudeUsage,
+        Some(&format!("{base_url}/api/oauth/usage")),
+    );
 
     let email = escalation_test_email("inactive-429");
     let fresh = Utc::now().timestamp_millis() + 3_600_000;
@@ -120,7 +123,7 @@ fn inactive_429_does_not_rate_limit_loop_and_backs_off_that_account() {
 
     let first = refresh_usage_cache(false);
     let second = refresh_usage_cache(false);
-    usage::set_usage_url_override(None);
+    crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeUsage, None);
 
     assert!(
         !first.rate_limited,
@@ -241,12 +244,14 @@ fn cu_locked(age: i64) -> CachedUsage {
 
 #[test]
 fn skipping_is_decided_per_poll_not_remembered_by_the_subscription_throttle() {
-    use crate::providers::claude::usage;
     let _poll = POLL_ACTIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let email = uniq("repoll");
     with_claude_home("scratch-json@e.com", |_| {
         let (url, hits) = spawn_mock_usage_server(500, String::new());
-        usage::set_usage_url_override(Some(&format!("{url}/api/oauth/usage")));
+        crate::endpoints::set_test_override(
+            crate::endpoints::Endpoint::ClaudeUsage,
+            Some(&format!("{url}/api/oauth/usage")),
+        );
         seed_claude_state(
             vec![account_with_cache(&email, Some(cu(10.0, 10.0, 2000)))],
             None,
@@ -258,7 +263,7 @@ fn skipping_is_decided_per_poll_not_remembered_by_the_subscription_throttle() {
         // Nothing else stands in the way of fetching it again.
         clear_inactive_fetch_backoff(&email);
         refresh_usage_cache(false);
-        usage::set_usage_url_override(None);
+        crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeUsage, None);
         assert_eq!(hit_count(&hits), 2);
     });
     reset_usage_fetch_tracker(&email);
@@ -393,9 +398,12 @@ fn codex_gate_split(
         "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
         Some(&format!("{token_url}/oauth/token")),
         || {
-            providers::codex::set_usage_url_override(Some(format!("{usage_url}/usage")));
+            crate::endpoints::set_test_override(
+                crate::endpoints::Endpoint::CodexUsage,
+                Some(&format!("{usage_url}/usage")),
+            );
             refresh_provider_usage_caches(force, 95.0);
-            providers::codex::set_usage_url_override(None);
+            crate::endpoints::set_test_override(crate::endpoints::Endpoint::CodexUsage, None);
         },
     );
     (hit_count(&token_hits), hit_count(&usage_hits))

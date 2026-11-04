@@ -315,11 +315,13 @@ fn provider_swap_cycle_labels_urgent_and_prepared_moves_as_non_proactive() {
 )]
 #[test]
 fn watch_cycle_reports_the_claude_429_and_swaps_claude_accounts() {
-    use crate::providers::claude::usage;
     let _poll = POLL_ACTIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let outcome = with_claude_home("scratch-json@e.com", |_| {
         let (url, hits) = spawn_mock_usage_server(429, String::new());
-        usage::set_usage_url_override(Some(&format!("{url}/api/oauth/usage")));
+        crate::endpoints::set_test_override(
+            crate::endpoints::Endpoint::ClaudeUsage,
+            Some(&format!("{url}/api/oauth/usage")),
+        );
         let a = uniq("wc-active");
         let b = uniq("wc-target");
         // Throttle the lapse probe so the 429 never reaches the profile endpoint.
@@ -336,7 +338,7 @@ fn watch_cycle_reports_the_claude_429_and_swaps_claude_accounts() {
             Some(&a),
         );
         let out = watch_cycle(95.0, 95.0, &mut SwapGuards::default(), false).unwrap();
-        usage::set_usage_url_override(None);
+        crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeUsage, None);
         assert_eq!(hit_count(&hits), 1);
         assert_eq!(State::load().unwrap().active.as_deref(), Some(a.as_str()));
         reset_usage_fetch_tracker(&a);

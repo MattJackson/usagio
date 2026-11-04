@@ -6,9 +6,7 @@ pub(crate) const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 /// Endpoint the `/usage` command hits. Returns limits + reset times.
 pub(crate) const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-/// Profile endpoint, used to label an account with its email/name. Tests
-/// substitute a mock URL (see `usage::fetch_profile`).
-#[cfg_attr(test, allow(dead_code))]
+/// Profile endpoint, used to label an account with its email/name.
 pub(crate) const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 
 /// OAuth token endpoint (refresh_token grant).

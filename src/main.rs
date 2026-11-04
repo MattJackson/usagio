@@ -40,6 +40,7 @@ mod watchdog;
 mod claude_local;
 mod cli;
 mod display;
+mod endpoints;
 mod env_override;
 mod history;
 mod picking;

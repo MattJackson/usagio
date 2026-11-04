@@ -418,11 +418,11 @@ pub(crate) mod render;
 // "Renew login…" sign-in window (wry) + default-browser opener.
 mod sign_in;
 
-// Test-only failure-injection seam, shared by ALL platforms' `SecretStore::set`
-// (macOS mock, Linux keyring/fallback, Windows Credential Manager). Lets
-// `main_tests.rs` arm the next `set` to fail so the apply_account rollback path
-// (never a half-applied switch) is exercisable on every CI platform, not just
-// macOS. Not compiled into production builds.
+// Test-only failure-injection seam for the active-slot write, checked once in
+// `providers::claude::active_slot_write` before either backend (keychain or
+// credentials file) is touched. Lets a test arm the next write to fail so the
+// apply_account rollback path (never a half-applied switch) is exercisable on
+// every CI platform. Not compiled into production builds.
 #[cfg(test)]
 pub(crate) mod test_secret_seam {
     use std::cell::Cell;
@@ -441,7 +441,8 @@ pub(crate) mod test_secret_seam {
     }
 }
 
-/// Arm the `cfg(test)` secret store to fail its next `set` on this thread.
+/// Make the next active-slot write on this thread fail (see
+/// `providers::claude::active_slot_write`).
 #[cfg(test)]
 pub(crate) fn arm_keychain_set_failure() {
     test_secret_seam::arm_set_failure();

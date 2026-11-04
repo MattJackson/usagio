@@ -979,13 +979,13 @@ fn last_chance_fallback_keeps_the_first_blob_on_a_freshness_tie() {
 struct TokenUrlGuard;
 impl TokenUrlGuard {
     fn set(url: &str) -> Self {
-        crate::providers::claude::oauth::set_token_url_override(Some(url));
+        crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeToken, Some(url));
         TokenUrlGuard
     }
 }
 impl Drop for TokenUrlGuard {
     fn drop(&mut self) {
-        crate::providers::claude::oauth::set_token_url_override(None);
+        crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeToken, None);
     }
 }
 

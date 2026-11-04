@@ -220,7 +220,10 @@ fn metadata_profile_request_handles_http_and_parse_failures() {
         (200, "not-json"),
     ] {
         let (url, _) = crate::test_support::spawn_mock_usage_server(status, body.into());
-        set_profile_url_override(Some(&format!("{url}/api/oauth/profile")));
+        crate::endpoints::set_test_override(
+            crate::endpoints::Endpoint::ClaudeProfile,
+            Some(&format!("{url}/api/oauth/profile")),
+        );
         assert!(
             fetch_profile_metadata("test-access").is_none(),
             "HTTP {status}: {body}"
@@ -229,9 +232,12 @@ fn metadata_profile_request_handles_http_and_parse_failures() {
     let mut expected = sample_profile();
     expected["organization"]["plan_display_name"] = "Ultra".into();
     let (url, _) = crate::test_support::spawn_mock_usage_server(200, expected.to_string());
-    set_profile_url_override(Some(&format!("{url}/api/oauth/profile")));
+    crate::endpoints::set_test_override(
+        crate::endpoints::Endpoint::ClaudeProfile,
+        Some(&format!("{url}/api/oauth/profile")),
+    );
     let actual = fetch_profile_metadata("test-access").unwrap();
-    set_profile_url_override(None);
+    crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeProfile, None);
     assert_eq!(actual, expected);
 }
 
@@ -239,13 +245,16 @@ fn metadata_profile_request_handles_http_and_parse_failures() {
 fn fetch_profile_uses_only_the_test_mock() {
     let _cfg = crate::store::ScopedConfigDir::new();
     // No mock: no request at all (tests must never contact Anthropic).
-    set_profile_url_override(None);
+    crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeProfile, None);
     assert!(fetch_profile("test-access").is_none());
     let expected = sample_profile();
     let (url, _) = crate::test_support::spawn_mock_usage_server(200, expected.to_string());
-    set_profile_url_override(Some(&format!("{url}/api/oauth/profile")));
+    crate::endpoints::set_test_override(
+        crate::endpoints::Endpoint::ClaudeProfile,
+        Some(&format!("{url}/api/oauth/profile")),
+    );
     let actual = fetch_profile("test-access");
-    set_profile_url_override(None);
+    crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeProfile, None);
     assert_eq!(actual, Some(expected));
 }
 

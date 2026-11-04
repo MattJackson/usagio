@@ -784,13 +784,6 @@ impl SecretStore for MacOsSecrets {
     }
 
     fn set(&self, service: &str, account: &str, secret: &str) -> Result<()> {
-        // Failure-injection seam (shared across platforms): a test can arm the
-        // next `set` to fail so the apply_account keychain-write-failure ROLLBACK
-        // path (the guard behind "never a half-applied switch") is exercisable —
-        // the mock otherwise always succeeds and left that branch uncovered.
-        if super::test_secret_seam::take_set_failure() {
-            bail!("injected keychain set failure (test seam)");
-        }
         in_memory::set(service, account, secret);
         Ok(())
     }
