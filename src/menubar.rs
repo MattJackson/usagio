@@ -1423,33 +1423,57 @@ pub(crate) fn poll_loop_with(opts: &LoopOpts) {
     }
 }
 
+/// The engine role held by `poll_loop_with`. Dropping it (the loop unwinding
+/// on a panic, before the supervisor's respawn backoff) releases the flock, so
+/// it also marks this process display-only: another process may take the lock
+/// in that window, and a manual refresh here must not run a second engine.
+struct EngineLock {
+    _file: Option<std::fs::File>,
+}
+
+impl Drop for EngineLock {
+    fn drop(&mut self) {
+        ENGINE_DISPLAY_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Take the engine lock (`~/.config/usagio/engine.lock`, a non-blocking
-/// flock), waiting while another process holds it. Returns the open file (the
-/// lock lives as long as it does), or `None` if the lock file can't be used at
-/// all — then this process runs the engine anyway rather than never polling.
-fn acquire_engine_lock() -> Option<std::fs::File> {
+/// flock), waiting while another process holds it. The returned guard holds the
+/// open file (the lock lives as long as it does); it holds no file if the lock
+/// file can't be used at all — then this process runs the engine anyway rather
+/// than never polling.
+fn acquire_engine_lock() -> EngineLock {
     use fs2::FileExt;
     let mut logged = false;
     loop {
-        let file = crate::store::config_dir().ok().and_then(|d| {
-            let _ = std::fs::create_dir_all(&d);
-            std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(d.join("engine.lock"))
-                .ok()
-        });
-        let Some(file) = file else {
-            crate::logging::log("event=engine_lock_unavailable ; running the engine unlocked");
-            return None;
+        let opened = crate::store::config_dir()
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|d| {
+                let _ = std::fs::create_dir_all(&d);
+                let path = d.join("engine.lock");
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(&path)
+                    .map_err(|e| format!("{}: {e}", path.display()))
+            });
+        let file = match opened {
+            Ok(f) => f,
+            Err(why) => {
+                crate::logging::log(&format!(
+                    "event=engine_lock_unavailable error={why} ; running the engine unlocked"
+                ));
+                ENGINE_DISPLAY_ONLY.store(false, std::sync::atomic::Ordering::SeqCst);
+                return EngineLock { _file: None };
+            }
         };
         if file.try_lock_exclusive().is_ok() {
             ENGINE_DISPLAY_ONLY.store(false, std::sync::atomic::Ordering::SeqCst);
             if logged {
                 crate::logging::log("event=engine_lock_acquired");
             }
-            return Some(file);
+            return EngineLock { _file: Some(file) };
         }
         ENGINE_DISPLAY_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
         if !logged {
@@ -8366,6 +8390,26 @@ mod tests {
         drop(held);
         REFRESH_IN_FLIGHT.store(false, Ordering::SeqCst);
         assert!(!started, "a display-only process must not run a cycle");
+    }
+
+    #[test]
+    fn dropping_the_engine_lock_makes_the_process_display_only() {
+        use std::sync::atomic::Ordering;
+        let _l = REFRESH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::store::ScopedConfigDir::new();
+        ENGINE_DISPLAY_ONLY.store(true, Ordering::SeqCst);
+        let lock = acquire_engine_lock();
+        let owner = !ENGINE_DISPLAY_ONLY.load(Ordering::SeqCst);
+        // A poll_loop panic unwinds and drops the lock before the respawn
+        // backoff; another process may take it then.
+        drop(lock);
+        let after_drop = ENGINE_DISPLAY_ONLY.load(Ordering::SeqCst);
+        ENGINE_DISPLAY_ONLY.store(false, Ordering::SeqCst);
+        assert!(owner, "holding engine.lock makes this process the owner");
+        assert!(
+            after_drop,
+            "a released engine.lock must not leave Refresh-now running an engine"
+        );
     }
 
     #[test]
