@@ -195,7 +195,7 @@ pub fn absorb_all_lagging(provider: &dyn Provider) -> Vec<AccountKey> {
 
 /// Case-insensitive "is `key` the active account" — matches every other
 /// identity check in `State` (`find`, `still_active`, `from_value`).
-fn is_active_key(key: &str, active: Option<&str>) -> bool {
+pub(crate) fn is_active_key(key: &str, active: Option<&str>) -> bool {
     active.is_some_and(|a| a.eq_ignore_ascii_case(key))
 }
 
@@ -587,6 +587,20 @@ static WATCHER_REGISTRY: std::sync::Mutex<WatcherRegistry> =
         handle: None,
         providers: Vec::new(),
     });
+
+/// Serializes the tests that install, respawn or clear the process-global
+/// `WATCHER_REGISTRY` (a respawn elsewhere would flip `respawn_watchers()`'s
+/// answer mid-test).
+#[cfg(test)]
+pub(crate) static WATCHER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test-only: empty the registry so the next test starts with no watcher.
+#[cfg(test)]
+pub(crate) fn clear_watchers_for_test() {
+    let mut reg = WATCHER_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    reg.handle = None;
+    reg.providers.clear();
+}
 
 /// Build the fsnotify watcher for `providers` and store it in the process-global
 /// registry (replacing the `Box::leak` the daemon used to do). Keeps the

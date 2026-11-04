@@ -492,6 +492,17 @@ fn real_get(service: &str, account: &str) -> Result<Option<String>> {
 }
 
 fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
+    real_set_with(&run_security, service, account, secret)
+}
+
+/// `real_set` over an injectable `security(1)` runner (a test seam for the
+/// delete -> add -> restore sequence).
+fn real_set_with(
+    run: &dyn Fn(&[&str]) -> Result<SecurityRun>,
+    service: &str,
+    account: &str,
+    secret: &str,
+) -> Result<()> {
     // L5 (round-1 codeaudit): passing the secret via argv (`-w <secret>`)
     // briefly exposes it in `ps(1)` output. Acknowledged limitation of
     // `security(1)` — its stdin variant does not exist for
@@ -511,13 +522,12 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
     let result = (|| -> Result<()> {
         // Remember the current value so a failed add (after the delete has
         // already succeeded) can put it back instead of leaving no credential.
-        let backup_run =
-            run_security(&["find-generic-password", "-s", service, "-a", account, "-w"]);
+        let backup_run = run(&["find-generic-password", "-s", service, "-a", account, "-w"]);
         if matches!(&backup_run, Ok(r) if r.timed_out) {
             timed_out = true;
         }
         let prior = backup_prior(backup_run, service, account)?;
-        let del = run_security(&["delete-generic-password", "-s", service, "-a", account])
+        let del = run(&["delete-generic-password", "-s", service, "-a", account])
             .context("running `security delete-generic-password` (pre-set)")?;
         if del.timed_out {
             timed_out = true;
@@ -536,7 +546,7 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
                 stderr.trim(),
             );
         }
-        let out = match run_security(&[
+        let out = match run(&[
             "add-generic-password",
             "-s",
             service,
@@ -548,12 +558,12 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
             Ok(out) => out,
             Err(e) => {
                 // Spawn / wait failure after the delete already succeeded.
-                restore_prior_secret(service, account, prior.as_deref());
+                restore_prior_secret(run, service, account, prior.as_deref());
                 return Err(e.context("running `security add-generic-password`"));
             }
         };
         if out.timed_out || !out.success() {
-            restore_prior_secret(service, account, prior.as_deref());
+            restore_prior_secret(run, service, account, prior.as_deref());
         }
         if out.timed_out {
             timed_out = true;
@@ -613,9 +623,14 @@ fn backup_prior(out: Result<SecurityRun>, service: &str, account: &str) -> Resul
 
 /// Best-effort: re-add the secret that `real_set` deleted when the following
 /// add failed, so the keychain isn't left with no credential at all.
-fn restore_prior_secret(service: &str, account: &str, prior: Option<&str>) {
+fn restore_prior_secret(
+    run: &dyn Fn(&[&str]) -> Result<SecurityRun>,
+    service: &str,
+    account: &str,
+    prior: Option<&str>,
+) {
     let Some(prior) = prior else { return };
-    let ok = run_security(&[
+    let ok = run(&[
         "add-generic-password",
         "-s",
         service,
@@ -1214,6 +1229,148 @@ mod tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: b"boom".to_vec(),
         }
+    }
+
+    /// Drive `real_set_with` against a scripted `security(1)`: the backup find
+    /// returns `find`, the delete succeeds, the add of `new-secret` returns
+    /// `add_new`, and every call is recorded.
+    fn real_set_scripted_full(
+        find: Result<SecurityRun>,
+        add_new: Result<SecurityRun>,
+    ) -> (Result<()>, Vec<Vec<String>>, String) {
+        let cfg = crate::store::ScopedConfigDir::new();
+        let calls = std::cell::RefCell::new(Vec::<Vec<String>>::new());
+        let find = std::cell::RefCell::new(Some(find));
+        let add_new = std::cell::RefCell::new(Some(add_new));
+        let runner = |args: &[&str]| -> Result<SecurityRun> {
+            calls
+                .borrow_mut()
+                .push(args.iter().map(|a| a.to_string()).collect());
+            match args[0] {
+                "find-generic-password" => find.borrow_mut().take().unwrap(),
+                "delete-generic-password" => Ok(run(Some(0), false, "")),
+                _ if args.contains(&"new-secret") => add_new.borrow_mut().take().unwrap(),
+                _ => Ok(run(Some(0), false, "")),
+            }
+        };
+        let res = real_set_with(&runner, "svc", "acct", "new-secret");
+        let log = std::fs::read_to_string(cfg.home().join(".config/usagio/usagio.log"))
+            .unwrap_or_default();
+        (res, calls.into_inner(), log)
+    }
+
+    /// The backup find succeeds with a prior secret; the add returns `add_new`.
+    fn real_set_scripted(add_new: SecurityRun) -> (Result<()>, Vec<Vec<String>>) {
+        let (res, calls, _) =
+            real_set_scripted_full(Ok(run(Some(0), false, "prior-secret\n")), Ok(add_new));
+        (res, calls)
+    }
+
+    fn verbs(calls: &[Vec<String>]) -> Vec<&str> {
+        calls.iter().map(|c| c[0].as_str()).collect()
+    }
+
+    #[test]
+    fn real_set_aborts_before_delete_when_the_backup_read_fails() {
+        for find in [
+            Ok(run(Some(1), false, "")),
+            Ok(run(Some(51), false, "")),
+            Ok(run(None, true, "")),
+            Err(anyhow::anyhow!("spawn failed")),
+        ] {
+            let (res, calls, _) = real_set_scripted_full(find, Ok(run(Some(0), false, "")));
+            let err = format!("{:#}", res.unwrap_err());
+            assert!(
+                err.contains("service=svc") && err.contains("account=acct"),
+                "error must name the real service/account: {err}"
+            );
+            assert_eq!(
+                verbs(&calls),
+                ["find-generic-password"],
+                "nothing destructive may run after a failed backup read"
+            );
+        }
+    }
+
+    #[test]
+    fn real_set_backup_failure_keeps_the_underlying_reason() {
+        let (res, _, _) = real_set_scripted_full(
+            Err(anyhow::anyhow!("spawn failed")),
+            Ok(run(Some(0), false, "")),
+        );
+        assert!(format!("{:#}", res.unwrap_err()).contains("spawn failed"));
+    }
+
+    #[test]
+    fn real_set_backup_timeout_is_logged_as_a_write_timeout() {
+        let (res, _, log) =
+            real_set_scripted_full(Ok(run(None, true, "")), Ok(run(Some(0), false, "")));
+        assert!(res.is_err());
+        assert!(log.contains("event=keychain_write_timeout"), "log: {log}");
+    }
+
+    #[test]
+    fn real_set_first_time_set_with_no_existing_item_proceeds() {
+        let (res, calls, _) =
+            real_set_scripted_full(Ok(run(Some(44), false, "")), Ok(run(Some(0), false, "")));
+        res.unwrap();
+        assert_eq!(
+            verbs(&calls),
+            [
+                "find-generic-password",
+                "delete-generic-password",
+                "add-generic-password"
+            ]
+        );
+    }
+
+    #[test]
+    fn real_set_first_time_failed_add_has_nothing_to_restore() {
+        let (res, calls, _) =
+            real_set_scripted_full(Ok(run(Some(44), false, "")), Ok(run(Some(1), false, "")));
+        assert!(res.is_err());
+        assert_eq!(adds(&calls), ["new-secret"], "no prior secret to restore");
+    }
+
+    #[test]
+    fn real_set_restores_the_prior_secret_when_the_add_fails_to_spawn() {
+        let (res, calls, _) = real_set_scripted_full(
+            Ok(run(Some(0), false, "prior-secret\n")),
+            Err(anyhow::anyhow!("spawn failed")),
+        );
+        assert!(format!("{:#}", res.unwrap_err()).contains("spawn failed"));
+        assert_eq!(adds(&calls), ["new-secret", "prior-secret"]);
+    }
+
+    fn adds(calls: &[Vec<String>]) -> Vec<&str> {
+        calls
+            .iter()
+            .filter(|c| c[0] == "add-generic-password")
+            .map(|c| c.last().unwrap().as_str())
+            .collect()
+    }
+
+    #[test]
+    fn real_set_restores_the_prior_secret_when_the_add_fails() {
+        let (res, calls) = real_set_scripted(run(Some(1), false, ""));
+        assert!(res.is_err());
+        assert_eq!(adds(&calls), ["new-secret", "prior-secret"]);
+    }
+
+    #[test]
+    fn real_set_restores_the_prior_secret_when_the_add_times_out() {
+        let (res, calls) = real_set_scripted(run(None, true, ""));
+        assert!(format!("{:#}", res.unwrap_err()).contains("timed out"));
+        assert_eq!(adds(&calls), ["new-secret", "prior-secret"]);
+    }
+
+    #[test]
+    fn real_set_reads_the_prior_secret_before_deleting_and_skips_restore_on_success() {
+        let (res, calls) = real_set_scripted(run(Some(0), false, ""));
+        res.unwrap();
+        assert_eq!(adds(&calls), ["new-secret"], "no restore after a good add");
+        assert_eq!(calls[0][0], "find-generic-password");
+        assert_eq!(calls[1][0], "delete-generic-password");
     }
 
     #[test]

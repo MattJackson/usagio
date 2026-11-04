@@ -301,6 +301,32 @@ mod tests {
         assert!(s.ends_with(" 0h") && s.starts_with("3650d"));
     }
 
+    #[test]
+    fn has_indefinite_block_sees_a_maxed_weekly_with_no_reset() {
+        // Weekly maxed with no reset time, session maxed but resetting soon:
+        // the 2h session unlock is not when the account is usable again.
+        assert!(has_indefinite_block(&usage(
+            Some(100.0),
+            Some(7200),
+            Some(100.0),
+            None
+        )));
+        // Both windows' resets known: not indefinite.
+        assert!(!has_indefinite_block(&usage(
+            Some(100.0),
+            Some(7200),
+            Some(100.0),
+            Some(9000)
+        )));
+        // A weekly without a reset but below the lock threshold: not blocked.
+        assert!(!has_indefinite_block(&usage(
+            Some(100.0),
+            Some(7200),
+            Some(10.0),
+            None
+        )));
+    }
+
     // ---- compute_display ----
 
     fn usage(sp: Option<f64>, sr: Option<i64>, wp: Option<f64>, wr: Option<i64>) -> AccountUsage {

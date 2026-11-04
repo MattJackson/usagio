@@ -1200,6 +1200,40 @@ fn ensure_fresh_never_spends_the_grant_of_an_account_that_went_active() {
 }
 
 #[test]
+fn active_key_case_mismatch_still_blocks_every_refresh_site() {
+    use crate::store::State;
+    with_isolated_home(|| {
+        seed_state(
+            vec![expired_account("now-active@example.com")],
+            Some("Now-Active@Example.com"),
+        );
+        let (url, hits) = spawn_token_server(200, || {});
+        let _u = TokenUrlGuard::set(&url);
+
+        // lifecycle::adopt_saved_rotation / save_rotation via ensure_fresh.
+        let mut stale = expired_account("now-active@example.com");
+        let changed = crate::providers::claude::oauth::ensure_fresh(&mut stale, 900).unwrap();
+        assert!(!changed);
+        // credentials.rs background refresh.
+        refresh_inactive_if_stale(None);
+
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the vendor-owned active account's grant must never be POSTed"
+        );
+        assert_eq!(
+            State::load()
+                .unwrap()
+                .find("now-active@example.com")
+                .unwrap()
+                .refresh_token,
+            "stale-rt"
+        );
+    });
+}
+
+#[test]
 fn refresh_inactive_if_stale_skips_accounts_already_flagged_needs_relogin() {
     use crate::store::State;
     with_isolated_home(|| {
@@ -1299,13 +1333,15 @@ fn spawn_watchers_refuses_to_watch_the_filesystem_root() {
 
 #[test]
 fn install_then_respawn_watchers_rebuilds_the_registered_watcher() {
+    let _w = WATCHER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _cfg = crate::store::ScopedConfigDir::new();
     let td = tempfile::tempdir().unwrap();
     let cred = td.path().join("creds").join("c.json");
     let prov = FakeProvider::new("fake-reg").with_path(cred);
     let prov_static: &'static FakeProvider = Box::leak(Box::new(prov));
 
-    // Start from an empty registry (nothing else in the suite touches it).
+    // Start from an empty registry (other registry tests serialize on
+    // WATCHER_TEST_LOCK).
     {
         let mut reg = WATCHER_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         reg.handle = None;

@@ -416,11 +416,16 @@ fn parse_reader<R: BufRead>(rdr: R) -> Vec<Snapshot> {
 /// check in `load_month_cached` invalidates a single month lazily. Kept
 /// exposed to tests so a follow-up cache-behaviour test can pin state
 /// without waiting for an mtime tick.
+/// Test-only: drop the cache entries for the months a "last N days" read can
+/// touch. Targeted (never a whole-cache clear) so it can't evict another
+/// test's entry for a far-future month mid-assertion.
 #[cfg(test)]
-#[allow(dead_code)]
-pub(crate) fn invalidate_cache() {
-    if let Ok(mut c) = month_cache().lock() {
-        c.months.clear();
+pub(crate) fn evict_recent_months() {
+    let now = Utc::now();
+    let mut c = month_cache().lock().unwrap_or_else(|e| e.into_inner());
+    for back in 0..=3 {
+        let d = now - Duration::days(31 * back);
+        c.months.remove(&(d.year(), d.month()));
     }
 }
 
@@ -1515,18 +1520,6 @@ mod tests {
     /// Serialises tests that drive the process-global appender slot and the
     /// once-per-process rotation flag.
     static APPEND_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Drop the cache entries for the months a "last N days" read can touch.
-    /// Targeted (not `invalidate_cache`) so it can't evict another test's
-    /// entry for a far-future month mid-assertion.
-    fn evict_recent_months() {
-        let now = Utc::now();
-        let mut c = month_cache().lock().unwrap();
-        for back in 0..=3 {
-            let d = now - Duration::days(31 * back);
-            c.months.remove(&(d.year(), d.month()));
-        }
-    }
 
     fn cfg_dir() -> PathBuf {
         store::config_dir().unwrap()

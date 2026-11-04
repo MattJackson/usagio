@@ -697,15 +697,25 @@ mod tests {
                 .into_iter()
                 .collect(),
             pace_fired_this_window: true,
+            retry_spent: ["pace".to_string(), "threshold:other".to_string()]
+                .into_iter()
+                .collect(),
             ..NotifState::default()
         };
-        // A weekly reset happens; `dedup_and_apply` must clear both.
+        // A weekly reset happens; `dedup_and_apply` must clear both, and re-arm
+        // the one-shot "pace" delivery retry (only that key).
         let prev = snap(None, Some(85.0));
         let curr = snap(None, Some(3.0));
         let cfg = NotificationConfig::default();
         let _ = dedup_and_apply(&mut state, &prev, &curr, evaluate(&prev, &curr, &cfg));
         assert!(state.crossings.is_empty());
         assert!(!state.pace_fired_this_window);
+        assert!(
+            !state.retry_spent.contains("pace"),
+            "a weekly reset re-arms the pace retry: {:?}",
+            state.retry_spent
+        );
+        assert!(state.retry_spent.contains("threshold:other"));
     }
 
     // --- session reset does NOT clear pace_fired (pace is weekly only) -----
@@ -1078,6 +1088,23 @@ mod tests {
                 pct: 70
             }),
             "{trig:?}"
+        );
+        // Last week's crossings are still recorded when the pair arrives: the
+        // reset must clear them BEFORE dedup, or the new window's 70 is
+        // suppressed as "already crossed".
+        let mut state = NotifState {
+            crossings: [(Window::Weekly, 70), (Window::Weekly, 90)]
+                .into_iter()
+                .collect(),
+            ..NotifState::default()
+        };
+        let fired = dedup_and_apply(&mut state, &prev, &curr, trig);
+        assert!(
+            fired.contains(&Trigger::Threshold {
+                window: Window::Weekly,
+                pct: 70
+            }),
+            "{fired:?}"
         );
     }
 

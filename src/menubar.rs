@@ -4821,8 +4821,12 @@ mod tests {
         let initial = State::load().unwrap().notification_config.threshold_enabled;
 
         const ITERATIONS: usize = 100;
-        let handles: Vec<_> = (0..2)
-            .map(|_| {
+        // Two threads toggle; a third bumps a counter field under the same
+        // lock. A toggle that skips the lock reads a stale counter and writes
+        // it back, so lost updates show up as an exact count shortfall instead
+        // of only (maybe) flipping the parity of the bool.
+        let handles: Vec<_> = (0..3)
+            .map(|worker| {
                 let home = home.clone();
                 std::thread::spawn(move || {
                     // HOME_OVERRIDE is thread-local (see store::ScopedConfigDir);
@@ -4830,7 +4834,16 @@ mod tests {
                     // the parent test set up.
                     crate::store::set_home_override(Some(home));
                     for _ in 0..ITERATIONS {
-                        toggle_notification_trigger("threshold");
+                        if worker == 2 {
+                            with_state_lock(|| {
+                                let mut st = State::load()?;
+                                st.trigger_pct = Some(st.trigger_pct.unwrap_or(0.0) + 1.0);
+                                st.save()
+                            })
+                            .unwrap();
+                        } else {
+                            toggle_notification_trigger("threshold");
+                        }
                     }
                 })
             })
@@ -4840,6 +4853,11 @@ mod tests {
         }
 
         let total_toggles = 2 * ITERATIONS;
+        assert_eq!(
+            State::load().unwrap().trigger_pct,
+            Some(ITERATIONS as f64),
+            "every locked counter bump must survive the concurrent toggles"
+        );
         let expected = if total_toggles % 2 == 1 {
             !initial
         } else {
@@ -6619,20 +6637,6 @@ mod tests {
         assert_eq!(groups[1].1, vec![1, 0], "Codex: soonest reset first");
     }
 
-    #[test]
-    fn build_snapshot_omits_sections_for_providers_with_zero_accounts() {
-        // No captured accounts → no section (the "no header, no rows" rule).
-        // Uses the pure `partition_capture_providers` sibling to prove the
-        // filter logic without touching state.json. `build_snapshot`'s own
-        // gate is the `if provider_rows.is_empty() { continue; }` branch —
-        // this test locks in the *behavior* the gate exists to enforce.
-        let snap = Snapshot::default();
-        assert!(
-            snap.sections.is_empty(),
-            "empty snapshot has no sections — a provider with zero rows must never emit one",
-        );
-    }
-
     // -----------------------------------------------------------------------
     // Capability-gated menu rows. `supports_switching`
     // gates the "Switch to this account" row and `supports_remove` the
@@ -7335,10 +7339,14 @@ mod tests {
         }
         // The usage-log reader is mtime-cached process-wide; drop entries other
         // tests (or the empty read above) left behind so ours is parsed fresh.
-        crate::usage_log::invalidate_cache();
+        crate::usage_log::evict_recent_months();
         let rows = account_extra_info_rows(&sec, &a);
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows[0].starts_with("Weekly · "), "{rows:?}");
+        assert_ne!(
+            rows[0], "Weekly · 60% · —",
+            "a real pace, not the no-history fallback"
+        );
         assert_eq!(rows[1], "updated 1m ago");
 
         // Weekly already locked → the burn forecast is redundant and skipped.
@@ -7730,6 +7738,27 @@ mod tests {
             Some(80.0),
             "unchanged mtime hits the cache"
         );
+    }
+
+    #[test]
+    fn build_snapshot_omits_sections_for_providers_with_zero_accounts() {
+        // Only Claude has accounts: every other registered provider (stubs
+        // included) must not get a section, or Settings > Tray Icon lists them
+        // all and the empty-state rows never show.
+        let _l = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::store::ScopedConfigDir::new();
+        let mut st = State::default();
+        st.accounts.push(restore_test_acct("only@x.com"));
+        st.active = Some("only@x.com".to_string());
+        save_state_with_mtime(&st, next_mtime_tag());
+
+        let snap = build_snapshot();
+        let ids: Vec<String> = snap
+            .sections
+            .iter()
+            .map(|s| s.provider_id.to_string())
+            .collect();
+        assert_eq!(ids, [CLAUDE_SLUG]);
     }
 
     #[test]
