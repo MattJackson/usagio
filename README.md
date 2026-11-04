@@ -202,9 +202,12 @@ usagio report              Usage patterns by weekday / hour / account
 usagio --version
 ```
 
-With no `[acct]`, `switch` / `start` / `continue` **auto-pick** the account that has
-room and whose weekly limit resets soonest — so you burn quota that's about to reset
-anyway.
+With no `[acct]`, `switch` / `start` / `continue` **auto-pick** from the cached
+usage: among accounts that are ready (at least 15 minutes of runway before your
+threshold), the one whose weekly limit resets earliest — so you burn quota that's
+about to reset anyway — with ties going to the one with the most runway. If no
+account is ready it picks the one near the threshold that lasts longest; it never
+picks an account at its limit.
 
 ```sh
 usagio start               # auto-pick the best account and open claude

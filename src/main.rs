@@ -341,8 +341,10 @@ fn print_help() {
          usagio renew <email>     Sign that account in again in your browser (fresh login)\n  \
                                         --provider <slug>  or use `codex:email`\n  \
          usagio rm <email>        Forget an account\n\n\
-         With no [email], switch/start/continue auto-pick the account that has room\n  \
-         and whose weekly limit resets soonest (use it before the quota resets).\n  \
+         With no [email], switch/start/continue auto-pick, from cached usage, the\n  \
+         ready account (15+ min of room before the trigger) whose weekly limit\n  \
+         resets earliest (use it before the quota resets). If none is ready, the\n  \
+         one that lasts longest; never an account at its limit.\n  \
          With an [email], a pick already at/over the trigger holds until it's\n  \
          exhausted; one under the trigger swaps at the trigger as usual.\n\n\
          Onboarding: log into an account with `claude` as usual, then\n  \
@@ -3013,14 +3015,13 @@ pub(crate) fn optimize_now() -> Result<Option<String>> {
     Ok(Some(best))
 }
 
-/// Pick the account whose weekly window resets soonest, preferring one that
-/// still sits BELOW the swap target (`eligible_target(ceiling, trigger)`) — an
-/// account already past the trigger is where auto-swap would move *away* from,
-/// so it's never "best" while any under-target account exists. Only when every
-/// account is already past target (it's all that's left) do we fall back to the
-/// least-consumed still-usable one. Operates entirely on cached rows — callers
-/// must not fetch first.
-/// Rank accounts by weekly reset, then runway.
+/// Pick an account by the auto-swap ranking (`autoswap::assess::rank_cmp`):
+/// among Ready accounts (at least `MIN_LANDING_MIN` of runway before the
+/// trigger), the one whose weekly window resets earliest, ties to the most
+/// runway; if none is Ready, the Draining (near-trigger) account with the most
+/// hard runway. Never an account at its limit, signed out, or without a
+/// subscription: with nothing left it errors naming the soonest unlock.
+/// Operates entirely on cached rows — callers must not fetch first.
 fn auto_pick_for(_state: &State, rows: &[Row], ceiling: f64, trigger: f64) -> Result<String> {
     auto_pick_v2(rows, ceiling, trigger, Utc::now())
 }
