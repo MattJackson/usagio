@@ -36,10 +36,30 @@ fn linux_secrets_round_trip_against_real_secret_service_daemon() {
     let account = "ci-test-account";
     let secret = "ci-test-secret-value";
 
+    // Isolate the child's config/home so that, if the daemon is down, the
+    // 0600 file fallback can never touch the developer's real
+    // ~/.config/usagio/secrets.json. The D-Bus session vars stay inherited.
+    let home = tempfile::tempdir().expect("tempdir");
+    let xdg = home.path().join(".config");
+
     let mut cmd = Command::cargo_bin("usagio").expect("binary builds");
-    cmd.args(["__secrets_selftest", &service, account, secret]);
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", &xdg)
+        .args(["__secrets_selftest", &service, account, secret]);
 
     cmd.assert()
         .success()
         .stdout(predicate::str::contains("OK"));
+
+    // `LinuxSecrets` silently degrades to `<config>/usagio/secrets.json` when
+    // the Secret Service daemon is unreachable, and the selftest would still
+    // print OK from that alone. A real D-Bus round trip never creates the
+    // fallback file (set/delete rewrite it, they never remove it), so its
+    // presence means the daemon path was NOT exercised.
+    let fallback = xdg.join("usagio").join("secrets.json");
+    assert!(
+        !fallback.exists(),
+        "round trip fell back to {} — the real Secret Service daemon was not used",
+        fallback.display()
+    );
 }
