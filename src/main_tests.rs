@@ -854,6 +854,29 @@ fn sibling_app_bundle_exe_finds_bundle_next_to_bin_dir() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The real brew shape: `<prefix>/bin/usagio` is a symlink into the versioned
+/// Cellar dir, and `<prefix>/opt/usagio` is the upgrade-stable alias. The
+/// LaunchAgent must get the opt path, never the versioned Cellar one.
+#[cfg(unix)]
+#[test]
+fn sibling_app_bundle_exe_prefers_the_stable_brew_opt_path() {
+    let (dir, cellar_bare, cellar_bundle) = mock_cellar_bundle_layout("usagio-opt-bundle-test");
+    let prefix = dir.join("prefix");
+    std::fs::create_dir_all(prefix.join("bin")).unwrap();
+    let stable_bin = prefix.join("bin/usagio");
+    std::os::unix::fs::symlink(&cellar_bare, &stable_bin).unwrap();
+    let opt_macos = prefix.join("opt/usagio/usagio.app/Contents/MacOS");
+    std::fs::create_dir_all(&opt_macos).unwrap();
+    let opt_bundle = opt_macos.join("usagio");
+    std::fs::write(&opt_bundle, b"opt-bundled").unwrap();
+
+    let found = sibling_app_bundle_exe(&stable_bin).expect("bundle exe should be found");
+    assert_eq!(found, opt_bundle);
+    assert_ne!(found, cellar_bundle);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[cfg(unix)]
 #[test]
 fn sibling_app_bundle_exe_none_when_bundle_absent() {
@@ -876,12 +899,11 @@ fn sibling_app_bundle_exe_none_when_bundle_absent() {
 }
 
 /// Mocks a Homebrew-style `<Cellar>/usagio/<version>/{bin,usagio.app}` layout
-/// and reproduces the exact plist-building the real `MacOsAutostart::install`
-/// does (minus the `launchctl load` shell-out, which needs a real launchd job
-/// and a valid Mach-O binary — orthogonal to what's under test here), then
-/// asserts the written LaunchAgent plist's `ProgramArguments` points at the
-/// bundle's `Contents/MacOS/usagio`, not the bare binary. This is what makes
-/// Login Items show the app icon instead of the generic "exec" glyph.
+/// and checks `resolve_launch_agent_exe` (the consumer `cmd_install` uses to
+/// build the LaunchAgent's `ProgramArguments`) picks the bundle's
+/// `Contents/MacOS/usagio`, not the bare binary. This is what makes Login
+/// Items show the app icon instead of the generic "exec" glyph. The plist
+/// itself is not written or inspected here.
 #[cfg(unix)]
 #[test]
 fn usagio_install_prefers_app_bundle_path_when_available() {
