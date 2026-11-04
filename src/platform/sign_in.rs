@@ -41,11 +41,25 @@ pub(super) fn open_url(url: &str) -> Result<()> {
         c.arg("url.dll,FileProtocolHandler");
         c
     };
-    let status = cmd.arg(url).status().context("opening the browser")?;
-    if !status.success() {
-        bail!("opening the browser failed ({status})");
+    let mut child = cmd.arg(url).spawn().context("opening the browser")?;
+    // `xdg-open` may run a foreground (text-mode / $BROWSER) browser that
+    // doesn't return until it exits, and this is called on the UI thread:
+    // reap it in the background instead of blocking the tray loop.
+    #[cfg(target_os = "linux")]
+    {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
     }
-    Ok(())
+    #[cfg(not(target_os = "linux"))]
+    {
+        let status = child.wait().context("opening the browser")?;
+        if !status.success() {
+            bail!("opening the browser failed ({status})");
+        }
+        Ok(())
+    }
 }
 
 const WIDTH: f64 = 520.0;
@@ -244,11 +258,27 @@ mod imp {
         window.set_position(gtk::WindowPosition::Center);
         let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
         window.add(&container);
-        let mut context = WebContext::new(Some(crate::login::store_dir(slug, key)?));
-        let webview = WebViewBuilder::new_with_web_context(&mut context)
+        // GTK keeps toplevels alive after the wrapper drops, so close the
+        // never-shown window on the early-error paths instead of leaking it.
+        let store = match crate::login::store_dir(slug, key) {
+            Ok(store) => store,
+            Err(e) => {
+                window.close();
+                return Err(e);
+            }
+        };
+        let mut context = WebContext::new(Some(store));
+        let webview = match WebViewBuilder::new_with_web_context(&mut context)
             .with_url(url)
             .build_gtk(&container)
-            .context("creating the sign-in web view")?;
+            .context("creating the sign-in web view")
+        {
+            Ok(webview) => webview,
+            Err(e) => {
+                window.close();
+                return Err(e);
+            }
+        };
         window.show_all();
         window.present();
 
