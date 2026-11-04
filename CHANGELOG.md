@@ -5,10 +5,16 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.0] - 2026-11-03
 
 ### Fixed
 
+- macOS: with `CLAUDE_CONFIG_DIR` set, switching now writes the per-directory keychain item Claude Code reads (`Claude Code-credentials-<hash>`), so the active login and the displayed account no longer diverge.
+- Switching no longer discards a renewed Claude login whose vendor write failed, no longer commits an account removed mid-switch, and a queued CLI switch can no longer overwrite a newer menu pick.
+- Manual holds are judged against the saved trigger while auto-swap is off; the leave latch is keyed to the window that caused the leave; future-stamped usage readings are treated as stale.
+- Unlimited-credit accounts count as able to run on credits. Reset notices fire only for windows that were meaningfully used; pace alerts no longer fire from last week's slope on the reset tick.
+- The menu shows refresh errors on the account row, "Refresh usage now" reports failures, expired logins show as expired, and the watchdog escalates correctly while a keychain failure is unresolved.
+- State backups and diagnostic dumps are no longer pruned wrongly after a clock change; the context ledger counts project `.claude/skills` and `.claude/agents` and follows Codex/opencode instruction-file rules.
 - Windows: resolve the home directory from `HOME`, else `USERPROFILE` (empty `HOME` counts as unset) for `~/.claude.json`, Claude credential watching and the Codex `auth.json`.
 - Linux/Windows: Claude account switch and capture now use `~/.claude/.credentials.json`, the file Claude Code reads, instead of the OS secret store. A stale "Claude Code-credentials" secret-store entry from earlier versions is orphaned and harmless.
 - Auto-swap now moves to the ready account whose weekly limit resets soonest, so remaining quota is spent before it expires. Previously it chose the account with the most runway unless a reset was within 6 hours, which picked a fresh account over one 6 hours from losing its room. Accounts without 15 minutes of runway are still skipped. The engine now matches the menu order.
