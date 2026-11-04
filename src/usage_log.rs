@@ -615,7 +615,7 @@ fn rotate_files(dir: &Path, now: DateTime<Utc>) -> Result<()> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Ok(());
     };
-    let mut found: Vec<(std::path::PathBuf, DateTime<Utc>)> = Vec::new();
+    let mut found: Vec<(std::path::PathBuf, DateTime<Utc>, i64)> = Vec::new();
     for entry in rd.flatten() {
         let name = entry.file_name();
         let n = name.to_string_lossy();
@@ -626,24 +626,36 @@ fn rotate_files(dir: &Path, now: DateTime<Utc>) -> Result<()> {
         let Ok(md) = entry.metadata() else { continue };
         let Ok(mt) = md.modified() else { continue };
         let mt_utc: DateTime<Utc> = mt.into();
-        found.push((entry.path(), mt_utc));
+        let month = month_index(&n).unwrap_or_else(|| month_of(mt_utc));
+        found.push((entry.path(), mt_utc, month));
     }
-    // If even the newest file is past the cutoff, the clock is implausibly
-    // ahead (RTC/VM jump); pruning would wipe everything irrecoverably.
-    if found
+    // A file is pruned only if it is past the cutoff AND some kept file lies
+    // within the retention span after it (by month in the filename). A forward
+    // clock jump leaves the real files with no such neighbour, so they survive
+    // even once a file written under the bad clock exists.
+    let kept: Vec<i64> = found
         .iter()
-        .map(|(_, t)| *t)
-        .max()
-        .is_none_or(|t| t < cutoff)
-    {
-        return Ok(());
-    }
-    for (path, mt_utc) in found {
-        if mt_utc < cutoff {
+        .filter(|(_, t, _)| *t >= cutoff)
+        .map(|(_, _, m)| *m)
+        .collect();
+    for (path, mt_utc, month) in &found {
+        if *mt_utc < cutoff && kept.iter().any(|k| (*month..=*month + 7).contains(k)) {
             let _ = std::fs::remove_file(path);
         }
     }
     Ok(())
+}
+
+fn month_of(t: DateTime<Utc>) -> i64 {
+    i64::from(t.year()) * 12 + i64::from(t.month0())
+}
+
+/// `history.YYYY-MM.ndjson` / `decisions.YYYY-MM.ndjson` → a month index.
+fn month_index(name: &str) -> Option<i64> {
+    let ym = name.split('.').nth(1)?;
+    let (y, m) = ym.split_once('-')?;
+    let (y, m) = (y.parse::<i64>().ok()?, m.parse::<i64>().ok()?);
+    (1..=12).contains(&m).then_some(y * 12 + m - 1)
 }
 
 /// Read every snapshot for `account` whose `ts` falls in `[from, to]` from
@@ -843,7 +855,7 @@ mod tests {
     #[test]
     fn rotate_removes_files_older_than_retention() {
         let dir = tempfile::tempdir().unwrap();
-        let old = dir.path().join("history.2024-01.ndjson");
+        let old = dir.path().join("history.2026-01.ndjson");
         let recent = dir.path().join("history.2026-08.ndjson");
         std::fs::write(&old, b"").unwrap();
         std::fs::write(&recent, b"").unwrap();
@@ -1173,6 +1185,13 @@ mod tests {
         assert!(!old.exists(), "190-day-old history must be pruned");
     }
 
+    /// `YYYY-MM` of roughly `n` months before the real now.
+    fn ym_ago(n: i64) -> String {
+        (Utc::now() - Duration::days(31 * n))
+            .format("%Y-%m")
+            .to_string()
+    }
+
     #[test]
     fn rotate_skips_pruning_when_the_clock_is_implausibly_ahead() {
         let dir = tempfile::tempdir().unwrap();
@@ -1182,7 +1201,13 @@ mod tests {
         let t = SystemTime::from(Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap());
         touch_with_mtime(&a, t);
         touch_with_mtime(&d, t);
-        // Every file is older than the cutoff: the clock jumped, not the files.
+        // The first process wrote a file under the jumped clock; the second
+        // rotation then sees a "fresh" newest file next to the real ones.
+        touch_with_mtime(
+            &dir.path().join("history.2027-11.ndjson"),
+            SystemTime::from(now),
+        );
+        rotate_files(dir.path(), now).unwrap();
         rotate_files(dir.path(), now).unwrap();
         assert!(
             a.exists() && d.exists(),
@@ -1230,11 +1255,14 @@ mod tests {
         let ancient = SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_700_000_000);
         let wrong_suffix = dir.path().join("history.2024-01.txt");
         let wrong_prefix = dir.path().join("other.2024-01.ndjson");
-        let real = dir.path().join("history.2024-01.ndjson");
+        let real = dir.path().join(format!("history.{}.ndjson", ym_ago(3)));
         for p in [&wrong_suffix, &wrong_prefix, &real] {
             touch_with_mtime(p, ancient);
         }
-        touch_with_mtime(&dir.path().join("history.fresh.ndjson"), SystemTime::now());
+        touch_with_mtime(
+            &dir.path().join(format!("history.{}.ndjson", ym_ago(0))),
+            SystemTime::now(),
+        );
         rotate_files(dir.path(), Utc::now()).unwrap();
         assert!(wrong_suffix.exists());
         assert!(wrong_prefix.exists());
@@ -1554,7 +1582,7 @@ mod tests {
         // Rotation has already happened in this process.
         BOOT_ROTATED.store(true, Ordering::SeqCst);
         append(&snap("claude", "a@x.io", utc(2049, 9, 5, 5), Some(1.0))).unwrap();
-        let stale = cfg_dir().join("history.2020-01.ndjson");
+        let stale = cfg_dir().join("history.2049-07.ndjson");
         touch_with_mtime(
             &stale,
             SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_700_000_000),
@@ -1704,13 +1732,16 @@ mod tests {
         let _l = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _cfg = store::ScopedConfigDir::new();
         let old = SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_700_000_000);
-        let stale_hist = cfg_dir().join("history.2020-01.ndjson");
-        let stale_dec = cfg_dir().join("decisions.2020-01.ndjson");
+        let stale_hist = cfg_dir().join(format!("history.{}.ndjson", ym_ago(3)));
+        let stale_dec = cfg_dir().join(format!("decisions.{}.ndjson", ym_ago(3)));
         touch_with_mtime(&stale_hist, old);
         touch_with_mtime(&stale_dec, old);
         // A current file proves the clock is sane (pruning is skipped when
         // every file is past the cutoff).
-        touch_with_mtime(&cfg_dir().join("history.2026-11.ndjson"), SystemTime::now());
+        touch_with_mtime(
+            &cfg_dir().join(format!("history.{}.ndjson", ym_ago(0))),
+            SystemTime::now(),
+        );
         // append(): the first call in a process rotates.
         BOOT_ROTATED.store(false, Ordering::SeqCst);
         append(&snap("claude", "a@x.io", utc(2049, 9, 5, 5), Some(1.0))).unwrap();
@@ -1785,7 +1816,7 @@ mod tests {
     fn rotate_if_needed_prunes_stale_files_in_config_dir() {
         let _l = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _cfg = store::ScopedConfigDir::new();
-        let stale = cfg_dir().join("history.2020-01.ndjson");
+        let stale = cfg_dir().join("history.2026-03.ndjson");
         let fresh = cfg_dir().join("history.2026-08.ndjson");
         let now = utc(2026, 9, 1, 0);
         touch_with_mtime(&stale, SystemTime::from(now - Duration::days(300)));
