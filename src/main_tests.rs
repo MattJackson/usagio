@@ -4586,6 +4586,33 @@ fn cli_output_probe() {
         "list-empty" => {
             cmd_list(&[]).unwrap();
         }
+        "token" => {
+            use crate::providers::claude::oauth;
+            let home = _cfg.home();
+            crate::env_lock::scoped_env_var("HOME", Some(home.to_str().unwrap()), || {
+                std::fs::write(
+                    home.join(".claude.json"),
+                    serde_json::json!({"oauthAccount": {
+                        "emailAddress": "duo@e.com", "accountUuid": "uuid-duo@e.com"}})
+                    .to_string(),
+                )
+                .unwrap();
+                let (base_url, _) = spawn_mock_token_server();
+                oauth::set_token_url_override(Some(&format!("{base_url}/v1/oauth/token")));
+                // Inactive + expired: refreshed, and the NEW token is printed.
+                seed_claude_state(vec![claude_expired("solo@e.com")], None);
+                cmd_token(None).unwrap();
+                // Active: the vendor slot's token is printed, not the stored one.
+                let mut st = State::load().unwrap();
+                st.upsert(claude_expired("duo@e.com"));
+                st.active = Some("duo@e.com".to_string());
+                st.save().unwrap();
+                let mut slot = claude_account("duo@e.com", 3_600_000);
+                slot.set_tokens("slot-at".into(), "slot-rt".into(), 9_999_999_999_999);
+                prime_active_account(&slot);
+                cmd_token(Some("duo")).unwrap();
+            });
+        }
         "context" => {
             let dir = tempfile::tempdir().unwrap();
             cmd_context(&[
@@ -4599,6 +4626,20 @@ fn cli_output_probe() {
         other => panic!("unknown probe {other}"),
     }
     println!("PROBE-END");
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "reads or writes the OS secret store, which is only hermetic (in-memory) on macOS"
+)]
+fn token_command_prints_the_refreshed_or_adopted_bearer() {
+    let text = run_cli_probe("token", &[]);
+    assert_eq!(
+        probe_lines(&text),
+        ["mock-refreshed-access-token", "slot-at"],
+        "stdout carries exactly the bearer, one per call"
+    );
 }
 
 #[test]
