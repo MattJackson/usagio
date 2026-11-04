@@ -3827,7 +3827,8 @@ fn merge_poll_update(
     if let Some(cu) = cu {
         if a.cached_usage.as_ref().is_none_or(|stored| {
             // A stored stamp from the future (clock was ahead) never pins.
-            stored.fetched_at <= cu.fetched_at || stored.fetched_at > Utc::now().timestamp() + 60
+            stored.fetched_at <= cu.fetched_at
+                || stored.fetched_at > Utc::now().timestamp() + autoswap::memory::FUTURE_SLACK_SECS
         }) {
             a.cached_usage = Some(cu.clone());
         }
