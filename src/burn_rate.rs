@@ -552,8 +552,10 @@ mod tests {
     #[test]
     fn estimate_ignores_samples_outside_session_horizon() {
         let mut rows = climbing_rows();
-        // Older than the 5h session horizon: must not influence the fit.
-        rows.extend([(330, 90.0), (360, 95.0), (420, 99.0)]);
+        // Older than the 5h session horizon: must not influence the fit. Lower
+        // than the in-horizon start (5%), so the reset-drop filter cannot
+        // discard them: only the horizon filter keeps them out.
+        rows.extend([(330, 0.0), (360, 0.0), (420, 0.0)]);
         let (_l, _g, key, now) = with_history(true, &rows);
         let est = estimate(&key, Window::Session, now).expect("enough in-horizon samples");
         assert!(
@@ -593,14 +595,15 @@ mod tests {
             .map(|k| (60 + k * 1680, 85.0 - 16.8 * k as f32))
             .collect();
         // Older than the 7-day weekly horizon (but inside the 8-day read
-        // window): must not influence the fit.
-        rows.extend([(7 * 24 * 60 + 600, 99.0), (7 * 24 * 60 + 1300, 98.0)]);
+        // window): must not influence the fit. Below the in-horizon start so the
+        // reset-drop filter cannot discard them: only the horizon filter does.
+        rows.extend([(7 * 24 * 60 + 600, 0.0), (7 * 24 * 60 + 1300, 0.0)]);
         let (_l, _g, key, now) = with_history(false, &rows);
         let est = estimate(&key, Window::Weekly, now).expect("weekly history is enough");
         assert_eq!(est.window, Window::Weekly);
         assert_eq!(est.current_pct, 85.0);
         assert!(
-            (est.rate_pct_per_hour - 0.6).abs() < 0.1,
+            (est.rate_pct_per_hour - 0.6).abs() < 0.01,
             "{}",
             est.rate_pct_per_hour
         );
@@ -669,6 +672,31 @@ mod tests {
         .unwrap();
         let mins = (est.empty_at - now).num_minutes();
         assert!((30..=50).contains(&mins), "~40m expected, got {mins}m");
+    }
+
+    #[test]
+    fn a_small_dip_is_noise_not_a_reset() {
+        // 41.0 -> 40.9 (0.1pp) and 46.0 -> 41.0 (exactly 5pp) are jitter: the
+        // fit keeps the whole series instead of truncating at the dip.
+        let now = Utc::now();
+        for pcts in [
+            [30.0, 35.0, 41.0, 40.9, 45.0, 50.0, 55.0],
+            [30.0, 35.0, 46.0, 41.0, 45.0, 50.0, 55.0],
+        ] {
+            let est = estimate_from(
+                mk_series(Window::Session, &pcts, 10, now),
+                Window::Session,
+                now,
+            )
+            .expect("the full series is used");
+            // Truncated at the dip, 4 samples would remain and the slope would
+            // be ~30 %/h; the whole series averages ~20 %/h.
+            assert!(
+                (est.rate_pct_per_hour - 25.0).abs() < 10.0 && est.rate_pct_per_hour < 28.0,
+                "{pcts:?} -> {}",
+                est.rate_pct_per_hour
+            );
+        }
     }
 
     #[test]
