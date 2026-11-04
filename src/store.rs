@@ -1325,6 +1325,9 @@ pub fn accounts_dropped_by(new_state: &State) -> Result<Vec<String>> {
             }
         }
     }
+    // `old.providers` is a HashMap: sort so repeated calls (and the Restore
+    // re-check under the lock) compare equal when nothing changed.
+    dropped.sort();
     Ok(dropped)
 }
 

@@ -630,6 +630,17 @@ fn trailing_usage_for_account(
             return (format!("{} credits", left.display_whole()), Vec::new());
         }
     }
+    // A maxed window with unknown reset: the other window's unlock time is
+    // not when the account frees up, so show the percentages, not a countdown.
+    let usage = account_usage_for(a);
+    let display = if countdown::has_indefinite_block(&usage) {
+        DisplayState::Usage {
+            session_pct: usage.session_pct,
+            weekly_pct: usage.weekly_pct,
+        }
+    } else {
+        display
+    };
     match display {
         DisplayState::Locked {
             until,
@@ -809,6 +820,17 @@ fn acct_max_pct(a: &AcctView) -> Option<f64> {
         .fold(None, |acc, p| Some(acc.map_or(p, |m: f64| m.max(p))))
 }
 
+/// Highest of the session/weekly percentages only — the windows
+/// `compute_display` locks on. Unlike [`acct_max_pct`] it ignores scoped
+/// windows (e.g. Opus), which can be maxed while the account stays usable.
+fn blocking_pct(a: &AcctView) -> Option<f64> {
+    let (s, w) = summary_pcts(a);
+    match (s, w) {
+        (Some(s), Some(w)) => Some(s.max(w)),
+        (s, w) => s.or(w),
+    }
+}
+
 /// The account the tray icon/title should reflect, honoring
 /// `State.tray_icon_mode` (carried on the snapshot):
 ///   - `None` — "at risk" (the default): across every provider's ACTIVE
@@ -837,12 +859,27 @@ fn tray_target<'a>(
     // At risk: the active account that blocks soonest (its binding window's
     // time to block at its own pace), falling back to the highest pct.
     let now = now_utc();
-    let actives: Vec<(&ProviderSection, &AcctView)> = snap
+    let all_actives: Vec<(&ProviderSection, &AcctView)> = snap
         .sections
         .iter()
         .filter_map(|sec| Some((sec, sec.accounts.iter().find(|a| a.active)?)))
+        .collect();
+    let actives: Vec<(&ProviderSection, &AcctView)> = all_actives
+        .iter()
+        .copied()
         .filter(|(_, a)| locked_countdown_for(a, now).is_none())
         .collect();
+    if actives.is_empty() {
+        // Every active account is locked: show the one that unlocks soonest
+        // (its lock countdown) rather than a blank "no active account".
+        let unlock = |a: &AcctView| match countdown::compute_display(&account_usage_for(a), now) {
+            DisplayState::Locked { until, .. } => Some(until),
+            _ => None,
+        };
+        return all_actives
+            .into_iter()
+            .min_by_key(|(_, a)| unlock(a).unwrap_or(DateTime::<Utc>::MAX_UTC));
+    }
     let ttb = |a: &AcctView| binding_for(a, now).and_then(|b| b.time_to_block);
     if actives.iter().any(|(_, a)| ttb(a).is_some()) {
         return actives.into_iter().min_by(|(_, a), (_, b)| {
@@ -2041,7 +2078,7 @@ fn cached_state() -> State {
 /// with no known reset — nothing useful to say.
 fn window_status_row(w: &WindowView) -> Option<(String, bool)> {
     let label = stat_display_label(w);
-    let locked = w.pct.is_some_and(|p| p >= 100.0);
+    let locked = w.pct.is_some_and(|p| p >= countdown::LOCKED_THRESHOLD_PCT);
     match (locked, w.reset.is_empty()) {
         (true, false) => Some((format!("{label} locked · unlocks in {}", w.reset), true)),
         (true, true) => Some((format!("{label} locked"), true)),
@@ -2209,17 +2246,18 @@ fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)
             // can't convey); otherwise keep window order (session before weekly).
             // Stable sort preserves that order among the non-locked windows.
             let mut ordered: Vec<&WindowView> = a.windows.iter().collect();
-            ordered.sort_by_key(|w| u8::from(!w.pct.is_some_and(|p| p >= 100.0)));
+            ordered.sort_by_key(|w| {
+                u8::from(!w.pct.is_some_and(|p| p >= countdown::LOCKED_THRESHOLD_PCT))
+            });
             // When the WEEKLY window is locked, the account is fully blocked
             // regardless of the session window — so drop the "Session renews in X"
             // line (its countdown is meaningless while the weekly limit blocks all
             // use). The "Weekly locked · unlocks in X" row says everything.
-            let weekly_locked = a
-                .windows
-                .iter()
-                .any(|w| w.id == "weekly" && w.pct.is_some_and(|p| p >= 100.0));
+            let weekly_locked = a.windows.iter().any(|w| {
+                w.id == "weekly" && w.pct.is_some_and(|p| p >= countdown::LOCKED_THRESHOLD_PCT)
+            });
             for w in ordered {
-                if weekly_locked && !w.pct.is_some_and(|p| p >= 100.0) {
+                if weekly_locked && !w.pct.is_some_and(|p| p >= countdown::LOCKED_THRESHOLD_PCT) {
                     continue;
                 }
                 if let Some((mut text, locked)) = window_status_row(w) {
@@ -2259,10 +2297,9 @@ fn account_extra_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
         // N% · ~X"). Once the weekly window is already locked (100%),
         // that reads as a redundant "· 100% · ~0m" — skip it; the
         // "Weekly limit reached" status row already conveys the lock.
-        let weekly_locked = a
-            .windows
-            .iter()
-            .any(|w| w.id == "weekly" && w.pct.is_some_and(|p| p >= 100.0));
+        let weekly_locked = a.windows.iter().any(|w| {
+            w.id == "weekly" && w.pct.is_some_and(|p| p >= countdown::LOCKED_THRESHOLD_PCT)
+        });
         if !weekly_locked {
             if let Some(row) = empty_in_row(&account_key, a, Utc::now()) {
                 rows.push(row);
@@ -2417,7 +2454,7 @@ fn menu_signature(snap: &Snapshot) -> String {
             if let Some(left) = login_expiring_in(a, now) {
                 s.push_str(&format!("renew={}|", login_left_label(left)));
             }
-            s.push_str(&format!("rn={}|", a.renewable));
+            s.push_str(&format!("rn={}|err={}|", a.renewable, a.error.is_some()));
             for w in &a.windows {
                 s.push_str(&format!(
                     "{}={}:r={}|",
@@ -2456,7 +2493,17 @@ fn menu_signature(snap: &Snapshot) -> String {
             reg.provider_id, reg.display_name, reg.installed
         ));
     }
-    s.push_str(&format!("as={} th={:.0}", snap.autoswap, snap.threshold));
+    let nc = &snap.notification_config;
+    s.push_str(&format!(
+        "as={} th={:.0} uc={} ti={:?} nt={}{}{}",
+        snap.autoswap,
+        snap.threshold,
+        snap.use_credits,
+        snap.tray_icon_mode,
+        nc.threshold_enabled,
+        nc.reset_back_enabled,
+        nc.pace_enabled,
+    ));
     s
 }
 
@@ -2498,7 +2545,7 @@ fn recovery_status(
         }
     }
     if matches!(state, DisplayState::Usage { .. })
-        && !acct_max_pct(active).is_some_and(|p| p >= 99.5)
+        && !blocking_pct(active).is_some_and(|p| p >= 99.5)
     {
         return None;
     }
@@ -2535,7 +2582,7 @@ fn recovery_status(
             }
             DisplayState::StaleAfterReset { .. } => pending = Some(account),
             DisplayState::Usage { .. } => {
-                if acct_max_pct(account).is_some_and(|p| p < 99.5) {
+                if blocking_pct(account).is_some_and(|p| p < 99.5) {
                     return Some((
                         "Switch".into(),
                         format!("{} · Usage available", account.display),
@@ -2978,6 +3025,17 @@ fn handle_backup_restore_dialog() {
     handle_backup_restore_dialog_with(crate::platform().file_dialog());
 }
 
+/// True if any string anywhere in `v` is the `"<redacted>"` placeholder that
+/// `store::redact_state_for_dump` writes (such a file holds no usable logins).
+fn json_contains_redacted(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::String(s) => s == "<redacted>",
+        serde_json::Value::Array(a) => a.iter().any(json_contains_redacted),
+        serde_json::Value::Object(o) => o.values().any(json_contains_redacted),
+        _ => false,
+    }
+}
+
 /// Testable core of the Restore… click: takes the `FileDialog` as a
 /// parameter so `#[cfg(test)]` can pass a `platform::MockFileDialog` instead
 /// of popping a real native panel. See `platform::Platform::file_dialog`.
@@ -3012,12 +3070,34 @@ fn handle_backup_restore_dialog_with(dialog: &dyn crate::platform::FileDialog) {
         notify("Restore failed: not a usagio state file (missing 'accounts')");
         return;
     }
+    if json_contains_redacted(&value) {
+        notify(
+            "Restore failed: this is a redacted diagnostic dump (tokens are \"<redacted>\"), \
+             not a working backup",
+        );
+        return;
+    }
     let new_state = State::from_value(&value);
 
+    // Ask OUTSIDE the cross-process state lock: the modal can stay open
+    // indefinitely and would otherwise block every poller/CLI state write.
+    let asked_about = match crate::store::accounts_dropped_by(&new_state) {
+        Ok(d) => d,
+        Err(e) => {
+            notify(&format!("Restore failed: {e}"));
+            return;
+        }
+    };
+    if !asked_about.is_empty() && !confirm(&restore_drop_confirmation(&asked_about)) {
+        return; // user declined; not an error
+    }
+
     let outcome = with_state_lock(|| -> Result<bool> {
+        // Recompute under the lock: if the set of dropped accounts changed
+        // while the dialog was open, the confirmation no longer applies.
         let dropped = crate::store::accounts_dropped_by(&new_state)?;
-        if !dropped.is_empty() && !confirm(&restore_drop_confirmation(&dropped)) {
-            return Ok(false); // user declined; not an error
+        if dropped != asked_about {
+            anyhow::bail!("accounts changed while the confirmation was open; try Restore again");
         }
         let dir = crate::store::config_dir()?;
         let stash = crate::store::stash_pre_restore(&dir)?;
@@ -3087,7 +3167,7 @@ fn accounts_needing_relogin() -> Vec<String> {
             st.providers
                 .values()
                 .flat_map(|p| p.accounts.iter())
-                .filter(|a| a.needs_relogin)
+                .filter(|a| a.needs_relogin && !a.no_subscription)
                 .map(|a| a.key.clone()),
         )
         .collect();
@@ -3202,13 +3282,25 @@ fn handle_capture(slug: &str) {
 /// "Renew login…": run the provider's own login in usagio's sign-in window —
 /// the default browser where no window can be shown — and save the result
 /// (see `crate::login`). Runs on the UI thread; the wait happens off it.
+/// Sign-in window store for a renew. `State::find` searches Claude accounts
+/// only, so its `login_store` applies only to a Claude renew; any other
+/// provider keys its store by the account key.
+fn renew_login_store(st: &State, slug: &str, key: &str) -> String {
+    if slug == CLAUDE_SLUG {
+        if let Some(store) = st.find(key).and_then(|a| a.login_store.clone()) {
+            return store;
+        }
+    }
+    key.to_string()
+}
+
 fn handle_renew(slug: &str, key: &str) {
     let Some(provider) = providers::get(slug) else {
         return;
     };
     let store = State::load()
         .ok()
-        .and_then(|st| st.find(key).and_then(|a| a.login_store.clone()))
+        .map(|st| renew_login_store(&st, slug, key))
         .unwrap_or_else(|| key.to_string());
     let target = crate::login::Target::Renew(key.to_string());
     let started = crate::login::start(provider, target, |result| match result {
@@ -3347,11 +3439,62 @@ fn login_message(mut msg: String, r: &crate::login::Renewed) -> String {
     msg
 }
 
+/// Run `work` on a worker thread while holding the shared swap guard. The
+/// poller holds that guard for a whole `run_cycle` (network fetches, token
+/// refreshes), so taking it on the UI thread would freeze the tray; the
+/// worker waits instead, keeping the serialization with the poller.
+fn spawn_serialized_with_poller(work: impl FnOnce(&mut SwapGuards) + Send + 'static) {
+    let shared = shared_swap_guard();
+    // Unit tests scope the config dir per thread; carry it to the worker.
+    #[cfg(test)]
+    let home = crate::store::home_override();
+    std::thread::spawn(move || {
+        #[cfg(test)]
+        crate::store::set_home_override(home);
+        let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+        work(&mut guard);
+    });
+}
+
 fn handle_switch(slug: &str, key: &str) {
     // Explicit user choice may select an exhausted account. Serialize with the
-    // poller so it cannot immediately undo the choice with an older decision.
-    let shared = shared_swap_guard();
-    let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+    // poller so it cannot immediately undo the choice with an older decision;
+    // off the UI thread, since the guard can be held across network fetches.
+    let (slug, key) = (slug.to_string(), key.to_string());
+    let provider = slug.clone();
+    spawn_latest_switch(&provider, move |guard| {
+        switch_serialized(guard, &slug, &key)
+    });
+}
+
+/// Latest requested switch per provider. `std::sync::Mutex` is not FIFO, so
+/// workers queued behind the poller can wake in any order; each carries the
+/// generation it was requested at and skips if a newer click superseded it.
+static SWITCH_GEN: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
+
+fn spawn_latest_switch(slug: &str, work: impl FnOnce(&mut SwapGuards) + Send + 'static) {
+    let gen = {
+        let mut m = SWITCH_GEN.lock().unwrap_or_else(|e| e.into_inner());
+        let n = m.get_or_insert_with(Default::default);
+        let g = n.entry(slug.to_string()).or_insert(0);
+        *g += 1;
+        *g
+    };
+    let slug = slug.to_string();
+    spawn_serialized_with_poller(move |guard| {
+        let current = SWITCH_GEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|m| m.get(&slug).copied());
+        if current == Some(gen) {
+            work(guard);
+        }
+    });
+}
+
+fn switch_serialized(guard: &mut SwapGuards, slug: &str, key: &str) {
     // State v2 (codex-switch-e2e): dispatch by provider slug instead of
     // hard-gating on Claude — `capabilities().supports_switching` already
     // keeps the "Switch to this account" row from being built for a
@@ -3930,13 +4073,19 @@ mod cross_platform {
                 if let Err(e) = handle.set_menu(menu_tree_from_snapshot(&snap)) {
                     crate::logging::log(&format!("menubar: set_menu failed: {e:#}"));
                 }
-                let _ = handle.set_icon(initial_icon_bytes(&snap));
+                if let Err(e) = handle.set_icon(initial_icon_bytes(&snap)) {
+                    crate::logging::log(&format!("menubar: set_icon failed: {e:#}"));
+                }
                 last_sig = sig;
             }
             let title = title_for(&snap);
             if title != last_title {
-                let _ = handle.set_title(&title);
-                last_title = title;
+                match handle.set_title(&title) {
+                    Ok(()) => last_title = title,
+                    Err(e) => {
+                        crate::logging::log(&format!("menubar: set_title failed: {e:#}"));
+                    }
+                }
             }
         }
     }
@@ -4267,6 +4416,42 @@ mod tests {
 
         // Clean up so later tests in this binary see the flag cleared.
         REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn only_the_latest_queued_switch_runs() {
+        let shared = shared_swap_guard();
+        let held = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        for name in ["A", "B"] {
+            let tx = tx.clone();
+            spawn_latest_switch("latest-test", move |_| {
+                let _ = tx.send(name);
+            });
+        }
+        drop(held);
+        let mut ran = Vec::new();
+        while let Ok(n) = rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            ran.push(n);
+        }
+        assert_eq!(ran, ["B"], "superseded switch must not run");
+    }
+
+    #[test]
+    fn serialized_work_does_not_block_the_caller_while_poller_holds_guard() {
+        let shared = shared_swap_guard();
+        let held = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_serialized_with_poller(move |_| {
+            let _ = tx.send(());
+        });
+        // We got here without blocking; the work must not run until released.
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("work runs once the guard is free");
     }
 
     #[test]
@@ -5300,6 +5485,44 @@ mod tests {
         let mut changed = base;
         changed.sections[0].accounts[0].windows[2].reset = "2h".into();
         assert_ne!(sig1, menu_signature(&changed));
+    }
+
+    #[test]
+    fn menu_signature_folds_settings_and_account_error() {
+        let base = one_section_snap(acct("you@work.com", Some(50.0), Some(60.0), true));
+        let sig = menu_signature(&base);
+        let mut m = one_section_snap(acct("you@work.com", Some(50.0), Some(60.0), true));
+        m.tray_icon_mode = Some("codex".into());
+        assert_ne!(sig, menu_signature(&m), "tray_icon_mode");
+        let mut m = one_section_snap(acct("you@work.com", Some(50.0), Some(60.0), true));
+        m.use_credits = !m.use_credits;
+        assert_ne!(sig, menu_signature(&m), "use_credits");
+        for i in 0..3 {
+            let mut m = one_section_snap(acct("you@work.com", Some(50.0), Some(60.0), true));
+            let c = &mut m.notification_config;
+            match i {
+                0 => c.threshold_enabled = !c.threshold_enabled,
+                1 => c.reset_back_enabled = !c.reset_back_enabled,
+                _ => c.pace_enabled = !c.pace_enabled,
+            }
+            assert_ne!(sig, menu_signature(&m), "notification flag {i}");
+        }
+        let mut m = one_section_snap(acct("you@work.com", Some(50.0), Some(60.0), true));
+        m.sections[0].accounts[0].error = Some("boom".into());
+        assert_ne!(sig, menu_signature(&m), "account error");
+    }
+
+    #[test]
+    fn window_status_row_locks_at_the_countdown_threshold() {
+        let w = WindowView {
+            id: "weekly".into(),
+            label: "7d".into(),
+            pct: Some(99.7),
+            reset: "3d".into(),
+        };
+        let (text, locked) = window_status_row(&w).unwrap();
+        assert!(locked, "99.7% is locked per countdown threshold: {text}");
+        assert!(text.contains("unlocks in"), "{text}");
     }
 
     #[test]
@@ -6340,6 +6563,29 @@ mod tests {
     }
 
     #[test]
+    fn restore_rejects_redacted_dump_and_keeps_live_tokens() {
+        let _g = crate::store::ScopedConfigDir::new();
+        let mut live = crate::store::State::default();
+        live.accounts.push(restore_test_acct("a@e.com"));
+        live.save().unwrap();
+        let redacted = crate::store::redact_state_for_dump(&crate::store::State::load().unwrap());
+        let path = crate::store::config_dir()
+            .unwrap()
+            .join("redacted-dump.json");
+        std::fs::write(&path, serde_json::to_vec(&redacted).unwrap()).unwrap();
+
+        let dialog = crate::platform::MockFileDialog::default();
+        *dialog.pick_file_returns.borrow_mut() = Some(path);
+        handle_backup_restore_dialog_with(&dialog);
+
+        let after = crate::store::State::load().unwrap();
+        assert_eq!(
+            after.accounts[0].access_token, "at",
+            "restoring a redacted dump must not overwrite live tokens"
+        );
+    }
+
+    #[test]
     fn backup_restore_click_calls_file_dialog_pick_file_once() {
         let _g = crate::store::ScopedConfigDir::new();
         let dialog = crate::platform::MockFileDialog::default();
@@ -6377,6 +6623,22 @@ mod tests {
         let mut a = crate::store::Account::from_keychain_blob(&blob).unwrap();
         a.email = Some(email.to_string());
         a
+    }
+
+    #[test]
+    fn restore_dropped_list_is_stable_across_calls_with_several_provider_slugs() {
+        use crate::store::{accounts_dropped_by, ScopedConfigDir, State};
+        let _g = ScopedConfigDir::new();
+        let mut current = State::default();
+        for slug in ["codex", "zed", "alpha", "mid"] {
+            current.upsert_provider_account(slug, codex_state_acct("k@x.com"));
+        }
+        current.save().unwrap();
+        let first = accounts_dropped_by(&State::default()).unwrap();
+        assert_eq!(first.len(), 4, "{first:?}");
+        for _ in 0..40 {
+            assert_eq!(accounts_dropped_by(&State::default()).unwrap(), first);
+        }
     }
 
     #[test]
@@ -6814,6 +7076,41 @@ mod tests {
     }
 
     #[test]
+    fn recovery_ignores_a_maxed_opus_only_window() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let mk = || {
+            let mut a = acct("solo@x.com", Some(10.0), Some(30.0), true);
+            a.windows.push(WindowView {
+                id: "opus".into(),
+                label: "Opus 7d".into(),
+                pct: Some(100.0),
+                reset: "2d".into(),
+            });
+            a
+        };
+        let a = mk();
+        let mut sec = claude_section();
+        sec.accounts = vec![mk()];
+        assert_eq!(
+            recovery_status(&sec, &a, now),
+            None,
+            "session/weekly have headroom: the account is usable"
+        );
+    }
+
+    #[test]
+    fn at_risk_tray_falls_back_to_locked_active_when_nothing_else_is_active() {
+        let mut a = acct("solo@x.com", Some(10.0), Some(100.0), true);
+        a.weekly_reset_at = Some(now_utc() + chrono::Duration::days(2));
+        let snap = one_section_snap(a);
+        assert!(
+            tray_target(&snap, None).is_some(),
+            "a locked sole active account must still be the tray target"
+        );
+        assert_ne!(title_for(&snap), "—");
+    }
+
+    #[test]
     fn recovery_blocked_without_any_reset_time_still_reports_the_block() {
         // Both limits maxed with no reset known anywhere: not "usage is fine".
         let a = acct("solo@x.com", Some(100.0), Some(10.0), true);
@@ -7243,6 +7540,17 @@ mod tests {
     }
 
     #[test]
+    fn renew_login_store_only_uses_claude_store_for_claude() {
+        let _g = crate::store::ScopedConfigDir::new();
+        let mut st = State::default();
+        let mut a = restore_test_acct("me@x.com");
+        a.login_store = Some("s-abc".into());
+        st.accounts.push(a);
+        assert_eq!(renew_login_store(&st, CLAUDE_SLUG, "me@x.com"), "s-abc");
+        assert_eq!(renew_login_store(&st, "codex", "me@x.com"), "me@x.com");
+    }
+
+    #[test]
     fn accounts_needing_relogin_lists_claude_and_provider_accounts_sorted() {
         let _g = crate::store::ScopedConfigDir::new();
         let mut st = State::default();
@@ -7254,6 +7562,14 @@ mod tests {
         c.needs_relogin = true;
         st.upsert_provider_account("codex", c);
         st.upsert_provider_account("codex", codex_state_acct("ok@x.com"));
+        st.save().unwrap();
+        assert_eq!(accounts_needing_relogin(), ["c@x.com", "z@x.com"]);
+
+        // A lapsed (Free) provider account renders its plan, not "re-login".
+        let mut lapsed = codex_state_acct("free@x.com");
+        lapsed.needs_relogin = true;
+        lapsed.no_subscription = true;
+        st.upsert_provider_account("codex", lapsed);
         st.save().unwrap();
         assert_eq!(accounts_needing_relogin(), ["c@x.com", "z@x.com"]);
 
@@ -7453,6 +7769,15 @@ mod tests {
             );
 
             handle_click("switch:codex:a@example.com");
+            // The switch runs on a worker thread; wait for it to land.
+            for _ in 0..500 {
+                let st = State::load().unwrap();
+                if st.provider_accounts("codex").unwrap().active.as_deref() == Some("a@example.com")
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
             let st = State::load().unwrap();
             assert_eq!(
                 st.provider_accounts("codex").unwrap().active.as_deref(),
@@ -7463,7 +7788,8 @@ mod tests {
                 blob_a
             );
         });
-        let _ = wait_for_poll_request(Duration::ZERO); // the switch asked for a poll
+        // The worker asks for a poll after switching; consume it.
+        let _ = wait_for_poll_request(Duration::from_secs(5));
     }
 
     #[test]
