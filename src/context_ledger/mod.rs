@@ -9,6 +9,15 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Ledger diagnostics to stderr. Unlike `eprintln!`, a closed stderr pipe
+/// (`usagio context 2>&1 | head`) is ignored instead of panicking.
+macro_rules! ledger_warn {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 pub mod claude;
 pub mod cli;
 pub mod codex;
@@ -144,6 +153,17 @@ const MAX_CONTEXT_FILE_BYTES: u64 = 4 << 20;
 
 /// Read a context file for token counting: regular files only (no FIFOs,
 /// devices, ...), capped at [`MAX_CONTEXT_FILE_BYTES`].
+/// `proj` and its ancestors up to (and including) the nearest directory with
+/// a `.git` entry, nearest first. Just `proj` when there is no git root.
+pub(crate) fn dirs_up_to_git_root(proj: &Path) -> Vec<&Path> {
+    let Some(root) = proj.ancestors().find(|d| d.join(".git").exists()) else {
+        return vec![proj];
+    };
+    let mut dirs: Vec<&Path> = proj.ancestors().take_while(|d| *d != root).collect();
+    dirs.push(root);
+    dirs
+}
+
 pub(crate) fn read_capped(path: &Path) -> Option<Vec<u8>> {
     read_capped_max(path, MAX_CONTEXT_FILE_BYTES)
 }

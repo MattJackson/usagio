@@ -43,10 +43,10 @@ pub fn run(provider: Option<String>, project: Option<PathBuf>) -> anyhow::Result
                 printed_any = true;
             }
             Err(super::LedgerError::UnknownProvider(_)) => {
-                eprintln!("usagio context: unknown provider '{}'", prov);
+                ledger_warn!("usagio context: unknown provider '{}'", prov);
             }
             Err(err) => {
-                eprintln!("usagio context: {} failed: {}", prov, err);
+                ledger_warn!("usagio context: {} failed: {}", prov, err);
             }
         }
     }

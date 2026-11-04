@@ -3,11 +3,12 @@
 //! Codex context sources (from openai/codex repo inspection):
 //! The Codex home is `$CODEX_HOME` (non-empty), defaulting to `~/.codex`.
 //! - <codex home>/AGENTS.override.md, else AGENTS.md — global instructions
-//! - <codex home>/instructions.md — global instructions (older name; only
-//!   used when AGENTS.md is absent)
+//!   (the legacy TS CLI's instructions.md is not read by current Codex)
 //! - <codex home>/config.toml → any [mcp_servers.*] blocks
 //! - AGENTS.override.md, else AGENTS.md in each directory from the git root
-//!   down to <project> — project-scoped instructions, capped at 32 KiB total
+//!   down to <project> — project-scoped instructions, capped at 32 KiB total.
+//!   The first of those that exists is the directory's doc; a blank one
+//!   contributes nothing (an empty override suppresses AGENTS.md)
 //!
 //! Codex evolves quickly — recheck paths against upstream when re-verifying.
 
@@ -43,11 +44,10 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     };
 
     // Global instructions — the first non-empty of AGENTS.override.md,
-    // AGENTS.md, instructions.md (the older name, only a fallback).
+    // AGENTS.md.
     for (fname, display) in [
         ("AGENTS.override.md", "Global AGENTS.override.md"),
         ("AGENTS.md", "Global AGENTS.md"),
-        ("instructions.md", "Global instructions.md"),
     ] {
         let before = items.len();
         push_file_if_exists(
@@ -79,24 +79,29 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
             if remaining == 0 {
                 break;
             }
+            // Codex takes the first candidate that exists as a file; a blank
+            // one contributes nothing rather than falling through.
+            let Some(fname) = ["AGENTS.override.md", "AGENTS.md"]
+                .into_iter()
+                .find(|f| dir.join(f).is_file())
+            else {
+                continue;
+            };
             let label = if dir == proj {
-                "Project AGENTS.md".to_string()
+                format!("Project {fname}")
             } else {
-                format!("AGENTS.md ({})", dir.display())
+                format!("{fname} ({})", dir.display())
             };
             let before = items.len();
-            for fname in ["AGENTS.override.md", "AGENTS.md"] {
-                push_file_if_exists(
-                    &mut items,
-                    dir.join(fname),
-                    ItemKind::ProjectInstructions,
-                    &label,
-                    Some(remaining),
-                );
-                if items.len() > before {
-                    remaining = remaining.saturating_sub(items[before].content_bytes);
-                    break;
-                }
+            push_file_if_exists(
+                &mut items,
+                dir.join(fname),
+                ItemKind::ProjectInstructions,
+                &label,
+                Some(remaining),
+            );
+            if items.len() > before {
+                remaining = remaining.saturating_sub(items[before].content_bytes);
             }
         }
     }
@@ -108,9 +113,9 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
             .ok_or_else(|| "not a regular file or unreadable".to_string())
             .and_then(|b| String::from_utf8(b).map_err(|e| e.to_string()));
         match read {
-            Err(e) => eprintln!("could not read {}: {}", config.display(), e),
+            Err(e) => ledger_warn!("could not read {}: {}", config.display(), e),
             Ok(text) => match toml::from_str::<toml::Value>(&text) {
-                Err(e) => eprintln!("could not parse {}: {}", config.display(), e),
+                Err(e) => ledger_warn!("could not parse {}: {}", config.display(), e),
                 Ok(parsed) => {
                     if let Some(mcp_servers) = parsed.get("mcp_servers").and_then(|v| v.as_table())
                     {
@@ -139,7 +144,7 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
                                     content_bytes: summary.byte_count,
                                     tool_count: Some(summary.tool_count),
                                 }),
-                                Err(err) => eprintln!("codex mcp {} skipped: {}", name, err),
+                                Err(err) => ledger_warn!("codex mcp {} skipped: {}", name, err),
                             }
                         }
                     }

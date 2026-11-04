@@ -67,7 +67,17 @@ pub fn migrate_config_dir_if_needed() -> Result<MigrationResult, MigrationError>
     // `parent()` of the new-slug config dir is the base we'd have joined
     // `LEGACY_APP_SLUG` onto), so we derive the base by trimming the app
     // segment off `platform().paths().config_dir(APP_SLUG)`.
-    let new_dir = crate::platform().paths().config_dir(crate::APP_SLUG);
+    migrate_for_config_dir(crate::platform().paths().config_dir(crate::APP_SLUG))
+}
+
+/// Migrate the legacy sibling of `new_dir` into it.
+fn migrate_for_config_dir(new_dir: PathBuf) -> Result<MigrationResult, MigrationError> {
+    // Mirror `store::config_dir`'s guard: an empty or relative config dir
+    // (e.g. `$HOME` unset) means there is no real config to migrate, and
+    // anything matched would be relative to the cwd.
+    if !new_dir.is_absolute() {
+        return Ok(MigrationResult::FreshInstall);
+    }
     let base = new_dir
         .parent()
         .ok_or(MigrationError::NoConfigBase)?
@@ -104,17 +114,11 @@ pub fn migrate_between(old: &Path, new: &Path) -> Result<MigrationResult, Migrat
             }
 
             match std::fs::rename(old, new) {
-                Ok(()) => {
-                    eprintln!(
-                        "usagio: migrated config {} → {}",
-                        old.display(),
-                        new.display()
-                    );
-                    Ok(MigrationResult::Migrated {
-                        from: old.to_path_buf(),
-                        to: new.to_path_buf(),
-                    })
-                }
+                // Silent: the caller prints the user-facing message.
+                Ok(()) => Ok(MigrationResult::Migrated {
+                    from: old.to_path_buf(),
+                    to: new.to_path_buf(),
+                }),
                 Err(e) if is_cross_device(&e) => copy_delete_fallback(old, new),
                 Err(e) => Err(MigrationError::RenameFailed(e)),
             }
@@ -488,6 +492,22 @@ mod tests {
     fn is_cross_device_false_for_other_errors() {
         assert!(!is_cross_device(&io::Error::from_raw_os_error(2)));
         assert!(!is_cross_device(&io::Error::other("boom")));
+    }
+
+    /// With `$HOME` unset the platform config dir is cwd-relative; the
+    /// migration must not move a cwd-relative `.config/claude-usage`.
+    #[test]
+    fn relative_config_dir_is_never_migrated() {
+        let cwd = tempfile::tempdir_in(".").unwrap();
+        let rel = PathBuf::from(cwd.path().file_name().unwrap());
+        write(
+            &rel.join(crate::LEGACY_APP_SLUG).join("state.json"),
+            b"{}",
+            0o600,
+        );
+        let r = migrate_for_config_dir(rel.join(crate::APP_SLUG)).unwrap();
+        assert!(matches!(r, MigrationResult::FreshInstall), "{r:?}");
+        assert!(rel.join(crate::LEGACY_APP_SLUG).join("state.json").exists());
     }
 
     // --- user_home ---

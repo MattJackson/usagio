@@ -186,7 +186,7 @@ impl Loopback {
                 bail!("timed out waiting for sign-in");
             }
             match self.listener.accept() {
-                Ok((stream, _)) => match self.answer(stream, state) {
+                Ok((stream, _)) => match self.answer(stream, state, cancel) {
                     Callback::Code(code) => return Ok(code),
                     Callback::Denied(why) => bail!("sign-in was not authorized: {why}"),
                     Callback::Ignore => {}
@@ -199,8 +199,8 @@ impl Loopback {
         }
     }
 
-    fn answer(&self, stream: TcpStream, state: &str) -> Callback {
-        let line = read_request_line(&stream);
+    fn answer(&self, stream: TcpStream, state: &str, cancel: &AtomicBool) -> Callback {
+        let line = read_request_line(&stream, cancel);
         let target = line.split_whitespace().nth(1).unwrap_or("");
         let result = parse_callback(target, self.path, state);
         let (status, body) = match &result {
@@ -240,9 +240,11 @@ fn is_transient_accept_error(kind: std::io::ErrorKind) -> bool {
 
 /// The request line of one request, read under an overall deadline and size
 /// cap so an idle preconnect or a slow local client can't stall the wait loop
-/// (which also polls for cancel and timeout). Reads through the end of the
-/// headers so closing the socket after replying doesn't reset it.
-fn read_request_line(stream: &TcpStream) -> String {
+/// (which also polls for cancel and timeout). Gives up as soon as `cancel` is
+/// set, so a superseded flow frees its (possibly fixed) port promptly. Reads
+/// through the end of the headers so closing the socket after replying
+/// doesn't reset it.
+fn read_request_line(stream: &TcpStream, cancel: &AtomicBool) -> String {
     const MAX: usize = 8192;
     let deadline = Instant::now() + Duration::from_secs(3);
     let _ = stream.set_nonblocking(false);
@@ -250,7 +252,11 @@ fn read_request_line(stream: &TcpStream) -> String {
     let mut head = Vec::new();
     let mut buf = [0u8; 1024];
     let mut s = stream;
-    while head.len() < MAX && Instant::now() < deadline && !head.ends_with(b"\r\n\r\n") {
+    while head.len() < MAX
+        && Instant::now() < deadline
+        && !head.ends_with(b"\r\n\r\n")
+        && !cancel.load(Ordering::SeqCst)
+    {
         match s.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => head.extend_from_slice(&buf[..n]),
