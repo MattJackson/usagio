@@ -2377,8 +2377,10 @@ fn mirror_inactive_rotation(
     outcome.unwrap_or_default()
 }
 
-/// Refresh metadata independently of token rotation. Called again under the
-/// state lock at poll commit so skipped usage fetches still persist the name.
+/// Refresh metadata independently of token rotation, reading
+/// `~/.claude.json` itself. The poll shares one reading through
+/// [`sync_active_claude_identity_from`] instead.
+#[cfg(test)]
 fn sync_active_claude_identity(state: &mut State) {
     sync_active_claude_identity_from(state, read_claude_identity().0.as_ref());
 }
@@ -2904,9 +2906,8 @@ const PREPAID_REFRESH_SECS: i64 = 10 * 60;
 /// Per-account `(attempted_at, fetched balance)` of the last `prepaid/credits`
 /// request. A failed attempt is recorded too (as `None`), so an erroring
 /// endpoint is not retried every poll.
-static PREPAID_CACHE: std::sync::Mutex<
-    Option<std::collections::HashMap<String, (i64, Option<providers::trait_def::Money>)>>,
-> = std::sync::Mutex::new(None);
+type PrepaidCache = std::collections::HashMap<String, (i64, Option<providers::trait_def::Money>)>;
+static PREPAID_CACHE: std::sync::Mutex<Option<PrepaidCache>> = std::sync::Mutex::new(None);
 
 /// Fill in the real prepaid wallet balance for an account with credits on.
 /// `/usage` reports `spend.balance: null` even when the wallet holds money, so

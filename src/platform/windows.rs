@@ -40,7 +40,6 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 // muri 0.9's `muda-compat` facade replaces `tray-icon`/`muda` for the Windows
 // tray menu (0.6.0 swap). A pure drop-in: `muri::compat::tray_icon` re-exports
@@ -199,6 +198,7 @@ pub struct WindowsMenu {
     cmd_tx: Mutex<Option<mpsc::Sender<UiCmd>>>,
     click_cb: Arc<Mutex<Option<ClickCb>>>,
     quit: Arc<AtomicBool>,
+    wake: LoopWaker,
 }
 
 impl Default for WindowsMenu {
@@ -209,6 +209,7 @@ impl Default for WindowsMenu {
             cmd_tx: Mutex::new(None),
             click_cb: Arc::new(Mutex::new(None)),
             quit: Arc::new(AtomicBool::new(false)),
+            wake: LoopWaker::default(),
         }
     }
 }
@@ -218,23 +219,87 @@ impl Default for WindowsMenu {
 /// requiring `tray_icon::TrayIcon` itself to be `Send`.
 pub struct WindowsMenuHandle {
     tx: mpsc::Sender<UiCmd>,
+    wake: LoopWaker,
+}
+
+impl WindowsMenuHandle {
+    fn send(&self, cmd: UiCmd) -> Result<()> {
+        self.tx
+            .send(cmd)
+            .map_err(|_| anyhow::anyhow!("tray event loop is not running"))?;
+        self.wake.wake();
+        Ok(())
+    }
 }
 
 impl MenuHandle for WindowsMenuHandle {
     fn set_icon(&self, png_bytes: &[u8]) -> Result<()> {
-        self.tx
-            .send(UiCmd::SetIcon(png_bytes.to_vec()))
-            .map_err(|_| anyhow::anyhow!("tray event loop is not running"))
+        self.send(UiCmd::SetIcon(png_bytes.to_vec()))
     }
     fn set_title(&self, title: &str) -> Result<()> {
-        self.tx
-            .send(UiCmd::SetTitle(title.to_string()))
-            .map_err(|_| anyhow::anyhow!("tray event loop is not running"))
+        self.send(UiCmd::SetTitle(title.to_string()))
     }
     fn set_menu(&self, menu: MenuTree) -> Result<()> {
-        self.tx
-            .send(UiCmd::SetMenu(menu))
-            .map_err(|_| anyhow::anyhow!("tray event loop is not running"))
+        self.send(UiCmd::SetMenu(menu))
+    }
+}
+
+/// Wakes the tray thread out of its message wait when work arrives from
+/// another thread (a `UiCmd`, or a quit request): posts a no-op thread message
+/// to the loop's thread once it has recorded its id. Before that the loop
+/// hasn't waited yet, and drains the channel on its first pass anyway.
+#[derive(Clone, Default)]
+struct LoopWaker(Arc<std::sync::atomic::AtomicU32>);
+
+/// Thread message used only to end the tray loop's wait.
+const WM_USAGIO_WAKE: u32 = ::windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x55;
+
+impl LoopWaker {
+    fn bind_current_thread(&self) {
+        #[rustfmt::skip]
+        use ::windows::Win32::System::Threading::GetCurrentThreadId;
+        // SAFETY: plain FFI call with no arguments.
+        self.0
+            .store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
+    }
+
+    fn wake(&self) {
+        #[rustfmt::skip]
+        use ::windows::Win32::{
+            Foundation::{LPARAM, WPARAM},
+            UI::WindowsAndMessaging::PostThreadMessageW,
+        };
+        let tid = self.0.load(Ordering::SeqCst);
+        if tid != 0 {
+            // SAFETY: posting a parameterless app message to a thread id; a
+            // stale id just fails. Failure is harmless: the loop's wait has a
+            // timeout as a backstop.
+            let _ = unsafe { PostThreadMessageW(tid, WM_USAGIO_WAKE, WPARAM(0), LPARAM(0)) };
+        }
+    }
+}
+
+/// Upper bound on one wait of the tray loop, a backstop in case a wake is
+/// lost. Normal wake-ups come from window messages or [`LoopWaker`].
+const TRAY_WAIT_BACKSTOP_MS: u32 = 1000;
+
+/// Block until this thread has a message in its queue (window input, a
+/// posted message, a [`LoopWaker`] wake), or the backstop elapses.
+fn wait_for_messages() {
+    #[rustfmt::skip]
+    use ::windows::Win32::UI::WindowsAndMessaging::{
+        MsgWaitForMultipleObjectsEx, MWMO_INPUTAVAILABLE, QS_ALLINPUT,
+    };
+    // SAFETY: no handles; waits only on this thread's message queue.
+    // MWMO_INPUTAVAILABLE returns at once if input is already queued, so a
+    // message that arrived after the last pump is never slept through.
+    unsafe {
+        let _ = MsgWaitForMultipleObjectsEx(
+            None,
+            TRAY_WAIT_BACKSTOP_MS,
+            QS_ALLINPUT,
+            MWMO_INPUTAVAILABLE,
+        );
     }
 }
 
@@ -341,7 +406,10 @@ impl MenuBackend for WindowsMenu {
         *self.cmd_rx.lock().unwrap() = Some(rx);
         *self.cmd_tx.lock().unwrap() = Some(tx.clone());
 
-        Ok(Box::new(WindowsMenuHandle { tx }))
+        Ok(Box::new(WindowsMenuHandle {
+            tx,
+            wake: self.wake.clone(),
+        }))
     }
 
     fn on_click(&self, cb: Box<dyn Fn(&str) + Send + Sync + 'static>) -> Result<()> {
@@ -391,6 +459,9 @@ impl MenuBackend for WindowsMenu {
         );
 
         let menu_rx = MenuEvent::receiver();
+        // From here a sender's wake reaches this thread; anything sent before
+        // is drained by the first pass below.
+        self.wake.bind_current_thread();
         loop {
             if self.quit.load(Ordering::SeqCst) {
                 break;
@@ -406,13 +477,19 @@ impl MenuBackend for WindowsMenu {
                     cb(&ev.id.0);
                 }
             }
-            std::thread::sleep(Duration::from_millis(30));
+            // Menu clicks are dispatched on this thread by the pump above;
+            // UI commands and quit requests from other threads post a wake.
+            if self.quit.load(Ordering::SeqCst) {
+                break;
+            }
+            wait_for_messages();
         }
         Ok(())
     }
 
     fn request_quit(&self) {
         self.quit.store(true, Ordering::SeqCst);
+        self.wake.wake();
     }
 }
 
@@ -902,6 +979,30 @@ mod tests {
     }
 
     // --- M7: request_quit() before run_event_loop() must not be a no-op ----
+
+    #[test]
+    fn a_wake_from_another_thread_ends_the_tray_wait_promptly() {
+        // The tray loop blocks in wait_for_messages instead of polling; a
+        // UiCmd or quit from another thread must end that wait at once, not
+        // after the backstop.
+        let waker = LoopWaker::default();
+        waker.bind_current_thread();
+        pump_windows_messages(); // start from an empty queue
+        let remote = waker.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            remote.wake();
+        });
+        let started = std::time::Instant::now();
+        wait_for_messages();
+        let waited = started.elapsed();
+        t.join().unwrap();
+        pump_windows_messages();
+        assert!(
+            waited < std::time::Duration::from_millis(u64::from(TRAY_WAIT_BACKSTOP_MS) / 2),
+            "wait ran {waited:?}: the wake was not delivered"
+        );
+    }
 
     #[test]
     fn request_quit_before_run_event_loop_returns_immediately() {
