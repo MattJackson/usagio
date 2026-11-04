@@ -7585,3 +7585,31 @@ fn cli_wait_loop_does_not_replay_its_pick_over_a_newer_queued_one() {
         assert_eq!(now.pending_switch.as_ref().map(|p| p.key.as_str()), Some(b));
     });
 }
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "reads or writes the OS secret store, which is only hermetic (in-memory) on macOS"
+)]
+fn guarded_switch_refuses_a_target_removed_during_phase_one() {
+    with_claude_home("a@e.com", |_home| {
+        seed_claude_state(
+            vec![
+                claude_account_with_identity("a@e.com", 3_600_000),
+                claude_account_with_identity("b@e.com", 3_600_000),
+            ],
+            Some("a@e.com"),
+        );
+        let provider = providers::get(CLAUDE_SLUG).unwrap();
+        prime_active_slot(&mock_claude_blob("at-a@e.com", "rt-a", 9_999_999_999_999));
+        let acct = State::load().unwrap().find("b@e.com").cloned().unwrap();
+        let identity = acct.oauth_account.clone().unwrap();
+        // `usagio rm b` lands while prepare_switch is on the network.
+        let mut st = State::load().unwrap();
+        assert!(st.remove("b@e.com"));
+        st.save().unwrap();
+        let _ = switch_to_guarded(provider, "b@e.com", &acct, &identity, false, None, false);
+        assert_eq!(State::load().unwrap().active.as_deref(), Some("a@e.com"));
+        assert_ne!(keychain_access_token().as_deref(), Some(acct.access_token.as_str()));
+    });
+}

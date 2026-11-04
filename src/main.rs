@@ -2107,6 +2107,11 @@ fn switch_to_guarded(
         // the stale `st`) to later re-push pre-rotation tokens on switch-
         // back. See H_R2_1 in the round-2 codeaudit findings.
         st = State::load()?;
+        // A remove may have landed during the unlocked phase 1; never make a
+        // deleted account live (same rule as the provider path).
+        if st.find(email).is_none() {
+            bail!("{label} was removed before the switch could complete");
+        }
         // Preserve any token rotation the currently-active session picked up
         // and wrote into the keychain (Claude legacy path). This mutates `st`
         // in memory; the final `st.save()` below persists the freshest tokens.
