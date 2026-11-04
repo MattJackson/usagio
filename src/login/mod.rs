@@ -204,7 +204,13 @@ impl Loopback {
         let target = line.split_whitespace().nth(1).unwrap_or("");
         let result = parse_callback(target, self.path, state);
         let (status, body) = match &result {
-            Callback::Code(_) => ("200 OK", page("Signed in", "You can close this window.")),
+            Callback::Code(_) => (
+                "200 OK",
+                page(
+                    "Sign-in received",
+                    "Return to usagio to finish; the result is shown there.",
+                ),
+            ),
             Callback::Denied(why) => ("200 OK", page("Sign-in cancelled", why)),
             Callback::Ignore => ("404 Not Found", String::new()),
         };
