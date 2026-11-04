@@ -224,9 +224,12 @@ fn refresh_token_grant_maps_statuses_and_missing_access_token() {
         Invalid,
         Transient,
     }
-    let cases: [(u16, &str, Want); 5] = [
+    let cases: [(u16, &str, Want); 6] = [
         (401, "{}", Want::Invalid),
-        (403, "{}", Want::Invalid),
+        // 403 is terminal only with a JSON OAuth error body; a bare 403
+        // (firewall/CDN page, empty object) is transient.
+        (403, r#"{"error":"invalid_grant"}"#, Want::Invalid),
+        (403, "{}", Want::Transient),
         (500, "{}", Want::Transient),
         // 200 without access_token is a malformed reply, not a grant.
         (200, r#"{"refresh_token":"x"}"#, Want::Transient),
