@@ -401,6 +401,8 @@ impl MenuBackend for WindowsMenu {
                     crate::logging::log(&format!("windows tray: UI command failed: {e}"));
                 }
             }
+            // Work a worker handed back to this (the UI) thread.
+            crate::menubar::run_ui_tasks();
             while let Ok(ev) = menu_rx.try_recv() {
                 if let Some(cb) = self.click_cb.lock().unwrap().as_ref() {
                     cb(&ev.id.0);

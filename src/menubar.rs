@@ -1049,6 +1049,8 @@ pub fn run() -> Result<()> {
         if let Some(start) = &start_exe {
             maybe_relaunch_after_upgrade(start);
         }
+        // Work a worker handed back to the main thread (a sign-in window).
+        run_ui_tasks();
         // A menu closes before its click is delivered, so handling it here won't
         // fight menu tracking.
         while let Ok(ev) = menu_rx.try_recv() {
@@ -3589,12 +3591,10 @@ fn handle_renew(slug: &str, key: &str) {
     }
     let (slug, key) = (slug.to_string(), key.to_string());
     let s = slug.clone();
-    begin_login_after_superseding(&s, move |browser_only| {
-        begin_renew(&slug, &key, browser_only)
-    });
+    begin_login_after_superseding(&s, move || begin_renew(&slug, &key));
 }
 
-fn begin_renew(slug: &str, key: &str, browser_only: bool) {
+fn begin_renew(slug: &str, key: &str) {
     let Some(provider) = providers::get(slug) else {
         return;
     };
@@ -3611,13 +3611,7 @@ fn begin_renew(slug: &str, key: &str, browser_only: bool) {
         Err(e) => notify(&format!("Renew failed: {e:#}")),
     });
     match started {
-        Ok(s) => show_sign_in(
-            &format!("Renew {key} — usagio"),
-            slug,
-            &store,
-            &s,
-            browser_only,
-        ),
+        Ok(s) => show_sign_in(&format!("Renew {key} — usagio"), slug, &store, &s),
         Err(e) => notify(&format!("Renew failed: {e:#}")),
     }
 }
@@ -3675,12 +3669,10 @@ fn handle_sign_in(slug: &str) {
         return;
     }
     let owned = slug.to_string();
-    begin_login_after_superseding(slug, move |browser_only| {
-        begin_sign_in(&owned, browser_only)
-    });
+    begin_login_after_superseding(slug, move || begin_sign_in(&owned));
 }
 
-fn begin_sign_in(slug: &str, browser_only: bool) {
+fn begin_sign_in(slug: &str) {
     let Some(provider) = providers::get(slug) else {
         return;
     };
@@ -3701,44 +3693,56 @@ fn begin_sign_in(slug: &str, browser_only: bool) {
             slug,
             &store,
             &s,
-            browser_only,
         ),
         Err(e) => notify(&format!("Sign-in failed: {e:#}")),
     }
 }
 
 /// Show a started login in the sign-in window, or the default browser where
-/// no window can be shown here.
-fn show_sign_in(
-    title: &str,
-    slug: &str,
-    store: &str,
-    started: &crate::login::Started,
-    browser_only: bool,
-) {
+/// no window can be shown here. UI thread only.
+fn show_sign_in(title: &str, slug: &str, store: &str, started: &crate::login::Started) {
     let platform = crate::platform();
-    let in_window = !browser_only
-        && platform.sign_in_window_available()
-        && match platform.open_sign_in_window(
-            title,
-            &started.url,
-            slug,
-            store,
-            std::sync::Arc::clone(&started.progress),
-        ) {
-            Ok(()) => true,
-            Err(e) => {
-                crate::logging::log(&format!("sign-in window failed, using browser: {e:#}"));
-                false
-            }
-        };
-    if !in_window {
-        match platform.open_url(&started.url) {
-            Ok(()) => track_browser_login(slug, std::sync::Arc::clone(&started.progress)),
-            Err(e) => {
-                started.progress.cancel();
-                notify(&format!("Sign-in failed: {e:#}"));
-            }
+    present_sign_in(
+        slug,
+        started,
+        platform.sign_in_window_available().then_some(|| {
+            platform.open_sign_in_window(
+                title,
+                &started.url,
+                slug,
+                store,
+                std::sync::Arc::clone(&started.progress),
+            )
+        }),
+        || platform.open_url(&started.url),
+    );
+}
+
+/// [`show_sign_in`]'s logic with the window and browser injected: try the
+/// window, fall back to the browser, and track the flow either way so a newer
+/// sign-in for `slug` can stop it (and free its port).
+fn present_sign_in(
+    slug: &str,
+    started: &crate::login::Started,
+    open_window: Option<impl FnOnce() -> Result<()>>,
+    open_browser: impl FnOnce() -> Result<()>,
+) {
+    let in_window = open_window.is_some_and(|open| match open() {
+        Ok(()) => true,
+        Err(e) => {
+            crate::logging::log(&format!("sign-in window failed, using browser: {e:#}"));
+            false
+        }
+    });
+    if in_window {
+        track_login(slug, std::sync::Arc::clone(&started.progress));
+        return;
+    }
+    match open_browser() {
+        Ok(()) => track_login(slug, std::sync::Arc::clone(&started.progress)),
+        Err(e) => {
+            started.progress.cancel();
+            notify(&format!("Sign-in failed: {e:#}"));
         }
     }
 }
@@ -3766,15 +3770,17 @@ fn login_message(mut msg: String, r: &crate::login::Renewed) -> String {
     msg
 }
 
-/// The in-flight browser-fallback login per provider. Nothing else can stop
-/// its loopback listener (Codex's fixed port 1455 included) once the tab is
-/// closed, so a newer sign-in for the same provider supersedes it first.
-static BROWSER_LOGINS: std::sync::Mutex<
+/// The in-flight login per provider, shown in the sign-in window or the
+/// browser. A newer sign-in for the same provider supersedes it first: an
+/// open (possibly hidden) window or a closed tab would otherwise keep its
+/// loopback listener — Codex's fixed port 1455 included — and the new flow
+/// could not bind. A superseded window closes itself once its flow ends.
+static IN_FLIGHT_LOGINS: std::sync::Mutex<
     Option<std::collections::HashMap<String, std::sync::Arc<crate::login::Progress>>>,
 > = std::sync::Mutex::new(None);
 
-fn track_browser_login(slug: &str, progress: std::sync::Arc<crate::login::Progress>) {
-    let replaced = BROWSER_LOGINS
+fn track_login(slug: &str, progress: std::sync::Arc<crate::login::Progress>) {
+    let replaced = IN_FLIGHT_LOGINS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(Default::default)
@@ -3785,11 +3791,11 @@ fn track_browser_login(slug: &str, progress: std::sync::Arc<crate::login::Progre
     }
 }
 
-/// Supersede the previous browser login for `slug`, if any. Never blocks; the
+/// Supersede the previous login for `slug`, if any. Never blocks; the
 /// caller waits for the listener to be released ([`wait_released`]) off the UI
 /// thread before binding the same port again.
 fn supersede_previous_login(slug: &str) -> Option<std::sync::Arc<crate::login::Progress>> {
-    let prev = BROWSER_LOGINS
+    let prev = IN_FLIGHT_LOGINS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_mut()
@@ -3828,32 +3834,53 @@ fn login_gen(slug: &str, bump: bool) -> u64 {
     *g
 }
 
-/// Run `begin(browser_only)` for a new sign-in on `slug`. With nothing to
-/// supersede it runs inline (the UI thread, window allowed). Otherwise the
-/// wait for the old listener happens on a worker, and since no window can be
-/// opened off the main thread, the new flow uses the browser. A newer click
-/// made during that wait wins: the worker then starts nothing.
-fn begin_login_after_superseding(slug: &str, begin: impl FnOnce(bool) + Send + 'static) {
+/// Run `begin` for a new sign-in on `slug`, on the UI thread (it may open
+/// the sign-in window, which keeps the account's own cookie store). With
+/// nothing to supersede it runs inline. Otherwise a worker waits for the old
+/// flow to release its listener — never the UI thread — and then hands
+/// `begin` back to the UI thread ([`run_on_ui_thread`]). A newer click made
+/// meanwhile wins: the handed-back `begin` then starts nothing.
+fn begin_login_after_superseding(slug: &str, begin: impl FnOnce() + Send + 'static) {
     let gen = login_gen(slug, true);
     match supersede_previous_login(slug) {
-        None => begin(false),
+        None => begin(),
         Some(prev) => {
             let slug = slug.to_string();
-            #[cfg(test)]
-            let home = crate::store::home_override();
             std::thread::spawn(move || {
-                #[cfg(test)]
-                crate::store::set_home_override(home);
                 wait_released(&prev);
-                if login_gen(&slug, false) == gen {
-                    begin(true);
-                } else {
-                    crate::logging::log(&format!(
-                        "event=login_superseded_while_waiting provider={slug}"
-                    ));
-                }
+                run_on_ui_thread(move || {
+                    if login_gen(&slug, false) == gen {
+                        begin();
+                    } else {
+                        crate::logging::log(&format!(
+                            "event=login_superseded_while_waiting provider={slug}"
+                        ));
+                    }
+                });
             });
         }
+    }
+}
+
+type UiTask = Box<dyn FnOnce() + Send>;
+
+/// Work handed to the UI thread from a worker; drained by [`run_ui_tasks`].
+static UI_TASKS: std::sync::Mutex<Vec<UiTask>> = std::sync::Mutex::new(Vec::new());
+
+/// Queue `task` to run on the UI thread at its next event-loop tick.
+fn run_on_ui_thread(task: impl FnOnce() + Send + 'static) {
+    UI_TASKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Box::new(task));
+}
+
+/// Run the tasks queued by [`run_on_ui_thread`]. Called from every platform's
+/// UI-thread event loop (the macOS tick, the GTK timeout, the Win32 pump).
+pub(crate) fn run_ui_tasks() {
+    let tasks = std::mem::take(&mut *UI_TASKS.lock().unwrap_or_else(|e| e.into_inner()));
+    for task in tasks {
+        task();
     }
 }
 
@@ -8637,7 +8664,7 @@ mod tests {
     #[test]
     fn a_finished_browser_login_is_not_superseded_and_leaves_the_registry() {
         let done = std::sync::Arc::new(crate::login::Progress::default());
-        track_browser_login("t-login-done", done.clone());
+        track_login("t-login-done", done.clone());
         done.mark_finished();
         assert!(
             supersede_previous_login("t-login-done").is_none(),
@@ -8650,8 +8677,8 @@ mod tests {
     fn tracking_a_new_browser_login_supersedes_the_one_it_replaces() {
         let old = std::sync::Arc::new(crate::login::Progress::default());
         let new = std::sync::Arc::new(crate::login::Progress::default());
-        track_browser_login("t-login-replace", old.clone());
-        track_browser_login("t-login-replace", new.clone());
+        track_login("t-login-replace", old.clone());
+        track_login("t-login-replace", new.clone());
         assert!(
             old.is_superseded(),
             "a replaced flow must not keep its listener untracked"
@@ -8719,57 +8746,144 @@ mod tests {
         );
     }
 
+    /// Serializes the tests that drain the shared UI task queue.
+    static UI_TASKS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Drain the UI queue on this (the "UI") thread until `flag` is set.
+    fn drain_until(flag: &std::sync::atomic::AtomicBool) -> bool {
+        use std::sync::atomic::Ordering;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !flag.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            run_ui_tasks();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        flag.load(Ordering::SeqCst)
+    }
+
     #[test]
     fn a_newer_sign_in_click_wins_over_a_worker_still_waiting() {
+        let _home = crate::store::ScopedConfigDir::new();
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
-        let wait_for = |flag: &AtomicBool| {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while !flag.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            flag.load(Ordering::SeqCst)
-        };
+        let _ui = UI_TASKS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Click 2 supersedes A and waits on a worker; click 3 finds nothing
         // tracked and starts inline. The waiting worker must not start B.
         let a = Arc::new(crate::login::Progress::default());
-        track_browser_login("t-login-gen", a.clone());
+        track_login("t-login-gen", a.clone());
         let started_b = Arc::new(AtomicBool::new(false));
         let b = Arc::clone(&started_b);
-        begin_login_after_superseding("t-login-gen", move |_| b.store(true, Ordering::SeqCst));
+        begin_login_after_superseding("t-login-gen", move || b.store(true, Ordering::SeqCst));
         let started_c = Arc::new(AtomicBool::new(false));
         let c = Arc::clone(&started_c);
-        begin_login_after_superseding("t-login-gen", move |browser_only| {
-            assert!(!browser_only, "nothing to supersede: runs inline");
-            c.store(true, Ordering::SeqCst);
-        });
-        assert!(started_c.load(Ordering::SeqCst));
+        begin_login_after_superseding("t-login-gen", move || c.store(true, Ordering::SeqCst));
+        assert!(
+            started_c.load(Ordering::SeqCst),
+            "nothing to supersede: runs inline"
+        );
         a.mark_finished();
-        std::thread::sleep(Duration::from_millis(500));
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            run_ui_tasks();
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(
             !started_b.load(Ordering::SeqCst),
             "an older click's worker started after a newer click"
         );
         // Control: with no newer click the worker does start its flow.
         let d = Arc::new(crate::login::Progress::default());
-        track_browser_login("t-login-gen", d.clone());
+        track_login("t-login-gen", d.clone());
         let started_e = Arc::new(AtomicBool::new(false));
         let e = Arc::clone(&started_e);
-        begin_login_after_superseding("t-login-gen", move |browser_only| {
-            assert!(browser_only);
-            e.store(true, Ordering::SeqCst);
-        });
+        begin_login_after_superseding("t-login-gen", move || e.store(true, Ordering::SeqCst));
         d.mark_finished();
-        assert!(wait_for(&started_e), "the only waiting click never started");
+        assert!(
+            drain_until(&started_e),
+            "the only waiting click never started"
+        );
         supersede_previous_login("t-login-gen");
+    }
+
+    #[test]
+    fn a_superseding_sign_in_starts_on_the_ui_thread_after_the_port_is_free() {
+        let _home = crate::store::ScopedConfigDir::new();
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let _ui = UI_TASKS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = Arc::new(crate::login::Progress::default());
+        track_login("t-login-ui", old.clone());
+        let started = Arc::new(AtomicBool::new(false));
+        let ran_on = Arc::new(Mutex::new(None));
+        let (s, r, o) = (Arc::clone(&started), Arc::clone(&ran_on), Arc::clone(&old));
+        begin_login_after_superseding("t-login-ui", move || {
+            // Only once the old flow released its listener.
+            assert!(
+                o.is_finished(),
+                "started before the old listener was released"
+            );
+            *r.lock().unwrap() = Some(std::thread::current().id());
+            s.store(true, Ordering::SeqCst);
+        });
+        assert!(old.is_superseded(), "the old flow is stopped at once");
+        assert!(!started.load(Ordering::SeqCst), "the UI thread never waits");
+        std::thread::sleep(Duration::from_millis(100));
+        run_ui_tasks();
+        assert!(!started.load(Ordering::SeqCst), "old listener still held");
+        old.mark_finished();
+        assert!(drain_until(&started), "the new sign-in never started");
+        assert_eq!(
+            *ran_on.lock().unwrap(),
+            Some(std::thread::current().id()),
+            "the new flow must start on the UI thread (it may open a window)"
+        );
+    }
+
+    #[test]
+    fn a_sign_in_shown_in_the_window_is_tracked_and_superseded() {
+        let _home = crate::store::ScopedConfigDir::new();
+        let started = crate::login::Started {
+            url: "https://auth.example.com/".into(),
+            progress: std::sync::Arc::new(crate::login::Progress::default()),
+        };
+        let mut browser_opened = false;
+        present_sign_in("t-login-window", &started, Some(|| Ok(())), || {
+            browser_opened = true;
+            Ok(())
+        });
+        assert!(!browser_opened, "the window opened: no browser");
+        let prev = supersede_previous_login("t-login-window")
+            .expect("a window flow must be tracked so a newer sign-in can stop it");
+        assert!(std::sync::Arc::ptr_eq(&prev, &started.progress));
+        assert!(started.progress.is_superseded());
+    }
+
+    #[test]
+    fn a_sign_in_falls_back_to_the_browser_and_is_tracked() {
+        let _home = crate::store::ScopedConfigDir::new();
+        let started = crate::login::Started {
+            url: "https://auth.example.com/".into(),
+            progress: std::sync::Arc::new(crate::login::Progress::default()),
+        };
+        let mut browser_opened = false;
+        present_sign_in(
+            "t-login-fallback",
+            &started,
+            Some(|| Err(anyhow::anyhow!("no window here"))),
+            || {
+                browser_opened = true;
+                Ok(())
+            },
+        );
+        assert!(browser_opened);
+        assert!(supersede_previous_login("t-login-fallback").is_some());
     }
 
     #[test]
     fn a_new_browser_login_cancels_the_previous_one_for_that_provider() {
         let old = std::sync::Arc::new(crate::login::Progress::default());
         let other = std::sync::Arc::new(crate::login::Progress::default());
-        track_browser_login("t-login-a", old.clone());
-        track_browser_login("t-login-b", other.clone());
+        track_login("t-login-a", old.clone());
+        track_login("t-login-b", other.clone());
         let prev = supersede_previous_login("t-login-a").expect("tracked");
         assert!(std::sync::Arc::ptr_eq(&prev, &old));
         assert!(
