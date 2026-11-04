@@ -4,7 +4,7 @@ use crate::notifications::notify;
 use crate::poll::trackers::{claim_subscription_check, clear_inactive_fetch_backoff};
 use crate::providers::trait_def::PlanStatus;
 use crate::providers::{Provider, CLAUDE_SLUG};
-use crate::state_ops::{save_if_changed, with_state_lock};
+use crate::state_ops::with_state_lock;
 use crate::store::State;
 use crate::switching::provider::provider_by_slug;
 use crate::{lifecycle, logging};
@@ -87,9 +87,8 @@ pub(crate) fn persist_plan(
     refreshed: Option<&(String, String, i64)>,
 ) {
     let lapsed = !plan.active;
-    let res = with_state_lock(|| {
+    let res = with_state_lock(|_| {
         let mut st = State::load()?;
-        let loaded = serde_json::to_vec(&st).unwrap_or_default();
         let mut changed = false;
         let apply = |no_sub: &mut bool, label: &mut Option<String>| {
             let was = *no_sub;
@@ -110,7 +109,7 @@ pub(crate) fn persist_plan(
                 lifecycle::set_provider_tokens(provider, a, at, rt, *exp)?;
             }
         }
-        save_if_changed(&st, &loaded)?;
+        st.save()?;
         Ok(changed)
     });
     match res {

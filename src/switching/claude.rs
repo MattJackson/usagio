@@ -77,11 +77,10 @@ pub(crate) fn prepare_switch(
         // (e.g. `usagio switch <active>` to relaunch, or clicking the active
         // row) must therefore ADOPT the vendor slot's current token, exactly
         // like the poll loop's active path — never mint one. See
-        // `active_refresh_cas`'s doc.
-        if matches!(
-            active_refresh_cas(provider, &mut acct),
-            ActiveRefreshOutcome::RefreshFailed
-        ) {
+        // `active_refresh_cas`'s doc. The CAS may write the slot, so it runs
+        // under the state lock.
+        let outcome = with_state_lock(|lock| Ok(active_refresh_cas(lock, provider, &mut acct)))?;
+        if matches!(outcome, ActiveRefreshOutcome::RefreshFailed) {
             logging::log(&format!(
                 "switch: active account {email} slot unreadable; keeping stored \
                  token (never POST /token for the active account)"
@@ -155,22 +154,17 @@ pub(crate) fn claim_refresh_token(
 ) -> std::result::Result<(), String> {
     if is_active {
         // `active_refresh_cas` requires the state lock (it may write the slot).
-        let cas = with_state_lock(|| {
+        let cas = with_state_lock(|lock| {
             let mut st = State::load()?;
-            let outcome = st.find_mut(email).map(|a| {
-                let before = serde_json::to_value(&*a).ok();
-                let outcome = active_refresh_cas(provider, a);
-                let changed = serde_json::to_value(&*a).ok() != before;
-                (outcome, a.clone(), changed)
-            });
-            if outcome.as_ref().is_some_and(|(_, _, changed)| *changed) {
-                st.save()?;
-            }
+            let outcome = st
+                .find_mut(email)
+                .map(|a| (active_refresh_cas(lock, provider, a), a.clone()));
+            st.save()?;
             Ok(outcome)
         });
         match cas {
-            Ok(Some((ActiveRefreshOutcome::Adopted, fresh, _))) => *acct = fresh,
-            Ok(Some((ActiveRefreshOutcome::RefreshFailed, _, _))) | Ok(None) => {
+            Ok(Some((ActiveRefreshOutcome::Adopted, fresh))) => *acct = fresh,
+            Ok(Some((ActiveRefreshOutcome::RefreshFailed, _))) | Ok(None) => {
                 logging::log(&format!(
                     "claim: active account {email} slot unreadable; using stored token"
                 ));
@@ -279,7 +273,7 @@ pub(crate) fn switch_to_guarded(
     // sees its saved rotation instead of writing a just-consumed refresh
     // token to the keychain.
     let _refresh = oauth::refresh_lock()?;
-    let switched = with_state_lock(|| {
+    let switched = with_state_lock(|_| {
         let mut st = State::load()?;
         if let Some(exp) = expect_active {
             if st.active.as_deref() != Some(exp)

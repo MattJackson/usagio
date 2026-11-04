@@ -1,14 +1,21 @@
 //! Shared account identity and credential persistence rules.
-use crate::credentials::with_state_lock;
+use crate::credentials::{with_state_lock, StateGuard};
 use crate::providers::{require, IdentitySnapshot, Provider, TokenGrant};
 use crate::store::{Account, ProviderAccount, State};
 use crate::{logging, providers};
 use anyhow::{bail, Result};
 use chrono::Utc;
 
+/// Proof that this process holds the refresh lock (see [`refresh_lock`]);
+/// released when dropped. Functions that must run under it take
+/// `&RefreshGuard`.
+pub struct RefreshGuard {
+    _file: std::fs::File,
+}
+
 /// Serialize refresh and switch preparation across usagio processes. Always
 /// acquire this before the state lock, including on the legacy Claude path.
-pub fn refresh_lock() -> Result<std::fs::File> {
+pub fn refresh_lock() -> Result<RefreshGuard> {
     use fs2::FileExt;
     let dir = crate::store::config_dir()?;
     std::fs::create_dir_all(&dir)?;
@@ -19,7 +26,7 @@ pub fn refresh_lock() -> Result<std::fs::File> {
         .write(true)
         .open(dir.join("refresh.lock"))?;
     file.lock_exclusive()?;
-    Ok(file)
+    Ok(RefreshGuard { _file: file })
 }
 
 /// One transaction policy for both account stores: serialize, reload ownership,
@@ -90,7 +97,7 @@ fn prepare_provider_refresh(
     key: &str,
 ) -> Result<PreparedRefresh<ProviderAccount>> {
     let slug = provider.provider_id();
-    let (snapshot, active) = crate::credentials::with_state_lock(|| {
+    let (snapshot, active) = crate::credentials::with_state_lock(|_| {
         let state = crate::store::State::load()?;
         let active = state
             .provider_accounts(slug)
@@ -124,7 +131,7 @@ fn prepare_provider_refresh(
     };
     if let Some(blob) = matched {
         let grant = require(provider.token_lifecycle())?.parse_stored_blob(&blob)?;
-        let adopted = crate::credentials::with_state_lock(|| {
+        let adopted = crate::credentials::with_state_lock(|_| {
             let mut state = crate::store::State::load()?;
             let account = state
                 .find_provider_account_mut(slug, key)
@@ -165,7 +172,7 @@ fn commit_provider_refresh(
     snapshot: &ProviderAccount,
     refreshed: Result<ProviderAccount>,
 ) -> Result<ProviderAccount> {
-    crate::credentials::with_state_lock(|| {
+    crate::credentials::with_state_lock(|_| {
         let mut state = crate::store::State::load()?;
         let account = state
             .find_provider_account_mut(slug, key)
@@ -300,9 +307,10 @@ pub(crate) enum ActiveRefreshOutcome {
     RefreshFailed,
 }
 
-/// Adopt only the matching vendor-owned login. Caller holds the state lock.
+/// Adopt only the matching vendor-owned login, under the state lock.
 /// Never POST a refresh grant for a credential owned by the vendor client.
 pub(crate) fn active_refresh_cas(
+    _lock: &StateGuard,
     provider: &dyn Provider,
     acct: &mut Account,
 ) -> ActiveRefreshOutcome {
@@ -411,7 +419,7 @@ pub(crate) fn refresh_provider_active_account(slug: &str) {
     {
         return;
     }
-    let result = with_state_lock(|| {
+    let result = with_state_lock(|_| {
         let mut state = State::load()?;
         let Some(active_key) = state.provider_accounts(slug).and_then(|p| p.active.clone()) else {
             return Ok(()); // nothing captured / nothing active for this provider yet
@@ -569,7 +577,7 @@ fn adopt_saved_rotation(acct: &mut Account) -> Result<(bool, bool)> {
 /// moved on meanwhile: the account went active (its tokens now come only from
 /// the vendor's slot), or a newer login replaced `sent` ("Renew login…").
 fn save_rotation(acct: &Account, sent: &str) -> anyhow::Result<()> {
-    crate::credentials::with_state_lock(|| {
+    crate::credentials::with_state_lock(|_| {
         let mut st = crate::store::State::load()?;
         if crate::credentials::is_active_key(acct.key(), st.active.as_deref()) {
             return Ok(());
@@ -598,10 +606,12 @@ pub(crate) fn client_status(
     }
 }
 
-/// Drain before changing credentials. Caller holds state and refresh locks.
+/// Drain before changing credentials, under the state and refresh locks.
 /// The durable receipt prevents retries from sending a second shutdown request,
 /// which some vendors interpret as force termination.
 pub(crate) fn prepare_handoff(
+    _lock: &StateGuard,
+    _refresh: &RefreshGuard,
     provider: &dyn Provider,
     status: &providers::ClientStatus,
     state: &mut State,

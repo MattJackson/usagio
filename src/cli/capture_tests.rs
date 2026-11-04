@@ -1,10 +1,11 @@
 use super::*;
-use crate::lifecycle::{active_refresh_cas, refresh_provider_active_account, ActiveRefreshOutcome};
+use crate::lifecycle::{refresh_provider_active_account, ActiveRefreshOutcome};
 use crate::providers::trait_def::LoginFlow;
 use crate::providers::trait_def::TokenGrant;
 use crate::providers::{Provider, CLAUDE_SLUG};
 use crate::rows::claude_plan_label;
 use crate::store::{Account, CachedUsage, State};
+use crate::test_support::locked_active_refresh_cas;
 use crate::test_support::{
     acct_with_cache, claude_account, codex_account, codex_auth_json, codex_login_response,
     hit_count, mock_claude_blob, prime_active_slot, spawn_mock_token_server,
@@ -744,7 +745,7 @@ fn failed_live_write_of_a_claude_renewal_sets_the_marker_the_poll_republishes() 
     // The next poll's CAS republishes the renewal over the old slot.
     let slot = MockActiveSlotProvider::new(&old_blob);
     let mut acct = a.clone();
-    let outcome = active_refresh_cas(&slot, &mut acct);
+    let outcome = locked_active_refresh_cas(&slot, &mut acct);
     assert!(
         matches!(outcome, ActiveRefreshOutcome::Adopted),
         "{outcome:?}"

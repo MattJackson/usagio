@@ -475,7 +475,7 @@ pub(crate) struct CycleResult {
 /// Apply `f` to `slug`'s swap memory under the state lock (reload, mutate,
 /// save) — never from a pre-fetch copy (§3.5).
 pub(crate) fn update_memory(slug: &str, f: impl FnOnce(&mut SwapMemory)) -> Result<SwapMemory> {
-    crate::state_ops::with_state_lock(|| {
+    crate::state_ops::with_state_lock(|_| {
         let mut st = State::load()?;
         let m = st.swap_memory.entry(slug.to_string()).or_default();
         let before = m.clone();
@@ -492,7 +492,7 @@ pub(crate) fn update_memory(slug: &str, f: impl FnOnce(&mut SwapMemory)) -> Resu
 /// key changed with no Auto/Manual note → `left_at`, cooldown, pick cleared)
 /// and pruning.
 pub(crate) fn begin_cycle(slug: &str, now: DateTime<Utc>) -> Result<State> {
-    crate::state_ops::with_state_lock(|| {
+    crate::state_ops::with_state_lock(|_| {
         let mut st = State::load()?;
         let active = crate::state_ops::provider_active(&st, slug);
         let m = st.swap_memory.entry(slug.to_string()).or_default();
@@ -783,7 +783,7 @@ pub(crate) fn soonest_unlock(assessed: &[Assessed], now: DateTime<Utc>) -> Optio
 /// Keep `manual_holds[slug]` ⇔ (pick settled tier ≥ Draining), so a rollback
 /// to the classic engine holds the same picks.
 pub(crate) fn dual_write_hold(slug: &str) {
-    let res = crate::state_ops::with_state_lock(|| {
+    let res = crate::state_ops::with_state_lock(|_| {
         let mut st = State::load()?;
         let Some(key) = st.manual_pick(slug).map(str::to_string) else {
             return Ok(());

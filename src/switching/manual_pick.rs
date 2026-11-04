@@ -122,7 +122,7 @@ pub(crate) fn release_reset_hold(
 /// against the saved trigger, the threshold `pick_tier` decided the hold by
 /// (not the cycle's effective one: auto-swap off runs at a 101% sentinel).
 pub(crate) fn settle_manual_picks() {
-    let settled = with_state_lock(|| {
+    let settled = with_state_lock(|_| {
         let mut st = State::load()?;
         let trigger = st.trigger_pct.unwrap_or(TRIGGER_PCT);
         let mut slugs: Vec<String> = st.manual_pick_at.keys().cloned().collect();

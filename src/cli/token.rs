@@ -24,25 +24,19 @@ pub(crate) fn token_selector(sel: &str) -> Result<&str> {
     }
 }
 
-/// The poll's locked active-account CAS: `(outcome, stored account)`. Saves
-/// only when the CAS changed the account, so idle cycles neither rewrite
-/// state.json nor rotate the rolling backups (as `save_if_changed`).
+/// The poll's locked active-account CAS: `(outcome, stored account)`. An
+/// idle cycle leaves the account unchanged, and `save` then neither rewrites
+/// state.json nor rotates the rolling backups.
 pub(crate) fn poll_active_cas(
     provider: &dyn Provider,
     email: &str,
 ) -> Result<(Option<ActiveRefreshOutcome>, Option<Account>)> {
-    with_state_lock(|| {
+    with_state_lock(|lock| {
         let mut st = State::load()?;
-        let mut changed = false;
-        let outcome = st.find_mut(email).map(|a| {
-            let before = serde_json::to_value(&*a).ok();
-            let outcome = active_refresh_cas(provider, a);
-            changed = serde_json::to_value(&*a).ok() != before;
-            outcome
-        });
-        if changed {
-            st.save()?;
-        }
+        let outcome = st
+            .find_mut(email)
+            .map(|a| active_refresh_cas(lock, provider, a));
+        st.save()?;
         let fresh = st.find(email).cloned();
         Ok((outcome, fresh))
     })
@@ -59,7 +53,7 @@ pub(crate) fn token_active_cas(
     provider: &dyn Provider,
     email: &str,
 ) -> Result<Option<(ActiveRefreshOutcome, Account)>> {
-    with_state_lock(|| {
+    with_state_lock(|lock| {
         let mut st = State::load()?;
         if !st
             .active
@@ -71,14 +65,10 @@ pub(crate) fn token_active_cas(
         let Some(a) = st.find_mut(email) else {
             return Ok(None);
         };
-        let before = serde_json::to_value(&*a).ok();
-        let outcome = active_refresh_cas(provider, a);
-        let changed = serde_json::to_value(&*a).ok() != before;
+        let outcome = active_refresh_cas(lock, provider, a);
         let acct = a.clone();
-        if changed {
-            st.save()
-                .context("recording the adopted token in state.json failed")?;
-        }
+        st.save()
+            .context("recording the adopted token in state.json failed")?;
         Ok(Some((outcome, acct)))
     })
 }

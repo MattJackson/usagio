@@ -15,7 +15,7 @@ use crate::poll::trackers::{
 use crate::providers::claude::{oauth, usage};
 use crate::providers::CLAUDE_SLUG;
 use crate::rows::{attach_prepaid_balance, cached_from_usage, cached_to_account_usage};
-use crate::state_ops::{save_if_changed, with_state_lock};
+use crate::state_ops::with_state_lock;
 use crate::store::{Account, CachedUsage, State};
 use crate::switching::claude::ensure_fresh_with_fallback;
 use crate::switching::identity::{
@@ -562,16 +562,16 @@ pub(crate) fn refresh_usage_cache_with(force: bool, defer_active: bool) -> Refre
     }
 
     // Merge under the lock with a fresh reload so we don't clobber a switch.
-    let merged = with_state_lock(|| {
+    let merged = with_state_lock(|_| {
         let mut st = State::load()?;
-        let before = serde_json::to_vec(&st).unwrap_or_default();
         sync_active_claude_identity_from(&mut st, claude_identity.as_ref());
         for (email, acct, cu, ns) in &updates {
             if let Some(a) = st.find_mut(email) {
                 merge_poll_update(a, acct, cu.as_ref(), ns.as_ref());
             }
         }
-        save_if_changed(&st, &before)?;
+        // An idle cycle changes nothing, and `save` then writes nothing.
+        st.save()?;
         Ok(())
     });
     if let Err(e) = merged {

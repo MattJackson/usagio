@@ -109,7 +109,7 @@ pub(crate) fn refresh_provider_usage_caches_with(
                 logging::log(&format!(
                     "event=credential_identity_mismatch provider={slug} account={key} reason={e}"
                 ));
-                let _ = with_state_lock(|| {
+                let _ = with_state_lock(|_| {
                     let mut st = State::load()?;
                     if let Some(a) = st.find_provider_account_mut(slug, &key) {
                         if a.secret_blob == acct.secret_blob {
@@ -316,7 +316,7 @@ pub(crate) fn persist_provider_observation(
     usage: Option<&CachedUsage>,
     plan: Option<&PlanStatus>,
 ) -> Result<bool> {
-    with_state_lock(|| {
+    with_state_lock(|_| {
         let mut state = State::load()?;
         let Some(current) = state.find_provider_account_mut(slug, &snapshot.key) else {
             return Ok(false);

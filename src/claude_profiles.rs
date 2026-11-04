@@ -34,7 +34,7 @@ fn refresh_with(
     // Oldest due account first; a failed request cannot starve later accounts.
     candidates.sort_by_key(|a| a.profile_refresh_after.unwrap_or(0));
     for candidate in candidates.into_iter().take(limit) {
-        let claimed = with_state_lock(|| {
+        let claimed = with_state_lock(|_| {
             let mut state = State::load()?;
             let Some(account) = state.find_mut(candidate.key()) else {
                 return Ok(None);
@@ -108,7 +108,7 @@ fn commit(snapshot: &Account, profile: &serde_json::Value) -> anyhow::Result<boo
         ));
         return Ok(false);
     }
-    let changed = with_state_lock(|| {
+    let changed = with_state_lock(|_| {
         let mut state = State::load()?;
         let Some(account) = state.find_mut(snapshot.key()) else {
             return Ok(None);

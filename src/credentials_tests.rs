@@ -425,9 +425,9 @@ fn nested_with_state_lock_does_not_deadlock() {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
             crate::store::set_home_override(Some(home_path));
-            let r: Result<()> = with_state_lock(|| {
+            let r: Result<()> = with_state_lock(|_| {
                 // Nested direct call — before the fix this blocked forever.
-                with_state_lock(|| Ok(()))?;
+                with_state_lock(|_| Ok(()))?;
                 Ok(())
             });
             let _ = tx.send(());
@@ -499,7 +499,7 @@ fn refresh_inactive_if_stale_skips_currently_active_account() {
     with_isolated_home(|| {
         // Seed state.json: one account, marked active. If the fn refreshed it
         // we'd race the vendor CLI's rotation — which is the whole bug.
-        with_state_lock(|| {
+        with_state_lock(|_| {
             let mut st = State::default();
             let a = Account {
                 email: Some("only@e.com".into()),
@@ -572,7 +572,7 @@ fn far_future_account(email: &str) -> crate::store::Account {
 fn refresh_inactive_if_stale_leaves_fresh_inactive_account_untouched() {
     use crate::store::State;
     with_isolated_home(|| {
-        with_state_lock(|| {
+        with_state_lock(|_| {
             let mut st = State::default();
             st.accounts.push(far_future_account("inactive@e.com"));
             st.active = None;
@@ -593,7 +593,7 @@ fn refresh_inactive_if_stale_leaves_fresh_inactive_account_untouched() {
 fn refresh_inactive_if_stale_considers_every_account_from_one_snapshot() {
     use crate::store::State;
     with_isolated_home(|| {
-        with_state_lock(|| {
+        with_state_lock(|_| {
             let mut st = State::default();
             st.accounts.push(far_future_account("first@e.com"));
             st.accounts.push(far_future_account("second@e.com"));
@@ -935,10 +935,10 @@ fn with_state_lock_holds_a_real_lock_and_tracks_nesting_depth() {
         let depth = || STATE_LOCK_DEPTH.with(|d| d.get());
 
         assert_eq!(depth(), 0);
-        with_state_lock(|| {
+        with_state_lock(|_| {
             assert_eq!(depth(), 1);
             assert!(probe_is_blocked(), "outer frame must hold the OS lock");
-            with_state_lock(|| {
+            with_state_lock(|_| {
                 assert_eq!(depth(), 2, "nesting increments the depth");
                 assert!(probe_is_blocked());
                 Ok(())
@@ -1071,7 +1071,7 @@ fn expired_account(email: &str) -> crate::store::Account {
 }
 
 fn seed_state(accounts: Vec<crate::store::Account>, active: Option<&str>) {
-    with_state_lock(|| {
+    with_state_lock(|_| {
         let st = crate::store::State {
             accounts,
             active: active.map(String::from),

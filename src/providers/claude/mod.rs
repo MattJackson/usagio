@@ -1676,7 +1676,7 @@ mod tests {
         expires_at: i64,
     ) -> crate::store::ScopedConfigDir {
         let cfg = crate::store::ScopedConfigDir::new();
-        crate::credentials::with_state_lock(|| {
+        crate::credentials::with_state_lock(|_| {
             let mut st = crate::store::State::load()?;
             let mut a = crate::store::Account::from_keychain_blob(&blob_with(access, expires_at))?;
             a.email = Some(email.into());
@@ -2023,7 +2023,7 @@ mod tests {
         let oa = serde_json::json!({"emailAddress":"a@e.com"});
         // No stored account: allowed.
         assert!(ensure_unverified_capture_is_safe("rt-live", Some(&oa)).is_ok());
-        crate::credentials::with_state_lock(|| {
+        crate::credentials::with_state_lock(|_| {
             let mut st = crate::store::State::load()?;
             let mut a = crate::store::Account::from_keychain_blob(
                 &serde_json::json!({"claudeAiOauth":{"accessToken":"at","refreshToken":"rt-stored","expiresAt":1i64}}).to_string(),

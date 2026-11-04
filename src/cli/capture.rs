@@ -104,7 +104,7 @@ pub(crate) fn capture_current() -> Result<(String, bool)> {
         logging::token_fingerprint(&acct.refresh_token),
         acct.expires_at,
     );
-    let existed = with_state_lock(|| {
+    let existed = with_state_lock(|_| {
         let mut state = State::load()?;
         let existing = state.find(&email);
         let existed = existing.is_some();
@@ -146,7 +146,7 @@ pub(crate) fn capture_current_generic(slug: &str) -> Result<(String, bool)> {
     let key = provider.account_identifier(&captured.identity);
     let expires_at = Utc::now().timestamp() + captured.tokens.expires_in_secs;
 
-    let existed = with_state_lock(|| {
+    let existed = with_state_lock(|_| {
         let mut state = State::load()?;
         state.adopt_legacy_provider_key(slug, &key);
         let existing = state.find_provider_account(slug, &key).cloned();
@@ -206,7 +206,7 @@ pub(crate) fn persist_login(
         return persist_claude_login(provider, key, captured, new_store);
     }
     let expires_at = Utc::now().timestamp() + captured.tokens.expires_in_secs;
-    let active = with_state_lock(|| {
+    let active = with_state_lock(|_| {
         let mut state = State::load()?;
         state.adopt_legacy_provider_key(slug, &key);
         let existing = state.find_provider_account(slug, &key).cloned();
@@ -286,12 +286,14 @@ pub(crate) fn persist_login(
     })?;
     let mut made_live = false;
     if active {
-        let _refresh = lifecycle::refresh_lock()?;
+        let refresh = lifecycle::refresh_lock()?;
         let attempt = (|| -> Result<bool> {
             let status = lifecycle::client_status(provider)?;
-            let ready = with_state_lock(|| {
+            let ready = with_state_lock(|lock| {
                 let mut state = State::load()?;
-                lifecycle::prepare_handoff(provider, &status, &mut state, &key, false)
+                lifecycle::prepare_handoff(
+                    lock, &refresh, provider, &status, &mut state, &key, false,
+                )
             })?;
             if ready {
                 commit_provider_switch(provider, slug, &key, false, false)?;
@@ -320,7 +322,7 @@ pub(crate) fn persist_claude_login(
 ) -> Result<login::Renewed> {
     let fresh = Account::from_keychain_blob(&captured.secret_blob)?;
     let native = &captured.identity.native_blob;
-    let (blob, active) = with_state_lock(|| {
+    let (blob, active) = with_state_lock(|_| {
         let mut state = State::load()?;
         let active = state
             .active
@@ -392,7 +394,7 @@ pub(crate) fn warn_expiring_logins() {
         return;
     }
     let now = Utc::now().timestamp_millis();
-    let due = with_state_lock(|| {
+    let due = with_state_lock(|_| {
         let mut st = State::load()?;
         let mut due = Vec::new();
         for a in st.accounts.iter_mut().filter(|a| !a.no_subscription) {

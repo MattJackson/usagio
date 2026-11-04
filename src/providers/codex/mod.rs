@@ -2102,7 +2102,7 @@ mod tests {
         // state.providers["codex"] via `with_state_lock_absorb` — the state
         // v2 equivalent of Claude's `absorb_credential`.
         let _cfg = crate::store::ScopedConfigDir::new();
-        crate::credentials::with_state_lock(|| {
+        crate::credentials::with_state_lock(|_| {
             let mut st = crate::store::State::load()?;
             st.upsert_provider_account(
                 "codex",
@@ -2143,7 +2143,7 @@ mod tests {
     #[test]
     fn absorb_credential_without_refresh_token_keeps_stored_grant() {
         let _cfg = crate::store::ScopedConfigDir::new();
-        crate::credentials::with_state_lock(|| {
+        crate::credentials::with_state_lock(|_| {
             let mut st = crate::store::State::load()?;
             st.upsert_provider_account(
                 "codex",
@@ -2226,7 +2226,7 @@ mod tests {
             }})
             .to_string()
         };
-        crate::credentials::with_state_lock(|| {
+        crate::credentials::with_state_lock(|_| {
             let mut st = crate::store::State::load()?;
             st.upsert_provider_account(
                 "codex",

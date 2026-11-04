@@ -797,3 +797,29 @@ pub(crate) fn codex_login_response(email: &str, account_id: &str) -> serde_json:
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
     serde_json::json!({"id_token": format!("e30.{payload}.sig"), "access_token": "renewed-at", "refresh_token": "renewed-rt"})
 }
+
+/// [`crate::lifecycle::active_refresh_cas`] under the state lock it requires.
+pub(crate) fn locked_active_refresh_cas(
+    provider: &dyn Provider,
+    acct: &mut Account,
+) -> crate::lifecycle::ActiveRefreshOutcome {
+    crate::credentials::with_state_lock(|lock| {
+        Ok(crate::lifecycle::active_refresh_cas(lock, provider, acct))
+    })
+    .unwrap()
+}
+
+/// [`crate::lifecycle::prepare_handoff`] under the refresh and state locks it
+/// requires.
+pub(crate) fn locked_prepare_handoff(
+    provider: &dyn Provider,
+    status: &crate::providers::ClientStatus,
+    state: &mut State,
+    key: &str,
+    manual: bool,
+) -> anyhow::Result<bool> {
+    let refresh = crate::lifecycle::refresh_lock()?;
+    crate::credentials::with_state_lock(|lock| {
+        crate::lifecycle::prepare_handoff(lock, &refresh, provider, status, state, key, manual)
+    })
+}

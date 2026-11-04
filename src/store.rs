@@ -1572,9 +1572,20 @@ pub fn save_state_safe(state: &State) -> Result<()> {
     // backups/, but the operator needs to know the safety net was bypassed).
     let json = serde_json::to_vec_pretty(state)?;
     let existing = std::fs::read(&path);
-    // Nothing to do when the file already holds exactly these bytes: no
-    // rewrite, and no rolling backup that would push real history out.
-    if existing.as_deref().is_ok_and(|old| old == json.as_slice()) {
+    // Nothing to do when the file already holds this state: no rewrite, and
+    // no rolling backup that would push real history out. "This state" means
+    // what loading the file would give: callers save under the state lock,
+    // so a state that equals its own load is unchanged. Compared as JSON
+    // values, not bytes, because the map fields serialize in per-process hash
+    // order. This is the one place every save passes through, so no caller
+    // has to remember to skip an unchanged save itself.
+    if existing.as_deref().is_ok_and(|old| {
+        old == json.as_slice()
+            || serde_json::from_slice::<serde_json::Value>(old).is_ok_and(|on_disk| {
+                serde_json::to_value(State::from_value(&on_disk)).ok()
+                    == serde_json::to_value(state).ok()
+            })
+    }) {
         return Ok(());
     }
     if let Err(ref e) = existing {
@@ -1792,10 +1803,13 @@ pub fn accounts_dropped_by(new_state: &State) -> Result<Vec<String>> {
 /// confirmed those drops with the user — see [`accounts_dropped_by`] — this
 /// function's job is only to carry that authorization through the same
 /// drop-protection guard every other write goes through, rather than
-/// bypassing it. Callers MUST hold `credentials::with_state_lock` around
-/// this call (H2, v0.5.0 codeaudit: the prior restore path took no lock at
-/// all, racing the daemon poll / a concurrent CLI command).
-pub fn save_state_restore(mut new_state: State) -> Result<()> {
+/// bypassing it. Runs under the state lock (H2, v0.5.0 codeaudit: the prior
+/// restore path took no lock at all, racing the daemon poll / a concurrent
+/// CLI command).
+pub fn save_state_restore(
+    _lock: &crate::credentials::StateGuard,
+    mut new_state: State,
+) -> Result<()> {
     let dropped = accounts_dropped_by(&new_state).unwrap_or_default();
     for entry in dropped {
         // `accounts_dropped_by` reports provider-account drops as

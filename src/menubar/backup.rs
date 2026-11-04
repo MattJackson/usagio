@@ -154,7 +154,7 @@ pub(super) fn handle_backup_restore_dialog_with(dialog: &dyn crate::platform::Fi
         return; // user declined; not an error
     }
 
-    let outcome = with_state_lock(|| -> Result<bool> {
+    let outcome = with_state_lock(|lock| -> Result<bool> {
         // Recompute under the lock: if the set of dropped accounts changed
         // while the dialog was open, the confirmation no longer applies.
         let dropped = crate::store::accounts_dropped_by(&new_state)?;
@@ -166,7 +166,7 @@ pub(super) fn handle_backup_restore_dialog_with(dialog: &dyn crate::platform::Fi
         // a failed restore leaves the live state.json untouched; the stash is
         // kept as an extra pre-restore copy.
         crate::store::stash_pre_restore(&dir)?;
-        crate::store::save_state_restore(new_state.clone())?;
+        crate::store::save_state_restore(lock, new_state.clone())?;
         Ok(true)
     });
 

@@ -1,5 +1,6 @@
 //! Provider-generic switching, including the queued (pending) switch protocol.
 
+use crate::lifecycle::RefreshGuard;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::poll::claude::log_manual_switch;
@@ -79,15 +80,15 @@ pub(crate) fn switch_provider_expecting(
     if !renewal_pending {
         lifecycle::ensure_provider_fresh(provider, key)?;
     }
-    let _refresh = lifecycle::refresh_lock()?;
+    let refresh = lifecycle::refresh_lock()?;
     let status = lifecycle::client_status(provider)?;
-    let ready = with_state_lock(|| {
+    let ready = with_state_lock(|lock| {
         let mut state = State::load()?;
         // Authoritative compare-and-set: same state lock as the queue write.
         if expected.is_some_and(|exp| !pending_switch_is(&state, slug, exp)) {
             return Ok(false);
         }
-        lifecycle::prepare_handoff(provider, &status, &mut state, key, manual)
+        lifecycle::prepare_handoff(lock, &refresh, provider, &status, &mut state, key, manual)
     })?;
     if !ready {
         return Ok(key.to_owned());
@@ -150,7 +151,7 @@ pub(crate) fn recover_obsolete_pending_switch(
     expected: &store::PendingSwitch,
 ) -> Result<()> {
     let slug = provider.provider_id();
-    let restart = with_state_lock(|| {
+    let restart = with_state_lock(|_| {
         let mut state = State::load()?;
         let accounts = state.provider_accounts_mut(slug);
         if accounts.pending_switch.as_ref() != Some(expected) {
@@ -202,7 +203,7 @@ pub(crate) fn recover_obsolete_pending_switch(
         if let Some(handoff) = handoff {
             handoff.handoff_client(&identity, Some(&token))?;
         }
-        with_state_lock(|| {
+        with_state_lock(|_| {
             let mut state = State::load()?;
             let accounts = state.provider_accounts_mut(slug);
             if accounts.pending_switch.as_ref() == Some(expected) {
@@ -238,7 +239,7 @@ pub(crate) fn commit_provider_switch_guarded(
     manual: bool,
     expect_active: Option<&str>,
 ) -> Result<Option<String>> {
-    let Some((acct, identity, drain_token)) = with_state_lock(|| {
+    let Some((acct, identity, drain_token)) = with_state_lock(|_| {
         // Absorb any lagging on-disk rotation for the OUTGOING account BEFORE we
         // overwrite the vendor's credential file — the same guard Claude's
         // `switch_to_guarded` applies (main.rs, `absorb_before_switch`). Without
@@ -332,7 +333,7 @@ pub(crate) fn commit_provider_switch_guarded(
             .handoff_client(&identity, drain_token.as_deref())
             .map_err(|error| anyhow!("credentials saved; client handoff will retry: {error}"))?;
     }
-    with_state_lock(|| {
+    with_state_lock(|_| {
         let mut state = State::load()?;
         let accounts = state.provider_accounts_mut(slug);
         let pending = accounts
@@ -426,22 +427,23 @@ pub(crate) fn switch_if_still_active(
     }
     let provider = provider_by_slug(slug)?;
     lifecycle::ensure_provider_fresh(provider, target)?;
-    let _refresh = lifecycle::refresh_lock()?;
+    let refresh = lifecycle::refresh_lock()?;
     let status = lifecycle::client_status(provider)?;
-    switch_provider_if_still_active(provider, &status, target, expect_active)
+    switch_provider_if_still_active(&refresh, provider, &status, target, expect_active)
 }
 
 /// Compare-and-set + handoff preparation under the state lock; the commit (which
 /// runs the seconds-long client handoff) happens AFTER the lock is released so
 /// `commit_provider_switch` can keep state reads responsive during the handoff.
 pub(crate) fn switch_provider_if_still_active(
+    refresh: &RefreshGuard,
     provider: &dyn Provider,
     status: &providers::ClientStatus,
     target: &str,
     expect_active: &str,
 ) -> Result<Option<String>> {
     let slug = provider.provider_id();
-    let ready = with_state_lock(|| {
+    let ready = with_state_lock(|lock| {
         let mut state = State::load()?;
         if state
             .provider_accounts(slug)
@@ -457,7 +459,7 @@ pub(crate) fn switch_provider_if_still_active(
         {
             return Ok(false);
         }
-        lifecycle::prepare_handoff(provider, status, &mut state, target, false)
+        lifecycle::prepare_handoff(lock, refresh, provider, status, &mut state, target, false)
     })?;
     if !ready {
         return Ok(None);

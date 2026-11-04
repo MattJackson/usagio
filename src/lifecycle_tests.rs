@@ -4,6 +4,8 @@ use crate::providers::claude::oauth;
 use crate::providers::trait_def::ClientHandoff;
 use crate::providers::Provider;
 use crate::store::{Account, State};
+use crate::test_support::locked_active_refresh_cas;
+use crate::test_support::locked_prepare_handoff;
 use crate::test_support::{
     codex_account, codex_auth_json, codex_id_token, hit_count, mock_claude_blob, read_log,
     spawn_mock_token_server, spawn_mock_usage_server, MockActiveSlotProvider,
@@ -37,7 +39,7 @@ fn active_refresh_never_posts_token_for_active_account() {
     let mut acct = Account::from_keychain_blob(&blob).unwrap();
     acct.email = Some("active@example.com".into());
 
-    let outcome = active_refresh_cas(&provider, &mut acct);
+    let outcome = locked_active_refresh_cas(&provider, &mut acct);
 
     oauth::set_token_url_override(None);
 
@@ -74,7 +76,7 @@ fn active_refresh_adopts_cc_rotation_from_slot() {
     acct.email = Some("active@example.com".into());
     acct.needs_relogin = true; // was flagged; adopting a live grant clears it
 
-    let outcome = active_refresh_cas(&provider, &mut acct);
+    let outcome = locked_active_refresh_cas(&provider, &mut acct);
 
     assert!(
         matches!(outcome, ActiveRefreshOutcome::Adopted),
@@ -99,7 +101,7 @@ fn active_refresh_in_sync_is_a_noop_adopt() {
     let mut acct = Account::from_keychain_blob(&blob).unwrap();
     acct.email = Some("active@example.com".into());
 
-    let outcome = active_refresh_cas(&provider, &mut acct);
+    let outcome = locked_active_refresh_cas(&provider, &mut acct);
 
     assert!(
         matches!(outcome, ActiveRefreshOutcome::Adopted),
@@ -215,11 +217,11 @@ fn active_refresh_reports_whether_the_vendor_cli_rotated_since_the_last_cycle() 
     provider.email = "log@example.com".into();
     let mut acct = Account::from_keychain_blob(&same).unwrap();
     acct.email = Some("log@example.com".into());
-    active_refresh_cas(&provider, &mut acct);
+    locked_active_refresh_cas(&provider, &mut acct);
     assert!(read_log().contains("event=active_refresh_in_sync account=log@example.com"));
     assert!(!read_log().contains("event=active_refresh_adopted"));
     provider.rotate_externally(&mock_claude_blob("new-at", "new-rt", 2));
-    active_refresh_cas(&provider, &mut acct);
+    locked_active_refresh_cas(&provider, &mut acct);
     assert!(read_log().contains("event=active_refresh_adopted account=log@example.com"));
     assert_eq!(acct.access_token, "new-at");
 }
@@ -234,7 +236,7 @@ fn claude_active_adoption_rejects_other_accounts_credentials() {
     account.email = Some("other@example.com".into());
     account.needs_relogin = true;
     assert!(matches!(
-        active_refresh_cas(&provider, &mut account),
+        locked_active_refresh_cas(&provider, &mut account),
         ActiveRefreshOutcome::RefreshFailed
     ));
     assert_eq!(account.keychain_blob, original);
@@ -257,11 +259,15 @@ fn graceful_handoff_drains_once_and_preserves_credentials_until_exit() {
         account_id: None,
         handoff_token: Some("instance-1".into()),
     };
-    assert!(!prepare_handoff(&provider, &status, &mut state, "b@example.com", true).unwrap());
+    assert!(
+        !locked_prepare_handoff(&provider, &status, &mut state, "b@example.com", true).unwrap()
+    );
     // Reload simulates another usagio process or a restart while draining.
     let mut reloaded = State::load().unwrap();
     status.busy = false;
-    assert!(!prepare_handoff(&provider, &status, &mut reloaded, "b@example.com", true).unwrap());
+    assert!(
+        !locked_prepare_handoff(&provider, &status, &mut reloaded, "b@example.com", true).unwrap()
+    );
     assert_eq!(*provider.drains.lock().unwrap(), vec!["instance-1"]);
     assert_eq!(
         provider.slot.lock().unwrap().as_deref(),
@@ -280,7 +286,9 @@ fn graceful_handoff_drains_once_and_preserves_credentials_until_exit() {
     provider
         .process_alive
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    assert!(prepare_handoff(&provider, &status, &mut reloaded, "b@example.com", true).is_err());
+    assert!(
+        locked_prepare_handoff(&provider, &status, &mut reloaded, "b@example.com", true).is_err()
+    );
     assert_eq!(
         provider.slot.lock().unwrap().as_deref(),
         Some("outgoing-secret")
@@ -300,7 +308,9 @@ fn graceful_handoff_drains_once_and_preserves_credentials_until_exit() {
     provider
         .process_alive
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    assert!(prepare_handoff(&provider, &status, &mut reloaded, "b@example.com", true).unwrap());
+    assert!(
+        locked_prepare_handoff(&provider, &status, &mut reloaded, "b@example.com", true).unwrap()
+    );
     assert_eq!(provider.drains.lock().unwrap().len(), 1);
 }
 
@@ -317,8 +327,8 @@ fn changing_a_pending_target_does_not_force_the_draining_daemon() {
         account_id: None,
         handoff_token: Some("same-instance".into()),
     };
-    prepare_handoff(&provider, &status, &mut state, "b@example.com", false).unwrap();
-    prepare_handoff(&provider, &status, &mut state, "c@example.com", true).unwrap();
+    locked_prepare_handoff(&provider, &status, &mut state, "b@example.com", false).unwrap();
+    locked_prepare_handoff(&provider, &status, &mut state, "c@example.com", true).unwrap();
     assert_eq!(provider.drains.lock().unwrap().len(), 1);
     let stored = State::load().unwrap();
     let pending = stored
@@ -347,9 +357,9 @@ fn idempotent_drain_retries_failed_delivery_without_losing_intent() {
         account_id: None,
         handoff_token: Some("instance".into()),
     };
-    assert!(prepare_handoff(&provider, &status, &mut state, "target", false).is_err());
+    assert!(locked_prepare_handoff(&provider, &status, &mut state, "target", false).is_err());
     let mut reloaded = State::load().unwrap();
-    assert!(!prepare_handoff(&provider, &status, &mut reloaded, "target", false).unwrap());
+    assert!(!locked_prepare_handoff(&provider, &status, &mut reloaded, "target", false).unwrap());
     assert_eq!(provider.drains.lock().unwrap().len(), 2);
     assert_eq!(provider.slot.lock().unwrap().as_deref(), Some("outgoing"));
 }
@@ -419,7 +429,7 @@ fn active_cas_adopts_a_vendor_rotation_even_with_a_lower_expiry() {
         Account::from_keychain_blob(&mock_claude_blob("old-at", "old-rt", 9_999_999_999_999))
             .unwrap();
     acct.email = Some("active@example.com".into());
-    let outcome = active_refresh_cas(&provider, &mut acct);
+    let outcome = locked_active_refresh_cas(&provider, &mut acct);
     assert!(
         matches!(outcome, ActiveRefreshOutcome::Adopted),
         "{outcome:?}"
@@ -440,7 +450,7 @@ fn active_cas_rewrites_the_slot_only_for_a_pending_live_write() {
     let mut acct = Account::from_keychain_blob(&new_blob).unwrap();
     acct.email = Some("active@example.com".into());
     acct.live_write_pending = Some(crate::logging::token_fingerprint("new-rt"));
-    let outcome = active_refresh_cas(&provider, &mut acct);
+    let outcome = locked_active_refresh_cas(&provider, &mut acct);
     assert!(
         matches!(outcome, ActiveRefreshOutcome::Adopted),
         "{outcome:?}"
@@ -459,7 +469,7 @@ fn active_cas_rewrites_the_slot_only_for_a_pending_live_write() {
     other.email = Some("active@example.com".into());
     other.live_write_pending = Some(crate::logging::token_fingerprint("older-rt"));
     *provider.slot.lock().unwrap() = Some(mock_claude_blob("v-at", "v-rt", 1));
-    active_refresh_cas(&provider, &mut other);
+    locked_active_refresh_cas(&provider, &mut other);
     assert_eq!(other.refresh_token, "v-rt");
 }
 
@@ -475,7 +485,7 @@ fn unchanged_drain_retry_does_not_resave_state() {
     state.provider_accounts_mut(slug).active = Some("a@e.com".into());
     state.save().unwrap();
     let status = provider.client_status().unwrap();
-    assert!(!prepare_handoff(&provider, &status, &mut state, "b@e.com", true).unwrap());
+    assert!(!locked_prepare_handoff(&provider, &status, &mut state, "b@e.com", true).unwrap());
     let backups = || {
         std::fs::read_dir(crate::store::config_dir().unwrap().join("backups"))
             .map(|d| d.count())
@@ -483,6 +493,6 @@ fn unchanged_drain_retry_does_not_resave_state() {
     };
     let before = backups();
     let mut again = State::load().unwrap();
-    assert!(!prepare_handoff(&provider, &status, &mut again, "b@e.com", true).unwrap());
+    assert!(!locked_prepare_handoff(&provider, &status, &mut again, "b@e.com", true).unwrap());
     assert_eq!(backups(), before, "an unchanged retry rotated a backup");
 }

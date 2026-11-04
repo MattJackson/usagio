@@ -51,7 +51,7 @@ pub(crate) fn mirror_inactive_rotation(
     // process. This lock is held across a `security(1)` write, but the mirror
     // only runs when a rotation was actually detected (rare), and the switch
     // path already holds the state lock across its own keychain write.
-    let outcome = with_state_lock(|| {
+    let outcome = with_state_lock(|_| {
         let slot = require(provider.active_slot());
         let vendor_identity = match slot.and_then(|slot| slot.read_active_identity()) {
             Ok(Some(id)) => id,

@@ -167,7 +167,7 @@ pub(crate) fn verify_swap_target_detailed(slug: &str, key: &str) -> std::result:
     if let Some(prev) = &previous {
         log_epoch_ends(slug, key, prev, &cu);
     }
-    let saved = with_state_lock(|| {
+    let saved = with_state_lock(|_| {
         let mut st = State::load()?;
         if slug == CLAUDE_SLUG {
             if let Some(a) = st.find_mut(key) {

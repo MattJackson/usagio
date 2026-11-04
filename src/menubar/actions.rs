@@ -531,7 +531,7 @@ pub(super) fn handle_remove(slug: &str, key: &str) {
 /// Enable or disable auto-swap. Surfaces a save failure so the menu checkmark
 /// and on-disk state can't silently disagree.
 pub(super) fn set_autoswap(enabled: bool) {
-    let r = with_state_lock(|| {
+    let r = with_state_lock(|_| {
         let mut st = State::load()?;
         st.autoswap_disabled = !enabled;
         st.save()
@@ -544,7 +544,7 @@ pub(super) fn set_autoswap(enabled: bool) {
 /// Settings ▸ Auto-swap ▸ "Use credits when every plan is used up". Flips the
 /// stored value under the lock (not the possibly stale menu snapshot's).
 pub(super) fn toggle_use_credits() {
-    let r = with_state_lock(|| {
+    let r = with_state_lock(|_| {
         let mut st = State::load()?;
         st.use_credits_when_exhausted = !st.use_credits_when_exhausted;
         st.save()
@@ -559,7 +559,7 @@ pub(super) fn toggle_use_credits() {
 /// to that provider slug. Reads-then-writes under the lock so a stale menu
 /// snapshot can't clobber a concurrent change.
 pub(super) fn set_tray_icon_mode(mode: &str) {
-    let r = with_state_lock(|| {
+    let r = with_state_lock(|_| {
         let mut st = State::load()?;
         st.tray_icon_mode = if mode == "at-risk" {
             None
@@ -578,7 +578,7 @@ pub(super) fn set_tray_icon_mode(mode: &str) {
 /// `menu_tree_from_snapshot` wires up) — reads-then-flips the on-disk value so a stale
 /// menu snapshot can't clobber a setting changed elsewhere in the meantime.
 pub(super) fn toggle_notification_trigger(trigger: &str) {
-    let r = with_state_lock(|| {
+    let r = with_state_lock(|_| {
         let mut st = State::load()?;
         let cfg = &mut st.notification_config;
         match trigger {
@@ -596,7 +596,7 @@ pub(super) fn toggle_notification_trigger(trigger: &str) {
 
 /// Set the swap threshold AND enable auto-swap.
 pub(super) fn set_autoswap_threshold(v: f64) {
-    let r = with_state_lock(|| {
+    let r = with_state_lock(|_| {
         let mut st = State::load()?;
         st.trigger_pct = Some(v);
         st.autoswap_disabled = false;

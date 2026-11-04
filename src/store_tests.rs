@@ -641,7 +641,8 @@ fn save_state_restore_succeeds_when_only_adding_accounts() {
     // test is that adding an account via restore never needs a
     // confirmation / never gets refused.
     let restore_target = make_state_with(&["a@e.com", "b@e.com"]);
-    save_state_restore(restore_target).expect("restore that only adds accounts must succeed");
+    crate::credentials::with_state_lock(|lock| save_state_restore(lock, restore_target))
+        .expect("restore that only adds accounts must succeed");
 
     let on_disk = State::load().unwrap();
     let keys: Vec<String> = on_disk
@@ -664,7 +665,8 @@ fn save_state_restore_authorizes_drops_that_a_plain_save_would_refuse() {
     // authorized path (the caller — the Restore… dialog — already confirmed
     // the drop with the user by the time this is called).
     let restore_target = make_state_with(&["a@e.com"]);
-    save_state_restore(restore_target).expect("save_state_restore must authorize the drop");
+    crate::credentials::with_state_lock(|lock| save_state_restore(lock, restore_target))
+        .expect("save_state_restore must authorize the drop");
 
     let on_disk = State::load().unwrap();
     let keys: Vec<String> = on_disk

@@ -1,14 +1,15 @@
 use super::*;
 use crate::lifecycle::ActiveRefreshOutcome;
+use crate::providers;
 use crate::providers::CLAUDE_SLUG;
 use crate::store::{Account, State};
 use crate::switching::claude::switch_to_guarded;
 use crate::switching::identity::sync_active_from_keychain;
+use crate::test_support::locked_active_refresh_cas;
 use crate::test_support::{
     claude_account_with_identity, mock_claude_blob, prime_active_slot, seed_claude_state,
     with_claude_home,
 };
-use crate::{lifecycle, providers};
 
 #[test]
 fn main_write_claude_identity_redoes_patch_when_file_changes_before_commit() {
@@ -139,7 +140,7 @@ fn pending_live_write_marker_does_not_survive_a_switch_away_and_back() {
         // The vendor CLI rotates the slot; no watcher absorbed it first.
         prime_active_slot(&mock_claude_blob("v-at", "v-rt", 9_999_999_999_999));
         let mut a = State::load().unwrap().find("a@e.com").cloned().unwrap();
-        let outcome = lifecycle::active_refresh_cas(provider, &mut a);
+        let outcome = locked_active_refresh_cas(provider, &mut a);
         assert!(
             matches!(outcome, ActiveRefreshOutcome::Adopted),
             "{outcome:?}"

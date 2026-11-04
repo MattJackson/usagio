@@ -36,7 +36,7 @@ fn refresh_provider_active_account_noop_when_provider_does_not_support_active_re
         no_subscription: false,
         plan: None,
     };
-    with_state_lock(|| {
+    with_state_lock(|_| {
         let mut st = State::load()?;
         st.upsert_provider_account("opencode", seed);
         st.provider_accounts_mut("opencode").active = Some("x@example.com".to_string());
@@ -158,7 +158,7 @@ fn claude_identity_refresh_persists_ultra_without_a_usage_fetch() {
         let mut identity = account.oauth_account.clone().unwrap();
         identity["planDisplayName"] = "Ultra".into();
         write_claude_identity(&identity, None).unwrap();
-        with_state_lock(|| {
+        with_state_lock(|_| {
             let mut state = State::load()?;
             sync_active_claude_identity(&mut state);
             state.save()
@@ -193,21 +193,40 @@ fn claude_identity_refresh_persists_ultra_without_a_usage_fetch() {
 }
 
 #[test]
-fn poll_merge_skips_save_when_nothing_changed() {
-    use crate::store::{ScopedConfigDir, State};
+fn save_skips_a_state_identical_to_the_file() {
+    use crate::store::{config_dir, ScopedConfigDir, State};
     let _g = ScopedConfigDir::new();
     let mut st = State {
         active: Some("a@x.com".into()),
         ..State::default()
     };
-    let before = serde_json::to_vec(&st).unwrap();
-    assert!(
-        !save_if_changed(&st, &before).unwrap(),
+    st.manual_picks.insert("claude".into(), "a@x.com".into());
+    st.manual_picks.insert("codex".into(), "b@x.com".into());
+    st.save().unwrap();
+    let path = config_dir().unwrap().join("state.json");
+    // The same state with its map keys in another order (another process's
+    // hash order) is still the same state: no rewrite.
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let picks = v["manual_picks"].as_object().unwrap().clone();
+    let mut reordered = serde_json::Map::new();
+    for (k, val) in picks.iter().rev() {
+        reordered.insert(k.clone(), val.clone());
+    }
+    v["manual_picks"] = serde_json::Value::Object(reordered);
+    let on_disk = serde_json::to_vec_pretty(&v).unwrap();
+    std::fs::write(&path, &on_disk).unwrap();
+    State::load().unwrap().save().unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        on_disk,
         "unchanged state must not be saved"
     );
+    let mut st = State::load().unwrap();
     st.active = Some("b@x.com".into());
-    assert!(
-        save_if_changed(&st, &before).unwrap(),
+    st.save().unwrap();
+    assert_eq!(
+        State::load().unwrap().active.as_deref(),
+        Some("b@x.com"),
         "changed state must be saved"
     );
 }

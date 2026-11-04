@@ -39,16 +39,12 @@ pub(crate) fn with_state_lock_absorb<F>(f: F) -> PResult<()>
 where
     F: FnOnce(&mut State) -> Result<()>,
 {
-    with_state_lock(|| {
+    with_state_lock(|_| {
         let mut st = State::load()?;
-        // Skip the (fsync-heavy, backup-rotating) save when the closure left
-        // the state untouched: the steady-state absorb rewrites identical
-        // credentials every cycle.
-        let before = serde_json::to_value(&st).ok();
         f(&mut st)?;
-        if before.is_some() && before == serde_json::to_value(&st).ok() {
-            return Ok(());
-        }
+        // `save` skips the (fsync-heavy, backup-rotating) write when the
+        // closure left the state untouched: the steady-state absorb rewrites
+        // identical credentials every cycle.
         st.save()
     })
     .map_err(|e| ProviderError::Other(format!("state lock: {e:#}")))
@@ -83,17 +79,28 @@ pub(crate) fn state_lock_held() -> bool {
     STATE_LOCK_DEPTH.with(|d| d.get()) > 0
 }
 
+/// Proof that the current thread holds the cross-process state lock. Only
+/// [`with_state_lock`] creates one, handing it to its closure for the
+/// closure's duration, so a function that must run under the lock takes
+/// `&StateGuard` and the compiler checks the requirement. Not `Send`: the lock
+/// belongs to the thread that took it.
+pub struct StateGuard {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
 /// Run `f` holding the shared exclusive advisory lock on the state file.
 /// Serialises state read-modify-write across processes; reentrant within a
 /// single thread so callers can nest without self-deadlocking.
-pub fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+pub fn with_state_lock<T>(f: impl FnOnce(&StateGuard) -> Result<T>) -> Result<T> {
     use fs2::FileExt;
     // Reentrant fast path: we already hold the OS lock on this thread; just
     // run the closure. The outer frame will unlock when it unwinds.
     if STATE_LOCK_DEPTH.with(|d| d.get()) > 0 {
         STATE_LOCK_DEPTH.with(|d| d.set(d.get() + 1));
         let _g = DepthGuard;
-        return f();
+        return f(&StateGuard {
+            _not_send: std::marker::PhantomData,
+        });
     }
     let dir = store::config_dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -107,7 +114,9 @@ pub fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     file.lock_exclusive().context("acquiring state lock")?;
     STATE_LOCK_DEPTH.with(|d| d.set(1));
     let _g = DepthGuard;
-    let r = f();
+    let r = f(&StateGuard {
+        _not_send: std::marker::PhantomData,
+    });
     // Fully-qualified to fs2's trait: std 1.89 added an inherent unlock() that
     // would otherwise shadow it and break the 1.88 MSRV.
     let _ = fs2::FileExt::unlock(&file);
@@ -226,7 +235,7 @@ pub(crate) fn flag_needs_relogin_if_unchanged(
     email: &str,
     failed_refresh_token: &str,
 ) -> Result<FlagOutcome> {
-    with_state_lock(|| {
+    with_state_lock(|_| {
         let mut st = State::load()?;
         let Some(a) = st.find_mut(email) else {
             return Ok(FlagOutcome::Missing);
@@ -265,7 +274,7 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
     // re-loads and re-checks `active` under the lock immediately before
     // saving.
     let (accounts, active_at_snapshot): (Vec<crate::store::Account>, Option<String>) =
-        match with_state_lock(|| {
+        match with_state_lock(|_| {
             let st = State::load()?;
             let active = st.active.clone();
             let accounts = st

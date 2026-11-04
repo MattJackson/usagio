@@ -123,7 +123,7 @@ pub fn ensure_fresh(acct: &mut Account, skew_secs: i64) -> Result<bool, RefreshE
 /// Exclusive `refresh.lock` in the config dir, held until dropped. Always
 /// taken BEFORE the state lock (a switch's commit takes it too, so it sees a
 /// rotation that was in flight).
-pub(crate) fn refresh_lock() -> anyhow::Result<std::fs::File> {
+pub(crate) fn refresh_lock() -> anyhow::Result<crate::lifecycle::RefreshGuard> {
     crate::lifecycle::refresh_lock()
 }
 

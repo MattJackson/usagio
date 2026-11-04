@@ -112,7 +112,7 @@ fn toggle_notification_trigger_read_modify_write_is_atomic_under_contention() {
                 crate::store::set_home_override(Some(home));
                 for _ in 0..ITERATIONS {
                     if worker == 2 {
-                        with_state_lock(|| {
+                        with_state_lock(|_| {
                             let mut st = State::load()?;
                             st.trigger_pct = Some(st.trigger_pct.unwrap_or(0.0) + 1.0);
                             st.save()

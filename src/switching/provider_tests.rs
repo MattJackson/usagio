@@ -6,11 +6,12 @@ use crate::providers::trait_def::LoginFlow;
 use crate::providers::{Provider, CLAUDE_SLUG};
 use crate::selectors::resolve_provider_selector;
 use crate::store::State;
+use crate::test_support::locked_prepare_handoff;
 use crate::test_support::{
     codex_account, codex_auth_json, codex_id_token, codex_login_response, usage_at,
     MockActiveSlotProvider,
 };
-use crate::{autoswap, lifecycle, login, providers, store, usage_log};
+use crate::{autoswap, login, providers, store, usage_log};
 use chrono::Utc;
 
 // --- choose_swap_target (auto-swap guard) ---
@@ -201,7 +202,7 @@ fn handoff_verification_retry_does_not_drain_replacement_or_overwrite_rotation()
         account_id: None,
         handoff_token: Some("replacement-instance".into()),
     };
-    assert!(lifecycle::prepare_handoff(&provider, &status, &mut state, key, true).unwrap());
+    assert!(locked_prepare_handoff(&provider, &status, &mut state, key, true).unwrap());
     commit_provider_switch(&provider, slug, key, true, true).unwrap();
     assert_eq!(provider.writes.load(Ordering::SeqCst), 1);
     assert!(provider.drains.lock().unwrap().is_empty());
@@ -251,12 +252,10 @@ fn queued_auto_handoff_preserves_no_bounce_latch_across_restart() {
             account_id: None,
             handoff_token: Some("instance".into()),
         };
-        assert!(
-            !lifecycle::prepare_handoff(&provider, &status, &mut state, "target", false).unwrap()
-        );
+        assert!(!locked_prepare_handoff(&provider, &status, &mut state, "target", false).unwrap());
     }
     let mut restarted = State::load().unwrap();
-    assert!(lifecycle::prepare_handoff(
+    assert!(locked_prepare_handoff(
         &provider,
         &providers::ClientStatus::default(),
         &mut restarted,
@@ -325,7 +324,7 @@ fn active_login_renewal_waits_for_drain_and_survives_old_token_rotation() {
         .unwrap()
         .secret_blob = "old-grant-rotated".into();
     reloaded.save().unwrap();
-    assert!(lifecycle::prepare_handoff(
+    assert!(locked_prepare_handoff(
         &provider,
         &providers::ClientStatus::default(),
         &mut reloaded,
@@ -447,7 +446,9 @@ fn auto_switch_hands_off_client_without_holding_state_lock() {
     state.provider_accounts_mut(slug).active = Some("old@example.com".into());
     state.save().unwrap();
     let status = provider.client_status().unwrap();
+    let refresh = crate::lifecycle::refresh_lock().unwrap();
     let out = switch_provider_if_still_active(
+        &refresh,
         &provider,
         &status,
         "target@example.com",
@@ -584,7 +585,7 @@ fn running_client_renewal_stays_a_renewal_through_drain_and_retry() {
         .process_alive
         .store(false, std::sync::atomic::Ordering::SeqCst);
     let mut st = State::load().unwrap();
-    let ready = lifecycle::prepare_handoff(
+    let ready = locked_prepare_handoff(
         &provider,
         &providers::ClientStatus::default(),
         &mut st,
@@ -612,7 +613,7 @@ fn auto_pick_commit_on_the_active_account_still_clears_pick_and_hold() {
     state.set_manual_hold(slug, Some(key));
     state.save().unwrap();
     let mut st = State::load().unwrap();
-    assert!(lifecycle::prepare_handoff(
+    assert!(locked_prepare_handoff(
         &provider,
         &providers::ClientStatus::default(),
         &mut st,
@@ -664,7 +665,7 @@ fn drained_renewal_keeps_the_users_pick_hold_and_swap_memory() {
     let mut st = State::load().unwrap();
     let staged = st.provider_accounts(slug).unwrap().pending_switch.clone();
     let manual = staged.as_ref().unwrap().manual;
-    assert!(lifecycle::prepare_handoff(
+    assert!(locked_prepare_handoff(
         &provider,
         &providers::ClientStatus::default(),
         &mut st,
