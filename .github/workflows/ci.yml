@@ -183,6 +183,12 @@ jobs:
         if: false
         run: cargo test --all-features platform::windows -- --ignored --test-threads=1
 
+      # macOS-only: the real menu-bar app must survive startup (1.1.1 crashed on
+      # launch on macOS 27 and no unit test could see it).
+      - name: macOS menu-bar startup smoke test
+        if: matrix.os == 'macos-latest'
+        run: cargo test --test macos_menubar_startup -- --ignored --test-threads=1
+
       # Ubuntu-only GUI smoke test: proves the real tray backend actually
       # initializes at runtime (GTK starts, and muri's ksni StatusNotifierItem
       # registers on the session bus — the 0.6.0 muri backend, not the old

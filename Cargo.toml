@@ -1,6 +1,6 @@
 [package]
 name = "usagio"
-version = "1.1.1"
+version = "1.1.2"
 edition = "2021"
 rust-version = "1.88"
 description = "Track usage / limits across every AI coding CLI you use, and switch between accounts."
@@ -179,6 +179,8 @@ objc2-foundation = { version = "0.3", features = [
     "NSData",             # NSImage::initWithData for bundled provider PNGs
     "NSProcessInfo",      # OS version gate for the per-account sign-in window
 ] }
+# The WebKit data-store calls need WebKit initialised first (see sign_in::sweep).
+objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "WKWebsiteDataStore"] }
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
     "NSResponder",

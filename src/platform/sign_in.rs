@@ -192,6 +192,13 @@ mod imp {
     /// Remove every WebKit data store of this app not in `keep` and not used
     /// by an open window. Both calls complete on the main run loop.
     pub(crate) fn sweep(keep: std::collections::HashSet<[u8; 16]>) {
+        // The class-level store calls don't initialise WebKit themselves. Before any web view
+        // exists (the startup sweep) macOS 27 crashes on WebKit's missing main run loop, so
+        // touch the default store first: it runs WebKit's process initialisation.
+        if let Some(mtm) = MainThreadMarker::new() {
+            // SAFETY: called on the main thread; the returned store is only dropped.
+            let _ = unsafe { objc2_web_kit::WKWebsiteDataStore::defaultDataStore(mtm) };
+        }
         let listed = WebView::fetch_data_store_identifiers(move |ids| {
             for id in ids {
                 if keep.contains(&id) || super::is_open(&id) {
