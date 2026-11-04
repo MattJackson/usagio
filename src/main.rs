@@ -3181,6 +3181,13 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
         } else {
             // Fingerprint BEFORE the refresh replaces the token in place.
             let old_prefix = logging::token_fingerprint(&acct.access_token);
+            // The refresh token the request will actually send: the refresh
+            // adopts a newer saved rotation from state.json when there is one.
+            let sent_refresh = State::load()
+                .ok()
+                .and_then(|st| st.find(email).map(|a| a.refresh_token.clone()))
+                .filter(|stored| !stored.is_empty())
+                .unwrap_or_else(|| acct.refresh_token.clone());
             // Same disk-fallback as the other reactive entry points, so a
             // rotation that exists only on disk doesn't flag needs_relogin.
             match ensure_fresh_with_fallback(provider, email, &mut acct) {
@@ -3216,6 +3223,9 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
                         "event=needs_relogin account={email} reason=invalid_grant"
                     ));
                     acct.needs_relogin = true;
+                    // The merge only flags if the stored token is still the
+                    // one that was rejected.
+                    acct.refresh_token = sent_refresh;
                     // Fall through to the merge step so the flag is persisted;
                     // skip the usage fetch — a rejected refresh means we don't
                     // have a usable access token to try the usage endpoint with.
