@@ -1575,7 +1575,10 @@ mod tests {
         let log = std::fs::read_to_string(crate::store::config_dir().unwrap().join("usagio.log"))
             .unwrap();
         assert!(
-            log.contains("to=file:~/.claude/.credentials.json result=ok"),
+            log.contains(&format!(
+                "to=file:{} result=ok",
+                dir.join(".claude/.credentials.json").display()
+            )),
             "log was: {log}"
         );
     }

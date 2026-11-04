@@ -20,6 +20,7 @@
 //! `std::env::set_var` / `std::env::remove_var` call from slipping in.
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread::ThreadId;
 
@@ -28,18 +29,24 @@ use std::thread::ThreadId;
 /// ever see interleaved `$HOME` values.
 pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// Keys currently bound by a live [`scoped_env_var`] (tests only), with the
-/// thread that bound each.
-static SCOPED_KEYS: Mutex<Vec<(String, ThreadId)>> = Mutex::new(Vec::new());
+/// A key bound by a live [`scoped_env_var`]: the binding thread and that
+/// thread's config-dir override at bind time.
+type ScopedKey = (String, ThreadId, Option<PathBuf>);
+
+/// Keys currently bound by a live [`scoped_env_var`] (tests only).
+static SCOPED_KEYS: Mutex<Vec<ScopedKey>> = Mutex::new(Vec::new());
 
 /// Whether this thread may read `key`'s scoped value: it scoped `key` itself,
-/// or some test scoped it and this thread has no `ScopedConfigDir` of its own
-/// (a worker spawned inside the scope). A thread with its own config dir never
-/// sees another test's scoped `HOME` / `CODEX_HOME`.
-fn visible_in(keys: &[(String, ThreadId)], key: &str) -> bool {
+/// or a worker of that test — a thread with no config-dir override, or with
+/// the same override the binding thread had (workers inherit their test's
+/// `ScopedConfigDir`). A thread with a different config dir never sees another
+/// test's scoped `HOME` / `CODEX_HOME`.
+fn visible_in(keys: &[ScopedKey], key: &str) -> bool {
     let me = std::thread::current().id();
-    let mine = keys.iter().any(|(k, t)| k == key && *t == me);
-    mine || (keys.iter().any(|(k, _)| k == key) && crate::store::home_override().is_none())
+    let my_dir = crate::store::home_override();
+    keys.iter().any(|(k, t, dir)| {
+        k == key && (*t == me || my_dir.is_none() || my_dir.as_ref() == dir.as_ref())
+    })
 }
 
 /// [`visible_in`] for the live set of scoped keys.
@@ -64,16 +71,17 @@ impl Drop for ScopedKeyMark {
 }
 
 fn push_scoped(key: &str) {
-    SCOPED_KEYS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((key.to_string(), std::thread::current().id()));
+    SCOPED_KEYS.lock().unwrap_or_else(|e| e.into_inner()).push((
+        key.to_string(),
+        std::thread::current().id(),
+        crate::store::home_override(),
+    ));
 }
 
 fn pop_scoped(key: &str) {
     let me = std::thread::current().id();
     let mut s = SCOPED_KEYS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(i) = s.iter().rposition(|(k, t)| k == key && *t == me) {
+    if let Some(i) = s.iter().rposition(|(k, t, _)| k == key && *t == me) {
         s.remove(i);
     }
 }
