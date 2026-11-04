@@ -502,6 +502,21 @@ fn parse_provider_accounts_raw(slug: &str, val: &serde_json::Value) -> Option<Pr
     Some(pa)
 }
 
+/// The key a raw Claude `accounts[]` entry would load under: its `email`,
+/// else `oauth_account.emailAddress`, else the legacy `name`.
+fn raw_account_key(e: &serde_json::Value) -> Option<String> {
+    e.get("email")
+        .and_then(|x| x.as_str())
+        .or_else(|| {
+            e.get("oauth_account")
+                .and_then(|o| o.get("emailAddress"))
+                .and_then(|x| x.as_str())
+        })
+        .or_else(|| e.get("name").and_then(|x| x.as_str()))
+        .filter(|k| !k.is_empty())
+        .map(String::from)
+}
+
 /// Lowercased `(slug, key)` of every provider account held in memory,
 /// including raw `unparsed_accounts` entries.
 fn provider_keys_in_state(state: &State) -> HashSet<(String, String)> {
@@ -623,6 +638,14 @@ pub struct State {
     pub schema_version: u32,
     #[serde(default)]
     pub accounts: Vec<Account>,
+    /// Raw Claude `accounts[]` entries that are not usable accounts (no
+    /// `access_token`/`refresh_token`, e.g. a half-written or hand-edited
+    /// entry). Kept verbatim and written back so a save never silently erases
+    /// them, and so the overwrite guard can count them without refusing every
+    /// save while one exists. Re-tried on each load: an entry that gains its
+    /// tokens is restored as a real account.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unparsed_accounts: Vec<serde_json::Value>,
     /// Email of the account currently written to the keychain, if known.
     #[serde(default)]
     pub active: Option<String>,
@@ -835,18 +858,28 @@ impl State {
         // Map an old `name` -> resolved email so a legacy `active` (a name) can be
         // migrated to the new email key.
         let mut name_to_email: Vec<(String, String)> = Vec::new();
+        let mut unparsed_accounts: Vec<serde_json::Value> = Vec::new();
 
-        if let Some(arr) = v.get("accounts").and_then(|a| a.as_array()) {
-            for obj in arr {
+        // Real entries first, then preserved raw ones (which may have been
+        // repaired since); a raw entry whose key a real one already holds is
+        // dropped by the dedup below in favour of the usable copy.
+        let entries = ["accounts", "unparsed_accounts"]
+            .into_iter()
+            .filter_map(|f| v.get(f).and_then(|a| a.as_array()))
+            .flatten();
+        for obj in entries {
+            {
                 let access_token = obj.get("access_token").and_then(|x| x.as_str());
                 let refresh_token = obj.get("refresh_token").and_then(|x| x.as_str());
                 let (Some(access_token), Some(refresh_token)) = (access_token, refresh_token)
                 else {
                     crate::logging::log(&format!(
-                        "warn: skipping state.json accounts[] entry without access_token/\
-                         refresh_token (email={:?}); it will not be loaded",
+                        "warn: state.json accounts[] entry without access_token/\
+                         refresh_token (email={:?}); keeping it untouched, the account is \
+                         unusable until it is re-captured",
                         obj.get("email").and_then(|x| x.as_str())
                     ));
+                    unparsed_accounts.push(obj.clone());
                     continue; // not a usable account entry
                 };
                 let legacy_name = obj.get("name").and_then(|x| x.as_str());
@@ -999,9 +1032,16 @@ impl State {
             })
             .unwrap_or_default();
 
+        // A raw entry superseded by a usable account of the same key is stale.
+        unparsed_accounts.retain(|e| {
+            raw_account_key(e)
+                .is_none_or(|k| !accounts.iter().any(|a| a.key().eq_ignore_ascii_case(&k)))
+        });
+
         State {
             schema_version: STATE_SCHEMA_VERSION,
             accounts,
+            unparsed_accounts,
             active,
             providers,
             autoswap_disabled: v
@@ -1189,6 +1229,9 @@ impl State {
 
     pub fn upsert(&mut self, acct: Account) {
         let key = acct.key().to_string();
+        // A fresh capture supersedes a stale unusable copy of the same key.
+        self.unparsed_accounts
+            .retain(|e| raw_account_key(e).is_none_or(|k| !k.eq_ignore_ascii_case(&key)));
         if let Some(existing) = self.find_mut(&key) {
             *existing = acct;
         } else {
@@ -1213,10 +1256,17 @@ impl State {
             .collect();
         self.accounts
             .retain(|a| !a.key().eq_ignore_ascii_case(email));
-        let changed = self.accounts.len() != before;
+        let raw_before = self.unparsed_accounts.len();
+        self.unparsed_accounts
+            .retain(|e| raw_account_key(e).is_none_or(|k| !k.eq_ignore_ascii_case(email)));
+        let raw_dropped = self.unparsed_accounts.len() != raw_before;
+        let changed = self.accounts.len() != before || raw_dropped;
         if changed {
             for k in removed_keys {
                 self.pending_removals.insert(k);
+            }
+            if raw_dropped {
+                self.pending_removals.insert(email.to_lowercase());
             }
         }
         changed
@@ -1307,6 +1357,40 @@ fn set_or_clear(
 /// each backup is a few KB even with a dozen accounts.
 pub(crate) const BACKUP_KEEP_COUNT: usize = 20;
 
+/// Minimum spacing between rolling backups for saves that keep the same set
+/// of accounts. Without it every poll (each rewrites usage snapshots) rotated
+/// the whole 20-file history out within minutes.
+pub(crate) const BACKUP_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Whether a routine (same-accounts) save should write a rolling backup: no
+/// backup yet, the newest is at least [`BACKUP_MIN_INTERVAL`] old, or it is
+/// dated in the future (the clock went back), so its age can't be trusted.
+fn backup_due(backups_dir: &Path, now: std::time::SystemTime) -> bool {
+    let Ok(rd) = std::fs::read_dir(backups_dir) else {
+        return true;
+    };
+    let newest = rd
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("state-")
+                && name.ends_with(".json")
+                && !name.starts_with("state-rejected-")
+        })
+        .filter_map(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .max();
+    match newest {
+        None => true,
+        Some(m) => match now.duration_since(m) {
+            Ok(age) => age >= BACKUP_MIN_INTERVAL,
+            // Slack for filesystem timestamp rounding; beyond it, a future
+            // mtime means the clock moved back.
+            Err(e) => e.duration() > std::time::Duration::from_secs(60),
+        },
+    }
+}
+
 /// Persist `state` to `state.json` with two guards on top of the atomic
 /// tmp+rename write path:
 ///
@@ -1334,7 +1418,13 @@ pub fn save_state_safe(state: &State) -> Result<()> {
     // so the situation is diagnosable (the rolling backup still preserves the old
     // bytes in the parse-fail case, so the accounts are recoverable from
     // backups/, but the operator needs to know the safety net was bypassed).
+    let json = serde_json::to_vec_pretty(state)?;
     let existing = std::fs::read(&path);
+    // Nothing to do when the file already holds exactly these bytes: no
+    // rewrite, and no rolling backup that would push real history out.
+    if existing.as_deref().is_ok_and(|old| old == json.as_slice()) {
+        return Ok(());
+    }
     if let Err(ref e) = existing {
         if e.kind() != std::io::ErrorKind::NotFound {
             crate::logging::log(&format!(
@@ -1344,6 +1434,10 @@ pub fn save_state_safe(state: &State) -> Result<()> {
         }
     }
     if let Ok(old_bytes) = existing {
+        // Whether the set of accounts differs from the file's: such a save is
+        // always backed up; other changes (usage snapshots, token refreshes)
+        // are backed up at most once per BACKUP_MIN_INTERVAL.
+        let mut membership_changed = true;
         let parsed = serde_json::from_slice::<serde_json::Value>(&old_bytes);
         if let Err(ref e) = parsed {
             crate::logging::log(&format!(
@@ -1353,17 +1447,24 @@ pub fn save_state_safe(state: &State) -> Result<()> {
         }
         if let Ok(v) = parsed {
             let old = State::from_value(&v);
+            // Usable accounts and preserved raw (tokenless) entries both
+            // count, on each side: an entry kept raw in memory is not a drop.
             let new_keys: HashSet<String> = state
                 .accounts
                 .iter()
                 .map(|a| a.key().to_lowercase())
+                .chain(state.unparsed_accounts.iter().filter_map(raw_account_key))
+                .map(|k| k.to_lowercase())
                 .collect();
-            let unauthorized: Vec<String> = old
+            let mut unauthorized: Vec<String> = old
                 .accounts
                 .iter()
                 .map(|a| a.key().to_lowercase())
+                .chain(old.unparsed_accounts.iter().filter_map(raw_account_key))
+                .map(|k| k.to_lowercase())
                 .filter(|k| !new_keys.contains(k) && !state.pending_removals.contains(k))
                 .collect();
+            unauthorized.dedup();
             // Same guard, scoped to each non-Claude provider's slot: a
             // provider-account key present on disk but missing from the
             // in-memory state (without an explicit `remove_provider_account`
@@ -1385,6 +1486,16 @@ pub fn save_state_safe(state: &State) -> Result<()> {
                     unauthorized_provider.push(format!("{slug_lc}:{k}"));
                 }
             }
+            let old_keys: HashSet<String> = old
+                .accounts
+                .iter()
+                .map(|a| a.key().to_string())
+                .chain(old.unparsed_accounts.iter().filter_map(raw_account_key))
+                .map(|k| k.to_lowercase())
+                .collect();
+            let old_provider_keys: HashSet<(String, String)> =
+                raw_provider_account_keys(&v).into_iter().collect();
+            membership_changed = old_keys != new_keys || old_provider_keys != new_provider_keys;
             if !unauthorized.is_empty() || !unauthorized_provider.is_empty() {
                 // Dump a REDACTED diagnostic (account keys/emails only, no
                 // tokens) into config_dir/backups/ with owner-only permissions.
@@ -1438,12 +1549,13 @@ pub fn save_state_safe(state: &State) -> Result<()> {
         // (2) Rolling backup of the (still-current) state.json. Best-effort:
         // a backup failure logs but does NOT block the save — losing a backup
         // is far less bad than blocking a legitimate write.
-        if let Err(e) = write_rolling_backup(&dir, &path, &old_bytes) {
-            crate::logging::log(&format!("backup: rolling copy failed: {e:#}"));
+        if membership_changed || backup_due(&dir.join("backups"), std::time::SystemTime::now()) {
+            if let Err(e) = write_rolling_backup(&dir, &path, &old_bytes) {
+                crate::logging::log(&format!("backup: rolling copy failed: {e:#}"));
+            }
         }
     }
 
-    let json = serde_json::to_vec_pretty(state)?;
     let tmp = path.with_extension("json.tmp");
     // Create the temp file owner-only from the start (no umask window), then
     // rename it into place; clean up the temp file on any failure.

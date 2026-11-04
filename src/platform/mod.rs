@@ -475,6 +475,64 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn process_generation_compares_instants_across_zones() {
+        use super::{compare_generation, parse_lstart, Generation};
+        let utc = chrono::FixedOffset::east_opt(0).unwrap();
+        let plus2 = chrono::FixedOffset::east_opt(2 * 3600).unwrap();
+        let actual = parse_lstart("Tue Nov  3 10:00:00 2026");
+        assert!(actual.is_some());
+        // Recorded in UTC, or in our +02:00 zone: same process either way.
+        assert_eq!(
+            compare_generation("Tue Nov  3 10:00:00 2026", actual, utc),
+            Generation::Same
+        );
+        assert_eq!(
+            compare_generation("Tue Nov  3 12:00:00 2026", actual, plus2),
+            Generation::Same
+        );
+        // A whole-hour gap we can't explain by our zone may be Codex's zone.
+        assert_eq!(
+            compare_generation("Tue Nov  3 15:00:00 2026", actual, utc),
+            Generation::Unknown
+        );
+        // Any other gap is a different process.
+        assert_eq!(
+            compare_generation("Tue Nov  3 10:00:07 2026", actual, utc),
+            Generation::Different
+        );
+        // Another locale's rendering, or no live reading: can't tell.
+        assert_eq!(
+            compare_generation("Di  3 Nov 10:00:00 2026", actual, utc),
+            Generation::Unknown
+        );
+        assert_eq!(
+            compare_generation("Tue Nov  3 10:00:00 2026", None, utc),
+            Generation::Unknown
+        );
+    }
+
+    #[test]
+    fn a_generation_recorded_in_another_locale_and_zone_is_still_alive() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // Codex recorded its start under C/UTC; we run in the user's zone.
+        let output = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC")
+            .output()
+            .unwrap();
+        let start = String::from_utf8(output.stdout).unwrap();
+        let alive = super::daemon_instance_alive(pid, start.trim());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(alive.unwrap(), "a live daemon was reported stopped");
+    }
+
+    #[test]
     fn daemon_pid_guard_rejects_group_and_wrapping_pids() {
         // 0 and 1 would signal our process group / init; anything above
         // i32::MAX wraps to a negative pid_t (kill(-n) signals a group).
@@ -535,12 +593,15 @@ mod tests {
             &crate::providers::codex::CodexProvider,
             &token,
         );
-        let wrong_generation = super::daemon_instance_alive(pid, "different process generation");
+        let wrong_generation = super::daemon_instance_alive(pid, "Thu Jan  1 00:00:07 1970");
+        let unknown_generation = super::daemon_instance_alive(pid, "not a start time");
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(alive.unwrap());
         assert!(pending.is_err());
         assert!(!wrong_generation.unwrap());
+        // An unparseable record is "can't tell", never "stopped".
+        assert!(unknown_generation.is_err());
         assert!(!super::daemon_instance_alive(pid, start.trim()).unwrap());
         crate::providers::Provider::verify_handoff_stopped(
             &crate::providers::codex::CodexProvider,
@@ -632,27 +693,115 @@ pub(crate) fn graceful_daemon_signal(pid: u32, expected_start: &str) -> Result<b
 }
 
 /// A missing control socket is not proof that the process released its sessions.
+///
+/// The recorded generation is Codex's own `ps -o lstart=` rendering, made in
+/// Codex's locale and time zone. An exact match with ours proves the same
+/// process; otherwise both sides are compared as instants (see
+/// [`compare_generation`]). `Ok(false)` only when the process is gone or is
+/// provably a different one; an `Err` when the generation can't be compared,
+/// so a handoff waits rather than treating a live daemon as stopped.
 #[cfg(unix)]
 pub(crate) fn daemon_instance_alive(pid: u32, expected_start: &str) -> Result<bool> {
     anyhow::ensure!(pid > 1 && pid <= i32::MAX as u32, "invalid daemon PID");
     anyhow::ensure!(!expected_start.is_empty(), "missing daemon generation");
-    let output = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "stat=", "-o", "lstart="])
-        .output()?;
+    let Some((status, start)) = ps_status_and_start(pid, false)? else {
+        return Ok(false);
+    };
+    // Zombies have exited and released descriptors, even before parent reaping.
+    if status.starts_with('Z') {
+        return Ok(false);
+    }
+    if start == expected_start.trim() {
+        return Ok(true);
+    }
+    // Same process rendered in another locale/zone? Ask ps again in a fixed
+    // one so our side is an exact instant.
+    let utc_start = match ps_status_and_start(pid, true)? {
+        Some((_, s)) => parse_lstart(&s),
+        // Exited between the two reads.
+        None => return Ok(false),
+    };
+    // Our zone's offset at the moment the process started (DST-correct).
+    let local = utc_start.map_or_else(
+        || *chrono::Local::now().offset(),
+        |a| chrono::TimeZone::offset_from_utc_datetime(&chrono::Local, &a),
+    );
+    match compare_generation(expected_start, utc_start, local) {
+        Generation::Same => Ok(true),
+        Generation::Different => Ok(false),
+        Generation::Unknown => Err(anyhow::anyhow!(
+            "cannot verify the daemon's process generation (recorded start time \
+             {expected_start:?} is not comparable with ps output)"
+        )),
+    }
+}
+
+/// `(stat, lstart)` for `pid`, or `None` when no such process exists. With
+/// `fixed`, ps runs under `LC_ALL=C TZ=UTC` so the start time is a C-locale
+/// UTC rendering.
+#[cfg(unix)]
+fn ps_status_and_start(pid: u32, fixed: bool) -> Result<Option<(String, String)>> {
+    let mut cmd = std::process::Command::new("ps");
+    cmd.args(["-p", &pid.to_string(), "-o", "stat=", "-o", "lstart="]);
+    if fixed {
+        cmd.env("LC_ALL", "C").env("TZ", "UTC");
+    }
+    let output = cmd.output()?;
     if !output.status.success() {
         anyhow::ensure!(
             output.status.code() == Some(1) && output.stdout.is_empty(),
             "could not inspect daemon process"
         );
-        return Ok(false);
+        return Ok(None);
     }
     let actual = String::from_utf8(output.stdout)?;
-    let actual = actual.trim();
     let (status, start) = actual
+        .trim()
         .split_once(char::is_whitespace)
         .ok_or_else(|| anyhow::anyhow!("invalid daemon process status"))?;
-    // Zombies have exited and released descriptors, even before parent reaping.
-    Ok(!status.starts_with('Z') && start.trim() == expected_start)
+    Ok(Some((status.to_string(), start.trim().to_string())))
+}
+
+/// Outcome of comparing a recorded process generation with the live one.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Generation {
+    Same,
+    Different,
+    /// The two can't be compared (unrecognised format, or an offset that may
+    /// just be a different time zone).
+    Unknown,
+}
+
+/// Parse a C-locale `ps -o lstart` value (`"Tue Nov  3 10:00:00 2026"`).
+pub(crate) fn parse_lstart(s: &str) -> Option<chrono::NaiveDateTime> {
+    let norm = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    chrono::NaiveDateTime::parse_from_str(&norm, "%a %b %e %H:%M:%S %Y").ok()
+}
+
+/// Compare the recorded `expected` lstart with the live process's start
+/// (`actual_utc`, a UTC wall time). `expected` is read as wall time in our
+/// zone (`local`) and in UTC; either landing on the same second is the same
+/// process. A gap that is a whole number of quarter hours within ±14 h could
+/// be Codex running in another zone, so that is `Unknown`, as is a recorded
+/// value in a format we can't parse (another locale) or no live reading.
+pub(crate) fn compare_generation(
+    expected: &str,
+    actual_utc: Option<chrono::NaiveDateTime>,
+    local: chrono::FixedOffset,
+) -> Generation {
+    let (Some(expected), Some(actual)) = (parse_lstart(expected), actual_utc) else {
+        return Generation::Unknown;
+    };
+    let as_local_utc = expected - chrono::Duration::seconds(i64::from(local.local_minus_utc()));
+    if as_local_utc == actual || expected == actual {
+        return Generation::Same;
+    }
+    let gap = (expected - actual).num_seconds().abs();
+    if gap <= 14 * 3600 && gap % (15 * 60) == 0 {
+        Generation::Unknown
+    } else {
+        Generation::Different
+    }
 }
 
 #[cfg(windows)]

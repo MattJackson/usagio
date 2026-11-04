@@ -440,30 +440,41 @@ pub fn prepaid_balance(body: &serde_json::Value) -> Option<Money> {
         .unwrap_or(Money::CREDITS);
     if let Some(c) = get(balance, "credits").and_then(|c| c.as_object()) {
         if let Some(amount) = c.get("amount_minor").and_then(|x| x.as_i64()) {
-            let exponent = c
-                .get("exponent")
-                .and_then(|x| x.as_u64())
-                .unwrap_or_else(|| u64::from(default_exponent(unit)));
-            return Money::new(amount, u32::try_from(exponent).ok()?, unit);
+            let exponent = match c.get("exponent").and_then(|x| x.as_u64()) {
+                Some(e) => u32::try_from(e).ok()?,
+                None => iso4217_minor_units(unit),
+            };
+            return Money::new(amount, exponent, unit);
         }
     }
     let amount = body.get("amount")?;
     let amount = amount
         .as_i64()
         .or_else(|| amount.as_f64().map(|f| f.round() as i64))?;
-    Money::new(amount, default_exponent(unit), unit)
+    Money::new(amount, iso4217_minor_units(unit), unit)
 }
 
-/// ISO 4217 minor-unit exponent for a currency code, used when the response
-/// carries bare minor units with no explicit `exponent`: zero-decimal
-/// currencies (JPY, KRW, ...) have 0, the dinar family 3, everything else
-/// (and the non-currency credits unit) 2.
-fn default_exponent(unit: &str) -> u32 {
-    match unit.to_ascii_uppercase().as_str() {
-        "JPY" | "KRW" | "VND" | "CLP" | "ISK" | "UGX" | "PYG" | "RWF" | "XAF" | "XOF" | "XPF"
-        | "KMF" | "GNF" | "DJF" | "VUV" => 0,
-        "BHD" | "KWD" | "OMR" | "JOD" | "TND" | "IQD" | "LYD" => 3,
-        _ => 2,
+/// ISO 4217 minor-unit count for `currency` (case-insensitive): how many
+/// decimal places its minor unit has. 0 for zero-decimal currencies (JPY,
+/// KRW, ...), 3 for the three-decimal ones (KWD, BHD, ...), 4 for the
+/// four-decimal fund codes, else 2 (USD, EUR, and credits).
+pub(crate) fn iso4217_minor_units(currency: &str) -> u32 {
+    const ZERO: &[&str] = &[
+        "BIF", "CLP", "DJF", "GNF", "ISK", "JPY", "KMF", "KRW", "PYG", "RWF", "UGX", "UYI", "VND",
+        "VUV", "XAF", "XOF", "XPF",
+    ];
+    const THREE: &[&str] = &["BHD", "IQD", "JOD", "KWD", "LYD", "OMR", "TND"];
+    const FOUR: &[&str] = &["CLF", "UYW"];
+    let c = currency.trim();
+    let is = |list: &[&str]| list.iter().any(|x| x.eq_ignore_ascii_case(c));
+    if is(ZERO) {
+        0
+    } else if is(THREE) {
+        3
+    } else if is(FOUR) {
+        4
+    } else {
+        2
     }
 }
 

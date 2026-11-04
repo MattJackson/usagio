@@ -560,11 +560,25 @@ fn claim_outcome_from_status_only_reset_is_applied() {
 }
 
 #[test]
-fn prepaid_bare_amount_uses_the_currency_minor_unit_exponent() {
-    let jpy = prepaid_balance(&serde_json::json!({ "amount": 5000, "currency": "JPY" })).unwrap();
-    assert_eq!((jpy.amount_minor, jpy.exponent), (5000, 0));
-    let kwd = prepaid_balance(&serde_json::json!({ "amount": 5000, "currency": "KWD" })).unwrap();
-    assert_eq!(kwd.exponent, 3);
-    let usd = prepaid_balance(&serde_json::json!({ "amount": 5000, "currency": "USD" })).unwrap();
-    assert_eq!(usd.exponent, 2);
+fn prepaid_balance_uses_the_currency_minor_unit_count() {
+    // JPY has no minor unit: 1500 minor units is 1500 yen, not 15.00.
+    let jpy = serde_json::json!({ "amount": 1500, "currency": "JPY", "balance": null });
+    let m = prepaid_balance(&jpy).unwrap();
+    assert_eq!(
+        (m.amount_minor, m.exponent, m.unit.as_str()),
+        (1500, 0, "JPY")
+    );
+    // KWD has three decimals (fils).
+    let kwd = serde_json::json!({
+        "currency": "KWD", "balance": { "credits": { "amount_minor": 12345 } }
+    });
+    assert_eq!(prepaid_balance(&kwd).unwrap().exponent, 3);
+    // An explicit exponent still wins; USD and unknowns default to 2.
+    let explicit = serde_json::json!({
+        "currency": "JPY", "balance": { "credits": { "amount_minor": 5, "exponent": 2 } }
+    });
+    assert_eq!(prepaid_balance(&explicit).unwrap().exponent, 2);
+    assert_eq!(super::iso4217_minor_units("usd"), 2);
+    assert_eq!(super::iso4217_minor_units("credits"), 2);
+    assert_eq!(super::iso4217_minor_units("krw"), 0);
 }

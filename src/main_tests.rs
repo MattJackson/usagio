@@ -3242,7 +3242,11 @@ fn keychain_rotation_is_adopted_only_for_the_matching_identity() {
     with_claude_home("a@e.com", |_| {
         prime_active_slot(&rotated_blob.keychain_blob);
         let mut st = make_state();
+        let reads = CLAUDE_IDENTITY_READS.with(std::cell::Cell::get);
         sync_active_from_keychain(provider, &mut st);
+        // One parse of ~/.claude.json serves both the metadata refresh and
+        // the rotation identity check.
+        assert_eq!(CLAUDE_IDENTITY_READS.with(std::cell::Cell::get) - reads, 1);
         let a = st.find("a@e.com").unwrap();
         assert_eq!(a.access_token, "at-rotated");
         assert_eq!(a.expires_at, 9_999);
@@ -8105,4 +8109,82 @@ fn a_refresh_failure_reaches_the_row_until_a_fetch_succeeds() {
     record_usage_fetch_success(&fetch_tracker_key("codex", &email));
     assert_eq!(row_from_account(&a).error, None);
     assert_eq!(row_from_provider_account("codex", &p).error, None);
+}
+
+#[test]
+fn prepaid_balance_is_fetched_at_most_once_per_refresh_window() {
+    use crate::providers::trait_def::{Credits, Money};
+    let mut acct = claude_account("prepaid-throttle@e.com", 3_600_000);
+    acct.oauth_account = Some(serde_json::json!({ "organizationUuid": "org-1" }));
+    let snapshot = || {
+        let mut cu = CachedUsage::default();
+        cu.reported.credits = Some(Credits {
+            enabled: true,
+            ..Credits::default()
+        });
+        cu
+    };
+    let fetches = std::cell::Cell::new(0);
+    let fetch = |_: &str, _: &str| {
+        fetches.set(fetches.get() + 1);
+        Money::new(1250, 2, "USD")
+    };
+    let t0 = 1_000_000;
+    let mut cu = snapshot();
+    attach_prepaid_balance_with(&mut cu, &acct, t0, fetch);
+    assert_eq!(
+        cu.reported.credits.as_ref().unwrap().balance,
+        Money::new(1250, 2, "USD")
+    );
+    // The next polls inside the window reuse the reading: no request.
+    for dt in [30, 60, PREPAID_REFRESH_SECS - 1] {
+        let mut cu = snapshot();
+        attach_prepaid_balance_with(&mut cu, &acct, t0 + dt, fetch);
+        assert_eq!(
+            cu.reported.credits.as_ref().unwrap().balance,
+            Money::new(1250, 2, "USD")
+        );
+    }
+    assert_eq!(fetches.get(), 1);
+    // Once the window passes, it is asked again.
+    let mut cu = snapshot();
+    attach_prepaid_balance_with(&mut cu, &acct, t0 + PREPAID_REFRESH_SECS, fetch);
+    assert_eq!(fetches.get(), 2);
+    // Credits off: never fetched.
+    let mut off = CachedUsage::default();
+    off.reported.credits = Some(Credits::default());
+    attach_prepaid_balance_with(&mut off, &acct, t0 + 10 * PREPAID_REFRESH_SECS, fetch);
+    assert_eq!(fetches.get(), 2);
+}
+
+#[test]
+fn a_failed_prepaid_fetch_keeps_the_previous_balance_and_is_not_retried_every_poll() {
+    use crate::providers::trait_def::{Credits, Money};
+    let mut acct = claude_account("prepaid-fail@e.com", 3_600_000);
+    acct.oauth_account = Some(serde_json::json!({ "organizationUuid": "org-2" }));
+    let mut prev = CachedUsage::default();
+    prev.reported.credits = Some(Credits {
+        enabled: true,
+        balance: Money::new(500, 2, "USD"),
+        ..Credits::default()
+    });
+    acct.cached_usage = Some(prev);
+    let fetches = std::cell::Cell::new(0);
+    let fetch = |_: &str, _: &str| {
+        fetches.set(fetches.get() + 1);
+        None
+    };
+    for dt in [0, 30] {
+        let mut cu = CachedUsage::default();
+        cu.reported.credits = Some(Credits {
+            enabled: true,
+            ..Credits::default()
+        });
+        attach_prepaid_balance_with(&mut cu, &acct, 2_000_000 + dt, fetch);
+        assert_eq!(
+            cu.reported.credits.unwrap().balance,
+            Money::new(500, 2, "USD")
+        );
+    }
+    assert_eq!(fetches.get(), 1);
 }

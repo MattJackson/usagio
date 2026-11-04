@@ -1508,3 +1508,63 @@ fn a_dead_grant_does_not_stop_the_loop_before_the_next_inactive_account() {
         }
     });
 }
+
+#[test]
+fn watcher_forwards_only_credential_file_events() {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    let names = vec![
+        OsString::from(".credentials.json"),
+        OsString::from("auth.json"),
+    ];
+    let ev = |p: &str| vec![PathBuf::from(p)];
+    assert!(event_touches_credentials(
+        &ev("/h/.claude/.credentials.json"),
+        &names
+    ));
+    assert!(event_touches_credentials(
+        &ev("/h/.claude/.credentials.json.tmp.123"),
+        &names
+    ));
+    assert!(event_touches_credentials(
+        &ev("/h/.codex/auth.json"),
+        &names
+    ));
+    assert!(!event_touches_credentials(
+        &ev("/h/.claude/projects/x.jsonl"),
+        &names
+    ));
+    assert!(!event_touches_credentials(
+        &ev("/h/.codex/history.jsonl"),
+        &names
+    ));
+    // A rescan with no paths may hide a credential change.
+    assert!(event_touches_credentials(&[], &names));
+}
+
+#[test]
+fn debounce_gives_up_after_its_max_wait_under_a_steady_stream() {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let s2 = stop.clone();
+    let feeder = std::thread::spawn(move || {
+        while !s2.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = tx.send(());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+    let t = std::time::Instant::now();
+    drain_debounced(
+        &rx,
+        std::time::Duration::from_millis(100),
+        std::time::Duration::from_millis(300),
+    );
+    let took = t.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    feeder.join().unwrap();
+    assert!(
+        took < std::time::Duration::from_secs(2),
+        "debounce ran {took:?}"
+    );
+    assert!(took >= std::time::Duration::from_millis(300));
+}

@@ -447,10 +447,20 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
     use notify::{Event, RecursiveMode, Watcher};
 
     let (tx, rx) = mpsc::channel::<Event>();
+    // Only events on a credential file (or a temp file named after one, as an
+    // atomic rename writes) wake the absorb pass: the watch is on whole parent
+    // directories, whose other files must not keep it busy.
+    let cred_names: Vec<std::ffi::OsString> = providers
+        .iter()
+        .flat_map(|p| p.credential_paths())
+        .filter_map(|p| p.file_name().map(std::ffi::OsStr::to_os_string))
+        .collect();
     let watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
         match res {
             Ok(ev) => {
-                let _ = tx.send(ev);
+                if event_touches_credentials(&ev.paths, &cred_names) {
+                    let _ = tx.send(ev);
+                }
             }
             // R2-EH-03: log mid-stream notify errors so persistent notify
             // failures on a credential-parent path leave a signal instead of
@@ -645,6 +655,36 @@ pub fn respawn_watchers() -> bool {
 /// second.
 const WATCHER_PANIC_BACKOFF: Duration = Duration::from_millis(500);
 
+/// Longest the watcher waits for a burst of events to go quiet before it runs
+/// the absorb pass anyway.
+const DEBOUNCE_MAX_WAIT: Duration = Duration::from_secs(2);
+
+/// Whether a filesystem event concerns a credential file: one of its paths is
+/// named after a credential file (exactly, or as a prefix — a vendor's atomic
+/// write goes through `<name>.tmp...`). An event with no paths (a rescan
+/// request) counts, since it may hide a credential change.
+fn event_touches_credentials(paths: &[std::path::PathBuf], names: &[std::ffi::OsString]) -> bool {
+    paths.is_empty()
+        || paths.iter().any(|p| {
+            p.file_name().is_some_and(|f| {
+                let f = f.as_encoded_bytes();
+                names.iter().any(|n| f.starts_with(n.as_encoded_bytes()))
+            })
+        })
+}
+
+/// Swallow events until `quiet` passes with none, or `max_wait` has elapsed
+/// in total, whichever comes first.
+fn drain_debounced<T>(rx: &mpsc::Receiver<T>, quiet: Duration, max_wait: Duration) {
+    let deadline = std::time::Instant::now() + max_wait;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() || rx.recv_timeout(quiet.min(left)).is_err() {
+            return;
+        }
+    }
+}
+
 /// Runs for the lifetime of the fsnotify watcher thread. Blocks on `rx` for
 /// the next raw filesystem event, then hands the debounce+absorb+refresh work
 /// to a `catch_unwind`-guarded closure so a panic anywhere in a provider's
@@ -658,7 +698,8 @@ fn fsnotify_watcher_supervisor(
     providers: Vec<&'static dyn Provider>,
 ) {
     // Debounce: coalesce a burst of writes (atomic rename fires multiple
-    // events) into one absorb pass.
+    // events) into one absorb pass, but never wait longer than
+    // DEBOUNCE_MAX_WAIT so a steady event stream can't starve it.
     let debounce = Duration::from_millis(250);
     loop {
         // Block for the next event outside the panic guard — recv() itself
@@ -670,7 +711,7 @@ fn fsnotify_watcher_supervisor(
             return;
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            while rx.recv_timeout(debounce).is_ok() {}
+            drain_debounced(&rx, debounce, DEBOUNCE_MAX_WAIT);
             for p in &providers {
                 let _ = absorb_all_lagging(*p);
             }

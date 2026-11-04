@@ -341,8 +341,10 @@ fn print_help() {
          usagio renew <email>     Sign that account in again in your browser (fresh login)\n  \
                                         --provider <slug>  or use `codex:email`\n  \
          usagio rm <email>        Forget an account\n\n\
-         With no [email], switch/start/continue auto-pick the account that has room\n  \
-         and whose weekly limit resets soonest (use it before the quota resets).\n  \
+         With no [email], switch/start/continue auto-pick, from cached usage, the\n  \
+         ready account (15+ min of room before the trigger) whose weekly limit\n  \
+         resets earliest (use it before the quota resets). If none is ready, the\n  \
+         one that lasts longest; never an account at its limit.\n  \
          With an [email], a pick already at/over the trigger holds until it's\n  \
          exhausted; one under the trigger swaps at the trigger as usual.\n\n\
          Onboarding: log into an account with `claude` as usual, then\n  \
@@ -2377,10 +2379,18 @@ fn mirror_inactive_rotation(
     outcome.unwrap_or_default()
 }
 
-/// Refresh metadata independently of token rotation. Called again under the
-/// state lock at poll commit so skipped usage fetches still persist the name.
+/// Refresh metadata independently of token rotation, reading
+/// `~/.claude.json` itself. The poll shares one reading through
+/// [`sync_active_claude_identity_from`] instead.
+#[cfg(test)]
 fn sync_active_claude_identity(state: &mut State) {
-    let (Some(active), (Some(identity), _)) = (state.active.clone(), read_claude_identity()) else {
+    sync_active_claude_identity_from(state, read_claude_identity().0.as_ref());
+}
+
+/// [`sync_active_claude_identity`] against an `oauthAccount` the caller has
+/// already read from `~/.claude.json` (one parse shared across a poll cycle).
+fn sync_active_claude_identity_from(state: &mut State, identity: Option<&serde_json::Value>) {
+    let (Some(active), Some(identity)) = (state.active.clone(), identity) else {
         return;
     };
     let Some(account) = state.find_mut(&active) else {
@@ -2402,7 +2412,7 @@ fn sync_active_claude_identity(state: &mut State) {
         identity.get("accountUuid").and_then(|v| v.as_str()),
         identity.get("emailAddress").and_then(|v| v.as_str()),
     ) {
-        update_claude_identity(account, &identity);
+        update_claude_identity(account, identity);
     }
 }
 
@@ -2463,7 +2473,17 @@ fn update_claude_identity(account: &mut Account, identity: &serde_json::Value) {
 /// we must NOT overwrite its stored tokens. In-place rotation keeps the same
 /// account uuid/email, so legitimate rotation is still captured.
 fn sync_active_from_keychain(provider: &'static dyn Provider, state: &mut State) {
-    sync_active_claude_identity(state);
+    sync_active_from_keychain_with(provider, state, read_claude_identity().0.as_ref());
+}
+
+/// [`sync_active_from_keychain`] against an `oauthAccount` already read from
+/// `~/.claude.json`, so a caller can parse that file once and share it.
+fn sync_active_from_keychain_with(
+    provider: &'static dyn Provider,
+    state: &mut State,
+    json_oauth: Option<&serde_json::Value>,
+) {
+    sync_active_claude_identity_from(state, json_oauth);
     let _ = provider;
     let Some(active) = state.active.clone() else {
         return;
@@ -2472,14 +2492,11 @@ fn sync_active_from_keychain(provider: &'static dyn Provider, state: &mut State)
     let Ok(fresh) = Account::from_keychain_blob(&blob) else {
         return;
     };
-    let (json_oauth, _) = read_claude_identity();
     let json_uuid = json_oauth
-        .as_ref()
         .and_then(|o| o.get("accountUuid"))
         .and_then(|x| x.as_str())
         .map(String::from);
     let json_email = json_oauth
-        .as_ref()
         .and_then(|o| o.get("emailAddress"))
         .and_then(|x| x.as_str())
         .map(str::to_ascii_lowercase);
@@ -2882,16 +2899,63 @@ fn cached_from_usage(u: &usage::Usage) -> CachedUsage {
     }
 }
 
+/// How long a prepaid wallet reading is reused before `prepaid/credits` is
+/// asked again. The balance only moves on top-ups and credit spend, so one
+/// request per account every few minutes is plenty; without this every poll
+/// (down to 30 s) cost an extra request per credits-enabled account.
+const PREPAID_REFRESH_SECS: i64 = 10 * 60;
+
+/// Per-account `(attempted_at, fetched balance)` of the last `prepaid/credits`
+/// request. A failed attempt is recorded too (as `None`), so an erroring
+/// endpoint is not retried every poll.
+type PrepaidCache = std::collections::HashMap<String, (i64, Option<providers::trait_def::Money>)>;
+static PREPAID_CACHE: std::sync::Mutex<Option<PrepaidCache>> = std::sync::Mutex::new(None);
+
 /// Fill in the real prepaid wallet balance for an account with credits on.
 /// `/usage` reports `spend.balance: null` even when the wallet holds money, so
-/// the balance comes from the org's `prepaid/credits` endpoint. Best-effort: on
-/// a failed fetch keep the balance from the previous snapshot rather than
-/// blanking it.
+/// the balance comes from the org's `prepaid/credits` endpoint, at most once
+/// per [`PREPAID_REFRESH_SECS`] per account. Best-effort: on a failed fetch
+/// keep the balance from the previous snapshot rather than blanking it.
 fn attach_prepaid_balance(cu: &mut CachedUsage, acct: &Account) {
+    attach_prepaid_balance_with(cu, acct, Utc::now().timestamp(), |token, org| {
+        usage::fetch_prepaid_balance(token, org)
+    });
+}
+
+fn attach_prepaid_balance_with(
+    cu: &mut CachedUsage,
+    acct: &Account,
+    now: i64,
+    fetch: impl FnOnce(&str, &str) -> Option<providers::trait_def::Money>,
+) {
     let Some(credits) = cu.reported.credits.as_mut() else {
         return;
     };
+    // Credits off: no wallet to show. A balance `/usage` reported itself
+    // needs no second request.
     if !credits.enabled || credits.balance.is_some() {
+        return;
+    }
+    let key = acct.key().to_ascii_lowercase();
+    let previous = || {
+        acct.cached_usage
+            .as_ref()?
+            .reported
+            .credits
+            .as_ref()?
+            .balance
+            .clone()
+    };
+    let recent = {
+        let guard = PREPAID_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        guard
+            .as_ref()
+            .and_then(|m| m.get(&key))
+            .filter(|(at, _)| (0..PREPAID_REFRESH_SECS).contains(&(now - at)))
+            .map(|(_, m)| m.clone())
+    };
+    if let Some(cached) = recent {
+        credits.balance = cached.or_else(previous);
         return;
     }
     let org = acct
@@ -2900,16 +2964,17 @@ fn attach_prepaid_balance(cu: &mut CachedUsage, acct: &Account) {
         .and_then(|o| o.get("organizationUuid"))
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
-    let fetched = org.and_then(|org| usage::fetch_prepaid_balance(&acct.access_token, org));
-    credits.balance = fetched.or_else(|| {
-        acct.cached_usage
-            .as_ref()?
-            .reported
-            .credits
-            .as_ref()?
-            .balance
-            .clone()
-    });
+    let Some(org) = org else {
+        credits.balance = previous();
+        return;
+    };
+    let fetched = fetch(&acct.access_token, org);
+    PREPAID_CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(key, (now, fetched.clone()));
+    credits.balance = fetched.or_else(previous);
 }
 
 /// Use the shared display priority; active status never changes account order.
@@ -2950,14 +3015,13 @@ pub(crate) fn optimize_now() -> Result<Option<String>> {
     Ok(Some(best))
 }
 
-/// Pick the account whose weekly window resets soonest, preferring one that
-/// still sits BELOW the swap target (`eligible_target(ceiling, trigger)`) — an
-/// account already past the trigger is where auto-swap would move *away* from,
-/// so it's never "best" while any under-target account exists. Only when every
-/// account is already past target (it's all that's left) do we fall back to the
-/// least-consumed still-usable one. Operates entirely on cached rows — callers
-/// must not fetch first.
-/// Rank accounts by weekly reset, then runway.
+/// Pick an account by the auto-swap ranking (`autoswap::assess::rank_cmp`):
+/// among Ready accounts (at least `MIN_LANDING_MIN` of runway before the
+/// trigger), the one whose weekly window resets earliest, ties to the most
+/// runway; if none is Ready, the Draining (near-trigger) account with the most
+/// hard runway. Never an account at its limit, signed out, or without a
+/// subscription: with nothing left it errors naming the soonest unlock.
+/// Operates entirely on cached rows — callers must not fetch first.
 fn auto_pick_for(_state: &State, rows: &[Row], ceiling: f64, trigger: f64) -> Result<String> {
     auto_pick_v2(rows, ceiling, trigger, Utc::now())
 }
@@ -3190,8 +3254,17 @@ fn claude_json_path() -> Result<std::path::PathBuf> {
     crate::providers::claude::claude_json_path().context("HOME/USERPROFILE is not set")
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Calls to [`read_claude_identity`] on this thread (each one parses the
+    /// whole of `~/.claude.json`), so tests can pin "parse once".
+    static CLAUDE_IDENTITY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Read the current `oauthAccount` + `userID` from `~/.claude.json`.
 fn read_claude_identity() -> (Option<serde_json::Value>, Option<String>) {
+    #[cfg(test)]
+    CLAUDE_IDENTITY_READS.with(|n| n.set(n.get() + 1));
     let Ok(path) = claude_json_path() else {
         return (None, None);
     };
@@ -3305,7 +3378,10 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
             return RefreshOutcome::default();
         }
     };
-    sync_active_from_keychain(provider, &mut state);
+    // Parse ~/.claude.json once for the whole cycle: the keychain sync and
+    // the commit-time metadata refresh below share this reading.
+    let claude_identity = read_claude_identity().0;
+    sync_active_from_keychain_with(provider, &mut state, claude_identity.as_ref());
     logging::log("poll: refreshing usage cache");
 
     // Per-account fetch floor uses the same tier ramp as `next_interval`; read
@@ -3784,7 +3860,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
     let merged = with_state_lock(|| {
         let mut st = State::load()?;
         let before = serde_json::to_vec(&st).unwrap_or_default();
-        sync_active_claude_identity(&mut st);
+        sync_active_claude_identity_from(&mut st, claude_identity.as_ref());
         for (email, acct, cu, ns) in &updates {
             if let Some(a) = st.find_mut(email) {
                 merge_poll_update(a, acct, cu.as_ref(), ns.as_ref());
