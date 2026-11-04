@@ -172,7 +172,7 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
                     } else {
                         // Never execute repo-controlled commands Claude Code
                         // itself would not start.
-                        eprintln!("mcp {}: not approved (not started)", name);
+                        eprintln!("mcp {}: not approved (not started)", printable(name));
                     }
                 }
                 sources.push((mcp_json, approved));
@@ -194,8 +194,11 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     let mut origin = std::collections::HashMap::new();
     for (path, entries) in sources {
         for (name, cfg) in entries {
-            if approval.disabled.contains(&name) {
-                eprintln!("mcp {}: disabled for this project (not started)", name);
+            if approval.project_disabled.contains(&name) {
+                eprintln!(
+                    "mcp {}: disabled for this project (not started)",
+                    printable(&name)
+                );
                 continue;
             }
             if seen.insert(name.clone()) {
@@ -210,7 +213,7 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
             Ok(summary) => {
                 items.push(LedgerItem {
                     kind: ItemKind::McpTools,
-                    name: format!("mcp: {}", name),
+                    name: format!("mcp: {}", printable(&name)),
                     mtime: file_mtime(&path),
                     path,
                     token_count: summary.token_count,
@@ -221,7 +224,7 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
             Err(err) => {
                 // Skip failed MCP servers — timeout / crash / bad config.
                 // In a follow-up we surface a "?" row with the error.
-                eprintln!("mcp {} skipped: {}", name, err);
+                eprintln!("mcp {} skipped: {}", printable(&name), err);
             }
         }
     }
@@ -234,7 +237,10 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
 struct McpApproval {
     enable_all: bool,
     enabled: std::collections::HashSet<String>,
+    /// `disabledMcpjsonServers`: rejects `.mcp.json` servers only.
     disabled: std::collections::HashSet<String>,
+    /// `projects.<path>.disabledMcpServers`: applies across every source.
+    project_disabled: std::collections::HashSet<String>,
 }
 
 impl McpApproval {
@@ -265,13 +271,27 @@ impl McpApproval {
         }
         self.disabled.extend(strs("disabledMcpjsonServers"));
         if project_entry {
-            self.disabled.extend(strs("disabledMcpServers"));
+            self.project_disabled.extend(strs("disabledMcpServers"));
         }
     }
 
     fn project_server_approved(&self, name: &str) -> bool {
         !self.disabled.contains(name) && (self.enable_all || self.enabled.contains(name))
     }
+}
+
+/// Server names can come from a cloned repo's `.mcp.json`: escape control
+/// characters (ESC/OSC sequences) before they reach the terminal.
+fn printable(name: &str) -> String {
+    name.chars()
+        .flat_map(|c| {
+            if c.is_control() {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
 }
 
 /// An absolute spelling of `p` without touching the filesystem.
@@ -424,6 +444,12 @@ use super::file_mtime;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn printable_escapes_terminal_control_sequences() {
+        assert_eq!(printable("a\u{1b}]52;c;x\u{7}b"), "a\\u{1b}]52;c;x\\u{7}b");
+        assert_eq!(printable("plain-name_1"), "plain-name_1");
+    }
 
     #[test]
     fn windows_verbatim_project_path_maps_to_plain_keys() {

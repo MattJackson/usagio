@@ -340,6 +340,18 @@ fn mcp_initialize_error_surfaced() {
 }
 
 #[test]
+fn mcp_tools_list_error_surfaced() {
+    let script = format!(
+        r#"read a; echo '{INIT_OK}'; read b; read c; echo '{{"jsonrpc":"2.0","id":2,"error":{{"code":-32601,"message":"Method not found"}}}}'; sleep 5"#
+    );
+    let e = mcp::fetch_tools(&sh_server(&script)).unwrap_err();
+    assert!(
+        e.starts_with("tools/list failed") && e.contains("Method not found"),
+        "got: {e}"
+    );
+}
+
+#[test]
 fn mcp_child_and_grandchildren_killed_after_fetch() {
     let td = tempdir().unwrap();
     let pids = td.path().join("pids");
@@ -769,7 +781,7 @@ fn mcp_malformed_or_unexpected_replies_are_errors() {
         r#"read a; echo '{INIT_OK}'; read b; read c; echo '{{"jsonrpc":"2.0","id":2,"error":{{"code":-1}}}}'; sleep 5"#
     );
     let e = mcp::fetch_tools(&sh_server(&rpc_err)).unwrap_err();
-    assert!(e.contains("missing result.tools"), "got: {e}");
+    assert!(e.starts_with("tools/list failed"), "got: {e}");
 
     let not_array = format!(
         r#"read a; echo '{INIT_OK}'; read b; read c; echo '{{"jsonrpc":"2.0","id":2,"result":{{"tools":{{}}}}}}'; sleep 5"#
@@ -1001,5 +1013,29 @@ fn codex_override_walk_cap_and_disabled_mcp() {
         assert_eq!(root_doc.content_bytes, 32 * 1024);
         assert!(by("Project AGENTS.md").is_none(), "cap reached");
         assert!(!marker.exists(), "enabled=false server was started");
+    });
+}
+
+#[test]
+fn mcpjson_rejection_does_not_hide_same_named_user_server() {
+    with_home(|home| {
+        let canon = self_approving_repo(home, None);
+        // the repo's `evil` is rejected, but the user's own `evil` server runs
+        let marker = home.join("user-ran");
+        fs::write(
+            home.join(".claude.json"),
+            serde_json::json!({
+                "mcpServers": { "evil": mcp_marker_server(&marker) },
+                "projects": { canon.to_string_lossy(): {
+                    "disabledMcpjsonServers": ["evil"] } } })
+            .to_string(),
+        )
+        .unwrap();
+        let l = build_ledger("claude", Some(&canon)).unwrap();
+        assert!(!canon.join("ran").exists());
+        assert!(
+            l.items.iter().any(|i| i.name == "mcp: evil"),
+            "user server dropped"
+        );
     });
 }
