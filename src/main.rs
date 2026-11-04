@@ -204,9 +204,12 @@ fn run() -> Result<()> {
             // user to re-login. Fire a menu-bar notification AND log loudly.
             // We still proceed (State::default), but the user is at least
             // told and can retry.
+            let log_path = store::config_dir()
+                .map(|d| d.join("usagio.log").display().to_string())
+                .unwrap_or_else(|_| "usagio.log in the config directory".to_string());
             let msg = format!(
                 "usagio: config migration FAILED — accounts may appear missing. \
-                 See ~/.config/usagio/logs; try again or copy the old dir manually. \
+                 See {log_path}; try again or copy the old dir manually. \
                  Details: {e:?}"
             );
             eprintln!("{msg}");
@@ -340,7 +343,8 @@ fn print_help() {
          usagio rm <email>        Forget an account\n\n\
          With no [email], switch/start/continue auto-pick the account that has room\n  \
          and whose weekly limit resets soonest (use it before the quota resets).\n  \
-         With an [email], auto-swap stays on it until it's exhausted.\n\n\
+         With an [email], a pick already at/over the trigger holds until it's\n  \
+         exhausted; one under the trigger swaps at the trigger as usual.\n\n\
          Onboarding: log into an account with `claude` as usual, then\n  \
          `usagio capture`. Repeat once per account.\n"
     );
@@ -582,7 +586,10 @@ pub(crate) fn persist_login(
                 .and_then(|pending| pending.drain_token.clone());
             accounts.pending_switch = Some(store::PendingSwitch {
                 key: key.clone(),
-                manual: true,
+                // A renewal is not a pick: `manual: false` on a switch whose
+                // target is already active marks it so the commit leaves
+                // manual_pick/manual_hold alone.
+                manual: false,
                 from: accounts.active.clone(),
                 drain_token,
                 credentials_written: false,
@@ -591,6 +598,16 @@ pub(crate) fn persist_login(
             });
         } else {
             state.upsert_provider_account(slug, acct);
+            // A queued switch TO this account may already have written its old
+            // credentials to the vendor file; make the retry rewrite them.
+            if let Some(pending) = state
+                .provider_accounts_mut(slug)
+                .pending_switch
+                .as_mut()
+                .filter(|pending| pending.key == key)
+            {
+                pending.credentials_written = false;
+            }
         }
         state.save()?;
         Ok(active)
@@ -605,7 +622,7 @@ pub(crate) fn persist_login(
                 lifecycle::prepare_handoff(provider, &status, &mut state, &key, true)
             })?;
             if ready {
-                commit_provider_switch(provider, slug, &key, true, true)?;
+                commit_provider_switch(provider, slug, &key, false, false)?;
             }
             Ok(ready)
         })();
@@ -734,6 +751,14 @@ fn strip_renew_qualifier(slug: &mut String, selector: Option<String>) -> Option<
     }
 }
 
+/// Resolve a non-Claude renew selector (full key or unique prefix) up front, so
+/// a prefix is never passed through as the expected account.
+fn resolve_provider_renew_key(state: &State, slug: &str, sel: &str) -> Result<String> {
+    resolve_provider_selector(state, &format!("{slug}:{sel}"))
+        .map(|(_, key)| key)
+        .ok_or_else(|| anyhow!("no unique {slug} account matches '{sel}'"))
+}
+
 /// `usagio login|renew [<email>] [--provider <slug>]`: run the provider's own
 /// login in the default browser — renewing `<email>`, or adding whichever
 /// account signs in when none is given (the CLI side of the menu's "Renew
@@ -754,12 +779,7 @@ fn cmd_renew(args: &[String]) -> Result<()> {
     let state = State::load()?;
     let target = match selector {
         Some(sel) if slug == CLAUDE_SLUG => login::Target::Renew(state.resolve(&sel)?),
-        Some(sel) => login::Target::Renew(
-            state
-                .find_provider_account(&slug, &sel)
-                .map(|a| a.key.clone())
-                .unwrap_or(sel),
-        ),
+        Some(sel) => login::Target::Renew(resolve_provider_renew_key(&state, &slug, &sel)?),
         // The browser keeps its own session; this store key is never shown
         // in a window, it just marks the account as browser-added.
         None => login::Target::Add {
@@ -836,8 +856,14 @@ fn cmd_list(args: &[String]) -> Result<()> {
     let refresh = args.iter().any(|a| a == "--refresh" || a == "-r");
     // By default read the cache (no network); --refresh does exactly one fetch.
     if refresh {
+        providers::init();
         refresh_usage_cache(true);
         claude_profiles::refresh(usize::MAX, true);
+        let trigger = State::load()
+            .ok()
+            .and_then(|s| s.trigger_pct)
+            .unwrap_or(TRIGGER_PCT);
+        refresh_provider_usage_caches_with(true, trigger, &std::collections::HashSet::new());
     }
     providers::init();
     let state = State::load()?;
@@ -931,11 +957,17 @@ fn cmd_switch(selector: Option<&str>, launch: Option<Launch>) -> Result<()> {
         if let Some(Ok(email)) = &claude {
             return finish_claude_switch(email, launch, true);
         }
+        // An ambiguous Claude prefix is an error, never a reason to switch a
+        // different provider's account (same rule as `rm`).
+        if let Some(Err(e)) = &claude {
+            if e.to_string().contains("ambiguous") {
+                return claude.unwrap().map(|_| ());
+            }
+        }
         if let Some((slug, key)) = resolve_provider_selector(&state, sel) {
             return finish_provider_switch(&slug, &key, launch, true);
         }
-        // Surface Claude's own error ("'dev' is ambiguous — matches: …")
-        // rather than a bare miss.
+        // Surface Claude's own error rather than a bare miss.
         if let Some(Err(e)) = claude {
             return Err(e);
         }
@@ -977,9 +1009,22 @@ fn finish_provider_switch(slug: &str, key: &str, launch: Option<Launch>, hold: b
             std::thread::sleep(std::time::Duration::from_secs(1));
             switch_provider_with_intent(slug, key, hold)?;
         }
+        ensure_switch_landed(slug, key, &label)?;
     }
     println!("Active login is now {label} ({slug}).");
     launch_selected_client(provider, launch)
+}
+
+/// After waiting out a queued switch: bail unless `key` really became active
+/// (the queue may have been superseded or cancelled instead).
+fn ensure_switch_landed(slug: &str, key: &str, label: &str) -> Result<()> {
+    let active = State::load()?
+        .provider_accounts(slug)
+        .and_then(|pa| pa.active.clone());
+    if active.is_some_and(|a| a.eq_ignore_ascii_case(key)) {
+        return Ok(());
+    }
+    bail!("the queued switch to {label} ({slug}) did not complete; it is not the active login")
 }
 
 fn launch_selected_client(provider: &dyn Provider, launch: Option<Launch>) -> Result<()> {
@@ -1323,21 +1368,30 @@ fn commit_provider_switch_guarded(
             .provider_accounts_mut(slug)
             .active
             .replace(acct.key.clone());
-        state.set_manual_pick(slug, hold.then_some(acct.key.as_str()));
-        let tier = pick_tier(&state, slug, &acct.key);
-        state.set_manual_pick_tier(slug, hold.then_some(tier.as_str()));
-        let hold = hold && tier >= autoswap::Tier::Draining;
-        state.set_manual_hold(slug, hold.then_some(acct.key.as_str()));
-        state.note_active_change(
-            slug,
-            prev.as_deref(),
-            &acct.key,
-            if manual {
-                autoswap::memory::ChangeKind::Manual
-            } else {
-                autoswap::memory::ChangeKind::Auto
-            },
-        );
+        // A non-manual "switch" to the already-active account is a login
+        // renewal (see `persist_login`): it must not touch the user's pick,
+        // hold, or the swap memory.
+        let renewal = !manual
+            && prev
+                .as_deref()
+                .is_some_and(|p| p.eq_ignore_ascii_case(&acct.key));
+        if !renewal {
+            state.set_manual_pick(slug, hold.then_some(acct.key.as_str()));
+            let tier = pick_tier(&state, slug, &acct.key);
+            state.set_manual_pick_tier(slug, hold.then_some(tier.as_str()));
+            let hold = hold && tier >= autoswap::Tier::Draining;
+            state.set_manual_hold(slug, hold.then_some(acct.key.as_str()));
+            state.note_active_change(
+                slug,
+                prev.as_deref(),
+                &acct.key,
+                if manual {
+                    autoswap::memory::ChangeKind::Manual
+                } else {
+                    autoswap::memory::ChangeKind::Auto
+                },
+            );
+        }
         if let (Some(from), Some((kind, latch))) = (prev.as_deref(), leave_latch) {
             state
                 .swap_memory
@@ -2069,7 +2123,7 @@ fn apply_account(
     // real recovery on the returning account would be ignored: the first
     // 429 lands on count=1 (which was reset to 0 by us here), and the
     // second bumps to 2, immediately re-escalating on possibly-stale data.
-    if let Some(prev) = from {
+    if let Some(prev) = from.filter(|p| !p.eq_ignore_ascii_case(to)) {
         reset_usage_fetch_tracker(prev);
     }
     Ok(())
@@ -2291,9 +2345,18 @@ fn sync_active_from_keychain(provider: &'static dyn Provider, state: &mut State)
 // token
 // ---------------------------------------------------------------------------
 
+/// `usagio token` is Claude-only: accept `claude:<x>`, reject other qualifiers.
+fn token_selector(sel: &str) -> Result<&str> {
+    match sel.split_once(':') {
+        Some((q, rest)) if q.eq_ignore_ascii_case(CLAUDE_SLUG) => Ok(rest),
+        Some((q, _)) => bail!("`usagio token` is Claude-only; '{q}:' accounts are not supported"),
+        None => Ok(sel),
+    }
+}
+
 fn cmd_token(selector: Option<&str>) -> Result<()> {
     let state = State::load()?;
-    let email = match selector {
+    let email = match selector.map(token_selector).transpose()? {
         Some(sel) => state.resolve(sel)?,
         None => match state.accounts.as_slice() {
             [only] => only.key().to_string(),
@@ -5114,19 +5177,43 @@ fn history_path() -> Result<std::path::PathBuf> {
 
 fn log_event(v: &serde_json::Value) {
     use std::io::Write;
-    let Ok(path) = history_path() else { return };
+    let path = match history_path() {
+        Ok(p) => p,
+        Err(e) => {
+            log_history_failure(&format!("history path unavailable: {e:#}"));
+            return;
+        }
+    };
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            log_history_failure(&format!("create {} failed: {e}", dir.display()));
+        }
     }
     // Rotate if it has grown too large (keep one previous generation), using the
     // same threshold as the debug log so the policy can't drift.
     logging::rotate_if_large(&path, logging::MAX_BYTES);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(f, "{v}");
+        Ok(mut f) => {
+            if let Err(e) = writeln!(f, "{v}") {
+                log_history_failure(&format!("write {} failed: {e}", path.display()));
+            }
+        }
+        Err(e) => log_history_failure(&format!("open {} failed: {e}", path.display())),
+    }
+}
+
+/// Log a history.jsonl write failure, at most once per process so a
+/// persistent fault doesn't flood the debug log every poll.
+fn log_history_failure(msg: &str) {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        logging::log(&format!(
+            "history: {msg} (further history errors suppressed)"
+        ));
     }
 }
 
@@ -5231,8 +5318,13 @@ fn cmd_report(args: &[String]) -> Result<()> {
     use chrono::{Datelike, Local, TimeZone, Timelike};
 
     let path = history_path()?;
-    let data = std::fs::read_to_string(&path)
-        .context("no history yet — run `usagio watch` (or `install`) to collect it")?;
+    let data = match std::fs::read(&path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!("no history yet — run `usagio watch` (or `install`) to collect it")
+        }
+        Err(e) => return Err(anyhow!(e).context(format!("reading {}", path.display()))),
+    };
     let samples: Vec<Sample> = data
         .lines()
         .filter_map(|l| serde_json::from_str::<Sample>(l).ok())

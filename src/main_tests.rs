@@ -6842,3 +6842,150 @@ fn poll_merge_skips_save_when_nothing_changed() {
         "changed state must be saved"
     );
 }
+
+#[test]
+fn token_selector_strips_claude_and_rejects_other_qualifiers() {
+    assert_eq!(token_selector("claude:a@x.com").unwrap(), "a@x.com");
+    assert_eq!(token_selector("a@x.com").unwrap(), "a@x.com");
+    let err = token_selector("codex:a@x.com").unwrap_err().to_string();
+    assert!(err.contains("Claude-only"), "{err}");
+}
+
+#[test]
+fn renew_resolves_unique_provider_prefix_and_rejects_misses() {
+    let mut state = State::default();
+    state.upsert_provider_account("codex", codex_account("dev@example.com", None));
+    assert_eq!(
+        resolve_provider_renew_key(&state, "codex", "dev").unwrap(),
+        "dev@example.com"
+    );
+    assert!(resolve_provider_renew_key(&state, "codex", "nobody").is_err());
+}
+
+#[test]
+fn switch_ambiguous_claude_prefix_does_not_fall_through_to_provider() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let mut state = State::default();
+    for email in ["dev1@e.com", "dev2@e.com"] {
+        let mut a = acct_with_cache(None);
+        a.email = Some(email.to_string());
+        state.upsert(a);
+    }
+    state.upsert_provider_account("codex", codex_account("dev3@e.com", None));
+    state.save().unwrap();
+    let err = cmd_switch(Some("dev"), None).unwrap_err().to_string();
+    assert!(err.contains("ambiguous"), "{err}");
+}
+
+#[test]
+fn switch_wait_requires_the_target_to_be_active() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let mut state = State::default();
+    state.upsert_provider_account("codex", codex_account("a@e.com", None));
+    state.upsert_provider_account("codex", codex_account("b@e.com", None));
+    state.provider_accounts_mut("codex").active = Some("b@e.com".into());
+    state.save().unwrap();
+    assert!(ensure_switch_landed("codex", "a@e.com", "a@e.com").is_err());
+    assert!(ensure_switch_landed("codex", "B@e.com", "b@e.com").is_ok());
+}
+
+#[test]
+fn report_distinguishes_missing_history_and_tolerates_bad_utf8() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let err = cmd_report(&[]).unwrap_err().to_string();
+    assert!(err.contains("no history yet"), "{err}");
+    let path = history_path().unwrap();
+    std::fs::create_dir_all(&path).unwrap(); // EISDIR, not "missing"
+    let err = format!("{:#}", cmd_report(&[]).unwrap_err());
+    assert!(!err.contains("no history yet"), "{err}");
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, b"\xff\xfe not json\n").unwrap();
+    assert!(
+        cmd_report(&[]).is_ok(),
+        "one bad byte must not hide history"
+    );
+}
+
+#[test]
+fn claude_self_switch_keeps_the_usage_fetch_tracker() {
+    with_claude_home("old@e.com", |_| {
+        let email = "selfswitch-tracker@e.com";
+        let acct = claude_account_with_identity(email, 1_000);
+        let identity = acct.oauth_account.clone().unwrap();
+        record_usage_fetch_429(email);
+        apply_account(
+            providers::get(CLAUDE_SLUG).unwrap(),
+            &acct,
+            &identity,
+            Some(email),
+            email,
+        )
+        .unwrap();
+        assert_eq!(get_usage_fetch_tracker(email).consecutive_429s, 1);
+        reset_usage_fetch_tracker(email);
+    });
+}
+
+#[test]
+fn active_login_renewal_does_not_become_a_manual_pick() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let provider = MockActiveSlotProvider::new("old-live-login");
+    let slug = provider.provider_id();
+    let key = "active@example.com";
+    let mut old = codex_account(key, None);
+    old.identity_email = Some(key.into());
+    let mut state = State::default();
+    state.upsert_provider_account(slug, old);
+    state.provider_accounts_mut(slug).active = Some(key.into());
+    state.save().unwrap();
+    let captured = providers::codex::CodexProvider
+        .complete_login(&codex_login_response(key, "account-a"))
+        .unwrap();
+    let result = persist_login(&provider, captured, None).unwrap();
+    assert!(result.made_live);
+    let after = State::load().unwrap();
+    assert_eq!(after.manual_pick(slug), None, "renewal recorded a pick");
+    assert_eq!(after.manual_hold(slug), None, "renewal recorded a hold");
+    assert!(after
+        .provider_accounts(slug)
+        .unwrap()
+        .pending_switch
+        .is_none());
+}
+
+#[test]
+fn renewing_a_queued_switch_target_forces_the_credential_rewrite() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let provider = MockActiveSlotProvider::new("live");
+    let slug = provider.provider_id();
+    let (a, b) = ("a@example.com", "b@example.com");
+    let mut state = State::default();
+    state.upsert_provider_account(slug, codex_account(a, None));
+    state.upsert_provider_account(slug, codex_account(b, None));
+    state.provider_accounts_mut(slug).active = Some(a.into());
+    state.provider_accounts_mut(slug).pending_switch = Some(crate::store::PendingSwitch {
+        key: b.into(),
+        manual: true,
+        from: Some(a.into()),
+        drain_token: None,
+        credentials_written: true,
+        leave_latch: None,
+        renewed_account: None,
+    });
+    state.save().unwrap();
+    let captured = providers::codex::CodexProvider
+        .complete_login(&codex_login_response(b, "account-b"))
+        .unwrap();
+    persist_login(&provider, captured, None).unwrap();
+    let pending = State::load()
+        .unwrap()
+        .provider_accounts(slug)
+        .unwrap()
+        .pending_switch
+        .clone()
+        .unwrap();
+    assert!(
+        !pending.credentials_written,
+        "renewed grant would never be written"
+    );
+}
