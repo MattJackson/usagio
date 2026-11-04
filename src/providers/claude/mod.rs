@@ -142,11 +142,14 @@ impl Provider for ClaudeProvider {
         // Snapshot the identity Claude Code stores alongside the keychain
         // token in ~/.claude.json (used to fully restore an account on a
         // later switch — the token alone doesn't set who is signed in).
+        ensure_claude_json_readable()?;
         let (oauth_account, user_id) = read_claude_identity();
 
         // Resolve the email: profile endpoint if online, else fall back to
         // the identity we just read from ~/.claude.json.
-        let email = usage::fetch_email(&access).or_else(|| {
+        let profile_email = usage::fetch_email(&access);
+        ensure_identity_matches_token(profile_email.as_deref(), oauth_account.as_ref())?;
+        let email = profile_email.or_else(|| {
             oauth_account
                 .as_ref()
                 .and_then(|o| o.get("emailAddress"))
@@ -372,7 +375,15 @@ impl Provider for ClaudeProvider {
             .map_err(|e| ProviderError::Other(e.to_string()))?;
         if let Err(e) = active_slot_write(blob) {
             if let Some((bytes, mode)) = &prior {
-                let _ = restore_claude_json_raw(bytes, *mode);
+                if let Err(re) = restore_claude_json_raw(bytes, *mode) {
+                    crate::logging::log(&format!(
+                        "event=switch provider=claude slot_written=err:{e} rollback=err:{re}"
+                    ));
+                    return Err(ProviderError::Other(format!(
+                        "{e}; rolling back ~/.claude.json failed too ({re}); it may now point \
+                         at the new account while the credential slot holds the old one"
+                    )));
+                }
             }
             return Err(e);
         }
@@ -857,10 +868,78 @@ fn write_bytes_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> P
     Ok(())
 }
 
+/// Capture must not store an identity-less account just because
+/// `~/.claude.json` is mid-write by Claude Code: fail (retryable) when the
+/// file exists but cannot be read or parsed. A missing file is fine.
+fn ensure_claude_json_readable() -> PResult<()> {
+    let Some(path) = claude_json_path() else {
+        return Ok(());
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
+            .map(|_| ())
+            .map_err(|e| {
+                ProviderError::Other(format!(
+                    "~/.claude.json is not valid JSON right now ({e}); try capture again"
+                ))
+            }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(ProviderError::Io(e)),
+    }
+}
+
+/// The token's profile email and `~/.claude.json`'s `oauthAccount` must name
+/// the same account, else the capture would pair X's token with Y's identity.
+fn ensure_identity_matches_token(
+    profile_email: Option<&str>,
+    oauth_account: Option<&Value>,
+) -> PResult<()> {
+    let json_email = oauth_account
+        .and_then(|o| o.get("emailAddress"))
+        .and_then(Value::as_str);
+    match (profile_email, json_email) {
+        (Some(p), Some(j)) if !p.eq_ignore_ascii_case(j) => Err(ProviderError::Other(format!(
+            "the signed-in token belongs to {p} but ~/.claude.json names {j}; \
+             finish signing in as one account, then run capture again"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 fn write_claude_identity(oauth_account: &Value, user_id: Option<&str>) -> PResult<()> {
+    write_claude_identity_with(oauth_account, user_id, || {})
+}
+
+/// Read-modify-write `~/.claude.json`. The Claude CLI rewrites this file
+/// continually, so re-read just before committing and redo the patch if the
+/// bytes moved (bounded). `before_commit` is a test seam.
+fn write_claude_identity_with(
+    oauth_account: &Value,
+    user_id: Option<&str>,
+    mut before_commit: impl FnMut(),
+) -> PResult<()> {
     let path = claude_json_path().ok_or_else(|| ProviderError::Other("HOME is not set".into()))?;
-    let bytes = std::fs::read(&path).map_err(ProviderError::Io)?;
-    let mut v: Value = serde_json::from_slice(&bytes)
+    for attempt in 0..3 {
+        let bytes = std::fs::read(&path).map_err(ProviderError::Io)?;
+        let json = patch_claude_json(&bytes, oauth_account, user_id)?;
+        let mode = claude_json_mode(&path);
+        before_commit();
+        let unchanged = std::fs::read(&path)
+            .map(|now| now == bytes)
+            .unwrap_or(false);
+        if unchanged || attempt == 2 {
+            return write_bytes_atomic_mode(&path, &json, mode);
+        }
+    }
+    unreachable!("loop returns on the last attempt")
+}
+
+fn patch_claude_json(
+    bytes: &[u8],
+    oauth_account: &Value,
+    user_id: Option<&str>,
+) -> PResult<Vec<u8>> {
+    let mut v: Value = serde_json::from_slice(bytes)
         .map_err(|e| ProviderError::Other(format!("parsing ~/.claude.json: {e}")))?;
     let obj = v
         .as_object_mut()
@@ -875,10 +954,8 @@ fn write_claude_identity(oauth_account: &Value, user_id: Option<&str>) -> PResul
         }
     }
     obj.remove("cachedUsageUtilization");
-    let json = serde_json::to_vec_pretty(&v)
-        .map_err(|e| ProviderError::Other(format!("serializing ~/.claude.json: {e}")))?;
-    let mode = claude_json_mode(&path);
-    write_bytes_atomic_mode(&path, &json, mode)
+    serde_json::to_vec_pretty(&v)
+        .map_err(|e| ProviderError::Other(format!("serializing ~/.claude.json: {e}")))
 }
 
 #[cfg(test)]
@@ -1482,6 +1559,49 @@ mod tests {
             }
             assert_eq!(active_slot_read().unwrap().as_deref(), Some("blob-1"));
         });
+    }
+
+    #[test]
+    fn write_claude_identity_redoes_patch_when_file_changes_before_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".claude.json");
+        crate::env_lock::scoped_env_var("HOME", Some(dir.path().to_str().unwrap()), || {
+            std::fs::write(&file, r#"{"projects":{}}"#).unwrap();
+            let mut first = true;
+            write_claude_identity_with(
+                &serde_json::json!({"emailAddress":"a@e.com"}),
+                None,
+                || {
+                    if std::mem::take(&mut first) {
+                        // The CLI lands a write between our read and commit.
+                        std::fs::write(&file, r#"{"projects":{},"cli_new_key":1}"#).unwrap();
+                    }
+                },
+            )
+            .unwrap();
+            let v: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            assert_eq!(v["cli_new_key"], 1, "concurrent CLI write was dropped");
+            assert_eq!(v["oauthAccount"]["emailAddress"], "a@e.com");
+        });
+    }
+
+    #[test]
+    fn ensure_claude_json_readable_rejects_garbage_but_allows_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::env_lock::scoped_env_var("HOME", Some(dir.path().to_str().unwrap()), || {
+            assert!(ensure_claude_json_readable().is_ok());
+            std::fs::write(dir.path().join(".claude.json"), "{trunc").unwrap();
+            assert!(ensure_claude_json_readable().is_err());
+        });
+    }
+
+    #[test]
+    fn identity_must_match_the_token_profile_email() {
+        let oa = serde_json::json!({"emailAddress":"Y@e.com"});
+        assert!(ensure_identity_matches_token(Some("x@e.com"), Some(&oa)).is_err());
+        assert!(ensure_identity_matches_token(Some("y@E.com"), Some(&oa)).is_ok());
+        assert!(ensure_identity_matches_token(None, Some(&oa)).is_ok());
+        assert!(ensure_identity_matches_token(Some("x@e.com"), None).is_ok());
     }
 
     #[test]
