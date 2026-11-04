@@ -195,6 +195,9 @@ fn desktop_exec_quote(s: &str) -> String {
             }
             '\\' => out.push_str("\\\\\\\\"),
             '%' => out.push_str("%%"),
+            // A raw line break would end the Exec= line; use the string escapes.
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
             _ => out.push(c),
         }
     }
@@ -1053,6 +1056,13 @@ mod tests {
             "/usr/local/bin/usagio"
         );
         assert_eq!(desktop_exec_quote("menubar"), "menubar");
+    }
+
+    #[test]
+    fn desktop_exec_quote_escapes_line_breaks() {
+        let q = desktop_exec_quote("/a\nExec=evil\r/b");
+        assert!(!q.contains('\n') && !q.contains('\r'), "{q:?}");
+        assert_eq!(q, "\"/a\\nExec=evil\\r/b\"");
     }
 
     #[test]

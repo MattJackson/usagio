@@ -15,9 +15,12 @@ use super::xml_escape;
 // Rename the result so the reader cannot observe a partially written status.
 const RUN: &str = r#"result=$1; shift
 child=
-trap 'if [ -n "$child" ]; then kill -KILL "$child" 2>/dev/null; wait "$child" 2>/dev/null; fi; exit 143' TERM INT HUP
+sig=
+trap 'sig=1' TERM INT HUP
 "$@" </dev/null >/dev/null 2>&1 &
 child=$!
+trap 'kill -KILL "$child" 2>/dev/null; wait "$child" 2>/dev/null; exit 143' TERM INT HUP
+if [ -n "$sig" ]; then kill -KILL "$child" 2>/dev/null; wait "$child" 2>/dev/null; exit 143; fi
 wait "$child"
 code=$?
 child=
@@ -209,6 +212,23 @@ mod tests {
     const PROBE: &str = "platform::macos::independent::tests::responsibility_probe";
     const OUTPUT: &str = "USAGIO_RESPONSIBILITY_PROBE_OUTPUT";
     const SUPERVISOR: &str = "USAGIO_RESPONSIBILITY_SUPERVISOR";
+
+    /// A TERM that lands between the fork and `child=$!` must not be lost:
+    /// the kill trap may only be armed once the pid is recorded, and a signal
+    /// caught earlier must be acted on.
+    #[test]
+    fn run_script_records_pid_before_arming_kill_trap() {
+        let fork = RUN.find("child=$!").unwrap();
+        let kill_trap = RUN.find("trap 'kill").expect("kill trap");
+        assert!(
+            kill_trap > fork,
+            "kill trap armed before the pid is recorded"
+        );
+        assert!(
+            RUN.contains("if [ -n \"$sig\" ]"),
+            "pending signal not handled"
+        );
+    }
 
     fn loaded_jobs() -> Vec<String> {
         let output = Command::new("/bin/launchctl").arg("list").output().unwrap();
