@@ -302,23 +302,67 @@ pub(crate) fn start_and_verify(expected: &crate::providers::IdentitySnapshot) ->
         std::thread::sleep(Duration::from_millis(500));
     }
     let actual = probe()?.context("Codex daemon did not return after restart")?;
-    if !actual
-        .email
-        .as_deref()
-        .is_some_and(|actual| actual.eq_ignore_ascii_case(email))
-        || expected
-            .uuid
-            .as_ref()
-            .is_some_and(|id| actual.account_id.as_ref() != Some(id))
-    {
+    if !identity_matches(&actual, email, expected.uuid.as_ref()) {
         bail!("Codex daemon did not load the selected account");
     }
     Ok(())
 }
 
+/// Whether the daemon's reported identity is the account we asked it to load:
+/// email must match (case-insensitively) and, when a uuid is expected, the
+/// account id must match too.
+fn identity_matches(actual: &ClientState, email: &str, uuid: Option<&String>) -> bool {
+    actual
+        .email
+        .as_deref()
+        .is_some_and(|actual| actual.eq_ignore_ascii_case(email))
+        && uuid.is_none_or(|id| actual.account_id.as_ref() == Some(id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_matches_checks_email_and_uuid() {
+        let st = |email: Option<&str>, id: Option<&str>| ClientState {
+            busy: false,
+            email: email.map(String::from),
+            account_id: id.map(String::from),
+            instance_token: None,
+        };
+        let u = "u-1".to_string();
+        assert!(identity_matches(
+            &st(Some("A@x.com"), Some("u-1")),
+            "a@x.com",
+            Some(&u)
+        ));
+        assert!(identity_matches(
+            &st(Some("a@x.com"), None),
+            "a@x.com",
+            None
+        ));
+        assert!(!identity_matches(
+            &st(Some("b@x.com"), Some("u-1")),
+            "a@x.com",
+            Some(&u)
+        ));
+        assert!(!identity_matches(
+            &st(None, Some("u-1")),
+            "a@x.com",
+            Some(&u)
+        ));
+        assert!(!identity_matches(
+            &st(Some("a@x.com"), Some("u-2")),
+            "a@x.com",
+            Some(&u)
+        ));
+        assert!(!identity_matches(
+            &st(Some("a@x.com"), None),
+            "a@x.com",
+            Some(&u)
+        ));
+    }
 
     /// Hold a synthetic Responses stream open until the test releases it.
     /// No credentials or prompts are recorded or sent beyond loopback.
