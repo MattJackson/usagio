@@ -258,6 +258,12 @@ fn desktop_exec_split(line: &str) -> Result<Vec<String>> {
                             } else if matches!(next, '"' | '`' | '$') {
                                 // Legacy single-backslash form (older installs).
                                 tok.push(next);
+                            } else if next == 'n' {
+                                // String-level line-break escapes written by
+                                // `desktop_exec_quote`.
+                                tok.push('\n');
+                            } else if next == 'r' {
+                                tok.push('\r');
                             } else {
                                 tok.push('\\');
                                 tok.push(next);
@@ -1090,6 +1096,8 @@ mod tests {
             "/q\"x y",
             "/home/me/100%/u",
             "/b`t k",
+            "/a\nb c",
+            "/a\rb",
         ] {
             let toks = desktop_exec_split(&desktop_exec_quote(raw)).unwrap();
             assert_eq!(toks, vec![raw.to_string()], "round trip of {raw:?}");
