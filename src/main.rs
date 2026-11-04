@@ -325,7 +325,7 @@ fn print_help() {
          usagio switch [email]    Make <email> the active login (no launch)\n  \
          usagio start [email]     Switch, then launch the selected provider CLI\n  \
          usagio continue [email]  Switch, then resume the selected provider session\n  \
-         usagio token [email]     Print a fresh access token\n  \
+         usagio token [email]     Print an access token (the active one: the token Claude Code is using)\n  \
          usagio watch [OPTS]      Auto-swap at your trigger (default 95%), keep working (foreground)\n  \
                                         --trigger <pct>  --ceiling <pct>  --interval <secs>\n  \
          usagio menubar           Run the menu-bar/tray app (usage + auto-swap)\n  \
@@ -2582,7 +2582,18 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
         None
     };
     let acct = match active {
-        Some((ActiveRefreshOutcome::Adopted, fresh)) => fresh,
+        Some((ActiveRefreshOutcome::Adopted, fresh)) => {
+            // Never refreshed for the active account (see `token_active_cas`):
+            // say so when Claude Code has left it expired.
+            if fresh.expires_at <= Utc::now().timestamp_millis() {
+                eprintln!(
+                    "warning: {email}'s access token (the one Claude Code is using) has \
+                     expired; run `claude` to renew it — usagio never refreshes the \
+                     active login"
+                );
+            }
+            fresh
+        }
         Some((ActiveRefreshOutcome::RefreshFailed, stored)) => {
             logging::log(&format!(
                 "token: active account {email} slot unreadable; returning stored \

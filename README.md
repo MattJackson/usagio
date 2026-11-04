@@ -191,7 +191,7 @@ usagio capture             Capture the account you're currently logged into
 usagio switch [acct]       Make <acct> the active login (no launch)
 usagio start [acct]        Switch, then launch the selected provider CLI
 usagio continue [acct]     Switch, then resume the selected provider session
-usagio token <acct>        Print a fresh access token (for scripting)
+usagio token <acct>        Print an access token (for scripting; see below)
 usagio login               Sign in to a new account in your browser (adds it)
 usagio renew <acct>        Sign <acct> in again in your browser (fresh login)
 usagio rm <acct>           Forget an account
@@ -211,6 +211,10 @@ usagio start               # auto-pick the best account and open claude
 usagio continue dev        # prefix-match dev@…, switch, resume last conversation
 TOKEN=$(usagio token dev)  # a fresh access token for scripts
 ```
+
+`usagio token` refreshes an inactive account's token when it is due. For the
+active account it prints the token Claude Code is using and never refreshes it
+(that would sign Claude Code out); it warns on stderr if that token has expired.
 
 For Codex, use an explicit provider when accounts share an email:
 
