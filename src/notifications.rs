@@ -109,6 +109,11 @@ pub struct NotifState {
     /// "claim it now" notification fires once per grant.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub reset_grants_usable_fired: BTreeSet<String>,
+    /// State-driven notifications whose one retry after a failed delivery has
+    /// been spent ("pace", "avail:<id>", "usable:<id>"); a second failure
+    /// commits the dedup bit instead of retrying forever.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub retry_spent: BTreeSet<String>,
 }
 
 /// Thresholds we check on every tick, ascending so a `Vec<Trigger>` from
@@ -218,6 +223,7 @@ pub fn dedup_and_apply(
     if is_reset(prev, curr, Window::Weekly) {
         state.crossings.retain(|(w, _)| *w != Window::Weekly);
         state.pace_fired_this_window = false;
+        state.retry_spent.remove("pace");
     }
     let mut kept = Vec::with_capacity(triggers.len());
     for t in triggers {
@@ -292,6 +298,18 @@ pub fn evaluate_pace(
 /// (prev, curr) pair, which advances regardless, so they are not retried
 /// (fire is documented best-effort).
 pub fn release_dedup(state: &mut NotifState, trigger: &Trigger, grant_id: Option<&str>) {
+    let key = match (trigger, grant_id) {
+        (Trigger::WeeklyPace { .. }, _) => "pace".to_string(),
+        (Trigger::ResetGrantAvailable { .. }, Some(id)) => format!("avail:{id}"),
+        (Trigger::ResetUsableNow { .. }, Some(id)) => format!("usable:{id}"),
+        _ => return,
+    };
+    // One retry per event: the second failure keeps the dedup bit set, so a
+    // permanently failing backend (or a late-erroring one that already showed
+    // the alert) cannot cause a storm.
+    if !state.retry_spent.insert(key) {
+        return;
+    }
     match (trigger, grant_id) {
         (Trigger::WeeklyPace { .. }, _) => state.pace_fired_this_window = false,
         (Trigger::ResetGrantAvailable { .. }, Some(id)) => {
@@ -1088,5 +1106,26 @@ mod tests {
             None,
         );
         assert!(!st.pace_fired_this_window);
+    }
+
+    #[test]
+    fn a_failed_delivery_is_retried_at_most_once() {
+        let mut st = NotifState::default();
+        let g = ResetGrant {
+            id: "g1".into(),
+            label: "L".into(),
+            resets_left: 1,
+            usable_now: false,
+            ..Default::default()
+        };
+        let t = reset_grant_triggers(&mut st, std::slice::from_ref(&g));
+        release_dedup(&mut st, &t[0], Some("g1"));
+        let t = reset_grant_triggers(&mut st, std::slice::from_ref(&g));
+        assert_eq!(t.len(), 1, "first failure: retried once");
+        release_dedup(&mut st, &t[0], Some("g1"));
+        assert!(
+            reset_grant_triggers(&mut st, std::slice::from_ref(&g)).is_empty(),
+            "second failure: dedup bit stays set"
+        );
     }
 }

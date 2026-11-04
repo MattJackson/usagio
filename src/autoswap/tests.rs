@@ -1827,3 +1827,22 @@ fn an_absurd_negative_pct_does_not_panic_the_next_check() {
     );
     let _ = decide(&s);
 }
+
+#[test]
+fn stuck_notice_falls_back_to_the_earliest_window_reset_when_nothing_is_blocked() {
+    let now = at(12, 0, 0);
+    let s = snap(
+        now,
+        "a",
+        vec![
+            acct("a", 50.0, 50.0, now).sreset(Some(now + Duration::hours(2))),
+            acct("b", 60.0, 60.0, now).sreset(Some(now + Duration::hours(1))),
+        ],
+    );
+    let v = assess_all(&s);
+    assert!(v.iter().all(|a| a.blocked_until.is_none()));
+    assert_eq!(
+        super::shell::soonest_unlock(&v, now),
+        Some(now + Duration::hours(1))
+    );
+}
