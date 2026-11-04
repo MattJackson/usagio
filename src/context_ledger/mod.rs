@@ -78,11 +78,12 @@ pub enum LedgerError {
 /// would be invoked from — used to find project-scoped context (e.g. an
 /// in-tree CLAUDE.md). Missing config dirs yield an empty ledger, not an error.
 pub fn build_ledger(provider: &str, project: Option<&Path>) -> Result<Ledger, LedgerError> {
-    let items = match provider {
-        "claude" | "claude-code" => claude::collect(project)?,
-        "codex" => codex::collect(project)?,
-        "opencode" => opencode::collect(project)?,
-        other => return Err(LedgerError::UnknownProvider(other.to_string())),
+    let cli = Cli::from_slug(provider)
+        .ok_or_else(|| LedgerError::UnknownProvider(provider.to_string()))?;
+    let items = match cli {
+        Cli::Claude => claude::collect(project)?,
+        Cli::Codex => codex::collect(project)?,
+        Cli::Opencode => opencode::collect(project)?,
     };
     let total_tokens = items.iter().map(|i| i.token_count).sum();
     let estimated_cost_per_turn = estimate_cost(provider, total_tokens);
@@ -209,14 +210,46 @@ pub(crate) fn probe_servers(
     })
 }
 
+/// The AI CLIs the ledger knows. Every provider-slug alias is resolved here
+/// once, so discovery, cost and display can never disagree about a slug.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Cli {
+    Claude,
+    Codex,
+    Opencode,
+}
+
+impl Cli {
+    pub(crate) fn from_slug(slug: &str) -> Option<Self> {
+        match slug {
+            "claude" | "claude-code" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            "opencode" => Some(Self::Opencode),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn display_name(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code",
+            Self::Codex => "Codex",
+            Self::Opencode => "opencode",
+        }
+    }
+
+    /// Rough input price, USD per 1M tokens.
+    fn input_usd_per_million(self) -> f64 {
+        match self {
+            Self::Claude => 3.0,   // Sonnet input
+            Self::Codex => 5.0,    // ballpark; not tied to one model
+            Self::Opencode => 3.0, // typically Anthropic-backed
+        }
+    }
+}
+
 /// Rough cost estimate per turn — very approximate. Uses Sonnet input pricing
 /// as a default; real per-model math lives in a future pricing module.
 fn estimate_cost(provider: &str, total_tokens: usize) -> Option<f64> {
-    let per_million_usd = match provider {
-        "claude" | "claude-code" => 3.0, // Sonnet input, USD per 1M tokens
-        "codex" => 5.0,                  // ballpark USD/1M input; not tied to one model
-        "opencode" => 3.0,               // typically Anthropic-backed
-        _ => return None,
-    };
+    let per_million_usd = Cli::from_slug(provider)?.input_usd_per_million();
     Some((total_tokens as f64) * per_million_usd / 1_000_000.0)
 }

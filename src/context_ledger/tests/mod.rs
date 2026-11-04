@@ -1284,3 +1284,30 @@ fn opencode_home_resolves_like_the_rest_of_the_crate() {
         },
     );
 }
+
+#[test]
+fn provider_aliases_agree_across_ledger_cost_and_display() {
+    // Every slug either is known to discovery, cost and display alike, or to
+    // none of them: the alias table lives in one place.
+    with_home(|_| {
+        for slug in [
+            "claude",
+            "claude-code",
+            "codex",
+            "opencode",
+            "open-code",
+            "gpt",
+            "",
+        ] {
+            let built = build_ledger(slug, None).is_ok();
+            let priced = estimate_cost(slug, 1).is_some();
+            let named = Cli::from_slug(slug).is_some();
+            assert_eq!(built, priced, "{slug}");
+            assert_eq!(built, named, "{slug}");
+        }
+        assert_eq!(
+            Cli::from_slug("claude-code").map(Cli::display_name),
+            Some("Claude Code")
+        );
+    });
+}
