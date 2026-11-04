@@ -231,7 +231,6 @@ fn codex_global_and_project_files_counted() {
             got,
             vec![
                 ("Global AGENTS.md", ItemKind::GlobalInstructions, 13),
-                ("Global instructions.md", ItemKind::GlobalInstructions, 22),
                 ("Project AGENTS.md", ItemKind::ProjectInstructions, 14),
             ]
         );
@@ -296,6 +295,40 @@ fn mcp_oversized_line_without_newline_rejected() {
     let script = "read a; head -c 1200000 /dev/zero | tr '\\0' a; sleep 5";
     let e = mcp::fetch_tools(&sh_server(script)).unwrap_err();
     assert!(e.contains("exceeded"), "got: {}", e);
+}
+
+#[test]
+fn mcp_notifications_before_responses_are_skipped() {
+    let note = r#"{"jsonrpc":"2.0","method":"notifications/message","params":{}}"#;
+    let req = r#"{"jsonrpc":"2.0","id":9,"method":"roots/list"}"#;
+    let script = format!(
+        "read a; echo '{note}'; echo '{INIT_OK}'; read b; read c; echo '{note}'; echo '{req}'; \
+         echo 'plain log line'; echo '{TOOLS_OK}'; sleep 5"
+    );
+    let s = mcp::fetch_tools(&sh_server(&script)).unwrap();
+    assert_eq!(s.tool_count, 2);
+}
+
+#[test]
+fn mcp_tools_list_follows_next_cursor() {
+    let p1 = r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"t1"}],"nextCursor":"c2"}}"#;
+    let p2 = r#"{"jsonrpc":"2.0","id":3,"result":{"tools":[{"name":"t2"},{"name":"t3"}]}}"#;
+    let script = format!(
+        "read a; echo '{INIT_OK}'; read b; read c; echo '{p1}'; read d; echo '{p2}'; sleep 5"
+    );
+    let s = mcp::fetch_tools(&sh_server(&script)).unwrap();
+    assert_eq!(s.tool_count, 3);
+}
+
+#[test]
+fn mcp_command_expands_env_var_defaults() {
+    let script = format!("read a; echo '{INIT_OK}'; read b; read c; echo '{TOOLS_OK}'; sleep 5");
+    let cfg = serde_json::json!({
+        "command": "${USAGIO_TEST_UNSET_SH:-/bin/sh}",
+        "args": ["-c", script]
+    });
+    let s = mcp::fetch_tools(&cfg).unwrap();
+    assert_eq!(s.tool_count, 2);
 }
 
 #[test]
@@ -429,6 +462,285 @@ fn not_stale_when_tracked_file_missing_or_ledger_empty() {
     assert!(!is_stale(&empty));
 }
 
+// ---- codeaudit r1 C4 regressions ---------------------------------------
+
+#[test]
+fn codex_instructions_md_is_only_a_fallback() {
+    with_home(|home| {
+        let dir = home.join(".codex");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("instructions.md"), "old style").unwrap();
+        let l = build_ledger("codex", None).unwrap();
+        let names: Vec<_> = l.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["Global instructions.md"]);
+    });
+}
+
+#[test]
+fn codex_dir_honours_codex_home() {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    let home = Some(PathBuf::from("/h"));
+    assert_eq!(
+        codex::resolve_codex_dir(Some(OsString::from("/c")), home.clone()),
+        Some(PathBuf::from("/c"))
+    );
+    assert_eq!(
+        codex::resolve_codex_dir(Some(OsString::new()), home.clone()),
+        Some(PathBuf::from("/h/.codex"))
+    );
+    assert_eq!(
+        codex::resolve_codex_dir(None, home),
+        Some(PathBuf::from("/h/.codex"))
+    );
+}
+
+#[test]
+fn claude_skill_counts_only_frontmatter() {
+    with_home(|home| {
+        let dir = home.join(".claude").join("skills").join("s");
+        fs::create_dir_all(&dir).unwrap();
+        let body = "x ".repeat(5000);
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: s\ndescription: does a thing\nmodel: opus\n---\n{body}"),
+        )
+        .unwrap();
+        let l = build_ledger("claude", None).unwrap();
+        assert_eq!(l.items.len(), 1);
+        assert_eq!(
+            l.items[0].content_bytes,
+            "name: s\ndescription: does a thing\n".len()
+        );
+    });
+}
+
+#[test]
+fn claude_mcp_servers_read_from_dot_claude_json_and_project_mcp_json() {
+    with_home(|home| {
+        let proj = tempdir().unwrap();
+        let server = |tools: &str| {
+            let script =
+                format!("read a; echo '{INIT_OK}'; read b; read c; echo '{tools}'; sleep 5");
+            serde_json::json!({ "command": "/bin/sh", "args": ["-c", script] })
+        };
+        fs::write(
+            home.join(".claude.json"),
+            serde_json::to_string(
+                &serde_json::json!({ "mcpServers": { "user-srv": server(TOOLS_OK) } }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            proj.path().join(".mcp.json"),
+            serde_json::to_string(
+                &serde_json::json!({ "mcpServers": { "proj-srv": server(TOOLS_OK) } }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(proj.path().join(".claude")).unwrap();
+        fs::write(
+            proj.path().join(".claude").join("settings.json"),
+            r#"{"enableAllProjectMcpServers": true}"#,
+        )
+        .unwrap();
+        let l = build_ledger("claude", Some(proj.path())).unwrap();
+        let mut names: Vec<_> = l
+            .items
+            .iter()
+            .filter(|i| i.kind == ItemKind::McpTools)
+            .map(|i| i.name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["mcp: proj-srv", "mcp: user-srv"]);
+    });
+}
+
+#[test]
+fn opencode_local_mcp_entry_is_translated_and_disabled_skipped() {
+    with_home(|home| {
+        let dir = home.join(".config").join("opencode");
+        fs::create_dir_all(&dir).unwrap();
+        let script =
+            format!("read a; echo '{INIT_OK}'; read b; read c; echo '{TOOLS_OK}'; sleep 5");
+        let cfg = serde_json::json!({
+            "mcp": {
+                "local-srv": { "type": "local", "command": ["/bin/sh", "-c", script], "environment": {"A": "b"} },
+                "off-srv": { "type": "local", "command": ["/bin/sh", "-c", "exit 1"], "enabled": false }
+            }
+        });
+        fs::write(dir.join("opencode.json"), cfg.to_string()).unwrap();
+        let l = build_ledger("opencode", None).unwrap();
+        let names: Vec<_> = l.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["mcp: local-srv"]);
+        assert_eq!(l.items[0].tool_count, Some(2));
+    });
+}
+
+#[test]
+fn opencode_jsonc_trailing_commas_and_instructions_and_global_agents_md() {
+    with_home(|home| {
+        let dir = home.join(".config").join("opencode");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("AGENTS.md"), "global rules").unwrap();
+        let proj = tempdir().unwrap();
+        fs::write(proj.path().join("extra.md"), "extra instructions").unwrap();
+        fs::write(
+            dir.join("opencode.jsonc"),
+            r#"{
+  // trailing commas are legal JSONC
+  "prompt": "hi, there",
+  "instructions": ["extra.md",],
+}"#,
+        )
+        .unwrap();
+        let l = build_ledger("opencode", Some(proj.path())).unwrap();
+        let names: Vec<_> = l.items.iter().map(|i| i.name.as_str()).collect();
+        assert!(names.contains(&"opencode prompt"), "{names:?}");
+        assert!(names.contains(&"Global AGENTS.md"), "{names:?}");
+        assert!(names.contains(&"instructions: extra.md"), "{names:?}");
+    });
+}
+
+#[test]
+fn out_of_range_mtime_does_not_panic() {
+    let far = std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::MAX / 2);
+    assert!(utc_from_system_time(far).is_none());
+    assert!(utc_from_system_time(std::time::UNIX_EPOCH).is_some());
+}
+
+#[test]
+fn read_capped_rejects_non_regular_files() {
+    let td = tempdir().unwrap();
+    assert!(read_capped(td.path()).is_none(), "directory");
+    assert!(
+        read_capped(std::path::Path::new("/dev/zero")).is_none(),
+        "device"
+    );
+    let f = td.path().join("f");
+    fs::write(&f, "ok").unwrap();
+    assert_eq!(read_capped(&f).unwrap(), b"ok");
+}
+
+#[test]
+fn mcp_servers_are_probed_concurrently() {
+    let slow =
+        format!("read a; sleep 1; echo '{INIT_OK}'; read b; read c; echo '{TOOLS_OK}'; sleep 5");
+    let servers: Vec<_> = (0..4)
+        .map(|i| (format!("s{i}"), sh_server(&slow)))
+        .collect();
+    let t = std::time::Instant::now();
+    let out = probe_servers(servers);
+    assert!(out.iter().all(|(_, r)| r.is_ok()), "{out:?}");
+    assert!(
+        t.elapsed() < std::time::Duration::from_millis(3000),
+        "took {:?}",
+        t.elapsed()
+    );
+    let names: Vec<_> = out.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, vec!["s0", "s1", "s2", "s3"]);
+}
+
+#[test]
+fn cli_run_fails_when_no_provider_could_be_built() {
+    with_home(|_| {
+        assert!(cli::run(Some("nope".into()), None).is_err());
+        assert!(cli::run(Some("codex".into()), None).is_ok());
+    });
+}
+
+fn mcp_marker_server(marker: &std::path::Path) -> serde_json::Value {
+    let script = format!(
+        "echo ran > '{}'; read a; echo '{INIT_OK}'; read b; read c; echo '{TOOLS_OK}'; sleep 5",
+        marker.display()
+    );
+    serde_json::json!({ "command": "/bin/sh", "args": ["-c", script] })
+}
+
+#[test]
+fn unapproved_project_mcp_json_server_is_never_executed() {
+    with_home(|_home| {
+        let proj = tempdir().unwrap();
+        let marker = proj.path().join("ran");
+        fs::write(
+            proj.path().join(".mcp.json"),
+            serde_json::json!({ "mcpServers": { "evil": mcp_marker_server(&marker) } }).to_string(),
+        )
+        .unwrap();
+        let l = build_ledger("claude", Some(proj.path())).unwrap();
+        assert!(!marker.exists(), "unapproved server command was executed");
+        assert!(l.items.iter().all(|i| i.kind != ItemKind::McpTools));
+    });
+}
+
+#[test]
+fn approved_project_mcp_json_server_runs_unless_disabled() {
+    with_home(|home| {
+        let proj = tempdir().unwrap();
+        let canon = fs::canonicalize(proj.path()).unwrap();
+        let (m1, m2) = (canon.join("ran1"), canon.join("ran2"));
+        fs::write(
+            canon.join(".mcp.json"),
+            serde_json::json!({ "mcpServers": {
+                "ok": mcp_marker_server(&m1), "off": mcp_marker_server(&m2) } })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            home.join(".claude.json"),
+            serde_json::json!({ "projects": { canon.to_string_lossy(): {
+                "enabledMcpjsonServers": ["ok", "off"],
+                "disabledMcpjsonServers": ["off"] } } })
+            .to_string(),
+        )
+        .unwrap();
+        // relative/odd spelling of the same project must still resolve
+        let spelled = canon.join(".");
+        let l = build_ledger("claude", Some(&spelled)).unwrap();
+        let names: Vec<_> = l.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["mcp: ok"]);
+        assert!(m1.exists() && !m2.exists());
+    });
+}
+
+#[test]
+fn claude_skill_when_to_use_is_counted() {
+    with_home(|home| {
+        let dir = home.join(".claude").join("skills").join("s");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: s\nwhen_to_use: always\n---\nbody",
+        )
+        .unwrap();
+        let l = build_ledger("claude", None).unwrap();
+        assert_eq!(
+            l.items[0].content_bytes,
+            "name: s\nwhen_to_use: always\n".len()
+        );
+    });
+}
+
+#[test]
+fn opencode_env_substitution_expands() {
+    crate::env_lock::scoped_env_var("USAGIO_TEST_OC_VAR", Some("val"), || {
+        assert_eq!(
+            opencode::expand_opencode_env("a-{env:USAGIO_TEST_OC_VAR}-b"),
+            "a-val-b"
+        );
+        assert_eq!(
+            opencode::expand_opencode_env("{env:USAGIO_NOPE_UNSET}x"),
+            "x"
+        );
+        assert_eq!(
+            opencode::expand_opencode_env("plain {env:oops"),
+            "plain {env:oops"
+        );
+    });
+}
+
 // ---- MCP driver: failure modes -----------------------------------------
 
 #[test]
@@ -448,8 +760,10 @@ fn mcp_silent_server_hits_wall_clock_timeout() {
 #[test]
 fn mcp_malformed_or_unexpected_replies_are_errors() {
     let bad_json = format!("read a; echo '{INIT_OK}'; read b; read c; echo 'not json'; sleep 5");
+    // A non-JSON line is skipped while waiting for the reply with our id
+    // (servers may interleave notifications), so it ends as a timeout.
     let e = mcp::fetch_tools(&sh_server(&bad_json)).unwrap_err();
-    assert!(e.contains("parse tools/list"), "got: {e}");
+    assert!(e.contains("timeout"), "got: {e}");
 
     let rpc_err = format!(
         r#"read a; echo '{INIT_OK}'; read b; read c; echo '{{"jsonrpc":"2.0","id":2,"error":{{"code":-1}}}}'; sleep 5"#

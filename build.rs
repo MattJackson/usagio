@@ -18,8 +18,10 @@
 //! any non-Windows target, so macOS and Linux builds are unaffected.
 
 fn main() {
-    // Only embed a manifest when building FOR Windows. `CARGO_CFG_WINDOWS` is
-    // set by Cargo for any windows target (both native and cross builds).
+    // Only embed a manifest when the build HOST is Windows: `#[cfg(windows)]`
+    // here is evaluated for the build script itself (the host), not the
+    // target, so a non-Windows host cross-compiling to Windows would not embed
+    // one. Release builds for Windows run natively on Windows.
     #[cfg(windows)]
     {
         use embed_manifest::{embed_manifest, new_manifest};

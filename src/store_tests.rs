@@ -715,8 +715,9 @@ fn stash_pre_restore_lands_under_config_backups_not_tmp() {
         stash_path.display()
     );
 
-    // The live state.json is gone (moved), and the stash carries its bytes.
-    assert!(!config_dir().unwrap().join("state.json").exists());
+    // The live state.json stays in place (copied, not moved, so lock-free
+    // readers never see a missing file), and the stash carries its bytes.
+    assert!(config_dir().unwrap().join("state.json").exists());
     let stashed = std::fs::read_to_string(&stash_path).unwrap();
     assert!(stashed.contains("a@e.com"));
 
@@ -752,9 +753,11 @@ fn unstash_pre_restore_rolls_the_live_state_back_exactly() {
         .unwrap()
         .expect("live state existed");
     assert!(
-        !live.exists(),
-        "stash should have moved the live file aside"
+        live.exists(),
+        "stash must copy, not move: lock-free readers must never see no state.json"
     );
+    // Simulate a failed/partial restore write clobbering the live file.
+    std::fs::write(&live, b"{ partial").unwrap();
 
     unstash_pre_restore(&stash).expect("rollback must restore the stashed state");
 
@@ -1219,11 +1222,11 @@ fn stash_pre_restore_in_the_same_second_gets_unique_names_and_never_overwrites()
     let name = stash.file_name().unwrap().to_string_lossy().into_owned();
     assert!(name.ends_with("-2.json"), "counter advances by one: {name}");
     assert!(std::fs::read_to_string(&stash).unwrap().contains("a@e.com"));
+    // Old stashes may be pruned past the cap, but none may be overwritten.
     for t in now - 1..=now + 3 {
-        assert_eq!(
-            std::fs::read_to_string(backups.join(format!("pre-restore-{t}-1.json"))).unwrap(),
-            "seed"
-        );
+        if let Ok(c) = std::fs::read_to_string(backups.join(format!("pre-restore-{t}-1.json"))) {
+            assert_eq!(c, "seed");
+        }
     }
 }
 
@@ -1498,6 +1501,119 @@ fn adopt_login_drops_an_expiry_the_new_login_does_not_state() {
     .unwrap();
     a.adopt_login(&fresh);
     assert_eq!(a.refresh_token_expires_at(), None);
+}
+
+// ---------------------------------------------------------------------------
+// provider-slot-drop (codeaudit r1 C4): one malformed provider account entry
+// must not take the provider's good accounts with it, and must never be
+// silently erased by a later save.
+// ---------------------------------------------------------------------------
+
+/// Write a state.json whose `providers.codex.accounts` holds one good entry
+/// and one entry missing required fields.
+fn seed_state_with_bad_codex_entry() {
+    let good = serde_json::to_value(provider_account("good@e.com")).unwrap();
+    let raw = serde_json::json!({
+        "schema_version": 2,
+        "accounts": [],
+        "providers": { "codex": {
+            "active": "good@e.com",
+            "accounts": [ good, { "key": "bad@e.com", "unexpected": true } ]
+        }}
+    });
+    let path = config_dir().unwrap().join("state.json");
+    std::fs::write(path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+}
+
+#[test]
+fn bad_provider_entry_keeps_the_good_accounts_at_load() {
+    let _g = ScopedConfigDir::new();
+    seed_state_with_bad_codex_entry();
+    let st = State::load().unwrap();
+    let pa = st.providers.get("codex").expect("codex slot must survive");
+    let keys: Vec<&str> = pa.accounts.iter().map(|a| a.key.as_str()).collect();
+    assert_eq!(keys, vec!["good@e.com"]);
+}
+
+#[test]
+fn bad_provider_entry_is_preserved_across_a_save() {
+    let _g = ScopedConfigDir::new();
+    seed_state_with_bad_codex_entry();
+    let st = State::load().unwrap();
+    st.save().expect("a load-save round trip must succeed");
+    let on_disk = std::fs::read_to_string(config_dir().unwrap().join("state.json")).unwrap();
+    assert!(
+        on_disk.contains("bad@e.com") && on_disk.contains("good@e.com"),
+        "unparseable entry must be kept verbatim: {on_disk}"
+    );
+}
+
+#[test]
+fn save_refuses_to_drop_an_unparseable_on_disk_provider_entry() {
+    let _g = ScopedConfigDir::new();
+    seed_state_with_bad_codex_entry();
+    // A state that knows nothing of the bad entry (e.g. built from a lossy
+    // parse) must not be allowed to overwrite it.
+    let mut stale = State::default();
+    stale
+        .providers
+        .entry("codex".to_string())
+        .or_default()
+        .accounts
+        .push(provider_account("good@e.com"));
+    let err = stale.save().expect_err("must refuse to erase bad@e.com");
+    assert!(format!("{err:#}").contains("bad@e.com"), "{err:#}");
+    let on_disk = std::fs::read_to_string(config_dir().unwrap().join("state.json")).unwrap();
+    assert!(on_disk.contains("bad@e.com"));
+}
+
+#[test]
+fn pre_restore_stashes_are_pruned_to_a_small_cap() {
+    let _g = ScopedConfigDir::new();
+    make_state_with(&["a@e.com"]).save().unwrap();
+    let dir = config_dir().unwrap();
+    for _ in 0..9 {
+        stash_pre_restore(&dir).unwrap().unwrap();
+    }
+    let n = std::fs::read_dir(dir.join("backups"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("pre-restore-"))
+        .count();
+    assert!(n <= 5, "pre-restore stashes must be capped, found {n}");
+}
+
+#[test]
+fn unparsed_entry_that_now_parses_is_promoted_on_load() {
+    let _g = ScopedConfigDir::new();
+    let good = serde_json::to_value(provider_account("fixed@e.com")).unwrap();
+    let raw = serde_json::json!({
+        "schema_version": 2, "accounts": [],
+        "providers": { "codex": { "accounts": [], "unparsed_accounts": [good] } }
+    });
+    std::fs::write(config_dir().unwrap().join("state.json"), raw.to_string()).unwrap();
+    let st = State::load().unwrap();
+    let pa = &st.providers["codex"];
+    assert_eq!(pa.accounts.len(), 1);
+    assert!(pa.unparsed_accounts.is_empty());
+}
+
+#[test]
+fn upsert_and_remove_drop_the_stale_raw_entry() {
+    let _g = ScopedConfigDir::new();
+    seed_state_with_bad_codex_entry();
+    let mut st = State::load().unwrap();
+    st.upsert_provider_account("codex", provider_account("bad@e.com"));
+    assert!(st.providers["codex"].unparsed_accounts.is_empty());
+    st.save().unwrap();
+
+    seed_state_with_bad_codex_entry();
+    let mut st = State::load().unwrap();
+    assert!(st.remove_provider_account("codex", "bad@e.com"));
+    st.save()
+        .expect("authorised removal of a raw entry must save");
+    let on_disk = std::fs::read_to_string(config_dir().unwrap().join("state.json")).unwrap();
+    assert!(!on_disk.contains("bad@e.com"), "{on_disk}");
 }
 
 #[test]
