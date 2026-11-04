@@ -167,8 +167,17 @@ pub(crate) fn probe() -> Result<Option<ClientState>> {
     if !path.exists() {
         return Ok(None);
     }
+    // Pin the token before AND after inspect(): if the daemon restarted in
+    // between, busy/email describe one instance and the token another.
+    let before = read_instance_token(&home);
     let mut state = with_control("ws://localhost/", inspect)?;
-    state.instance_token = ["daemon.pid", "app-server.pid"]
+    let after = read_instance_token(&home);
+    state.instance_token = stable_instance_token(before, after)?;
+    Ok(Some(state))
+}
+
+fn read_instance_token(home: &Path) -> Option<String> {
+    ["daemon.pid", "app-server.pid"]
         .into_iter()
         .find_map(|name| {
             let bytes = std::fs::read(home.join("app-server-daemon").join(name)).ok()?;
@@ -179,8 +188,14 @@ pub(crate) fn probe() -> Result<Option<ClientState>> {
                 .and_then(|id| u32::try_from(id).ok())?;
             let start = record.get("processStartTime").and_then(Value::as_str)?;
             Some(json!({"pid":pid,"start":start}).to_string())
-        });
-    Ok(Some(state))
+        })
+}
+
+fn stable_instance_token(before: Option<String>, after: Option<String>) -> Result<Option<String>> {
+    if before != after {
+        bail!("Codex daemon changed while being inspected; retry next cycle");
+    }
+    Ok(after)
 }
 
 fn with_control<T: Send + 'static>(
@@ -319,6 +334,14 @@ pub(crate) fn start_and_verify(expected: &crate::providers::IdentitySnapshot) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_token_must_match_before_and_after_inspect() {
+        let a = Some("a".to_string());
+        assert_eq!(stable_instance_token(a.clone(), a.clone()).unwrap(), a);
+        assert!(stable_instance_token(a, Some("b".into())).is_err());
+        assert_eq!(stable_instance_token(None, None).unwrap(), None);
+    }
 
     /// Hold a synthetic Responses stream open until the test releases it.
     /// No credentials or prompts are recorded or sent beyond loopback.

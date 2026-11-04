@@ -216,7 +216,7 @@ pub(crate) fn parse_credits(body: &serde_json::Value) -> Option<Credits> {
     let flag = |k: &str| c.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
     // The backend sends ten decimal places ("636.4935245000"); two read fine.
     let cents = |s: &str| match s.split_once('.') {
-        Some((whole, frac)) => format!("{whole}.{}", &frac[..frac.len().min(2)]),
+        Some((whole, frac)) => format!("{whole}.{}", frac.chars().take(2).collect::<String>()),
         None => s.to_string(),
     };
     let balance = c.get("balance").and_then(|b| match b {
@@ -847,7 +847,16 @@ impl Provider for CodexProvider {
             .unwrap_or_default();
         let expires_at = id_claims.get("exp").and_then(|x| x.as_i64()).unwrap_or(0);
         let access = parsed.tokens.access_token.clone();
-        let refresh = parsed.tokens.refresh_token.clone().unwrap_or_default();
+        // A blob without a refresh token must not wipe the stored grant (or
+        // clear needs_relogin); Claude's absorb refuses such blobs too.
+        let Some(refresh) = parsed
+            .tokens
+            .refresh_token
+            .clone()
+            .filter(|r| !r.is_empty())
+        else {
+            return Ok(());
+        };
         let blob_owned = blob.to_string();
         crate::credentials::with_state_lock_absorb(|st| {
             if let Some(a) = st.find_provider_account_mut(self.provider_id(), &account.key) {
@@ -1087,6 +1096,12 @@ pub(super) fn jwt_payload_claims(jwt: &str) -> Option<serde_json::Map<String, Va
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_credits_does_not_panic_on_multibyte_fraction() {
+        let body = serde_json::json!({ "credits": { "balance": "1.a\u{20ac}" } });
+        let _ = parse_credits(&body); // must not panic slicing mid-char
+    }
 
     #[test]
     fn parse_credits_preserves_explicit_zero_and_omits_unknown() {
@@ -1849,6 +1864,47 @@ mod tests {
         assert_eq!(a.access_token, "at");
         assert_eq!(a.expires_at, 5_000_000_000);
         assert_eq!(a.secret_blob, new_blob);
+    }
+
+    #[test]
+    fn absorb_credential_without_refresh_token_keeps_stored_grant() {
+        let _cfg = crate::store::ScopedConfigDir::new();
+        crate::credentials::with_state_lock(|| {
+            let mut st = crate::store::State::load()?;
+            st.upsert_provider_account(
+                "codex",
+                crate::store::ProviderAccount {
+                    key: "user@example.com".into(),
+                    secret_blob: make_blob("user@example.com", 1000),
+                    access_token: "old-at".into(),
+                    refresh_token: "old-rt".into(),
+                    expires_at: 1000,
+                    identity_email: Some("user@example.com".into()),
+                    identity_uuid: None,
+                    identity_display_name: None,
+                    identity_native_blob: Value::Null,
+                    cached_usage: None,
+                    notif_state: Default::default(),
+                    needs_relogin: false,
+                    no_subscription: false,
+                    plan: None,
+                },
+            );
+            st.save()
+        })
+        .unwrap();
+        let no_rt = serde_json::json!({"tokens": {
+            "id_token": make_id_token("user@example.com", 5_000_000_000i64),
+            "access_token": "at"
+        }})
+        .to_string();
+        let k = AccountKey::new("codex", "user@example.com");
+        CodexProvider.absorb_credential(&k, &no_rt).unwrap();
+        let st = crate::store::State::load().unwrap();
+        let a = st
+            .find_provider_account("codex", "user@example.com")
+            .unwrap();
+        assert_eq!(a.refresh_token, "old-rt");
     }
 
     #[test]
