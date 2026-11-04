@@ -1244,11 +1244,11 @@ fn prune_rejected_dumps_evicts_oldest_beyond_cap_and_only_rejected_json() {
     touch_at(&d, "state-rejected-4.txt", 0);
 
     // At the cap exactly: nothing is evicted.
-    prune_rejected_dumps(&d, 3).unwrap();
+    prune_rejected_dumps(&d, 3, None).unwrap();
     assert!(d.join("state-rejected-1.json").exists());
 
     // Over the cap: oldest evicted, exactly `keep` remain, others untouched.
-    prune_rejected_dumps(&d, 2).unwrap();
+    prune_rejected_dumps(&d, 2, None).unwrap();
     assert_eq!(
         file_names(&d),
         vec![
@@ -1623,6 +1623,48 @@ fn prune_backups_never_evicts_the_file_just_written() {
     touch_at(&d, "state-fresh.json", 1);
     prune_backups(&d, 2, Some(&d.join("state-fresh.json"))).unwrap();
     assert!(d.join("state-fresh.json").exists());
+    assert_eq!(file_names(&d).len(), 2);
+}
+
+#[test]
+fn prune_backups_after_a_backward_clock_jump_keeps_recent_history() {
+    let g = ScopedConfigDir::new();
+    let d = g.home();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 1_700_000_000; // touch_at's base
+                         // Written before the clock went back a long way: dated in the future.
+    touch_at(&d, "state-f1.json", 9_000_000_000);
+    touch_at(&d, "state-f2.json", 9_000_000_001);
+    touch_at(&d, "state-f3.json", 9_000_000_002);
+    // Post-jump history: the previous save and the one just written.
+    touch_at(&d, "state-prev.json", now - 10);
+    touch_at(&d, "state-fresh.json", now);
+    prune_backups(&d, 3, Some(&d.join("state-fresh.json"))).unwrap();
+    assert!(
+        d.join("state-prev.json").exists(),
+        "previous post-jump backup evicted: {:?}",
+        file_names(&d)
+    );
+    assert!(d.join("state-fresh.json").exists());
+    assert_eq!(file_names(&d).len(), 3);
+}
+
+#[test]
+fn prune_rejected_dumps_never_evicts_the_dump_just_written() {
+    let g = ScopedConfigDir::new();
+    let d = g.home();
+    touch_at(&d, "state-rejected-a.json", 9_000_000_000);
+    touch_at(&d, "state-rejected-b.json", 9_000_000_001);
+    touch_at(&d, "state-rejected-new.json", 1);
+    prune_rejected_dumps(&d, 2, Some(&d.join("state-rejected-new.json"))).unwrap();
+    assert!(
+        d.join("state-rejected-new.json").exists(),
+        "fresh dump evicted: {:?}",
+        file_names(&d)
+    );
     assert_eq!(file_names(&d).len(), 2);
 }
 

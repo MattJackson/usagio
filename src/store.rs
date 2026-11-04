@@ -1419,7 +1419,7 @@ pub fn save_state_safe(state: &State) -> Result<()> {
                 // consecutive refusals cannot grow unbounded, and cannot
                 // dilute the BACKUP_KEEP_COUNT cap shared with real backups
                 // (prune_backups matches both `state-*` prefixes).
-                let _ = prune_rejected_dumps(&backups_dir, BACKUP_KEEP_COUNT);
+                let _ = prune_rejected_dumps(&backups_dir, BACKUP_KEEP_COUNT, Some(&dump_path));
                 let msg = format!(
                     "REFUSED save_state: would drop {} claude account(s) without an explicit \
                      remove(): {:?}, and {} provider account(s) without an explicit \
@@ -1726,7 +1726,9 @@ fn write_rolling_backup(dir: &Path, _state_path: &Path, current_bytes: &[u8]) ->
 /// the oldest until at most `keep` survive.
 ///
 /// Never evicts `just_written` (a skewed clock can make the newest backup
-/// sort as the oldest).
+/// sort as the oldest). Backups dated in the future (written before the clock
+/// went back) are evicted first, so post-jump history is not reduced to the
+/// one file just written.
 pub(crate) fn prune_backups(dir: &Path, keep: usize, just_written: Option<&Path>) -> Result<()> {
     let mut entries: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
     for e in std::fs::read_dir(dir).context("read backups dir")? {
@@ -1750,7 +1752,9 @@ pub(crate) fn prune_backups(dir: &Path, keep: usize, just_written: Option<&Path>
             .unwrap_or(std::time::UNIX_EPOCH);
         entries.push((e.path(), mtime));
     }
-    entries.sort_by_key(|(_, m)| *m);
+    // A little slack for filesystem timestamp rounding.
+    let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    entries.sort_by_key(|(_, m)| (*m <= future, *m));
     let mut i = 0;
     while entries.len() > keep && i < entries.len() {
         if Some(entries[i].0.as_path()) == just_written {
@@ -1764,8 +1768,13 @@ pub(crate) fn prune_backups(dir: &Path, keep: usize, just_written: Option<&Path>
 }
 
 /// R2-1: cap `state-rejected-*.json` diagnostic dumps at `keep` so a run of
-/// consecutive save refusals cannot grow unbounded. Oldest are evicted first.
-pub(crate) fn prune_rejected_dumps(dir: &Path, keep: usize) -> Result<()> {
+/// consecutive save refusals cannot grow unbounded. Oldest are evicted first,
+/// never `just_written` (the dump the REFUSED log line points at).
+pub(crate) fn prune_rejected_dumps(
+    dir: &Path,
+    keep: usize,
+    just_written: Option<&Path>,
+) -> Result<()> {
     let mut entries: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
     for e in std::fs::read_dir(dir).context("read backups dir")? {
         let e = match e {
@@ -1784,8 +1793,13 @@ pub(crate) fn prune_rejected_dumps(dir: &Path, keep: usize) -> Result<()> {
         entries.push((e.path(), mtime));
     }
     entries.sort_by_key(|(_, m)| *m);
-    while entries.len() > keep {
-        let (p, _) = entries.remove(0);
+    let mut i = 0;
+    while entries.len() > keep && i < entries.len() {
+        if Some(entries[i].0.as_path()) == just_written {
+            i += 1;
+            continue;
+        }
+        let (p, _) = entries.remove(i);
         let _ = std::fs::remove_file(&p);
     }
     Ok(())
