@@ -2417,7 +2417,7 @@ fn menu_signature(snap: &Snapshot) -> String {
             if let Some(left) = login_expiring_in(a, now) {
                 s.push_str(&format!("renew={}|", login_left_label(left)));
             }
-            s.push_str(&format!("rn={}|", a.renewable));
+            s.push_str(&format!("rn={}|err={}|", a.renewable, a.error.is_some()));
             for w in &a.windows {
                 s.push_str(&format!(
                     "{}={}:r={}|",
@@ -2456,7 +2456,17 @@ fn menu_signature(snap: &Snapshot) -> String {
             reg.provider_id, reg.display_name, reg.installed
         ));
     }
-    s.push_str(&format!("as={} th={:.0}", snap.autoswap, snap.threshold));
+    let nc = &snap.notification_config;
+    s.push_str(&format!(
+        "as={} th={:.0} uc={} ti={:?} nt={}{}{}",
+        snap.autoswap,
+        snap.threshold,
+        snap.use_credits,
+        snap.tray_icon_mode,
+        nc.threshold_enabled,
+        nc.reset_back_enabled,
+        nc.pace_enabled,
+    ));
     s
 }
 
@@ -5333,6 +5343,31 @@ mod tests {
         let mut changed = base;
         changed.sections[0].accounts[0].windows[2].reset = "2h".into();
         assert_ne!(sig1, menu_signature(&changed));
+    }
+
+    #[test]
+    fn menu_signature_folds_settings_and_account_error() {
+        let base = one_section_snap(acct("you@work.com", Some(50.0), Some(60.0), true));
+        let sig = menu_signature(&base);
+        let mut m = one_section_snap(acct("you@work.com", Some(50.0), Some(60.0), true));
+        m.tray_icon_mode = Some("codex".into());
+        assert_ne!(sig, menu_signature(&m), "tray_icon_mode");
+        let mut m = one_section_snap(acct("you@work.com", Some(50.0), Some(60.0), true));
+        m.use_credits = !m.use_credits;
+        assert_ne!(sig, menu_signature(&m), "use_credits");
+        for i in 0..3 {
+            let mut m = one_section_snap(acct("you@work.com", Some(50.0), Some(60.0), true));
+            let c = &mut m.notification_config;
+            match i {
+                0 => c.threshold_enabled = !c.threshold_enabled,
+                1 => c.reset_back_enabled = !c.reset_back_enabled,
+                _ => c.pace_enabled = !c.pace_enabled,
+            }
+            assert_ne!(sig, menu_signature(&m), "notification flag {i}");
+        }
+        let mut m = one_section_snap(acct("you@work.com", Some(50.0), Some(60.0), true));
+        m.sections[0].accounts[0].error = Some("boom".into());
+        assert_ne!(sig, menu_signature(&m), "account error");
     }
 
     #[test]
