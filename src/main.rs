@@ -595,6 +595,7 @@ pub(crate) fn persist_login(
                 credentials_written: false,
                 leave_latch: None,
                 renewed_account: Some(acct),
+                renewal: true,
             });
         } else {
             state.upsert_provider_account(slug, acct);
@@ -619,7 +620,7 @@ pub(crate) fn persist_login(
             let status = provider.client_status()?;
             let ready = with_state_lock(|| {
                 let mut state = State::load()?;
-                lifecycle::prepare_handoff(provider, &status, &mut state, &key, true)
+                lifecycle::prepare_handoff(provider, &status, &mut state, &key, false)
             })?;
             if ready {
                 commit_provider_switch(provider, slug, &key, false, false)?;
@@ -685,13 +686,18 @@ fn persist_claude_login(
         // Inside the lock, so a concurrent switch can't land between the
         // "is it active" check and this write.
         if active {
-            provider
-                .write_active_account(&a.keychain_blob, &identity)
-                .map_err(|e| {
-                    anyhow!(
-                        "saved, but making it live failed (will be retried on the next poll): {e}"
-                    )
-                })?;
+            if let Err(e) = provider.write_active_account(&a.keychain_blob, &identity) {
+                // Durable marker so the next poll's CAS republishes this exact
+                // grant instead of adopting the old slot over it.
+                let fp = logging::token_fingerprint(&a.refresh_token);
+                if let Some(a) = state.find_mut(&email) {
+                    a.live_write_pending = Some(fp);
+                }
+                state.save()?;
+                return Err(anyhow!(
+                    "saved, but making it live failed (will be retried on the next poll): {e}"
+                ));
+            }
         }
         Ok((a.keychain_blob.clone(), active))
     })?;
@@ -964,7 +970,7 @@ fn cmd_switch(selector: Option<&str>, launch: Option<Launch>) -> Result<()> {
         // An ambiguous Claude prefix is an error, never a reason to switch a
         // different provider's account (same rule as `rm`).
         if let Some(Err(e)) = &claude {
-            if e.to_string().contains("ambiguous") {
+            if store::is_ambiguous_selector(e) {
                 return claude.unwrap().map(|_| ());
             }
         }
@@ -1153,16 +1159,13 @@ fn switch_provider_expecting(
         lifecycle::ensure_provider_fresh(provider, key)?;
     }
     let _refresh = lifecycle::refresh_lock()?;
-    // Authoritative check: we hold the refresh lock, so no other switch can
-    // change the queue until we are done.
-    if let Some(exp) = expected {
-        if !pending_switch_is(&State::load()?, slug, exp) {
-            return Ok(key.to_owned());
-        }
-    }
     let status = provider.client_status()?;
     let ready = with_state_lock(|| {
         let mut state = State::load()?;
+        // Authoritative compare-and-set: same state lock as the queue write.
+        if expected.is_some_and(|exp| !pending_switch_is(&state, slug, exp)) {
+            return Ok(false);
+        }
         lifecycle::prepare_handoff(provider, &status, &mut state, key, manual)
     })?;
     if !ready {
@@ -1244,6 +1247,7 @@ fn recover_obsolete_pending_switch(
             pending.key = active.clone();
             pending.from = Some(active);
             pending.manual = false;
+            pending.renewal = false;
             pending.credentials_written = false;
             pending.leave_latch = None;
             pending.renewed_account = None;
@@ -1343,6 +1347,10 @@ fn commit_provider_switch_guarded(
             .and_then(|accounts| accounts.pending_switch.as_ref())
             .is_some_and(|pending| pending.key == key && pending.credentials_written)
             && lifecycle::matching_active_blob(provider, &identity)?.is_some();
+        let pending_renewal = state
+            .provider_accounts(slug)
+            .and_then(|accounts| accounts.pending_switch.as_ref())
+            .is_some_and(|pending| pending.key == key && pending.renewal);
         let from = state.provider_accounts_mut(slug).active.clone();
         let leave_latch = state
             .provider_accounts(slug)
@@ -1356,6 +1364,7 @@ fn commit_provider_switch_guarded(
             credentials_written,
             leave_latch,
             renewed_account,
+            renewal: pending_renewal && !manual,
         });
         state.save()?;
         if !credentials_written {
@@ -1406,15 +1415,15 @@ fn commit_provider_switch_guarded(
             "account removed during client handoff"
         );
         let leave_latch = pending.leave_latch.clone();
+        let renewal = pending.renewal && !manual;
         accounts.pending_switch = None;
         let prev = state
             .provider_accounts_mut(slug)
             .active
             .replace(acct.key.clone());
-        // A non-manual "switch" to the already-active account is a login
-        // renewal (see `persist_login`): it must not touch the user's pick,
-        // hold, or the swap memory.
-        let renewal = !manual
+        // A login renewal (explicit `renewal` marker staged by `persist_login`)
+        // must not touch the user's pick, hold, or the swap memory.
+        let renewal = renewal
             && prev
                 .as_deref()
                 .is_some_and(|p| p.eq_ignore_ascii_case(&acct.key));
@@ -1923,13 +1932,29 @@ fn claim_refresh_token(
     is_active: bool,
 ) -> std::result::Result<(), String> {
     if is_active {
-        if matches!(
-            active_refresh_cas(provider, acct),
-            ActiveRefreshOutcome::RefreshFailed
-        ) {
-            logging::log(&format!(
-                "claim: active account {email} slot unreadable; using stored token"
-            ));
+        // `active_refresh_cas` requires the state lock (it may write the slot).
+        let cas = with_state_lock(|| {
+            let mut st = State::load()?;
+            let outcome = st
+                .find_mut(email)
+                .map(|a| (active_refresh_cas(provider, a), a.clone()));
+            if outcome.is_some() {
+                st.save()?;
+            }
+            Ok(outcome)
+        });
+        match cas {
+            Ok(Some((ActiveRefreshOutcome::Adopted, fresh))) => *acct = fresh,
+            Ok(Some((ActiveRefreshOutcome::RefreshFailed, _))) | Ok(None) => {
+                logging::log(&format!(
+                    "claim: active account {email} slot unreadable; using stored token"
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "reading the active login for {email} failed: {e:#}"
+                ));
+            }
         }
         return Ok(());
     }
@@ -2523,7 +2548,7 @@ fn resolve_account_selector(state: &State, sel: &str) -> Result<(String, String)
         (Ok(email), Some((slug, key))) => bail!(
             "'{sel}' matches {CLAUDE_SLUG}:{email} and {slug}:{key}; qualify it with a provider prefix"
         ),
-        (Err(e), _) if e.to_string().contains("ambiguous") => Err(e),
+        (Err(e), _) if store::is_ambiguous_selector(&e) => Err(e),
         (Err(_), Some(found)) => Ok(found),
         (Err(_), None) => bail!("no account matches '{sel}'"),
     }

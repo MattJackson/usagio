@@ -5923,6 +5923,7 @@ fn handoff_verification_retry_does_not_drain_replacement_or_overwrite_rotation()
     state.provider_accounts_mut(slug).accounts.push(account);
     state.provider_accounts_mut(slug).active = Some("old@example.com".into());
     state.provider_accounts_mut(slug).pending_switch = Some(store::PendingSwitch {
+        renewal: false,
         key: key.into(),
         manual: true,
         from: Some("old@example.com".into()),
@@ -6294,6 +6295,7 @@ fn removing_pending_target_restores_client_without_recreating_account() {
     let _cfg = crate::store::ScopedConfigDir::new();
     let provider = MockActiveSlotProvider::new("still-valid-vendor-login");
     let pending = store::PendingSwitch {
+        renewal: false,
         key: "removed@example.com".into(),
         manual: true,
         from: Some("removed@example.com".into()),
@@ -6335,6 +6337,7 @@ fn changed_selection_preserves_staged_renewal_as_inactive_credentials() {
     let mut renewed = codex_account("a", None);
     renewed.secret_blob = "renewed-a".into();
     let pending = store::PendingSwitch {
+        renewal: false,
         key: "a".into(),
         manual: true,
         from: Some("a".into()),
@@ -6601,6 +6604,7 @@ fn renewing_active_account_keeps_a_queued_switch_to_another_account() {
         .push(codex_account("other@example.com", None));
     state.provider_accounts_mut(slug).active = Some(k.into());
     state.provider_accounts_mut(slug).pending_switch = Some(store::PendingSwitch {
+        renewal: false,
         key: "other@example.com".into(),
         manual: true,
         from: Some(k.into()),
@@ -6709,6 +6713,7 @@ fn pending_switch_check_reports_a_state_read_failure() {
     let cfg = crate::store::ScopedConfigDir::new();
     let mut state = State::default();
     state.provider_accounts_mut("codex").pending_switch = Some(store::PendingSwitch {
+        renewal: false,
         key: "a@example.com".into(),
         manual: true,
         from: None,
@@ -6753,6 +6758,7 @@ fn auto_commit_aborts_when_a_renewal_was_staged_after_the_cas() {
     state.provider_accounts_mut(slug).active = Some(k.into());
     // The renewal staged by persist_login between the CAS and the commit.
     state.provider_accounts_mut(slug).pending_switch = Some(store::PendingSwitch {
+        renewal: false,
         key: k.into(),
         manual: true,
         from: Some(k.into()),
@@ -6966,6 +6972,7 @@ fn renewing_a_queued_switch_target_forces_the_credential_rewrite() {
     state.upsert_provider_account(slug, codex_account(b, None));
     state.provider_accounts_mut(slug).active = Some(a.into());
     state.provider_accounts_mut(slug).pending_switch = Some(crate::store::PendingSwitch {
+        renewal: false,
         key: b.into(),
         manual: true,
         from: Some(a.into()),
@@ -6993,15 +7000,37 @@ fn renewing_a_queued_switch_target_forces_the_credential_rewrite() {
 }
 
 #[test]
-fn active_cas_keeps_a_newer_stored_renewal_and_rewrites_the_slot() {
+fn active_cas_adopts_a_vendor_rotation_even_with_a_lower_expiry() {
     let _g = crate::store::ScopedConfigDir::new();
-    // The slot still holds the old (dead) grant; state holds the renewed one
-    // whose live write failed. The CAS must not revert state to the slot.
+    // Claude Code rotated; the slot's expiry is LOWER than ours (clock step or
+    // shorter server lifetime). Without a pending marker it must be adopted.
+    let cc_blob = mock_claude_blob("cc-at", "cc-rt", 1_000);
+    let provider = MockActiveSlotProvider::new(&cc_blob);
+    let mut acct =
+        Account::from_keychain_blob(&mock_claude_blob("old-at", "old-rt", 9_999_999_999_999))
+            .unwrap();
+    acct.email = Some("active@example.com".into());
+    let outcome = active_refresh_cas(&provider, &mut acct);
+    assert!(
+        matches!(outcome, ActiveRefreshOutcome::Adopted),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        acct.refresh_token, "cc-rt",
+        "vendor rotation was overwritten"
+    );
+    assert_eq!(provider.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn active_cas_rewrites_the_slot_only_for_a_pending_live_write() {
+    let _g = crate::store::ScopedConfigDir::new();
     let old_blob = mock_claude_blob("old-at", "old-rt", 1_000);
-    let new_blob = mock_claude_blob("new-at", "new-rt", 9_999_999_999_999);
+    let new_blob = mock_claude_blob("new-at", "new-rt", 2_000);
     let provider = MockActiveSlotProvider::new(&old_blob);
     let mut acct = Account::from_keychain_blob(&new_blob).unwrap();
     acct.email = Some("active@example.com".into());
+    acct.live_write_pending = Some(crate::logging::token_fingerprint("new-rt"));
     let outcome = active_refresh_cas(&provider, &mut acct);
     assert!(
         matches!(outcome, ActiveRefreshOutcome::Adopted),
@@ -7011,10 +7040,18 @@ fn active_cas_keeps_a_newer_stored_renewal_and_rewrites_the_slot() {
         acct.refresh_token, "new-rt",
         "renewal was reverted to the slot"
     );
+    assert_eq!(acct.live_write_pending, None, "marker not cleared");
     assert_eq!(provider.writes.load(std::sync::atomic::Ordering::SeqCst), 1);
     let slot =
         Account::from_keychain_blob(&provider.slot.lock().unwrap().clone().unwrap()).unwrap();
     assert_eq!(slot.refresh_token, "new-rt");
+    // A marker for some OTHER refresh token is stale: adopt the slot.
+    let mut other = Account::from_keychain_blob(&new_blob).unwrap();
+    other.email = Some("active@example.com".into());
+    other.live_write_pending = Some(crate::logging::token_fingerprint("older-rt"));
+    *provider.slot.lock().unwrap() = Some(mock_claude_blob("v-at", "v-rt", 1));
+    active_refresh_cas(&provider, &mut other);
+    assert_eq!(other.refresh_token, "v-rt");
 }
 
 #[test]
@@ -7030,6 +7067,10 @@ fn claim_for_the_active_account_uses_the_slot_token_without_posting() {
     let mut acct =
         Account::from_keychain_blob(&mock_claude_blob("stale-at", "stale-rt", 1_000)).unwrap();
     acct.email = Some("active@example.com".into());
+    let mut st = State::default();
+    st.upsert(acct.clone());
+    st.active = Some("active@example.com".into());
+    st.save().unwrap();
     claim_refresh_token(provider, "active@example.com", &mut acct, true).unwrap();
     crate::providers::claude::oauth::set_token_url_override(None);
     assert_eq!(
@@ -7082,6 +7123,7 @@ fn stale_pending_retry_does_not_overwrite_a_newer_queued_switch() {
     state.upsert_provider_account("codex", codex_account(a, None));
     state.upsert_provider_account("codex", codex_account(b, None));
     let pending = |key: &str| crate::store::PendingSwitch {
+        renewal: false,
         key: key.into(),
         manual: true,
         from: None,
@@ -7123,4 +7165,91 @@ fn unchanged_drain_retry_does_not_resave_state() {
     let mut again = State::load().unwrap();
     assert!(!lifecycle::prepare_handoff(&provider, &status, &mut again, "b@e.com", true).unwrap());
     assert_eq!(backups(), before, "an unchanged retry rotated a backup");
+}
+
+#[test]
+fn running_client_renewal_stays_a_renewal_through_drain_and_retry() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let mut provider = MockActiveSlotProvider::new("old-live-login");
+    provider.client_running = true;
+    let slug = provider.provider_id();
+    let key = "active@example.com";
+    let mut old = codex_account(key, None);
+    old.identity_email = Some(key.into());
+    let mut state = State::default();
+    state.upsert_provider_account(slug, old);
+    state.provider_accounts_mut(slug).active = Some(key.into());
+    state.save().unwrap();
+    let captured = providers::codex::CodexProvider
+        .complete_login(&codex_login_response(key, "account-a"))
+        .unwrap();
+    let result = persist_login(&provider, captured, None).unwrap();
+    assert!(!result.made_live);
+    let pending = State::load()
+        .unwrap()
+        .provider_accounts(slug)
+        .unwrap()
+        .pending_switch
+        .clone()
+        .unwrap();
+    assert!(
+        !pending.manual && pending.renewal,
+        "drain rewrote the renewal"
+    );
+    // The client drains; the retry commits with the pending's own flags.
+    provider
+        .process_alive
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut st = State::load().unwrap();
+    let ready = lifecycle::prepare_handoff(
+        &provider,
+        &providers::ClientStatus::default(),
+        &mut st,
+        key,
+        pending.manual,
+    )
+    .unwrap();
+    assert!(ready);
+    commit_provider_switch(&provider, slug, key, pending.manual, pending.manual).unwrap();
+    let after = State::load().unwrap();
+    assert_eq!(after.manual_pick(slug), None);
+    assert_eq!(after.manual_hold(slug), None);
+}
+
+#[test]
+fn auto_pick_commit_on_the_active_account_still_clears_pick_and_hold() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let provider = MockActiveSlotProvider::new("live");
+    let slug = provider.provider_id();
+    let key = "a@example.com";
+    let mut state = State::default();
+    state.upsert_provider_account(slug, codex_account(key, None));
+    state.provider_accounts_mut(slug).active = Some(key.into());
+    state.set_manual_pick(slug, Some(key));
+    state.set_manual_hold(slug, Some(key));
+    state.save().unwrap();
+    let mut st = State::load().unwrap();
+    assert!(lifecycle::prepare_handoff(
+        &provider,
+        &providers::ClientStatus::default(),
+        &mut st,
+        key,
+        false
+    )
+    .unwrap());
+    commit_provider_switch(&provider, slug, key, false, false).unwrap();
+    let after = State::load().unwrap();
+    assert_eq!(after.manual_pick(slug), None, "pick survived an auto-pick");
+    assert_eq!(after.manual_hold(slug), None, "hold survived an auto-pick");
+}
+
+#[test]
+fn failed_live_write_leaves_a_marker_and_the_poll_republishes_it() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    // Marker bookkeeping on the account itself; the write path is covered by
+    // the CAS test above.
+    let mut a = Account::from_keychain_blob(&mock_claude_blob("n-at", "n-rt", 5)).unwrap();
+    a.live_write_pending = Some("x".into());
+    a.adopt_login(&Account::from_keychain_blob(&mock_claude_blob("m-at", "m-rt", 6)).unwrap());
+    assert_eq!(a.live_write_pending, None);
 }
