@@ -225,7 +225,7 @@ pub struct ValueSpan {
 /// Severity tint for a submenu row's trailing value segment. Platform-agnostic
 /// so the generic `MenuTree` never names the renderer's color type; each
 /// backend maps it to muri's `Color` (`SystemRed` / `SystemOrange`). Mirrors
-/// `menubar::Severity`'s two bands.
+/// `menubar::model::Severity`'s two bands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueColor {
     Red,
@@ -402,7 +402,7 @@ mod macos;
 mod windows;
 
 /// Wake the tray's UI-thread loop so work queued for it (see
-/// `menubar::run_ui_tasks`) runs now. Only the Windows loop blocks between
+/// `menubar::actions::run_ui_tasks`) runs now. Only the Windows loop blocks between
 /// ticks; the macOS and GTK loops tick on a timer, so this is a no-op there.
 pub(crate) fn wake_ui_thread() {
     #[cfg(target_os = "windows")]

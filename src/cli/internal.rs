@@ -38,7 +38,7 @@ pub(crate) fn cmd_render_shot(args: &[String]) -> Result<()> {
         .ok_or_else(|| anyhow!("usage: __render_shot <theme> <out.png> [scale]"))?;
     let scale: f32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2.0);
     providers::init();
-    let png = menubar::render_menu_png_for_theme(theme, scale);
+    let png = menubar::render::render_menu_png_for_theme(theme, scale);
     std::fs::write(out, &png).with_context(|| format!("writing {out}"))?;
     println!(
         "wrote {} bytes to {out} (theme={theme}, scale={scale})",

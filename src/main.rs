@@ -235,7 +235,7 @@ fn run() -> Result<()> {
         Some("token") => cmd_token(args.get(1).map(String::as_str)),
         Some("watch") => cmd_watch(tail_args(&args)),
         Some("menubar") => {
-            menubar::set_theme_override_from_args(tail_args(&args));
+            menubar::theme::set_theme_override_from_args(tail_args(&args));
             menubar::run()
         }
         Some("report") => cmd_report(tail_args(&args)),

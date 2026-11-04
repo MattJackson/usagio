@@ -835,11 +835,11 @@ fn an_upgraded_codex_key_keeps_the_sign_in_store_it_was_added_with() {
         Some("new:fresh")
     );
     assert_eq!(
-        crate::menubar::renew_login_store(&state, "codex", key),
+        crate::menubar::signin::renew_login_store(&state, "codex", key),
         "new:fresh",
         "a renew must reopen the store the account signed in with"
     );
-    assert!(crate::menubar::sign_in_stores_to_keep(&state)
+    assert!(crate::menubar::signin::sign_in_stores_to_keep(&state)
         .contains(&login::store_id("codex", "new:fresh")));
     // Saved under the new key, it survives the next load too.
     state.save().unwrap();

@@ -123,7 +123,7 @@ pub(crate) fn refresh_usage_cache_with(force: bool, defer_active: bool) -> Refre
     // than trusting a cache taken while it was inactive.
     let active_just_switched = note_polled_active(state.active.as_deref());
     // Settings ▸ Notifications ▸: per-trigger enable flags, persisted on
-    // `State` and toggled from the menu bar (`menubar::toggle_notification_trigger`).
+    // `State` and toggled from the menu bar (`menubar::actions::toggle_notification_trigger`).
     let notif_cfg = state.notification_config.clone();
     for email in &emails {
         let Some(acct) = state.find(email).cloned() else {
@@ -152,7 +152,7 @@ pub(crate) fn refresh_usage_cache_with(force: bool, defer_active: bool) -> Refre
         }
         // Locked accounts don't change until their reset — skip the network
         // refresh entirely, keeping the (accurate) locked cache. The
-        // reset-boundary wake (`menubar::next_reset_wake_secs`) brings the
+        // reset-boundary wake (`menubar::poller::next_reset_wake_secs`) brings the
         // poller back at expiry, when `is_locked_until_reset` flips false and
         // the account refreshes to its fresh post-reset reading. This is the
         // primary rate-limit guard: a shelf of 100%-locked accounts polled

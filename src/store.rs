@@ -697,7 +697,7 @@ pub struct State {
     /// "at risk" — the captured agent closest to its limit across every
     /// provider. `Some(slug)` pins the tray to one registered provider's
     /// active account (e.g. `"claude"`, `"codex"`). Set from Settings ▸ Tray
-    /// Icon; read by `menubar::tray_target`/`title_for`.
+    /// Icon; read by `menubar::tray::tray_target`/`title_for`.
     #[serde(default)]
     pub tray_icon_mode: Option<String>,
     /// Menu-bar: Settings ▸ Notifications ▸ per-trigger enable checkboxes
@@ -1747,7 +1747,7 @@ fn fsync_dir(_dir: &std::path::Path) -> std::io::Result<()> {
 
 /// Compute the account emails present in the on-disk `state.json` but absent
 /// from `new_state` — i.e. exactly what a restore to `new_state` would drop.
-/// Used by the Restore… dialog (`menubar::handle_backup_restore_dialog`) to
+/// Used by the Restore… dialog (`menubar::backup::handle_backup_restore_dialog`) to
 /// build a confirmation that names the accounts, rather than just a bare
 /// count (H2, v0.5.0 codeaudit — "will drop 2 account(s)" told the user
 /// nothing about *which* two).
@@ -2072,7 +2072,7 @@ pub(crate) fn prune_rejected_dumps(
 /// List backup files (name, mtime) newest-first. v0.5.0 dropped the menu-bar
 /// "Restore from backup ▸ <list>" submenu that used to render these directly
 /// (replaced by a native file panel defaulting to the backups directory —
-/// see `menubar::handle_backup_restore_dialog`), but this stays a public,
+/// see `menubar::backup::handle_backup_restore_dialog`), but this stays a public,
 /// tested entry point for anything that wants to enumerate rolling backups
 /// (a future `usagio backups list` CLI command, or a test).
 #[allow(dead_code)]

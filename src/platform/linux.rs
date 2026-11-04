@@ -812,8 +812,8 @@ impl MenuBackend for LinuxMenu {
         let mut tray = Tray::new(decode_tray_icon(initial_icon))
             .title(initial_title)
             .tooltip(linux_tooltip(initial_title))
-            .options(crate::menubar::tray_options());
-        if let Some(theme) = crate::menubar::forced_theme() {
+            .options(crate::menubar::theme::tray_options());
+        if let Some(theme) = crate::menubar::theme::forced_theme() {
             tray = tray.theme(theme);
         }
         let mtm = muri::MainThreadMarker::new()
@@ -872,7 +872,7 @@ impl MenuBackend for LinuxMenu {
                 loop_for_quit.quit();
             }
             // Work a worker handed back to this (the GTK) thread.
-            crate::menubar::run_ui_tasks();
+            crate::menubar::actions::run_ui_tasks();
             // Menu-item clicks arrive on tray-icon's own global channel.
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 if let Some(cb) = click_cb.lock().unwrap().as_ref() {

@@ -349,7 +349,7 @@ fn opt(n: Option<usize>) -> String {
 
 /// The real side effects used by the running daemon. Logging goes to the debug
 /// log; watcher respawn drops+rebuilds the global fsnotify watcher; self-restart
-/// reuses the battle-tested launchd kickstart path (`menubar::watchdog_self_restart`).
+/// reuses the battle-tested launchd kickstart path (`menubar::supervisor::watchdog_self_restart`).
 pub struct RealEffects;
 
 impl WatchdogEffects for RealEffects {
@@ -385,7 +385,7 @@ impl WatchdogEffects for RealEffects {
         // plain exit() would NOT be revived. Returning `false` there is correct:
         // the watcher-respawn remediation + the surfaced log lines are the
         // safety net for the non-launchd case, with zero restart-loop risk.
-        crate::menubar::watchdog_self_restart()
+        crate::menubar::supervisor::watchdog_self_restart()
     }
 }
 

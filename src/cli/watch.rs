@@ -11,7 +11,7 @@ pub(crate) const WATCH_USAGE: &str =
 
 /// Parse `watch` flags; a missing or unparsable value is an error, never a
 /// silent fallback to the saved/default setting.
-pub(crate) fn parse_watch_opts(args: &[String]) -> Result<menubar::LoopOpts> {
+pub(crate) fn parse_watch_opts(args: &[String]) -> Result<menubar::poller::LoopOpts> {
     fn value<T: std::str::FromStr>(flag: &str, it: &mut std::slice::Iter<'_, String>) -> Result<T> {
         let raw = it
             .next()
@@ -19,7 +19,7 @@ pub(crate) fn parse_watch_opts(args: &[String]) -> Result<menubar::LoopOpts> {
         raw.parse()
             .map_err(|_| anyhow!("invalid value '{raw}' for {flag}\n{WATCH_USAGE}"))
     }
-    let mut opts = menubar::LoopOpts::default();
+    let mut opts = menubar::poller::LoopOpts::default();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -54,7 +54,7 @@ pub(crate) fn cmd_watch(args: &[String]) -> Result<()> {
     // The exact loop the menu-bar app runs: the configured trigger and
     // auto-swap setting (unless overridden above), reset-boundary wakes,
     // suspend/resume detection, per-provider cadence and swaps.
-    menubar::poll_loop_with(&opts);
+    menubar::poller::poll_loop_with(&opts);
     Ok(())
 }
 

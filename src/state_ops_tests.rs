@@ -237,11 +237,11 @@ fn a_provider_account_added_by_sign_in_keeps_its_store_through_a_sweep() {
     persist_login(&provider, captured, Some("new:fresh")).unwrap();
     let state = State::load().unwrap();
     assert_eq!(
-        crate::menubar::renew_login_store(&state, slug, k),
+        crate::menubar::signin::renew_login_store(&state, slug, k),
         "new:fresh",
         "a renew must reopen the store the account signed in with"
     );
-    let keep = crate::menubar::sign_in_stores_to_keep(&state);
+    let keep = crate::menubar::signin::sign_in_stores_to_keep(&state);
     assert!(
         keep.contains(&login::store_id(slug, "new:fresh")),
         "the sweep would delete the account's working sign-in session"
@@ -254,6 +254,6 @@ fn a_provider_account_added_by_sign_in_keeps_its_store_through_a_sweep() {
         .unwrap()
         .login_stores
         .is_empty());
-    assert!(!crate::menubar::sign_in_stores_to_keep(&state)
+    assert!(!crate::menubar::signin::sign_in_stores_to_keep(&state)
         .contains(&login::store_id(slug, "new:fresh")));
 }

@@ -151,7 +151,7 @@ fn is_blocking(
 /// unusable, so its usage cannot change until that reset — polling it only
 /// burns request budget (and risks the shared-tenant HTTP 429s that then
 /// starve the accounts we DO need to refresh). The reset-boundary wake
-/// (`menubar::next_reset_wake_secs`) brings the poller back exactly at expiry,
+/// (`menubar::poller::next_reset_wake_secs`) brings the poller back exactly at expiry,
 /// at which point this returns `false` (the reset is now in the past) and the
 /// account refreshes to its fresh post-reset reading.
 ///

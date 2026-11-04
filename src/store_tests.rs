@@ -591,7 +591,7 @@ fn reconciler_never_persists_silent_account_drop() {
 // ---------------------------------------------------------------------------
 // H2 (v0.5.0 codeaudit) — restore flow: accounts_dropped_by / save_state_restore
 // / stash_pre_restore. Exercises the store-level building blocks that
-// `menubar::handle_backup_restore_dialog` composes; the dialog itself opens a
+// `menubar::backup::handle_backup_restore_dialog` composes; the dialog itself opens a
 // native file picker + osascript confirm, so it isn't unit-testable, but its
 // entire safety-relevant behaviour lives in these three functions.
 // ---------------------------------------------------------------------------

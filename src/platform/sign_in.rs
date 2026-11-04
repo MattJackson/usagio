@@ -39,7 +39,7 @@ fn window_closed(id: [u8; 16]) {
             o.remove(i);
         }
     });
-    crate::menubar::sweep_sign_in_stores_later();
+    crate::menubar::signin::sweep_sign_in_stores_later();
 }
 
 fn is_open(id: &[u8; 16]) -> bool {

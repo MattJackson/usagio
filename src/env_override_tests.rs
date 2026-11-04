@@ -5,7 +5,7 @@ use crate::providers::CLAUDE_SLUG;
 
 #[test]
 fn env_override_active_reads_shared_slug_map() {
-    // The hook drives both the menu (via menubar::env_override_for) and the
+    // The hook drives both the menu (via menubar::model::env_override_for) and the
     // swap filter — one source of truth for the whole app. The un-hooked
     // answer falls through to the real env var, so pin it unset first.
     crate::env_lock::scoped_env_var(CLAUDE_ENV_OVERRIDE_VAR, None, || {

@@ -86,19 +86,21 @@ fn cfg_test_module_files(files: &[PathBuf]) -> std::collections::HashSet<PathBuf
 /// route through the `Platform` trait yet, and either a linked issue or a
 /// note explaining what would need to happen for the exception to go away.
 ///
-/// **menubar cross-OS wiring**: `src/menubar.rs` builds the tray menu ONCE for
+/// **menubar cross-OS wiring**: `src/menubar/` builds the tray menu ONCE for
 /// every OS — a single `cross_platform::menu_tree_from_snapshot` produces the
 /// generic `platform::MenuTree`, and `platform::render::render_menu` turns that
 /// into a `muri::compat::tray_icon::menu::Menu` on each platform's UI thread
 /// (the old macOS native `NSMenu` styler `mod mac_style` and the separate
 /// per-OS menu builders were deleted in the 0.6.0 muri migration). What stays
-/// macOS-gated is only the run-loop machinery macOS drives itself: an
+/// macOS-gated is only the run-loop machinery macOS drives itself (in
+/// `menubar/mod.rs`, with its imports grouped in one gated `use {}`): an
 /// `NSApplication`/`NSTimer` loop needing `objc2`/`objc2-app-kit`/
 /// `objc2-foundation`/`block2` — real
 /// `[target.'cfg(target_os = "macos")'.dependencies]` in Cargo.toml that don't
 /// exist in the dependency graph on Linux/Windows. The Linux/Windows
 /// `MenuBackend` event loop + redraw pump (`cross_platform::run`/`redraw_loop`,
-/// the `MenuHandle` channel) is the mirror-image non-macOS gate. Those pieces
+/// the `MenuHandle` channel, in `menubar/cross_platform.rs`) is the
+/// mirror-image non-macOS gate. Those pieces
 /// must be real `#[cfg(target_os = ...)]`, not something routable through a
 /// runtime trait call; the menu *content* builders in `mod cross_platform` are
 /// NOT gated (they compile everywhere and feed macOS too). Each entry below is
@@ -120,48 +122,47 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "mod ui;",
     ),
     (
-        "src/menubar.rs",
+        "src/menubar/mod.rs",
+        "#[cfg(all(target_os = \"macos\", feature = \"custom-popup\"))]",
+        "mod popover;",
+    ),
+    (
+        "src/menubar/mod.rs",
         "#[cfg(target_os = \"macos\")]",
         "use std::cell::RefCell;",
     ),
-    ("src/menubar.rs", "#[cfg(target_os = \"macos\")]", "use {"),
     (
-        "src/menubar.rs",
+        "src/menubar/mod.rs",
+        "#[cfg(target_os = \"macos\")]",
+        "use {",
+    ),
+    (
+        "src/menubar/mod.rs",
         "#[cfg(target_os = \"macos\")]",
         "pub fn run() -> Result<()> {",
     ),
     (
-        "src/menubar.rs",
+        "src/menubar/mod.rs",
         "#[cfg(not(target_os = \"macos\"))]",
         "pub fn run() -> Result<()> {",
     ),
     (
-        "src/menubar.rs",
-        "#[cfg(all(target_os = \"macos\", feature = \"custom-popup\"))]",
-        "fn build_popover_host(",
-    ),
-    (
-        "src/menubar.rs",
-        "#[cfg(all(target_os = \"macos\", feature = \"custom-popup\"))]",
-        "fn popover_model(snap: &Snapshot) -> crate::ui::PopoverModel {",
-    ),
-    (
-        "src/menubar.rs",
+        "src/menubar/cross_platform.rs",
         "#[cfg(not(target_os = \"macos\"))]",
-        "use crate::platform::MenuHandle;",
+        "use {",
     ),
     (
-        "src/menubar.rs",
+        "src/menubar/cross_platform.rs",
         "#[cfg(not(target_os = \"macos\"))]",
         "fn initial_icon_bytes(snap: &Snapshot) -> &'static [u8] {",
     ),
     (
-        "src/menubar.rs",
+        "src/menubar/cross_platform.rs",
         "#[cfg(not(target_os = \"macos\"))]",
         "fn redraw_loop(handle: Box<dyn MenuHandle>, initial: Snapshot) {",
     ),
     (
-        "src/menubar.rs",
+        "src/menubar/cross_platform.rs",
         "#[cfg(not(target_os = \"macos\"))]",
         "pub(super) fn run() -> Result<()> {",
     ),
@@ -173,21 +174,15 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     // Lint-level only (`allow(dead_code)`): no behaviour branch.
     (
-        "src/menubar.rs",
+        "src/menubar/tray.rs",
         "#[cfg_attr(target_os = \"macos\", allow(dead_code))]",
-        "fn tray_icon_bytes(snap: &Snapshot) -> &'static [u8] {",
+        "pub(super) fn tray_icon_bytes(snap: &Snapshot) -> &'static [u8] {",
     ),
     // Lint-level only (`allow(dead_code)`): no behaviour branch.
     (
-        "src/menubar.rs",
+        "src/menubar/tray.rs",
         "#[cfg_attr(not(target_os = \"macos\"), allow(dead_code))]",
-        "fn tooltip_for(snap: &Snapshot) -> String {",
-    ),
-    // Test-only module compiled off-macOS; exact cfg form pinned below.
-    (
-        "src/menubar.rs",
-        "#[cfg(all(test, not(target_os = \"macos\")))]",
-        "mod tests {",
+        "pub(super) fn tooltip_for(snap: &Snapshot) -> String {",
     ),
 ];
 

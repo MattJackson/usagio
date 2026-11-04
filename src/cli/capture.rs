@@ -16,7 +16,7 @@ use crate::{lifecycle, logging, login, providers, store};
 // ---------------------------------------------------------------------------
 
 pub(crate) fn cmd_capture(args: &[String]) -> Result<()> {
-    // Mirror the menu's `menubar::handle_capture` dispatch exactly — the CLI is
+    // Mirror the menu's `menubar::actions::handle_capture` dispatch exactly — the CLI is
     // the headless twin of the "Capture ▸ <provider>" menu items, sharing the
     // same `capture_current` / `capture_current_generic` code. Claude uses the
     // dedicated `state.accounts` bucket; every other registered provider uses

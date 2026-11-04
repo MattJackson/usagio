@@ -40,7 +40,7 @@ use crate::providers::trait_def::{
 /// Read/write timeout applied to every outbound HTTP call this provider
 /// makes. The default `ureq::Agent` only bounds the TCP *connect* (30s); a
 /// server or proxy that accepts the connection but then stalls mid-response
-/// (or mid-request-write) would otherwise hang `menubar::poll_loop`'s
+/// (or mid-request-write) would otherwise hang `menubar::poller::poll_loop`'s
 /// network thread forever with no diagnostics. 15s is generous for a
 /// legitimate slow response but tight enough to fail fast and let the next
 /// poll tick retry.

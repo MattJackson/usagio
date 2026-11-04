@@ -254,7 +254,7 @@ struct LoopWaker(Arc<std::sync::atomic::AtomicU32>);
 /// The running tray loop's waker, for [`wake_ui_thread`].
 static UI_WAKER: Mutex<Option<LoopWaker>> = Mutex::new(None);
 
-/// Wake the running tray loop so it drains `menubar::run_ui_tasks` now
+/// Wake the running tray loop so it drains `menubar::actions::run_ui_tasks` now
 /// rather than at the wait backstop. A no-op before the loop starts.
 pub(super) fn wake_ui_thread() {
     let waker = UI_WAKER.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -400,8 +400,8 @@ impl MenuBackend for WindowsMenu {
         let mut tray = Tray::new(decode_icon(initial_icon))
             .tooltip(windows_tooltip(initial_title))
             .menu(Menu::new())
-            .options(crate::menubar::tray_options());
-        if let Some(theme) = crate::menubar::forced_theme() {
+            .options(crate::menubar::theme::tray_options());
+        if let Some(theme) = crate::menubar::theme::forced_theme() {
             tray = tray.theme(theme);
         }
         let mtm = muri::MainThreadMarker::new()
@@ -486,7 +486,7 @@ impl MenuBackend for WindowsMenu {
                 }
             }
             // Work a worker handed back to this (the UI) thread.
-            crate::menubar::run_ui_tasks();
+            crate::menubar::actions::run_ui_tasks();
             while let Ok(ev) = menu_rx.try_recv() {
                 if let Some(cb) = self.click_cb.lock().unwrap().as_ref() {
                     cb(&ev.id.0);
