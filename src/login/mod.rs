@@ -337,6 +337,11 @@ impl Progress {
     pub fn is_finished(&self) -> bool {
         self.finished.load(Ordering::SeqCst)
     }
+    /// The sign-in page was closed, or a newer login superseded this flow.
+    #[cfg(test)]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
     /// The user closed the sign-in page — stop waiting.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
