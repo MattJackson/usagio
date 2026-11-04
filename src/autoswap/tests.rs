@@ -1863,3 +1863,52 @@ fn stuck_notice_stays_unknown_when_a_blocked_account_has_no_known_unlock() {
     assert!(v.iter().any(|a| a.blocked));
     assert_eq!(super::shell::soonest_unlock(&v, now), None);
 }
+
+#[test]
+fn prune_clamps_future_timestamps_to_now() {
+    let now = Utc.with_ymd_and_hms(2026, 11, 3, 12, 0, 0).unwrap();
+    let nt = now.timestamp();
+    let future = nt + 90 * 86_400;
+    let mut m = SwapMemory::default();
+    m.left_at.insert("b@e.com".into(), future);
+    m.left_at.insert("c@e.com".into(), nt + 30); // within slack: untouched
+    m.last_switch_at = Some(future);
+    m.trigger_left.insert(
+        "b@e.com".into(),
+        Latch {
+            window: WindowId::Session,
+            resets_at: None,
+            pct: 95.0,
+            at: future,
+        },
+    );
+    m.prune(now);
+    assert_eq!(m.left_at("b@e.com"), Some(nt));
+    assert_eq!(m.left_at("c@e.com"), Some(nt + 30));
+    assert_eq!(m.last_switch_at, Some(nt));
+    assert_eq!(m.trigger_latch("b@e.com").map(|l| l.at), Some(nt));
+}
+
+#[test]
+fn failed_switch_notifies_once_per_target_and_kind() {
+    use super::shell::should_notify_failure as notify;
+    let mut last = None;
+    assert!(notify(&mut last, "B@e.com", "auth"));
+    assert!(!notify(&mut last, "b@e.com", "auth"), "same episode");
+    assert!(notify(&mut last, "b@e.com", "client-handoff"), "new kind");
+    assert!(notify(&mut last, "c@e.com", "client-handoff"), "new target");
+    last = None; // a success clears it
+    assert!(notify(&mut last, "c@e.com", "client-handoff"));
+}
+
+#[test]
+fn failure_kind_classifies_causes() {
+    let k = |s: &str| super::shell::failure_kind(&anyhow::anyhow!("{s}"));
+    assert_eq!(k("keychain write denied"), "credential-write");
+    assert_eq!(
+        k("client has no supported graceful handoff"),
+        "client-handoff"
+    );
+    assert_eq!(k("refresh failed"), "auth");
+    assert_eq!(k("boom"), "other");
+}

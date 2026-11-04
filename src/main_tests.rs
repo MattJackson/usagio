@@ -3252,6 +3252,37 @@ fn compare_and_set_switch_for_other_providers_respects_the_expected_active_accou
     });
 }
 
+#[test]
+fn compare_and_set_switch_aborts_when_a_pin_lands_after_the_cycle_started() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+        for (who, at, rt) in [("a", "at-a", "rt-a"), ("b", "at-b", "rt-b")] {
+            let blob = codex_auth_json(&format!("{who}@example.com"), 4_000_000_000, at, rt);
+            std::fs::write(dir.path().join("auth.json"), blob).unwrap();
+            capture_current_generic("codex").unwrap();
+        }
+        // The cycle began with no pin on b (active)...
+        let cycle_start = State::load().unwrap();
+        let _armed = autoswap::shell::arm_expected_pick("codex", &cycle_start);
+        // ...then the user pinned b while the switch was preparing.
+        let mut st = State::load().unwrap();
+        st.set_manual_pick("codex", Some("b@example.com"));
+        st.save().unwrap();
+        let moved = switch_if_still_active("codex", "a@example.com", "b@example.com").unwrap();
+        assert_eq!(
+            moved, None,
+            "a pin set mid-cycle must win over the auto move"
+        );
+        let st = State::load().unwrap();
+        assert_eq!(
+            provider_active(&st, "codex").as_deref(),
+            Some("b@example.com")
+        );
+        assert_eq!(st.manual_pick("codex"), Some("b@example.com"));
+    });
+}
+
 // --- mutation-hardening: the Claude usage refresh policy ---
 
 fn uniq(tag: &str) -> String {
