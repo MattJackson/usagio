@@ -27,6 +27,52 @@ use std::sync::Mutex;
 /// ever see interleaved `$HOME` values.
 pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// Keys currently bound by a live [`scoped_env_var`] (tests only).
+static SCOPED_KEYS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// True while some test has explicitly scoped `key`.
+pub(crate) fn is_scoped(key: &str) -> bool {
+    SCOPED_KEYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|k| k == key)
+}
+
+/// For tests that set an env var by hand while already holding [`ENV_LOCK`]
+/// (because `scoped_env_var` is not reentrant): marks `key` as explicitly
+/// scoped until the returned guard drops.
+pub(crate) struct ScopedKeyMark(String);
+
+pub(crate) fn mark_scoped(key: &str) -> ScopedKeyMark {
+    SCOPED_KEYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(key.to_string());
+    ScopedKeyMark(key.to_string())
+}
+
+impl Drop for ScopedKeyMark {
+    fn drop(&mut self) {
+        let mut s = SCOPED_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = s.iter().rposition(|k| *k == self.0) {
+            s.remove(i);
+        }
+    }
+}
+
+/// Test-build environment read for path resolution: the real value only when a
+/// test explicitly scoped `key`; otherwise `None`, so a developer's exported
+/// `CLAUDE_CONFIG_DIR` / `USERPROFILE` / `CODEX_HOME` can never redirect a
+/// test onto real user paths.
+pub(crate) fn guarded_var(key: &str) -> Option<OsString> {
+    if is_scoped(key) {
+        std::env::var_os(key)
+    } else {
+        None
+    }
+}
+
 /// Run `f` with `key` bound to `val` (or unset when `val` is `None`).
 /// Restores the prior value (including unset) after `f` returns or panics.
 /// Serialised across the crate via [`ENV_LOCK`].
@@ -42,6 +88,10 @@ where
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let prev = std::env::var_os(key);
+    SCOPED_KEYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(key.to_string());
     // SAFETY: guarded by ENV_LOCK — no other thread inside this test binary
     // reads or writes `key` concurrently while this scope is live.
     #[allow(clippy::disallowed_methods)]
@@ -56,6 +106,12 @@ where
     }
     impl Drop for Restore<'_> {
         fn drop(&mut self) {
+            {
+                let mut s = SCOPED_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(i) = s.iter().rposition(|k| k == self.key) {
+                    s.remove(i);
+                }
+            }
             #[allow(clippy::disallowed_methods)]
             match self.prev.take() {
                 Some(v) => std::env::set_var(self.key, v),

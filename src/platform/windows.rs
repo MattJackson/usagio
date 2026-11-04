@@ -636,6 +636,9 @@ fn userprofile_fallback() -> PathBuf {
 }
 
 impl Paths for WindowsPaths {
+    fn home_env_order(&self) -> [&'static str; 2] {
+        ["USERPROFILE", "HOME"]
+    }
     fn config_dir(&self, app: &str) -> PathBuf {
         appdata_root().join(app)
     }

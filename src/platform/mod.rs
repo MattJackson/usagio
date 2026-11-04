@@ -304,6 +304,10 @@ pub trait Paths: Send + Sync {
     fn data_dir(&self, app: &str) -> PathBuf;
     fn log_dir(&self, app: &str) -> PathBuf;
     fn cache_dir(&self, app: &str) -> PathBuf;
+    /// Environment variables consulted for the user's home directory, in
+    /// priority order. Matches what the vendor CLIs resolve on this OS
+    /// (Windows: `USERPROFILE` first; Unix: `HOME` first).
+    fn home_env_order(&self) -> [&'static str; 2];
 }
 
 // ---------- FileDialog -----------------------------------------------------

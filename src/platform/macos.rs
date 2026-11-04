@@ -1177,6 +1177,9 @@ impl Autostart for MacOsAutostart {
 pub struct MacOsPaths;
 
 impl Paths for MacOsPaths {
+    fn home_env_order(&self) -> [&'static str; 2] {
+        ["HOME", "USERPROFILE"]
+    }
     fn config_dir(&self, app: &str) -> PathBuf {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)

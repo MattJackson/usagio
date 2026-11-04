@@ -2192,7 +2192,11 @@ fn apply_account(
             // If the rollback ALSO fails we're half-applied (~/.claude.json points
             // at the new account, keychain still holds the old) — surface that
             // explicitly rather than silently swallowing the rollback error.
-            if let Err(re) = restore_claude_json_raw(bytes, *mode) {
+            // Re-patch the prior identity into the CURRENT file so Claude Code's
+            // own writes since the snapshot survive the rollback.
+            if let Err(re) = crate::providers::claude::rollback_claude_identity(bytes, *mode)
+                .map_err(|e| anyhow!("{e}"))
+            {
                 logging::log(&format!(
                     "event=switch from={} to={to} identity_written=ok \
                      keychain_written=err:{e:#} rollback=err:{re:#}",
@@ -2292,11 +2296,18 @@ fn mirror_inactive_rotation(
         if !matches {
             return Ok(None);
         }
-        Ok(Some(
-            provider
-                .mirror_rotated_token(&acct.keychain_blob)
-                .map_err(|e| e.to_string()),
-        ))
+        let result = provider
+            .mirror_rotated_token(&acct.keychain_blob)
+            .map_err(|e| e.to_string());
+        crate::logging::log(&format!(
+            "event=mirror account={} result={}",
+            acct.key(),
+            match &result {
+                Ok(()) => "ok".to_string(),
+                Err(e) => format!("err:{e}"),
+            }
+        ));
+        Ok(Some(result))
     });
     // On the Ok path, the inner Option is the mirror outcome; if we couldn't
     // even acquire the lock / run the closure this cycle, skip (None) — the
@@ -3030,8 +3041,8 @@ fn cmd_secrets_selftest(args: &[String]) -> Result<()> {
 }
 
 fn claude_json_path() -> Result<std::path::PathBuf> {
-    let home = crate::paths::user_home().context("HOME/USERPROFILE is not set")?;
-    Ok(home.join(".claude.json"))
+    // Same resolution as the Claude provider (honours CLAUDE_CONFIG_DIR).
+    crate::providers::claude::claude_json_path().context("HOME/USERPROFILE is not set")
 }
 
 /// Read the current `oauthAccount` + `userID` from `~/.claude.json`.
@@ -3072,40 +3083,6 @@ fn claude_json_mode(_path: &std::path::Path) -> u32 {
     0o600
 }
 
-/// Restore ~/.claude.json to prior raw bytes (atomic tmp+rename), re-applying the
-/// original mode so the rollback preserves the file's permissions (matching the
-/// documented "rewrites preserve the original file mode" invariant). Cleans up
-/// the temp file on any failure.
-fn restore_claude_json_raw(bytes: &[u8], mode: u32) -> Result<()> {
-    let path = claude_json_path()?;
-    write_bytes_atomic_mode(&path, bytes, mode)
-}
-
-/// Atomically write `bytes` to `path` (tmp + rename) ending at permission
-/// `mode`, cleaning up the temp file on any failure. The temp is created
-/// owner-only from the start (via `store::write_private`, no umask window) since
-/// these files carry OAuth tokens; `mode` is then applied before the rename.
-/// Shared by the `~/.claude.json` identity write and rollback, and unit-tested.
-fn write_bytes_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> Result<()> {
-    let tmp = path.with_extension("json.usagio.tmp");
-    if let Err(e) = store::write_private(&tmp, bytes) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).context("writing temp file");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
-    }
-    #[cfg(not(unix))]
-    let _ = mode;
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).context("renaming file into place");
-    }
-    Ok(())
-}
-
 /// Patch `~/.claude.json` so its active identity is this account: set
 /// `oauthAccount`, set or (when unknown) REMOVE `userID`, and drop the stale
 /// `cachedUsageUtilization`. Atomic, preserves the file mode, cleans the tmp on
@@ -3120,40 +3097,12 @@ fn write_claude_identity(oauth_account: &serde_json::Value, user_id: Option<&str
 fn write_claude_identity_with(
     oauth_account: &serde_json::Value,
     user_id: Option<&str>,
-    mut before_commit: impl FnMut(),
+    before_commit: impl FnMut(),
 ) -> Result<()> {
-    let path = claude_json_path()?;
-    for attempt in 0..3 {
-        let bytes = std::fs::read(&path).context("reading ~/.claude.json")?;
-        let mut v: serde_json::Value =
-            serde_json::from_slice(&bytes).context("parsing ~/.claude.json")?;
-        let obj = v
-            .as_object_mut()
-            .ok_or_else(|| anyhow!("~/.claude.json is not a JSON object"))?;
-        obj.insert("oauthAccount".into(), oauth_account.clone());
-        match user_id {
-            Some(uid) => {
-                obj.insert("userID".into(), serde_json::Value::String(uid.to_string()));
-            }
-            // Don't leave the previous account's userID paired with a new identity.
-            None => {
-                obj.remove("userID");
-            }
-        }
-        obj.remove("cachedUsageUtilization");
-        let json = serde_json::to_vec_pretty(&v)?;
-        // Preserve the file's existing mode; the shared writer creates the temp
-        // owner-only first, so tokens are never briefly world-readable.
-        let mode = claude_json_mode(&path);
-        before_commit();
-        let unchanged = std::fs::read(&path)
-            .map(|now| now == bytes)
-            .unwrap_or(false);
-        if unchanged || attempt == 2 {
-            return write_bytes_atomic_mode(&path, &json, mode).context("replacing ~/.claude.json");
-        }
-    }
-    unreachable!("loop returns on the last attempt")
+    // One implementation (torn-read retry, missing-file message) shared with
+    // the Claude provider.
+    crate::providers::claude::write_claude_identity_with(oauth_account, user_id, before_commit)
+        .map_err(|e| anyhow!("{e}"))
 }
 
 // ---------------------------------------------------------------------------

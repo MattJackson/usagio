@@ -142,13 +142,17 @@ impl Provider for ClaudeProvider {
         // Snapshot the identity Claude Code stores alongside the keychain
         // token in ~/.claude.json (used to fully restore an account on a
         // later switch — the token alone doesn't set who is signed in).
-        ensure_claude_json_readable()?;
-        let (oauth_account, user_id) = read_claude_identity();
+        // One strict read: a torn/unparseable file fails (retryable) instead
+        // of silently yielding an identity-less capture.
+        let (oauth_account, user_id) = read_claude_identity_strict()?;
 
         // Resolve the email: profile endpoint if online, else fall back to
         // the identity we just read from ~/.claude.json.
         let profile_email = usage::fetch_email(&access);
         ensure_identity_matches_token(profile_email.as_deref(), oauth_account.as_ref())?;
+        if profile_email.is_none() {
+            ensure_unverified_capture_is_safe(&refresh, oauth_account.as_ref())?;
+        }
         let email = profile_email.or_else(|| {
             oauth_account
                 .as_ref()
@@ -239,14 +243,17 @@ impl Provider for ClaudeProvider {
     }
 
     fn patch_stored_blob(&self, blob: &str, grant: &TokenGrant) -> PResult<String> {
-        let mut v: Value = serde_json::from_str(blob)
-            .map_err(|e| ProviderError::Other(format!("keychain value is not valid JSON: {e}")))?;
+        let mut v: Value = serde_json::from_str(blob).map_err(|e| {
+            ProviderError::Other(format!(
+                "Claude credential (keychain or credentials file) is not valid JSON: {e}"
+            ))
+        })?;
         let obj = v
             .get_mut("claudeAiOauth")
             .and_then(|x| x.as_object_mut())
             .ok_or_else(|| {
                 ProviderError::Other(
-                    "keychain value has no claudeAiOauth object (not a claude.ai login)".into(),
+                    "Claude credential has no claudeAiOauth object (not a claude.ai login)".into(),
                 )
             })?;
         let now_ms = Utc::now().timestamp_millis();
@@ -375,7 +382,7 @@ impl Provider for ClaudeProvider {
             .map_err(|e| ProviderError::Other(e.to_string()))?;
         if let Err(e) = active_slot_write(blob) {
             if let Some((bytes, mode)) = &prior {
-                if let Err(re) = restore_claude_json_raw(bytes, *mode) {
+                if let Err(re) = rollback_claude_identity(bytes, *mode) {
                     crate::logging::log(&format!(
                         "event=switch provider=claude slot_written=err:{e} rollback=err:{re}"
                     ));
@@ -451,10 +458,10 @@ impl Provider for ClaudeProvider {
             "file:~/.claude/.credentials.json"
         };
         let result = active_slot_write(blob);
-        let account = extract_claude_email(&serde_json::from_str(blob).unwrap_or(Value::Null))
-            .unwrap_or_else(|| "<unknown>".to_string());
+        // The blob is claudeAiOauth-only (no identity); the caller logs the
+        // account (see `mirror_inactive_rotation`).
         crate::logging::log(&format!(
-            "event=mirror provider={} account={account} to={to} result={}",
+            "event=mirror provider={} to={to} result={}",
             self.provider_id(),
             match &result {
                 Ok(()) => "ok".to_string(),
@@ -474,20 +481,18 @@ impl Provider for ClaudeProvider {
     // --- Credential sync ---------------------------------------------------
 
     fn credential_paths(&self) -> Vec<PathBuf> {
-        let Some(home) = crate::paths::user_home() else {
-            return Vec::new();
-        };
-        vec![
-            home.join(".claude.json"),
-            home.join(".claude").join(".credentials.json"),
-        ]
+        // `~/.claude.json` is deliberately not listed: it holds identity
+        // only (no tokens), is often several MB, and every sync pass would
+        // parse it three times for no possible absorb.
+        claude_credentials_json_path().into_iter().collect()
     }
 
     /// Extract an AccountKey from either shape Claude writes on disk:
     ///
     /// - `~/.claude.json` has `oauthAccount.emailAddress` at the top level.
-    /// - `~/.claude/.credentials.json` mirrors the keychain shape
-    ///   (`claudeAiOauth.{...}`) and may carry `oauthAccount` alongside.
+    /// - `~/.claude/.credentials.json` is normally just the keychain shape
+    ///   (`claudeAiOauth.{accessToken,...}`) with NO identity; such a blob is
+    ///   identified on demand by `identify_credential_online`.
     ///
     /// Emails are lowercased inside `AccountKey::new` so a case shift on
     /// disk can't create a phantom second account.
@@ -495,6 +500,13 @@ impl Provider for ClaudeProvider {
         let v: Value = serde_json::from_str(blob).ok()?;
         let email = extract_claude_email(&v);
         email.map(|e| AccountKey::new(self.provider_id(), e))
+    }
+
+    /// A real `.credentials.json` carries tokens but no identity. Place it by
+    /// asking the profile endpoint who the access token belongs to (one
+    /// request; only reached from the invalid_grant last-chance fallback).
+    fn identify_credential_online(&self, blob: &str) -> Option<AccountKey> {
+        identify_via_profile(self.provider_id(), blob, usage::fetch_email)
     }
 
     fn credential_freshness(&self, blob: &str) -> CredentialFreshness {
@@ -551,6 +563,22 @@ impl Provider for ClaudeProvider {
             Ok(())
         })
     }
+}
+
+/// Identify a tokens-only blob via `fetch_email(accessToken)`. Blobs without
+/// an access token (e.g. `~/.claude.json`) make no request.
+fn identify_via_profile(
+    provider: &'static str,
+    blob: &str,
+    fetch_email: impl FnOnce(&str) -> Option<String>,
+) -> Option<AccountKey> {
+    let v: Value = serde_json::from_str(blob).ok()?;
+    let access = v
+        .get("claudeAiOauth")?
+        .get("accessToken")?
+        .as_str()
+        .filter(|a| !a.is_empty())?;
+    fetch_email(access).map(|e| AccountKey::new(provider, e))
 }
 
 /// Reach into a JSON blob and pull the Claude account email from wherever
@@ -644,22 +672,25 @@ fn subscription_type(org_type: Option<&str>) -> Value {
 }
 
 fn parse_claude_blob(blob: &str) -> PResult<(String, String, i64)> {
-    let v: Value = serde_json::from_str(blob)
-        .map_err(|e| ProviderError::Other(format!("keychain value is not valid JSON: {e}")))?;
+    let v: Value = serde_json::from_str(blob).map_err(|e| {
+        ProviderError::Other(format!(
+            "Claude credential (keychain or credentials file) is not valid JSON: {e}"
+        ))
+    })?;
     let o = v.get("claudeAiOauth").ok_or_else(|| {
         ProviderError::Other(
-            "keychain value has no claudeAiOauth object (not a claude.ai login)".into(),
+            "Claude credential has no claudeAiOauth object (not a claude.ai login)".into(),
         )
     })?;
     let access = o
         .get("accessToken")
         .and_then(|x| x.as_str())
-        .ok_or_else(|| ProviderError::Other("no accessToken in keychain value".into()))?
+        .ok_or_else(|| ProviderError::Other("no accessToken in Claude credential".into()))?
         .to_string();
     let refresh = o
         .get("refreshToken")
         .and_then(|x| x.as_str())
-        .ok_or_else(|| ProviderError::Other("no refreshToken in keychain value".into()))?
+        .ok_or_else(|| ProviderError::Other("no refreshToken in Claude credential".into()))?
         .to_string();
     let expires_at = o.get("expiresAt").and_then(|x| x.as_i64()).unwrap_or(0);
     Ok((access, refresh, expires_at))
@@ -790,17 +821,32 @@ pub(crate) fn active_slot_write(blob: &str) -> PResult<()> {
 
 // ---- ~/.claude.json identity read/write (mirrors main.rs helpers) --------
 
-fn claude_json_path() -> Option<std::path::PathBuf> {
+/// Claude Code's relocatable config root: a non-empty `CLAUDE_CONFIG_DIR`.
+fn claude_config_dir_override() -> Option<std::path::PathBuf> {
+    crate::paths::path_env_var("CLAUDE_CONFIG_DIR")
+        .filter(|d| !d.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// `$CLAUDE_CONFIG_DIR/.claude.json` when that variable is set and
+/// non-empty (Claude Code's documented relocation), else `~/.claude.json`.
+pub(crate) fn claude_json_path() -> Option<std::path::PathBuf> {
+    if let Some(dir) = claude_config_dir_override() {
+        return Some(dir.join(".claude.json"));
+    }
     Some(crate::paths::user_home()?.join(".claude.json"))
 }
 
 /// Where Claude Code writes its plaintext credentials on Linux and Windows
-/// (`~/.claude/.credentials.json` / `%USERPROFILE%\.claude\.credentials.json`).
-/// Not `cfg(target_os)`-gated — both env vars are read unconditionally and
-/// whichever is set wins, so this compiles and behaves identically on every
-/// target; only the caller (which checks `os_display_name()`) decides
-/// whether to use it.
+/// (`~/.claude/.credentials.json` / `%USERPROFILE%\.claude\.credentials.json`,
+/// or `$CLAUDE_CONFIG_DIR/.credentials.json` when that is set). Not
+/// `cfg(target_os)`-gated; only the caller (which checks `os_display_name()`)
+/// decides whether to use it. The macOS keychain service name is NOT varied
+/// by `CLAUDE_CONFIG_DIR` (unverified upstream).
 fn claude_credentials_json_path() -> Option<std::path::PathBuf> {
+    if let Some(dir) = claude_config_dir_override() {
+        return Some(dir.join(".credentials.json"));
+    }
     Some(
         crate::paths::user_home()?
             .join(".claude")
@@ -843,12 +889,36 @@ fn claude_json_mode(_path: &std::path::Path) -> u32 {
     0o600
 }
 
+/// Undo our identity patch without discarding Claude Code's own writes made
+/// since the snapshot: re-patch the CURRENT file with the prior
+/// `oauthAccount`/`userID`. Falls back to restoring the raw snapshot when the
+/// prior file had no identity to patch back (or was unparseable).
+pub(crate) fn rollback_claude_identity(prior_bytes: &[u8], mode: u32) -> PResult<()> {
+    let prior: Option<Value> = serde_json::from_slice(prior_bytes).ok();
+    let oauth = prior
+        .as_ref()
+        .and_then(|v| v.get("oauthAccount"))
+        .filter(|x| !x.is_null());
+    if let Some(oauth) = oauth {
+        let uid = prior
+            .as_ref()
+            .and_then(|v| v.get("userID"))
+            .and_then(Value::as_str);
+        return write_claude_identity(oauth, uid);
+    }
+    restore_claude_json_raw(prior_bytes, mode)
+}
+
 fn restore_claude_json_raw(bytes: &[u8], mode: u32) -> PResult<()> {
     let path = claude_json_path().ok_or_else(|| ProviderError::Other("HOME is not set".into()))?;
     write_bytes_atomic_mode(&path, bytes, mode)
 }
 
-fn write_bytes_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> PResult<()> {
+pub(crate) fn write_bytes_atomic_mode(
+    path: &std::path::Path,
+    bytes: &[u8],
+    mode: u32,
+) -> PResult<()> {
     let tmp = path.with_extension("json.usagio.tmp");
     if let Err(e) = crate::store::write_private(&tmp, bytes) {
         let _ = std::fs::remove_file(&tmp);
@@ -868,23 +938,59 @@ fn write_bytes_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> P
     Ok(())
 }
 
-/// Capture must not store an identity-less account just because
-/// `~/.claude.json` is mid-write by Claude Code: fail (retryable) when the
-/// file exists but cannot be read or parsed. A missing file is fine.
-fn ensure_claude_json_readable() -> PResult<()> {
+/// Read `(oauthAccount, userID)` from `~/.claude.json` in ONE read. Capture
+/// must not store an identity-less account just because the file is mid-write
+/// by Claude Code: a file that exists but cannot be read or parsed is a
+/// (retryable) error. A missing file is fine: `(None, None)`.
+fn read_claude_identity_strict() -> PResult<(Option<Value>, Option<String>)> {
     let Some(path) = claude_json_path() else {
+        return Ok((None, None));
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((None, None)),
+        Err(e) => return Err(ProviderError::Io(e)),
+    };
+    let v = serde_json::from_slice::<Value>(&bytes).map_err(|e| {
+        ProviderError::Other(format!(
+            "~/.claude.json is not valid JSON right now ({e}); try capture again"
+        ))
+    })?;
+    let oauth = v.get("oauthAccount").cloned().filter(|x| !x.is_null());
+    let uid = v.get("userID").and_then(|u| u.as_str()).map(String::from);
+    Ok((oauth, uid))
+}
+
+/// When the profile endpoint could not confirm whose token this is, the
+/// `~/.claude.json` identity is unverified. If an account is already stored
+/// under that identity with a DIFFERENT refresh token, capturing could
+/// overwrite its real credential with another account's (mid-`/login`), so
+/// refuse (retryable) rather than guess. A brand-new identity is allowed.
+fn ensure_unverified_capture_is_safe(
+    live_refresh: &str,
+    oauth_account: Option<&Value>,
+) -> PResult<()> {
+    let Some(email) = oauth_account
+        .and_then(|o| o.get("emailAddress"))
+        .and_then(Value::as_str)
+    else {
         return Ok(());
     };
-    match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
-            .map(|_| ())
-            .map_err(|e| {
-                ProviderError::Other(format!(
-                    "~/.claude.json is not valid JSON right now ({e}); try capture again"
-                ))
-            }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(ProviderError::Io(e)),
+    let Ok(st) = crate::store::State::load() else {
+        return Ok(());
+    };
+    match st.find(email) {
+        Some(a) if a.refresh_token != live_refresh => {
+            crate::logging::log(&format!(
+                "event=capture provider=claude account={email} result=refused reason=unverified-identity"
+            ));
+            Err(ProviderError::Other(format!(
+                "could not verify which account this token belongs to: the profile lookup failed \
+                 (offline, or the live token is expired) and the token differs from the saved \
+                 login for {email}; run `claude` once to refresh it, then capture again"
+            )))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -913,15 +1019,33 @@ fn write_claude_identity(oauth_account: &Value, user_id: Option<&str>) -> PResul
 /// Read-modify-write `~/.claude.json`. The Claude CLI rewrites this file
 /// continually, so re-read just before committing and redo the patch if the
 /// bytes moved (bounded). `before_commit` is a test seam.
-fn write_claude_identity_with(
+pub(crate) fn write_claude_identity_with(
     oauth_account: &Value,
     user_id: Option<&str>,
     mut before_commit: impl FnMut(),
 ) -> PResult<()> {
     let path = claude_json_path().ok_or_else(|| ProviderError::Other("HOME is not set".into()))?;
     for attempt in 0..3 {
-        let bytes = std::fs::read(&path).map_err(ProviderError::Io)?;
-        let json = patch_claude_json(&bytes, oauth_account, user_id)?;
+        let bytes = std::fs::read(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ProviderError::Other(format!(
+                    "{} does not exist; run `claude` once to create it, then retry",
+                    path.display()
+                ))
+            } else {
+                ProviderError::Io(e)
+            }
+        })?;
+        // A torn read (Claude Code rewriting in place) fails to parse; retry
+        // within the bound instead of aborting the switch on attempt 0.
+        let json = match patch_claude_json(&bytes, oauth_account, user_id) {
+            Ok(j) => j,
+            Err(_) if attempt < 2 => {
+                std::thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let mode = claude_json_mode(&path);
         before_commit();
         let unchanged = std::fs::read(&path)
@@ -1188,14 +1312,12 @@ mod tests {
     }
 
     #[test]
-    fn credential_paths_includes_both_files_when_home_is_set() {
-        // The order is [~/.claude.json, ~/.claude/.credentials.json] — the
-        // last-chance fallback iterates in this order.
+    fn credential_paths_lists_only_the_credentials_file_when_home_is_set() {
+        // ~/.claude.json holds no tokens, so it is not scanned.
         crate::env_lock::scoped_env_var("HOME", Some("/some/home"), || {
             let paths = ClaudeProvider.credential_paths();
-            assert_eq!(paths.len(), 2);
-            assert!(paths[0].ends_with(".claude.json"));
-            assert!(paths[1].ends_with(".credentials.json"));
+            assert_eq!(paths.len(), 1);
+            assert!(paths[0].ends_with(".credentials.json"));
         });
     }
 
@@ -1586,13 +1708,195 @@ mod tests {
     }
 
     #[test]
-    fn ensure_claude_json_readable_rejects_garbage_but_allows_missing() {
+    fn read_claude_identity_strict_rejects_garbage_but_allows_missing() {
         let dir = tempfile::tempdir().unwrap();
         crate::env_lock::scoped_env_var("HOME", Some(dir.path().to_str().unwrap()), || {
-            assert!(ensure_claude_json_readable().is_ok());
+            assert_eq!(read_claude_identity_strict().unwrap(), (None, None));
             std::fs::write(dir.path().join(".claude.json"), "{trunc").unwrap();
-            assert!(ensure_claude_json_readable().is_err());
+            assert!(read_claude_identity_strict().is_err());
+            std::fs::write(
+                dir.path().join(".claude.json"),
+                r#"{"oauthAccount":{"emailAddress":"a@e.com"},"userID":"u"}"#,
+            )
+            .unwrap();
+            let (oa, uid) = read_claude_identity_strict().unwrap();
+            assert_eq!(oa.unwrap()["emailAddress"], "a@e.com");
+            assert_eq!(uid.as_deref(), Some("u"));
         });
+    }
+
+    #[test]
+    fn claude_config_dir_relocates_json_and_credentials_paths() {
+        let _cfg = crate::store::ScopedConfigDir::new();
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        crate::env_lock::scoped_env_var("CLAUDE_CONFIG_DIR", Some(d), || {
+            assert_eq!(claude_json_path(), Some(dir.path().join(".claude.json")));
+            assert_eq!(
+                claude_credentials_json_path(),
+                Some(dir.path().join(".credentials.json"))
+            );
+            assert_eq!(
+                ClaudeProvider.credential_paths(),
+                vec![dir.path().join(".credentials.json")]
+            );
+        });
+        // Empty counts as unset.
+        crate::env_lock::scoped_env_var("CLAUDE_CONFIG_DIR", Some(""), || {
+            assert!(claude_json_path().unwrap().ends_with(".claude.json"));
+            assert!(claude_credentials_json_path()
+                .unwrap()
+                .ends_with(".claude/.credentials.json"));
+        });
+    }
+
+    #[test]
+    fn exported_claude_config_dir_never_redirects_a_home_scoped_test() {
+        // A developer's real CLAUDE_CONFIG_DIR is in the process env but NOT
+        // scoped by the test: it must be ignored (sentinel stays untouched).
+        let sentinel = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let sfile = sentinel.path().join(".claude.json");
+        std::fs::write(&sfile, r#"{"oauthAccount":{"emailAddress":"real@me.com"}}"#).unwrap();
+        std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
+        // Emulate an exported variable the test did not scope: set it
+        // directly, bypassing scoped_env_var, under the env lock.
+        let _l = crate::env_lock::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        #[allow(clippy::disallowed_methods)]
+        std::env::set_var("CLAUDE_CONFIG_DIR", sentinel.path());
+        struct Unset;
+        impl Drop for Unset {
+            fn drop(&mut self) {
+                #[allow(clippy::disallowed_methods)]
+                std::env::remove_var("CLAUDE_CONFIG_DIR");
+            }
+        }
+        let _u = Unset;
+        let _hold = crate::env_lock::mark_scoped("HOME");
+        #[allow(clippy::disallowed_methods)]
+        let prev = std::env::var_os("HOME");
+        #[allow(clippy::disallowed_methods)]
+        std::env::set_var("HOME", home.path());
+        write_claude_identity(&serde_json::json!({"emailAddress":"new@e.com"}), None).unwrap();
+        #[allow(clippy::disallowed_methods)]
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&sfile).unwrap(),
+            r#"{"oauthAccount":{"emailAddress":"real@me.com"}}"#
+        );
+        let written = std::fs::read_to_string(home.path().join(".claude.json")).unwrap();
+        assert!(written.contains("new@e.com"));
+    }
+
+    #[test]
+    fn credential_paths_do_not_scan_claude_json() {
+        let _cfg = crate::store::ScopedConfigDir::new();
+        for p in ClaudeProvider.credential_paths() {
+            assert!(!p.ends_with(".claude.json"), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn tokens_only_blob_is_identified_through_the_profile() {
+        let blob = serde_json::json!({"claudeAiOauth": {
+            "accessToken": "at-1", "refreshToken": "rt", "expiresAt": 0i64
+        }})
+        .to_string();
+        let k = identify_via_profile("claude", &blob, |t| {
+            assert_eq!(t, "at-1");
+            Some("Dev@Example.com".into())
+        })
+        .unwrap();
+        assert_eq!(k.key, "dev@example.com");
+        // An identity-only file has no access token: no request is made.
+        let idfile = serde_json::json!({"oauthAccount":{"emailAddress":"a@e.com"}}).to_string();
+        assert!(identify_via_profile("claude", &idfile, |_| panic!("no request")).is_none());
+        // Profile failure => unidentified.
+        assert!(identify_via_profile("claude", &blob, |_| None).is_none());
+    }
+
+    #[test]
+    fn rollback_keeps_claude_codes_intervening_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".claude.json");
+        crate::env_lock::scoped_env_var("HOME", Some(dir.path().to_str().unwrap()), || {
+            let prior = br#"{"oauthAccount":{"emailAddress":"old@e.com"},"userID":"u-old"}"#;
+            std::fs::write(&file, prior).unwrap();
+            // Our patch to the new account, then Claude Code saves unrelated state.
+            write_claude_identity(
+                &serde_json::json!({"emailAddress":"new@e.com"}),
+                Some("u-new"),
+            )
+            .unwrap();
+            let mut v: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            v["projects"] = serde_json::json!({"p": 1});
+            std::fs::write(&file, serde_json::to_vec(&v).unwrap()).unwrap();
+
+            rollback_claude_identity(prior, 0o600).unwrap();
+            let v: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            assert_eq!(v["oauthAccount"]["emailAddress"], "old@e.com");
+            assert_eq!(v["userID"], "u-old");
+            assert_eq!(v["projects"]["p"], 1, "CLI write was reverted");
+        });
+    }
+
+    #[test]
+    fn missing_claude_json_names_the_file_on_switch_write() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::env_lock::scoped_env_var("HOME", Some(dir.path().to_str().unwrap()), || {
+            let e = write_claude_identity(&serde_json::json!({"emailAddress":"a@e.com"}), None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains(".claude.json") && e.contains("run `claude`"),
+                "{e}"
+            );
+        });
+    }
+
+    #[test]
+    fn torn_claude_json_read_is_retried_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".claude.json");
+        crate::env_lock::scoped_env_var("HOME", Some(dir.path().to_str().unwrap()), || {
+            std::fs::write(&file, "{\"a\":").unwrap(); // torn
+            let f2 = file.clone();
+            let healer = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                std::fs::write(&f2, "{}").unwrap();
+            });
+            let r = write_claude_identity(&serde_json::json!({"emailAddress":"a@e.com"}), None);
+            healer.join().unwrap();
+            r.expect("torn read must be retried within the bound");
+            let v: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            assert_eq!(v["oauthAccount"]["emailAddress"], "a@e.com");
+        });
+    }
+
+    #[test]
+    fn unverified_capture_refuses_to_overwrite_a_different_stored_grant() {
+        let _cfg = crate::store::ScopedConfigDir::new();
+        let oa = serde_json::json!({"emailAddress":"a@e.com"});
+        // No stored account: allowed.
+        assert!(ensure_unverified_capture_is_safe("rt-live", Some(&oa)).is_ok());
+        crate::credentials::with_state_lock(|| {
+            let mut st = crate::store::State::load()?;
+            let mut a = crate::store::Account::from_keychain_blob(
+                &serde_json::json!({"claudeAiOauth":{"accessToken":"at","refreshToken":"rt-stored","expiresAt":1i64}}).to_string(),
+            )?;
+            a.email = Some("a@e.com".into());
+            st.upsert(a);
+            st.save()
+        })
+        .unwrap();
+        assert!(ensure_unverified_capture_is_safe("rt-other", Some(&oa)).is_err());
+        assert!(ensure_unverified_capture_is_safe("rt-stored", Some(&oa)).is_ok());
+        assert!(ensure_unverified_capture_is_safe("rt-other", None).is_ok());
     }
 
     #[test]

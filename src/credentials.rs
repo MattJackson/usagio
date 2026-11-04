@@ -128,7 +128,7 @@ pub fn read_blob(path: &Path) -> Option<String> {
 /// `last_chance_fallback` does) should check `read_blob` itself rather than
 /// use this helper for that path. Both current callers only need the
 /// "recognised or not" split, which `identified` already gives them.
-fn for_each_credential_path<F>(provider: &dyn Provider, mut f: F)
+fn for_each_credential_path<F>(provider: &dyn Provider, online_identify: bool, mut f: F)
 where
     F: FnMut(&Path, &str, Option<(AccountKey, CredentialFreshness)>),
 {
@@ -136,9 +136,20 @@ where
         let Some(blob) = read_blob(&path) else {
             continue;
         };
-        let identified = provider
-            .identify_credential(&blob)
-            .map(|key| (key.clone(), provider.credential_freshness(&blob)));
+        let key = provider.identify_credential(&blob).or_else(|| {
+            if !online_identify {
+                return None;
+            }
+            let k = provider.identify_credential_online(&blob);
+            if k.is_some() {
+                crate::logging::log(&format!(
+                    "credentials: identified unlabelled blob at {} via the profile endpoint",
+                    path.display()
+                ));
+            }
+            k
+        });
+        let identified = key.map(|key| (key, provider.credential_freshness(&blob)));
         f(&path, &blob, identified);
     }
 }
@@ -153,7 +164,7 @@ where
 /// polling for another). Absorb those too.
 pub fn absorb_all_lagging(provider: &dyn Provider) -> Vec<AccountKey> {
     let mut seen = Vec::new();
-    for_each_credential_path(provider, |path, blob, identified| {
+    for_each_credential_path(provider, false, |path, blob, identified| {
         let Some((key, freshness)) = identified else {
             return;
         };
@@ -359,7 +370,7 @@ pub fn absorb_before_switch(provider: &dyn Provider) {
 /// the data in hand, no reason not to update it.
 pub fn last_chance_fallback(provider: &dyn Provider, target: &AccountKey) -> bool {
     let mut best_for_target: Option<(String, CredentialFreshness)> = None;
-    for_each_credential_path(provider, |path, blob, identified| {
+    for_each_credential_path(provider, true, |path, blob, identified| {
         let Some((key, freshness)) = identified else {
             // L6 (round-1 codeaudit): log unrecognised blobs so a mismatched
             // rotation shape (e.g. vendor CLI schema change) is visible.

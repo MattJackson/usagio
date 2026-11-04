@@ -688,7 +688,7 @@ fn write_bytes_atomic_mode_applies_requested_mode() {
     // proves the `mode` argument controls the final mode (not write_private's
     // default) — deleting the set_permissions call would make this fail.
     let path = dir.path().join("claude.json");
-    write_bytes_atomic_mode(&path, b"{\"x\":1}", 0o640).unwrap();
+    crate::providers::claude::write_bytes_atomic_mode(&path, b"{\"x\":1}", 0o640).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), b"{\"x\":1}");
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(
@@ -1905,6 +1905,10 @@ fn apply_account_rolls_back_claude_json_when_keychain_write_fails() {
             "a keychain write failure must fail the switch, never report success"
         );
         let after = std::fs::read_to_string(&claude_json).unwrap();
+        // Rollback re-patches the prior identity (so Claude Code's own writes
+        // survive), hence compare the JSON value rather than the exact bytes.
+        let after: serde_json::Value = serde_json::from_str(&after).unwrap();
+        let prior: serde_json::Value = serde_json::from_str(prior).unwrap();
         assert_eq!(
             after, prior,
             "~/.claude.json must be rolled back to its prior contents on keychain failure \
@@ -2821,6 +2825,44 @@ fn apply_account_writes_the_slot_claude_code_reads() {
         )
         .unwrap();
         assert_eq!(keychain_access_token().as_deref(), Some("at-new@e.com"));
+    });
+}
+
+#[test]
+fn main_identity_write_retries_a_torn_claude_json_read() {
+    with_claude_home("who@e.com", |home| {
+        let file = home.join(".claude.json");
+        std::fs::write(&file, "{\"a\":").unwrap(); // torn mid-write
+        let f2 = file.clone();
+        let healer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::fs::write(&f2, "{}").unwrap();
+        });
+        let r = write_claude_identity(&serde_json::json!({"emailAddress": "t@e.com"}), None);
+        healer.join().unwrap();
+        r.expect("a torn read must be retried, not abort the switch");
+        let (oauth, _) = read_claude_identity();
+        assert_eq!(
+            oauth.unwrap().get("emailAddress").and_then(|v| v.as_str()),
+            Some("t@e.com")
+        );
+    });
+}
+
+#[test]
+fn claude_config_dir_redirects_the_main_switch_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("cfg");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(cfg.join(".claude.json"), "{}").unwrap();
+    crate::env_lock::scoped_env_var("CLAUDE_CONFIG_DIR", Some(cfg.to_str().unwrap()), || {
+        assert_eq!(claude_json_path().unwrap(), cfg.join(".claude.json"));
+        write_claude_identity(&serde_json::json!({"emailAddress": "c@e.com"}), None).unwrap();
+        let (oauth, _) = read_claude_identity();
+        assert_eq!(
+            oauth.unwrap().get("emailAddress").and_then(|v| v.as_str()),
+            Some("c@e.com")
+        );
     });
 }
 
@@ -4036,6 +4078,7 @@ fn watch_cycle_polls_every_swappable_provider_and_swaps_the_exhausted_one() {
             std::env::set_var("CODEX_HOME", dir.path());
             RestoreCodexHome(prev)
         };
+        let _mark = crate::env_lock::mark_scoped("CODEX_HOME");
         {
             // No Claude account is active, so no keychain is involved; its two
             // accounts still feed the history log.

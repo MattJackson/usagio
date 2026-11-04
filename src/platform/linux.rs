@@ -129,6 +129,9 @@ fn home_dir() -> PathBuf {
 }
 
 impl Paths for LinuxPaths {
+    fn home_env_order(&self) -> [&'static str; 2] {
+        ["HOME", "USERPROFILE"]
+    }
     fn config_dir(&self, app: &str) -> PathBuf {
         xdg_config_home().join(app)
     }

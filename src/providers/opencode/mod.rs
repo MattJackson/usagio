@@ -38,7 +38,7 @@
 //! **(b) is what's implemented here**, for three reasons:
 //!   1. Scope: v0.5.0's contract is "never re-login" for accounts usagio
 //!      actively manages. opencode's `capture_current_login` is still a
-//!      stub (`Ok(None)` below) — there's no captured opencode account for a
+//!      stub (`Err(Unsupported)` below) — there's no captured opencode account for a
 //!      refresh/mirror-back to apply to yet, so building CAS/mirror-back
 //!      plumbing now would have no caller.
 //!   2. Identity gap: per-`providerID` blobs carry no email/user_id (see
@@ -98,7 +98,7 @@ impl Provider for OpencodeProvider {
         // TODO: read `~/.local/share/opencode/auth.json` (or the
         // `OPENCODE_AUTH_CONTENT` env override) and iterate its providerID
         // keys to produce one CapturedAccount per configured provider.
-        Ok(None)
+        Err(ProviderError::Unsupported)
     }
 
     fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
@@ -129,6 +129,9 @@ mod tests {
 
     #[test]
     fn capture_returns_none_placeholder() {
-        assert!(matches!(OpencodeProvider.capture_current_login(), Ok(None)));
+        assert!(matches!(
+            OpencodeProvider.capture_current_login(),
+            Err(ProviderError::Unsupported)
+        ));
     }
 }
