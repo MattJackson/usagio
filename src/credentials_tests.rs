@@ -1296,12 +1296,14 @@ fn spawn_watchers_refuses_to_watch_the_filesystem_root() {
 
 #[test]
 fn install_then_respawn_watchers_rebuilds_the_registered_watcher() {
+    let _w = WATCHER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let td = tempfile::tempdir().unwrap();
     let cred = td.path().join("creds").join("c.json");
     let prov = FakeProvider::new("fake-reg").with_path(cred);
     let prov_static: &'static FakeProvider = Box::leak(Box::new(prov));
 
-    // Start from an empty registry (nothing else in the suite touches it).
+    // Start from an empty registry (other registry tests serialize on
+    // WATCHER_TEST_LOCK).
     {
         let mut reg = WATCHER_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         reg.handle = None;

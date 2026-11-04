@@ -691,6 +691,10 @@ mod tests {
 
     #[test]
     fn real_effects_respawn_reports_fd_counts_and_keeps_keychain_counter_without_a_watcher() {
+        let _w = crate::credentials::WATCHER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::credentials::clear_watchers_for_test();
         let _cfg = crate::store::ScopedConfigDir::new();
         let _kc = KC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         record_keychain_result(false);
@@ -720,6 +724,34 @@ mod tests {
             contents.contains("result=no_watcher_installed"),
             "{contents}"
         );
+    }
+
+    #[test]
+    fn real_effects_respawn_resets_the_keychain_counter_after_a_real_respawn() {
+        let _w = crate::credentials::WATCHER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cfg = crate::store::ScopedConfigDir::new();
+        let _kc = KC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = cfg.home();
+        crate::env_lock::scoped_env_var("HOME", Some(home.to_str().unwrap()), || {
+            let claude = crate::providers::get("claude").unwrap();
+            crate::credentials::install_watchers(vec![claude]);
+            record_keychain_result(false);
+            record_keychain_result(false);
+            record_keychain_result(false);
+            assert_eq!(keychain_consecutive_failures(), 3);
+
+            RealEffects.respawn_watcher();
+
+            assert_eq!(
+                keychain_consecutive_failures(),
+                0,
+                "a real respawn must reset the pre-respawn failure count"
+            );
+        });
+        crate::credentials::clear_watchers_for_test();
+        record_keychain_result(true);
     }
 
     /// Explicitly unmanaged, even if cargo inherited a launchd environment.
