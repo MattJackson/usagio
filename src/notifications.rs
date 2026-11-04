@@ -596,6 +596,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reset_rearms_thresholds_even_when_reset_back_is_disabled() {
+        let mut state = NotifState::default();
+        let cfg = NotificationConfig {
+            reset_back_enabled: false,
+            ..NotificationConfig::default()
+        };
+        let prev = snap(Some(50.0), None);
+        let curr = snap(Some(75.0), None);
+        let _ = dedup_and_apply(&mut state, &prev, &curr, evaluate(&prev, &curr, &cfg));
+        assert!(state.crossings.contains(&(Window::Session, 70)));
+
+        // Reset tick: no ResetBack notification (disabled), but the window's
+        // crossings must still be cleared.
+        let reset = snap(Some(5.0), None);
+        let fired = dedup_and_apply(&mut state, &curr, &reset, evaluate(&curr, &reset, &cfg));
+        assert!(fired.is_empty(), "reset-back is disabled: {fired:?}");
+        assert!(state.crossings.is_empty(), "reset must still re-arm");
+
+        let lo = snap(Some(40.0), None);
+        let hi = snap(Some(75.0), None);
+        let fired = dedup_and_apply(&mut state, &lo, &hi, evaluate(&lo, &hi, &cfg));
+        assert_eq!(
+            fired,
+            vec![Trigger::Threshold {
+                window: Window::Session,
+                pct: 70
+            }]
+        );
+    }
+
+    #[test]
+    fn session_and_weekly_thresholds_dedup_independently() {
+        let mut state = NotifState::default();
+        let cfg = NotificationConfig::default();
+        let prev = snap(Some(50.0), Some(50.0));
+        let curr = snap(Some(75.0), Some(75.0));
+        let fired = dedup_and_apply(&mut state, &prev, &curr, evaluate(&prev, &curr, &cfg));
+        assert_eq!(fired.len(), 2, "both windows cross 70: {fired:?}");
+        assert!(state.crossings.contains(&(Window::Session, 70)));
+        assert!(state.crossings.contains(&(Window::Weekly, 70)));
+        // A weekly-only reset must leave the session crossing intact.
+        let reset = snap(Some(75.0), Some(3.0));
+        let _ = dedup_and_apply(&mut state, &curr, &reset, evaluate(&curr, &reset, &cfg));
+        assert!(state.crossings.contains(&(Window::Session, 70)));
+        assert!(!state.crossings.contains(&(Window::Weekly, 70)));
+    }
+
     // --- weekly reset clears both crossings and pace_fired -----------------
 
     #[test]
