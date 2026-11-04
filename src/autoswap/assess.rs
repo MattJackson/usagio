@@ -263,7 +263,11 @@ pub fn assess(a: &AccountIn, is_active: bool, ctx: &Ctx) -> Assessed {
             .any(|w| !w.pending && !w.blocked && w.lb >= w.limit - BLIND_BAND);
     if blind_in_band {
         let bm = blind_age_min.unwrap_or(0.0);
-        for w in windows.iter_mut().filter(|w| !w.pending) {
+        // Per window (§3.3): only a window whose last reading was in the band.
+        for w in windows
+            .iter_mut()
+            .filter(|w| !w.pending && w.lb >= w.limit - BLIND_BAND)
+        {
             let blind_rate = match w.id {
                 WindowId::Session => BLIND_RATE_SESSION,
                 WindowId::Weekly => BLIND_RATE_WEEKLY,
@@ -474,7 +478,14 @@ pub fn rank_cmp(a: &Assessed, b: &Assessed, unit: Option<&str>) -> Ordering {
             let k = |x: &Assessed| {
                 let m = x.credits.as_ref();
                 let other_unit = m.is_some_and(|m| Some(m.unit.as_str()) != unit);
-                (other_unit, -m.map_or(0, |m| m.amount_minor))
+                // Amounts compare only within one unit: other units group by
+                // unit name first (§3.3 B11).
+                let group = if other_unit {
+                    m.map_or_else(String::new, |m| m.unit.clone())
+                } else {
+                    String::new()
+                };
+                (other_unit, group, -m.map_or(0, |m| m.amount_minor))
             };
             k(a).cmp(&k(b)).then_with(|| a.key.cmp(&b.key))
         }

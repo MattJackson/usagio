@@ -602,7 +602,13 @@ impl<'a> Decider<'a> {
                 for limit in [w.limit, DRAIN_EXIT_PCT] {
                     let m = runway::time_to(w.est, limit, r);
                     if m.is_finite() && m > 0.0 {
-                        take(now + Duration::seconds((m * 60.0) as i64));
+                        // A hugely out-of-range pct must not overflow the date.
+                        let secs = (m * 60.0).min(1.0e9) as i64;
+                        if let Some(t) =
+                            Duration::try_seconds(secs).and_then(|d| now.checked_add_signed(d))
+                        {
+                            take(t);
+                        }
                     }
                 }
             }

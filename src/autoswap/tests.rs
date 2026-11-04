@@ -1772,3 +1772,58 @@ fn a_missing_pct_is_shown_as_a_dash_not_zero() {
     assert_eq!(super::shell::fmt_pct(None), "—");
     assert_eq!(super::shell::fmt_pct(Some(41.6)), "42%");
 }
+
+#[test]
+fn credits_in_different_non_dominant_units_are_not_ranked_by_raw_minor_units() {
+    let now = at(12, 0, 0);
+    let s = snap(
+        now,
+        "x",
+        vec![
+            acct("x", 100.0, 100.0, now),
+            acct("b", 100.0, 100.0, now),
+            acct("c", 100.0, 100.0, now),
+        ],
+    );
+    let mut v = assess_all(&s);
+    for a in v.iter_mut() {
+        a.tier = Tier::Credits;
+    }
+    v[1].credits = Money::new(5_000, 2, "EUR");
+    v[2].credits = Money::new(100_000, 0, "JPY");
+    // Neither is the dominant unit ("USD"): group by unit, not raw amount.
+    let order = |a: &Assessed, b: &Assessed| rank_cmp(a, b, Some("USD"));
+    // EUR sorts before JPY by unit name regardless of the raw minor amounts.
+    assert_eq!(order(&v[1], &v[2]), std::cmp::Ordering::Less);
+    assert_eq!(order(&v[2], &v[1]), std::cmp::Ordering::Greater);
+}
+
+#[test]
+fn blind_projection_only_applies_to_windows_that_were_in_the_band() {
+    let read = at(12, 0, 0);
+    let now = read + Duration::minutes(4);
+    // Weekly 94 (in band, binding is irrelevant); session 85 is outside the
+    // band and must not get a projection that could cross the limit.
+    let s = snap(now, "act", vec![acct("act", 85.0, 94.0, read).backoff()]);
+    let act = assess_all(&s).into_iter().find(|a| a.is_active).unwrap();
+    let sess = act
+        .windows
+        .iter()
+        .find(|w| w.id == WindowId::Session)
+        .unwrap();
+    assert!(sess.proj.is_none(), "{sess:?}");
+}
+
+#[test]
+fn an_absurd_negative_pct_does_not_panic_the_next_check() {
+    let now = at(12, 0, 0);
+    let s = snap(
+        now,
+        "act",
+        vec![
+            acct("act", 20.0, -1.0e300, now).rate(1.0, 1.0).wreset(None),
+            acct("b", 10.0, 10.0, now),
+        ],
+    );
+    let _ = decide(&s);
+}
