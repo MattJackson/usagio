@@ -4011,13 +4011,19 @@ mod cross_platform {
                 if let Err(e) = handle.set_menu(menu_tree_from_snapshot(&snap)) {
                     crate::logging::log(&format!("menubar: set_menu failed: {e:#}"));
                 }
-                let _ = handle.set_icon(initial_icon_bytes(&snap));
+                if let Err(e) = handle.set_icon(initial_icon_bytes(&snap)) {
+                    crate::logging::log(&format!("menubar: set_icon failed: {e:#}"));
+                }
                 last_sig = sig;
             }
             let title = title_for(&snap);
             if title != last_title {
-                let _ = handle.set_title(&title);
-                last_title = title;
+                match handle.set_title(&title) {
+                    Ok(()) => last_title = title,
+                    Err(e) => {
+                        crate::logging::log(&format!("menubar: set_title failed: {e:#}"));
+                    }
+                }
             }
         }
     }
