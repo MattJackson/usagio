@@ -6599,3 +6599,36 @@ fn auto_commit_aborts_when_a_renewal_was_staged_after_the_cas() {
         .is_some());
     assert_eq!(pa.active.as_deref(), Some(k));
 }
+
+#[test]
+fn rm_with_ambiguous_claude_selector_never_deletes_a_provider_account() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let mut state = State::default();
+    state.accounts.push(claude_account("dev1@a.com", 3_600_000));
+    state.accounts.push(claude_account("dev2@a.com", 3_600_000));
+    state
+        .provider_accounts_mut("codex")
+        .accounts
+        .push(codex_account("dev@x.com", None));
+    state.save().unwrap();
+    let err = cmd_rm(Some("dev")).unwrap_err().to_string();
+    assert!(err.contains("ambiguous"), "{err}");
+    let state = State::load().unwrap();
+    assert_eq!(state.accounts.len(), 2);
+    assert_eq!(state.provider_accounts("codex").unwrap().accounts.len(), 1);
+}
+
+#[test]
+fn rm_refuses_a_selector_matching_two_providers() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let mut state = State::default();
+    state.accounts.push(claude_account("dev@a.com", 3_600_000));
+    state
+        .provider_accounts_mut("codex")
+        .accounts
+        .push(codex_account("dev@a.com", None));
+    state.save().unwrap();
+    assert!(cmd_rm(Some("dev@a.com")).is_err());
+    assert_eq!(State::load().unwrap().accounts.len(), 1);
+    cmd_rm(Some("codex:dev@a.com")).unwrap();
+}

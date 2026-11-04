@@ -2364,16 +2364,19 @@ fn resolve_account_selector(state: &State, sel: &str) -> Result<(String, String)
         return resolve_provider_selector(state, sel)
             .ok_or_else(|| anyhow!("no unique {slug} account matches '{account}'"));
     }
-    let claude = (!state.accounts.is_empty()).then(|| state.resolve(sel));
-    if let Some(Ok(email)) = claude {
-        return Ok((CLAUDE_SLUG.to_string(), email));
-    }
-    if let Some(found) = resolve_provider_selector(state, sel) {
-        return Ok(found);
-    }
-    match claude {
-        Some(Err(e)) => Err(e),
-        _ => bail!("no account matches '{sel}'"),
+    // Unqualified: fall through to other providers ONLY when Claude has no
+    // match at all. An ambiguous Claude selector stays an error, and a match in
+    // more than one provider must be qualified (this feeds a destructive `rm`).
+    let claude = state.resolve(sel);
+    let other = resolve_provider_selector(state, sel);
+    match (claude, other) {
+        (Ok(email), None) => Ok((CLAUDE_SLUG.to_string(), email)),
+        (Ok(email), Some((slug, key))) => bail!(
+            "'{sel}' matches {CLAUDE_SLUG}:{email} and {slug}:{key}; qualify it with a provider prefix"
+        ),
+        (Err(e), _) if e.to_string().contains("ambiguous") => Err(e),
+        (Err(_), Some(found)) => Ok(found),
+        (Err(_), None) => bail!("no account matches '{sel}'"),
     }
 }
 
