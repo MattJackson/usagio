@@ -561,6 +561,47 @@ mod tests {
         assert_eq!(est.empty_at - now, Duration::hours(MAX_EMPTY_IN_HOURS));
     }
 
+    #[test]
+    fn estimate_weekly_uses_multi_day_history_and_7d_horizon() {
+        // 0.6 %/h climb, exactly MIN_SAMPLES readings every 28h spanning ~5.8
+        // days, ending at 85%: a horizon shorter than 7d drops samples.
+        let mut rows: Vec<(i64, f32)> = (0..MIN_SAMPLES as i64)
+            .map(|k| (60 + k * 1680, 85.0 - 16.8 * k as f32))
+            .collect();
+        // Older than the 7-day weekly horizon (but inside the 8-day read
+        // window): must not influence the fit.
+        rows.extend([(7 * 24 * 60 + 600, 99.0), (7 * 24 * 60 + 1300, 98.0)]);
+        let (_l, _g, key, now) = with_history(false, &rows);
+        let est = estimate(&key, Window::Weekly, now).expect("weekly history is enough");
+        assert_eq!(est.window, Window::Weekly);
+        assert_eq!(est.current_pct, 85.0);
+        assert!(
+            (est.rate_pct_per_hour - 0.6).abs() < 0.1,
+            "{}",
+            est.rate_pct_per_hour
+        );
+        let eta = (est.empty_at - now).num_hours();
+        assert!((20..=30).contains(&eta), "empty in {eta}h");
+        // A weekly estimate never reads the session pct column.
+        drop((_l, _g));
+        let (_l, _g, key, now) = with_history(true, &rows);
+        assert!(estimate(&key, Window::Weekly, now).is_none());
+    }
+
+    #[test]
+    fn format_menu_row_labels_each_window() {
+        let now = Utc::now();
+        let mk = |window| BurnRateEstimate {
+            window,
+            current_pct: 50.0,
+            rate_pct_per_hour: 0.0,
+            empty_at: now + Duration::hours(MAX_EMPTY_IN_HOURS),
+            reset_at: None,
+        };
+        assert!(format_menu_row(&mk(Window::Session)).starts_with("Session"));
+        assert!(format_menu_row(&mk(Window::Weekly)).starts_with("Weekly"));
+    }
+
     // Ignored by default — this hits the live usage_log crate function, which panics
     // in unit-test mode without a fixture harness.  See tests/integration when wiring.
     #[test]

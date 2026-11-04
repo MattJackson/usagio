@@ -408,18 +408,11 @@ fn run_with_timeout(mut child: Child, timeout: Duration) -> Result<SecurityRun> 
     })
 }
 
-fn real_get(service: &str, account: &str) -> Result<Option<String>> {
-    // Only exit code 44 ("SecItem not found" per <Security/SecBase.h> /
-    // `security(1)` conventions) is a genuine "not present". Any other
-    // non-zero — keychain locked, permission denied, IPC failure —
-    // surfaces as Err so callers like `sync_active_from_keychain` treat
-    // it as "don't touch anything" rather than "assume gone" (which
-    // would let a subsequent switch overwrite a still-valid token).
-    // See H7 in the round-1 codeaudit findings.
-    let out = run_security(&["find-generic-password", "-s", service, "-a", account, "-w"])
-        .context("running `security find-generic-password`")?;
-    let timed_out = out.timed_out;
-    let result = if timed_out {
+/// Pure mapping of a finished `security find-generic-password -w` run to the
+/// caller-visible result: exit 44 is "not found" (`Ok(None)`); a timeout or
+/// any other failure is `Err` so callers never mistake it for "absent".
+fn interpret_get(out: &SecurityRun, service: &str, account: &str) -> Result<Option<String>> {
+    if out.timed_out {
         // robustness-01: locked keychain / unattended SecurityAgent dialog.
         // Distinct error branch, but still just an Err to the caller — same
         // "don't touch anything" treatment as any other failure above.
@@ -442,7 +435,21 @@ fn real_get(service: &str, account: &str) -> Result<Option<String>> {
     } else {
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
         Ok(if s.is_empty() { None } else { Some(s) })
-    };
+    }
+}
+
+fn real_get(service: &str, account: &str) -> Result<Option<String>> {
+    // Only exit code 44 ("SecItem not found" per <Security/SecBase.h> /
+    // `security(1)` conventions) is a genuine "not present". Any other
+    // non-zero — keychain locked, permission denied, IPC failure —
+    // surfaces as Err so callers like `sync_active_from_keychain` treat
+    // it as "don't touch anything" rather than "assume gone" (which
+    // would let a subsequent switch overwrite a still-valid token).
+    // See H7 in the round-1 codeaudit findings.
+    let out = run_security(&["find-generic-password", "-s", service, "-a", account, "-w"])
+        .context("running `security find-generic-password`")?;
+    let timed_out = out.timed_out;
+    let result = interpret_get(&out, service, account);
     // Belt-and-suspenders: log every keychain touch so a bug that leaves
     // nothing else logged still shows up here (M4-audit finding).
     crate::logging::log(&format!(
@@ -548,6 +555,14 @@ fn real_delete(service: &str, account: &str) -> Result<()> {
         crate::logging::log(&format!(
             "event=keychain_delete_timeout svc={service} acct={account}"
         ));
+    }
+    interpret_delete(&out, service, account)
+}
+
+/// Pure mapping of a finished `security delete-generic-password` run: exit 0
+/// and exit 44 (not found) are `Ok`; a timeout or any other failure is `Err`.
+fn interpret_delete(out: &SecurityRun, service: &str, account: &str) -> Result<()> {
+    if out.timed_out {
         bail!(
             "`security delete-generic-password` timed out after {SECURITY_TIMEOUT_SECS}s \
              (locked keychain or an unattended SecurityAgent dialog) for \
@@ -1064,6 +1079,45 @@ impl Paths for MacOsPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run(code: Option<i32>, timed_out: bool, stdout: &str) -> SecurityRun {
+        use std::os::unix::process::ExitStatusExt;
+        SecurityRun {
+            timed_out,
+            status: code.map(|c| ExitStatus::from_raw(c << 8)),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: b"boom".to_vec(),
+        }
+    }
+
+    #[test]
+    fn interpret_get_only_exit_44_is_not_found() {
+        assert_eq!(
+            interpret_get(&run(Some(0), false, "tok\n"), "s", "a").unwrap(),
+            Some("tok".to_string())
+        );
+        assert_eq!(
+            interpret_get(&run(Some(0), false, "\n"), "s", "a").unwrap(),
+            None
+        );
+        assert_eq!(
+            interpret_get(&run(Some(44), false, ""), "s", "a").unwrap(),
+            None
+        );
+        // Locked keychain / permission / any other failure must be Err.
+        assert!(interpret_get(&run(Some(51), false, ""), "s", "a").is_err());
+        assert!(interpret_get(&run(Some(1), false, ""), "s", "a").is_err());
+        // Timeout (status None) must be Err, never "absent".
+        assert!(interpret_get(&run(None, true, ""), "s", "a").is_err());
+    }
+
+    #[test]
+    fn interpret_delete_only_exit_44_is_benign() {
+        assert!(interpret_delete(&run(Some(0), false, ""), "s", "a").is_ok());
+        assert!(interpret_delete(&run(Some(44), false, ""), "s", "a").is_ok());
+        assert!(interpret_delete(&run(Some(51), false, ""), "s", "a").is_err());
+        assert!(interpret_delete(&run(None, true, ""), "s", "a").is_err());
+    }
 
     #[test]
     fn paths_config_dir_uses_home_dot_config() {

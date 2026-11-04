@@ -532,3 +532,15 @@ fn scoped_opus_limit_defers_to_the_fixed_opus_window() {
     assert_eq!(r.scoped_limits[0].utilization, Some(42.0));
     assert!(r.scoped_limits[0].resets_at.is_none());
 }
+
+#[test]
+fn claim_outcome_from_status_only_reset_is_applied() {
+    assert_eq!(ClaimOutcome::from_status("reset"), ClaimOutcome::Reset);
+    for other in ["already_used", "not_limited", "cooldown", "unknown", ""] {
+        assert_eq!(
+            ClaimOutcome::from_status(other),
+            ClaimOutcome::NoChange(other.to_string()),
+            "{other:?} must not be reported as an applied reset"
+        );
+    }
+}

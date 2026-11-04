@@ -1389,6 +1389,85 @@ mod tests {
     }
 
     #[test]
+    fn first_append_per_process_prunes_stale_history_and_decisions() {
+        let _l = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cfg = store::ScopedConfigDir::new();
+        let old = SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_700_000_000);
+        let stale_hist = cfg_dir().join("history.2020-01.ndjson");
+        let stale_dec = cfg_dir().join("decisions.2020-01.ndjson");
+        touch_with_mtime(&stale_hist, old);
+        touch_with_mtime(&stale_dec, old);
+        // append(): the first call in a process rotates.
+        BOOT_ROTATED.store(false, Ordering::SeqCst);
+        append(&snap("claude", "a@x.io", utc(2049, 9, 5, 5), Some(1.0))).unwrap();
+        assert!(!stale_hist.exists(), "append must prune stale history");
+        assert!(!stale_dec.exists(), "rotation must cover decisions files");
+        // append_decision(): same once-per-process rotation.
+        touch_with_mtime(&stale_hist, old);
+        touch_with_mtime(&stale_dec, old);
+        BOOT_ROTATED.store(false, Ordering::SeqCst);
+        append_decision(&serde_json::json!({"k": 1})).unwrap();
+        assert!(
+            !stale_hist.exists(),
+            "append_decision must prune stale history"
+        );
+        assert!(
+            !stale_dec.exists(),
+            "append_decision must prune stale decisions"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_and_decision_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let _l = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cfg = store::ScopedConfigDir::new();
+        BOOT_ROTATED.store(true, Ordering::SeqCst);
+        let ts = utc(2049, 10, 5, 5);
+        append(&snap("claude", "a@x.io", ts, Some(1.0))).unwrap();
+        append_decision(&serde_json::json!({"k": 1})).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&month_path(&cfg_dir(), ts)), 0o600);
+        assert_eq!(mode(&decisions_path(&cfg_dir(), Utc::now())), 0o600);
+        assert_eq!(mode(&cfg_dir()), 0o700);
+    }
+
+    #[test]
+    fn non_reading_rows_are_excluded_from_last_n_days_and_last_snapshot() {
+        let _cfg = store::ScopedConfigDir::new();
+        evict_recent_months();
+        let now = Utc::now();
+        let dir = cfg_dir();
+        let ok = Snapshot {
+            outcome: Some("ok".into()),
+            ..snap("claude", "r@x.io", now - Duration::hours(3), Some(10.0))
+        };
+        write_snap(&dir, &ok);
+        for (i, outcome) in ["429", "err", "skip"].iter().enumerate() {
+            write_snap(
+                &dir,
+                &Snapshot {
+                    outcome: Some((*outcome).into()),
+                    ..snap(
+                        "claude",
+                        "r@x.io",
+                        now - Duration::hours(2) + Duration::minutes(i as i64),
+                        Some(10.0),
+                    )
+                },
+            );
+        }
+        evict_recent_months();
+        let key = AccountKey::new("claude", "r@x.io");
+        let rows = last_n_days(&key, 1);
+        assert_eq!(rows.len(), 1, "only the ok row is a reading: {rows:?}");
+        assert_eq!(rows[0].ts, ok.ts);
+        let last = last_snapshot(&key).expect("a reading exists");
+        assert_eq!(last.ts, ok.ts, "repeated-cache rows must not be 'latest'");
+    }
+
+    #[test]
     fn rotate_if_needed_prunes_stale_files_in_config_dir() {
         let _l = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _cfg = store::ScopedConfigDir::new();

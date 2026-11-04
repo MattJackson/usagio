@@ -791,18 +791,51 @@ fn watcher_does_not_leak_an_fd_per_file_in_a_large_dir() {
 fn notify_backend_is_not_kqueue() {
     let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
         .expect("read Cargo.toml");
-    // Isolate the `notify = ...` dependency line(s) (ignore `notify-rust`).
-    for line in manifest.lines() {
-        let t = line.trim_start();
-        if t.starts_with("notify ") || t.starts_with("notify=") {
-            assert!(
-                !line.contains("macos_kqueue"),
-                "Cargo.toml enables the notify `macos_kqueue` backend, which \
-                 leaks a file descriptor per watched file and exhausted \
-                 RLIMIT_NOFILE (breaking keychain switch/refresh). Use the \
-                 default FSEvents backend: `notify = \"6\"`."
-            );
-        }
+    assert!(
+        !notify_enables_kqueue(&manifest),
+        "Cargo.toml enables the notify `macos_kqueue` backend, which \
+         leaks a file descriptor per watched file and exhausted \
+         RLIMIT_NOFILE (breaking keychain switch/refresh). Use the \
+         default FSEvents backend: `notify = \"6\"`."
+    );
+}
+
+/// Whether ANY `notify` dependency declaration in the manifest — inline,
+/// `[dependencies.notify]` table, multi-line features, or under
+/// `[target.*.dependencies]` — enables the `macos_kqueue` feature.
+fn notify_enables_kqueue(manifest: &str) -> bool {
+    fn walk(v: &toml::Value, in_deps: bool) -> bool {
+        let Some(t) = v.as_table() else { return false };
+        t.iter().any(|(k, child)| {
+            let is_deps_table = k.ends_with("dependencies");
+            if in_deps && k == "notify" {
+                return child
+                    .get("features")
+                    .and_then(|f| f.as_array())
+                    .is_some_and(|f| f.iter().any(|x| x.as_str() == Some("macos_kqueue")));
+            }
+            walk(child, is_deps_table)
+        })
+    }
+    let doc: toml::Value = manifest.parse().expect("parse Cargo.toml");
+    walk(&doc, false)
+}
+
+#[test]
+fn notify_kqueue_scan_sees_every_declaration_form() {
+    for bad in [
+        "[dependencies]\nnotify = { version = \"6\", features = [\"macos_kqueue\"] }\n",
+        "[dependencies.notify]\nversion = \"6\"\nfeatures = [\"macos_kqueue\"]\n",
+        "[dependencies]\nnotify = { version = \"6\", features = [\n  \"serde\",\n  \"macos_kqueue\",\n] }\n",
+        "[target.'cfg(target_os = \"macos\")'.dependencies]\nnotify = { version = \"6\", features = [\"macos_kqueue\"] }\n",
+    ] {
+        assert!(notify_enables_kqueue(bad), "missed: {bad}");
+    }
+    for good in [
+        "[dependencies]\nnotify = \"6\"\nnotify-rust = { version = \"4\", features = [\"macos_kqueue\"] }\n",
+        "[dependencies.notify]\nversion = \"6\"\nfeatures = [\"serde\"]\n",
+    ] {
+        assert!(!notify_enables_kqueue(good), "false positive: {good}");
     }
 }
 

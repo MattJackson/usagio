@@ -5970,7 +5970,7 @@ mod tests {
     }
 
     #[test]
-    fn flat_account_order_tie_breaks_by_headroom_then_email() {
+    fn flat_account_order_tie_breaks_by_headroom() {
         let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
         // Same reset instant: more headroom (lower max_pct) sorts first.
         let reset = Some(now + chrono::Duration::days(1));
@@ -5987,6 +5987,25 @@ mod tests {
             .map(|&(si, ai)| sections[si].accounts[ai].key.as_str())
             .collect();
         assert_eq!(keys, vec!["b@x.com", "a@x.com"]);
+    }
+
+    #[test]
+    fn flat_account_order_ties_break_by_key_not_input_order() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let reset = Some(now + chrono::Duration::days(1));
+        let mk = |k: &str| acct_with_resets(k, Some(10.0), Some(10.0), false, None, reset);
+        // Identical usage and reset, stored in reverse key order.
+        let sections = vec![section_with(
+            CLAUDE_SLUG,
+            "Claude",
+            vec![mk("c@x.com"), mk("a@x.com"), mk("b@x.com")],
+        )];
+        let order = flat_account_order(&sections, now);
+        let keys: Vec<&str> = order
+            .iter()
+            .map(|&(si, ai)| sections[si].accounts[ai].key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["a@x.com", "b@x.com", "c@x.com"]);
     }
 
     #[test]
@@ -6051,8 +6070,10 @@ mod tests {
         // Sections registered in reverse-alpha order — grouped_order must
         // still return Claude before Codex.
         let sections = vec![
-            section_with("codex", "Codex", vec![c1, c2]),
-            section_with(CLAUDE_SLUG, "Claude", vec![a1, a2]),
+            // Accounts are stored latest-reset first so the expected
+            // soonest-first order differs from storage order.
+            section_with("codex", "Codex", vec![c2, c1]),
+            section_with(CLAUDE_SLUG, "Claude", vec![a2, a1]),
         ];
         let account_order = flat_account_order(&sections, now);
         let snap = Snapshot {
@@ -6072,8 +6093,8 @@ mod tests {
         assert_eq!(snap.sections[groups[0].0].display_name, "Claude");
         assert_eq!(snap.sections[groups[1].0].display_name, "Codex");
         // Within-provider account order preserved.
-        assert_eq!(groups[0].1.len(), 2);
-        assert_eq!(groups[1].1.len(), 2);
+        assert_eq!(groups[0].1, vec![1, 0], "Claude: soonest reset first");
+        assert_eq!(groups[1].1, vec![1, 0], "Codex: soonest reset first");
     }
 
     #[test]

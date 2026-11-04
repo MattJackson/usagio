@@ -1499,3 +1499,37 @@ fn adopt_login_drops_an_expiry_the_new_login_does_not_state() {
     a.adopt_login(&fresh);
     assert_eq!(a.refresh_token_expires_at(), None);
 }
+
+#[test]
+fn redact_state_for_dump_leaks_no_token_material_for_claude_or_providers() {
+    // Tokens embedded in keychain_blob / secret_blob appear JSON-escaped in
+    // the dump, so check for raw distinctive substrings (and the key names
+    // that would only appear if a blob were dumped verbatim).
+    let mut st = State::default();
+    let mut a = Account::from_keychain_blob(&blob("LEAKACC-claude", "LEAKREF-claude", 1)).unwrap();
+    a.email = Some("c@e.com".into());
+    st.accounts.push(a);
+    let mut pa = provider_account("p@e.com");
+    pa.access_token = "LEAKACC-prov".into();
+    pa.refresh_token = "LEAKREF-prov".into();
+    pa.secret_blob = "{\"tokens\":{\"access_token\":\"LEAKACC-blob\"}}".into();
+    st.providers
+        .entry("codex".into())
+        .or_default()
+        .accounts
+        .push(pa);
+    let dump = redact_state_for_dump(&st).to_string();
+    assert!(
+        dump.contains("c@e.com") && dump.contains("p@e.com"),
+        "{dump}"
+    );
+    for needle in [
+        "LEAKACC",
+        "LEAKREF",
+        "accessToken",
+        "refreshToken",
+        "access_token\\\"",
+    ] {
+        assert!(!dump.contains(needle), "{needle} leaked in dump: {dump}");
+    }
+}

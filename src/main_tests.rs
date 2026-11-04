@@ -356,15 +356,18 @@ fn row_from_account_tags_provider_id_claude() {
 #[test]
 fn env_override_active_reads_shared_slug_map() {
     // The hook drives both the menu (via menubar::env_override_for) and the
-    // swap filter — one source of truth for the whole app.
-    assert!(!env_override_active(CLAUDE_SLUG));
-    with_env_override_hook(&[CLAUDE_SLUG], || {
-        assert!(env_override_active(CLAUDE_SLUG));
-        // Unknown / non-Claude slugs are unaffected by the Claude env var.
-        assert!(!env_override_active("codex"));
+    // swap filter — one source of truth for the whole app. The un-hooked
+    // answer falls through to the real env var, so pin it unset first.
+    crate::env_lock::scoped_env_var(CLAUDE_ENV_OVERRIDE_VAR, None, || {
+        assert!(!env_override_active(CLAUDE_SLUG));
+        with_env_override_hook(&[CLAUDE_SLUG], || {
+            assert!(env_override_active(CLAUDE_SLUG));
+            // Unknown / non-Claude slugs are unaffected by the Claude env var.
+            assert!(!env_override_active("codex"));
+        });
+        // Restored on exit.
+        assert!(!env_override_active(CLAUDE_SLUG));
     });
-    // Restored on exit.
-    assert!(!env_override_active(CLAUDE_SLUG));
 }
 
 // --- next_interval (backoff + adaptive cadence) ---
@@ -961,46 +964,26 @@ fn sibling_app_bundle_exe_none_when_bundle_absent() {
 fn usagio_install_prefers_app_bundle_path_when_available() {
     let (dir, bare_exe, bundle_exe) = mock_cellar_bundle_layout("usagio-install-bundle-test");
 
-    // Resolve exactly the way `cmd_install` -> `launch_agent_exe_path` would,
-    // given this mocked Cellar layout (bypassing `current_exe()`/
-    // `stable_exe_path()`, which can't be pointed at a scratch dir).
-    let resolved = sibling_app_bundle_exe(&bare_exe).expect("bundle should resolve");
+    // The real consumer (`launch_agent_exe_path`) over an injected pair:
+    // running from the bare Cellar binary must resolve to the bundle exe.
+    let resolved = resolve_launch_agent_exe(bare_exe.clone(), || bare_exe.clone());
     assert_eq!(resolved, bundle_exe);
+    assert!(resolved
+        .to_string_lossy()
+        .contains("usagio.app/Contents/MacOS/usagio"));
 
-    let home = dir.join("home");
-    std::fs::create_dir_all(&home).unwrap();
-    let plist_path = home
-        .join("Library/LaunchAgents")
-        .join("com.mattjackson.usagio.test-bundle.plist");
-
-    crate::env_lock::scoped_env_var("HOME", Some(home.to_str().unwrap()), || {
-        let mut prog_args = format!("    <string>{}</string>\n", resolved.display());
-        prog_args.push_str("    <string>menubar</string>\n");
-        let plist = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.mattjackson.usagio.test-bundle</string>
-  <key>ProgramArguments</key>
-  <array>
-{prog_args}  </array>
-</dict>
-</plist>
-"#
-        );
-        std::fs::create_dir_all(plist_path.parent().unwrap()).unwrap();
-        std::fs::write(&plist_path, &plist).unwrap();
-
-        let written = std::fs::read_to_string(&plist_path).unwrap();
-        assert!(
-            written.contains("usagio.app/Contents/MacOS/usagio"),
-            "expected ProgramArguments to point into the app bundle, got:\n{written}"
-        );
-        assert!(
-            !written.contains(&bare_exe.display().to_string()),
-            "must not fall back to the bare binary path when a bundle exists"
-        );
+    // Already running from inside a bundle: used as-is, stable never consulted.
+    let in_bundle = resolve_launch_agent_exe(bundle_exe.clone(), || {
+        panic!("stable path must not be resolved when already in a bundle")
     });
+    assert_eq!(in_bundle, bundle_exe);
+
+    // No sibling bundle: falls back to the bare stable path.
+    let lone = dir.join("lone/bin/usagio");
+    assert_eq!(
+        resolve_launch_agent_exe(lone.clone(), || lone.clone()),
+        lone
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
