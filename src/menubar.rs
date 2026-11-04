@@ -2673,7 +2673,7 @@ fn menu_signature(snap: &Snapshot) -> String {
             if let Some(left) = login_expiring_in(a, now) {
                 s.push_str(&format!("renew={}|", login_left_label(left)));
             }
-            s.push_str(&format!("rn={}|err={}|", a.renewable, a.error.is_some()));
+            s.push_str(&format!("rn={}|err={:?}|", a.renewable, a.error));
             for w in &a.windows {
                 s.push_str(&format!(
                     "{}={}:r={}|",

@@ -8077,3 +8077,31 @@ fn a_single_switch_clears_the_outgoing_and_the_incoming_live_write_markers() {
         );
     });
 }
+
+#[test]
+fn a_refresh_failure_reaches_the_row_until_a_fetch_succeeds() {
+    let email = uniq("row-refresh-error");
+    let mut a = acct_with_cache(Some(usage_at(40.0)));
+    a.email = Some(email.clone());
+    assert_eq!(row_from_account(&a).error, None);
+    note_refresh_error(&email, Some("token refresh failed: HTTP 500".into()));
+    let row = row_from_account(&a);
+    assert_eq!(row.error.as_deref(), Some("token refresh failed: HTTP 500"));
+    assert!(row.has_data(), "the cached sample still counts");
+    // Provider rows read their own namespaced key.
+    let mut p = codex_account(&email, None);
+    p.cached_usage = Some(usage_at(40.0));
+    assert_eq!(row_from_provider_account("codex", &p).error, None);
+    note_refresh_error(
+        &fetch_tracker_key("codex", &email),
+        Some("usage fetch failed: boom".into()),
+    );
+    assert_eq!(
+        row_from_provider_account("codex", &p).error.as_deref(),
+        Some("usage fetch failed: boom")
+    );
+    record_usage_fetch_success(&email);
+    record_usage_fetch_success(&fetch_tracker_key("codex", &email));
+    assert_eq!(row_from_account(&a).error, None);
+    assert_eq!(row_from_provider_account("codex", &p).error, None);
+}

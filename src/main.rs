@@ -2818,7 +2818,7 @@ fn row_from_account(a: &Account) -> Row {
             c.opus_pct
                 .map(|p| cell_from_parts(Some(p), c.opus_reset.as_deref()))
         }),
-        error: None,
+        error: last_refresh_error(&fetch_tracker_key(CLAUDE_SLUG, a.key())),
         fetched_at: c.map(|c| c.fetched_at),
         reported: c.map(|c| c.reported.clone()).unwrap_or_default(),
     }
@@ -2853,7 +2853,7 @@ pub(crate) fn row_from_provider_account(slug: &str, a: &ProviderAccount) -> Row 
             c.opus_pct
                 .map(|p| cell_from_parts(Some(p), c.opus_reset.as_deref()))
         }),
-        error: None,
+        error: last_refresh_error(&fetch_tracker_key(slug, &a.key)),
         fetched_at: c.map(|c| c.fetched_at),
         reported: c.map(|c| c.reported.clone()).unwrap_or_default(),
     }
@@ -3028,9 +3028,11 @@ fn auto_pick_v2(rows: &[Row], ceiling: f64, trigger: f64, now: DateTime<Utc>) ->
 }
 
 impl Row {
-    /// True once we have a cached usage sample to reason about.
+    /// True once we have a cached usage sample to reason about. A refresh
+    /// error does not discard it: the engine keeps judging the cached sample
+    /// by its age, and the menu shows the error beside it.
     fn has_data(&self) -> bool {
-        self.error.is_none() && self.fetched_at.is_some()
+        self.fetched_at.is_some()
     }
 
     /// Money the account can still spend on usage credits — see
@@ -3432,6 +3434,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
             match cas {
                 Ok((Some(ActiveRefreshOutcome::RefreshFailed), _)) => {
                     // Keep the existing cache this cycle; retry next tick.
+                    note_refresh_error(email, Some("token refresh failed".to_string()));
                     continue;
                 }
                 Ok((Some(_), Some(fresh))) => {
@@ -3506,6 +3509,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
                     logging::log(&format!(
                         "token refresh failed for {email}: {e} (keeping cache)"
                     ));
+                    note_refresh_error(email, Some(format!("token refresh failed: {e}")));
                     continue;
                 }
             }
@@ -3654,6 +3658,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
                     record_inactive_fetch_failure(email, now_ts);
                 }
                 logging::log(&format!("usage 403 for {email}; keeping cache"));
+                note_refresh_error(email, Some("usage request refused (HTTP 403)".to_string()));
                 if let Some(p) = detect_lapsed_plan(provider, email, &acct.access_token, now_ts) {
                     persist_plan(CLAUDE_SLUG, email, &p, None);
                 }
@@ -3687,6 +3692,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
                     record_inactive_fetch_failure(email, now_ts);
                 }
                 logging::log(&format!("usage error for {email}: {e}; keeping cache"));
+                note_refresh_error(email, Some(format!("usage fetch failed: {e}")));
                 None
             }
         };
@@ -4174,6 +4180,10 @@ fn refresh_provider_usage_caches_with(
                         logging::log(&format!(
                             "provider refresh failed for {slug}/{key}: {e}; keeping cache"
                         ));
+                        note_refresh_error(
+                            &tracker_key,
+                            Some(format!("token refresh failed: {e}")),
+                        );
                         continue;
                     }
                 }
@@ -4226,6 +4236,7 @@ fn refresh_provider_usage_caches_with(
                     } else {
                         outcomes.insert(key.clone(), "err");
                         record_usage_fetch_non_429(&tracker_key);
+                        note_refresh_error(&tracker_key, Some(format!("usage fetch failed: {e}")));
                     }
                     if !is_active {
                         record_inactive_fetch_failure(&tracker_key, now_ts);
@@ -4728,7 +4739,36 @@ fn with_fetch_trackers<T>(
     f(guard.as_mut().unwrap())
 }
 
+/// The last token-refresh / usage-fetch failure per fetch-tracker key, shown
+/// on the account's menu row until a fetch succeeds. In-memory like the
+/// trackers: the polling process is the one whose menu renders it.
+static LAST_REFRESH_ERRORS: std::sync::Mutex<
+    Option<std::collections::HashMap<String, String>>,
+> = std::sync::Mutex::new(None);
+
+fn note_refresh_error(key: &str, err: Option<String>) {
+    let mut g = LAST_REFRESH_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(Default::default);
+    match err {
+        Some(e) => {
+            m.insert(key.to_string(), e);
+        }
+        None => {
+            m.remove(key);
+        }
+    }
+}
+
+fn last_refresh_error(key: &str) -> Option<String> {
+    LAST_REFRESH_ERRORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(key).cloned())
+}
+
 fn record_usage_fetch_success(email: &str) {
+    note_refresh_error(email, None);
     with_fetch_trackers(|t| {
         let entry = t.entry(email.to_string()).or_default();
         entry.consecutive_429s = 0;
