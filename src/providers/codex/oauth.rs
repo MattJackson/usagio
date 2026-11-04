@@ -159,6 +159,19 @@ impl From<CodexRefreshGrant> for TokenGrant {
     }
 }
 
+/// Whether a 403 body from the token endpoint names a dead grant
+/// (`invalid_grant` / `refresh_token_{reused,expired,invalidated}`).
+fn forbidden_body_is_terminal(body: &str) -> bool {
+    [
+        "invalid_grant",
+        "refresh_token_reused",
+        "refresh_token_expired",
+        "refresh_token_invalidated",
+    ]
+    .iter()
+    .any(|m| body.contains(m))
+}
+
 /// POST a `refresh_token` grant to Codex's token endpoint. Pure network call
 /// — no filesystem access, no CAS. See `active_refresh_cas` for the
 /// file-safe wrapper used for the single active Codex login.
@@ -185,7 +198,16 @@ pub fn refresh_token_grant(refresh_token: &str) -> Result<CodexRefreshGrant, Ref
             .map_err(|e| RefreshError::Transient(format!("parsing codex refresh response: {e}")))?,
         Err(ureq::Error::Status(400, _)) => return Err(RefreshError::InvalidGrant),
         Err(ureq::Error::Status(401, _)) => return Err(RefreshError::InvalidGrant),
-        Err(ureq::Error::Status(403, _)) => return Err(RefreshError::InvalidGrant),
+        // 403 is not an RFC 6749 error status: it is usually a WAF/CDN block
+        // (transient). Only treat it as a dead grant when the body says so.
+        Err(ureq::Error::Status(403, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            return Err(if forbidden_body_is_terminal(&body) {
+                RefreshError::InvalidGrant
+            } else {
+                RefreshError::Transient("codex token endpoint returned HTTP 403".into())
+            });
+        }
         Err(ureq::Error::Status(429, _)) => return Err(RefreshError::RateLimited),
         Err(ureq::Error::Status(code, _)) => {
             return Err(RefreshError::Transient(format!(

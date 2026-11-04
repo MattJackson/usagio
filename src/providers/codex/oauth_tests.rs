@@ -125,6 +125,7 @@ fn spawn_mock_token_server(
             200 => "200 OK",
             400 => "400 Bad Request",
             401 => "401 Unauthorized",
+            403 => "403 Forbidden",
             429 => "429 Too Many Requests",
             _ => "500 Internal Server Error",
         };
@@ -161,6 +162,30 @@ fn refresh_token_grant_maps_400_to_invalid_grant() {
     crate::env_lock::scoped_env_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE", Some(&url), || {
         let err = refresh_token_grant("stale-rt").unwrap_err();
         assert!(matches!(err, RefreshError::InvalidGrant));
+    });
+    let _ = handle.join();
+}
+
+#[test]
+fn refresh_token_grant_403_html_waf_block_is_transient() {
+    let (url, handle) = spawn_mock_token_server(403, "<html>blocked by WAF</html>".into(), || {});
+    crate::env_lock::scoped_env_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE", Some(&url), || {
+        let err = refresh_token_grant("healthy-rt").unwrap_err();
+        assert!(matches!(err, RefreshError::Transient(_)), "got {err:?}");
+    });
+    let _ = handle.join();
+}
+
+#[test]
+fn refresh_token_grant_403_with_invalid_grant_body_is_terminal() {
+    let (url, handle) = spawn_mock_token_server(
+        403,
+        r#"{"error":{"code":"refresh_token_expired"}}"#.into(),
+        || {},
+    );
+    crate::env_lock::scoped_env_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE", Some(&url), || {
+        let err = refresh_token_grant("dead-rt").unwrap_err();
+        assert!(matches!(err, RefreshError::InvalidGrant), "got {err:?}");
     });
     let _ = handle.join();
 }
