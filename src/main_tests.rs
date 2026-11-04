@@ -7073,3 +7073,54 @@ fn freshly_switched_provider_active_bypasses_the_fresh_cache_skip() {
     // Next poll, same active: the normal skip applies again.
     assert_eq!(codex_one(&k, cu(10.0, 10.0, 10), true, false), 0);
 }
+
+#[test]
+fn stale_pending_retry_does_not_overwrite_a_newer_queued_switch() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let (a, b) = ("a@e.com", "b@e.com");
+    let mut state = State::default();
+    state.upsert_provider_account("codex", codex_account(a, None));
+    state.upsert_provider_account("codex", codex_account(b, None));
+    let pending = |key: &str| crate::store::PendingSwitch {
+        key: key.into(),
+        manual: true,
+        from: None,
+        drain_token: None,
+        credentials_written: false,
+        leave_latch: None,
+        renewed_account: None,
+    };
+    let stale = pending(a);
+    // The user queued B after the poller snapshotted A.
+    state.provider_accounts_mut("codex").pending_switch = Some(pending(b));
+    state.save().unwrap();
+    switch_provider_expecting("codex", a, true, Some(&stale)).unwrap();
+    let after = State::load().unwrap();
+    let now = after.provider_accounts("codex").unwrap();
+    assert_eq!(now.pending_switch.as_ref().unwrap().key, b);
+    assert_eq!(now.active, None);
+}
+
+#[test]
+fn unchanged_drain_retry_does_not_resave_state() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let mut provider = MockActiveSlotProvider::new("live");
+    provider.client_running = true;
+    let slug = provider.provider_id();
+    let mut state = State::default();
+    state.upsert_provider_account(slug, codex_account("a@e.com", None));
+    state.upsert_provider_account(slug, codex_account("b@e.com", None));
+    state.provider_accounts_mut(slug).active = Some("a@e.com".into());
+    state.save().unwrap();
+    let status = provider.client_status().unwrap();
+    assert!(!lifecycle::prepare_handoff(&provider, &status, &mut state, "b@e.com", true).unwrap());
+    let backups = || {
+        std::fs::read_dir(crate::store::config_dir().unwrap().join("backups"))
+            .map(|d| d.count())
+            .unwrap_or(0)
+    };
+    let before = backups();
+    let mut again = State::load().unwrap();
+    assert!(!lifecycle::prepare_handoff(&provider, &status, &mut again, "b@e.com", true).unwrap());
+    assert_eq!(backups(), before, "an unchanged retry rotated a backup");
+}

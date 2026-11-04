@@ -1009,9 +1009,13 @@ fn finish_provider_switch(slug: &str, key: &str, launch: Option<Launch>, hold: b
         if launch.is_none() {
             return Ok(());
         }
+        // Each re-drive probes the client (a subprocess for Codex), so back
+        // off from 1s to 5s while it is still busy.
+        let mut wait = 1;
         while try_provider_switch_pending(slug, key)? {
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            std::thread::sleep(std::time::Duration::from_secs(wait));
             switch_provider_with_intent(slug, key, hold)?;
+            wait = (wait + 1).min(5);
         }
         ensure_switch_landed(slug, key, &label)?;
     }
@@ -1111,9 +1115,35 @@ pub(crate) fn switch_to_provider_account(slug: &str, key: &str, hold: bool) -> R
 }
 
 fn switch_provider_with_intent(slug: &str, key: &str, manual: bool) -> Result<String> {
+    switch_provider_expecting(slug, key, manual, None)
+}
+
+/// Whether `slug`'s queued switch is still exactly `expected`.
+fn pending_switch_is(state: &State, slug: &str, expected: &store::PendingSwitch) -> bool {
+    state
+        .provider_accounts(slug)
+        .and_then(|pa| pa.pending_switch.as_ref())
+        == Some(expected)
+}
+
+/// `switch_provider_with_intent`, optionally as a retry of the queued switch
+/// `expected` (compare-and-set): if the queue moved on meanwhile (a newer
+/// explicit choice, or it already completed) do nothing rather than replay a
+/// stale intent over it.
+fn switch_provider_expecting(
+    slug: &str,
+    key: &str,
+    manual: bool,
+    expected: Option<&store::PendingSwitch>,
+) -> Result<String> {
     let provider = provider_by_slug(slug)?;
     if !provider.capabilities().supports_switching {
         bail!("switching is not supported for {slug}");
+    }
+    if let Some(exp) = expected {
+        if !pending_switch_is(&State::load()?, slug, exp) {
+            return Ok(key.to_owned());
+        }
     }
     let renewal_pending = State::load()?
         .provider_accounts(slug)
@@ -1123,6 +1153,13 @@ fn switch_provider_with_intent(slug: &str, key: &str, manual: bool) -> Result<St
         lifecycle::ensure_provider_fresh(provider, key)?;
     }
     let _refresh = lifecycle::refresh_lock()?;
+    // Authoritative check: we hold the refresh lock, so no other switch can
+    // change the queue until we are done.
+    if let Some(exp) = expected {
+        if !pending_switch_is(&State::load()?, slug, exp) {
+            return Ok(key.to_owned());
+        }
+    }
     let status = provider.client_status()?;
     let ready = with_state_lock(|| {
         let mut state = State::load()?;
@@ -1164,7 +1201,9 @@ fn complete_pending_switches() {
             }
             continue;
         }
-        if let Err(error) = switch_provider_with_intent(slug, &pending.key, pending.manual) {
+        if let Err(error) =
+            switch_provider_expecting(slug, &pending.key, pending.manual, Some(pending))
+        {
             logging::log(&format!(
                 "event=pending_switch_retry provider={slug} reason={error}"
             ));

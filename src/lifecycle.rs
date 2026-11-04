@@ -653,7 +653,7 @@ pub(crate) fn prepare_handoff(
                     .and_then(|pending| pending.leave_latch.clone())
             })
     };
-    accounts.pending_switch = Some(crate::store::PendingSwitch {
+    let queued = crate::store::PendingSwitch {
         key: key.to_owned(),
         manual,
         from: accounts.active.clone(),
@@ -661,8 +661,14 @@ pub(crate) fn prepare_handoff(
         credentials_written: false,
         leave_latch,
         renewed_account,
-    });
-    state.save()?;
+    };
+    // A retry that changes nothing must not rewrite state.json (each save
+    // rotates a rolling backup).
+    let changed = accounts.pending_switch.as_ref() != Some(&queued);
+    accounts.pending_switch = Some(queued);
+    if changed {
+        state.save()?;
+    }
     if !already_requested || provider.handoff_request_is_idempotent() {
         provider.begin_handoff(token)?;
         logging::log(&format!(
