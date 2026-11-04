@@ -334,7 +334,7 @@ struct Decider<'a> {
 impl<'a> Decider<'a> {
     fn sorted(&self, f: impl Fn(&Assessed) -> bool) -> Vec<&Assessed> {
         let mut v: Vec<&Assessed> = self.cands.iter().filter(|c| f(c)).collect();
-        v.sort_by(|a, b| rank_cmp(a, b, self.s.now, self.unit.as_deref()));
+        v.sort_by(|a, b| rank_cmp(a, b, self.unit.as_deref()));
         v
     }
 

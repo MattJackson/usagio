@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Auto-swap now moves to the ready account whose weekly limit resets soonest, so remaining quota is spent before it expires. Previously it chose the account with the most runway unless a reset was within 6 hours, which picked a fresh account over one 6 hours from losing its room. Accounts without 15 minutes of runway are still skipped. The engine now matches the menu order.
+
 ## [1.0.8] - 2026-10-31
 
 ### Fixed

@@ -208,9 +208,47 @@ fn t4_today_session_vs_weekly_ranking() {
         .into_iter()
         .filter(|a| !a.is_active)
         .collect();
-    c.sort_by(|a, b| rank_cmp(a, b, now, None));
+    c.sort_by(|a, b| rank_cmp(a, b, None));
     assert_eq!(c[0].key, "dev8", "40/90 ranks above 16/92");
     assert_eq!(c[1].key, "dev4");
+}
+
+/// 2026-11-04 00:08: dev3 hit a real 100%. matthew (86%, weekly reset Nov 10
+/// 17:00) and dev5 (0%, reset Nov 10 23:00) were both Ready; v2 served dev5
+/// on runway and matthew's room would have expired first. Earliest reset wins.
+#[test]
+fn ready_serve_spends_the_earliest_weekly_reset_first() {
+    let now = ymd(11, 4, 0, 8, 52);
+    let acct_w = |key: &str, w: f64, reset| {
+        let mut a = acct(key, 0.0, w, now).wreset(Some(reset));
+        a.session = None;
+        a
+    };
+    let s = snap(
+        now,
+        "dev3",
+        vec![
+            acct_w("dev3", 100.0, ymd(11, 13, 0, 0, 0)),
+            acct_w("dev5", 0.0, ymd(11, 10, 23, 0, 0)),
+            acct_w("matthew", 86.0, ymd(11, 10, 17, 0, 0)),
+        ],
+    );
+    let d = decide(&s);
+    assert_eq!(switched(&d), Some(("matthew", Kind::Serve)), "{d:?}");
+
+    // D2 still holds: an earlier reset without MIN_LANDING runway is not Ready
+    // and loses to a roomy account.
+    let s = snap(
+        now,
+        "dev3",
+        vec![
+            acct_w("dev3", 100.0, ymd(11, 13, 0, 0, 0)),
+            acct_w("dev5", 0.0, ymd(11, 10, 23, 0, 0)),
+            acct_w("matthew", 93.0, ymd(11, 10, 17, 0, 0)),
+        ],
+    );
+    let d = decide(&s);
+    assert_eq!(switched(&d), Some(("dev5", Kind::Serve)), "{d:?}");
 }
 
 #[test]

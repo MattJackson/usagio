@@ -451,18 +451,18 @@ pub fn dominant_unit(accounts: &[Assessed]) -> Option<String> {
 /// `rank_key` (§3.3) as a comparator: better first. Also used by `auto_pick`,
 /// `optimize_now` and `switch` with no selector. Uses `total_cmp` throughout,
 /// so it is a total order and never NaN-poisoned.
-pub fn rank_cmp(a: &Assessed, b: &Assessed, now: DateTime<Utc>, unit: Option<&str>) -> Ordering {
+///
+/// Ready accounts go earliest weekly reset first: room left at a reset is
+/// lost, so the room that expires soonest is spent first. Every Ready account
+/// already clears `MIN_LANDING_MIN`, so this never lands on an account about
+/// to block (D2). Matches the menu order (`account_order::Priority`).
+pub fn rank_cmp(a: &Assessed, b: &Assessed, unit: Option<&str>) -> Ordering {
     let (ta, tb) = (rank_tier(a), rank_tier(b));
     ta.cmp(&tb).then_with(|| match ta {
         Tier::Ready => {
-            let horizon = now + Duration::hours(REBALANCE_HORIZON_H);
-            let expiring = |x: &Assessed| {
-                x.weekly_reset
-                    .filter(|r| *r < horizon)
-                    .unwrap_or(DateTime::<Utc>::MAX_UTC)
-            };
-            expiring(a)
-                .cmp(&expiring(b))
+            let reset = |x: &Assessed| x.weekly_reset.unwrap_or(DateTime::<Utc>::MAX_UTC);
+            reset(a)
+                .cmp(&reset(b))
                 .then(b.soft_runway.total_cmp(&a.soft_runway))
                 .then_with(|| a.key.cmp(&b.key))
         }

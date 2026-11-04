@@ -5264,7 +5264,7 @@ fn cadence_wakes_at_the_v2_next_check_time() {
 }
 
 #[test]
-fn auto_pick_v2_ranks_by_runway_then_expiring_room() {
+fn auto_pick_v2_ranks_ready_by_earliest_weekly_reset() {
     let now = Utc::now();
     let far = now + Duration::days(5);
     // v1 picked the soonest reset (dev4, 3 points to the trigger); v2 picks
@@ -5274,6 +5274,16 @@ fn auto_pick_v2_ranks_by_runway_then_expiring_room() {
         row_full("dev8@e.com", 40.0, 90.0, far),
     ];
     assert_eq!(auto_pick_v2(&rows, 95.0, 95.0, now).unwrap(), "dev8@e.com");
+    // Among Ready accounts the earliest weekly reset goes first, at any
+    // distance (not only inside the 6 h rebalance horizon).
+    let rows = vec![
+        row_full("later@e.com", 10.0, 10.0, far),
+        row_full("sooner@e.com", 10.0, 50.0, now + Duration::days(1)),
+    ];
+    assert_eq!(
+        auto_pick_v2(&rows, 95.0, 95.0, now).unwrap(),
+        "sooner@e.com"
+    );
     // A Ready account whose weekly resets inside the 6 h horizon goes first.
     let rows = vec![
         row_full("roomy@e.com", 10.0, 10.0, far),

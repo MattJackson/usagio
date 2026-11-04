@@ -205,7 +205,9 @@ Per account:
 
 **Ranking** (`rank_key`; also used by `auto_pick`, `optimize_now` and `switch` with no selector):
 
-- `Ready`: `(expiring = weekly reset < now + REBALANCE_HORIZON ? reset : MAX, −soft_runway, email)`
+- `Ready`: `(weekly reset or MAX, −soft_runway, email)`. Room left at a reset is lost, so the soonest reset is
+  spent first; the `MIN_LANDING` gate on Ready keeps D2 from recurring. (Was: earliest reset only inside
+  `REBALANCE_HORIZON`, else most runway, which served a 0% account over an 86% one resetting 6 h sooner.)
 - `Draining`: `(−hard_runway, email)`
 - `Credits`: `(unit == provider's dominant unit ? 0 : 1, −spendable.amount_minor, email)`. Amounts are compared
   only within a unit (B11).
