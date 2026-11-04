@@ -1536,3 +1536,72 @@ fn opencode_dot_opencode_dir_and_inline_content_take_precedence() {
     }
     assert_eq!(got, vec!["dot-opencode".len(), "inline content wins".len()]);
 }
+
+#[test]
+fn claude_md_imports_expand_recursively_up_to_four_hops() {
+    with_home(|home| {
+        let dir = home.join(".claude");
+        fs::create_dir_all(dir.join("notes")).unwrap();
+        fs::write(dir.join("CLAUDE.md"), "root @notes/h1.md").unwrap();
+        // Relative imports resolve against the importing file's directory.
+        fs::write(dir.join("notes/h1.md"), "one @h2.md").unwrap();
+        // A cycle back to an already-loaded file is not counted again.
+        fs::write(dir.join("notes/h2.md"), "two @h3.md @../CLAUDE.md @h1.md").unwrap();
+        fs::write(dir.join("notes/h3.md"), "three @~/.claude/notes/h4.md").unwrap();
+        fs::write(dir.join("notes/h4.md"), "four @h5.md").unwrap();
+        fs::write(dir.join("notes/h5.md"), "five: too deep").unwrap();
+        let l = build_ledger("claude", None).unwrap();
+        let names: Vec<_> = l.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Global CLAUDE.md",
+                "@notes/h1.md (from CLAUDE.md)",
+                "@h2.md (from h1.md)",
+                "@h3.md (from h2.md)",
+                "@~/.claude/notes/h4.md (from h3.md)",
+            ]
+        );
+        assert!(l
+            .items
+            .iter()
+            .all(|i| i.kind == ItemKind::GlobalInstructions));
+    });
+}
+
+#[test]
+fn project_claude_md_external_imports_need_approval() {
+    with_home(|home| {
+        fs::write(home.join("outside.md"), "personal notes").unwrap();
+        let repo = tempdir().unwrap();
+        let proj = fs::canonicalize(repo.path()).unwrap();
+        fs::create_dir_all(proj.join(".git")).unwrap();
+        fs::write(proj.join("inside.md"), "in repo").unwrap();
+        fs::write(proj.join("CLAUDE.md"), "@inside.md\n@~/outside.md").unwrap();
+        let names = |approved: Option<bool>| {
+            let mut entry = serde_json::json!({});
+            if let Some(a) = approved {
+                entry["hasClaudeMdExternalIncludesApproved"] = a.into();
+            }
+            let cfg = serde_json::json!({ "projects": { proj.to_str().unwrap(): entry } });
+            fs::write(home.join(".claude.json"), cfg.to_string()).unwrap();
+            let l = build_ledger("claude", Some(&proj)).unwrap();
+            l.items
+                .iter()
+                .filter(|i| i.name.starts_with('@'))
+                .map(|i| (i.name.clone(), i.kind))
+                .collect::<Vec<_>>()
+        };
+        let inside = (
+            "@inside.md (from CLAUDE.md)".to_string(),
+            ItemKind::ProjectInstructions,
+        );
+        let outside = (
+            "@~/outside.md (from CLAUDE.md)".to_string(),
+            ItemKind::ProjectInstructions,
+        );
+        assert_eq!(names(None), vec![inside.clone()]);
+        assert_eq!(names(Some(false)), vec![inside.clone()]);
+        assert_eq!(names(Some(true)), vec![inside, outside]);
+    });
+}

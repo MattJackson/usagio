@@ -2,6 +2,8 @@
 //!
 //! Claude loads context from a well-documented set of locations:
 //! - ~/.claude/CLAUDE.md — global instructions
+//! - `@path` imports inside any of those CLAUDE.md files, recursively (see
+//!   [`Imports`])
 //! - <project>/CLAUDE.md, <project>/.claude/CLAUDE.md, <project>/CLAUDE.local.md,
 //!   and CLAUDE.md / CLAUDE.local.md in every ancestor directory — project
 //!   instructions
@@ -33,42 +35,67 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     let claude_dir = config_dir.clone().unwrap_or_else(|| home.join(".claude"));
     let (user_json, settings) = user_config_paths(&home, config_dir);
 
-    // Global CLAUDE.md
-    push_file_if_exists(
-        &mut items,
-        claude_dir.join("CLAUDE.md"),
-        ItemKind::GlobalInstructions,
-        "Global CLAUDE.md",
-    );
-
     // Claude Code keys projects by absolute path.
     let proj_abs: Option<PathBuf> =
         project.map(|p| fs::canonicalize(p).unwrap_or_else(|_| absolute_path(p)));
+    let user_val = read_json_logged(&user_json);
+    let local_proj = match (&user_val, project) {
+        (Some(val), Some(given)) => project_keys(proj_abs.as_deref(), given)
+            .iter()
+            .find_map(|k| val.get("projects").and_then(|p| p.get(k.as_str())))
+            .cloned(),
+        _ => None,
+    };
+    let project_flag = |key: &str| {
+        local_proj
+            .as_ref()
+            .and_then(|p| p.get(key))
+            .and_then(|b| b.as_bool())
+            == Some(true)
+    };
 
-    // Project instructions: ./CLAUDE.md, ./.claude/CLAUDE.md, ./CLAUDE.local.md,
-    // plus CLAUDE.md / CLAUDE.local.md in every ancestor directory.
+    // Instruction files, each with its `@path` imports: the global
+    // CLAUDE.md, then the project's ./CLAUDE.md, ./.claude/CLAUDE.md,
+    // ./CLAUDE.local.md, plus CLAUDE.md / CLAUDE.local.md in every ancestor.
+    let mut roots: Vec<(PathBuf, ItemKind, String)> = vec![(
+        claude_dir.join("CLAUDE.md"),
+        ItemKind::GlobalInstructions,
+        "Global CLAUDE.md".to_string(),
+    )];
     if let Some(proj) = &proj_abs {
         for (rel, label) in [
             ("CLAUDE.md", "Project CLAUDE.md"),
             (".claude/CLAUDE.md", "Project .claude/CLAUDE.md"),
             ("CLAUDE.local.md", "Project CLAUDE.local.md"),
         ] {
-            push_file_if_exists(
-                &mut items,
-                proj.join(rel),
-                ItemKind::ProjectInstructions,
-                label,
-            );
+            roots.push((proj.join(rel), ItemKind::ProjectInstructions, label.into()));
         }
         for dir in proj.ancestors().skip(1) {
             for f in ["CLAUDE.md", "CLAUDE.local.md"] {
-                push_file_if_exists(
-                    &mut items,
+                roots.push((
                     dir.join(f),
                     ItemKind::ProjectInstructions,
-                    &format!("{f} ({})", dir.display()),
-                );
+                    format!("{f} ({})", dir.display()),
+                ));
             }
+        }
+    }
+    let mut imports = Imports {
+        home: &home,
+        working_dir: proj_abs.as_deref(),
+        external_approved: project_flag("hasClaudeMdExternalIncludesApproved"),
+        // A file loaded in its own right is never counted again as an import.
+        seen: roots
+            .iter()
+            .filter_map(|(p, _, _)| fs::canonicalize(p).ok())
+            .collect(),
+    };
+    for (path, kind, label) in roots {
+        let before = items.len();
+        push_file_if_exists(&mut items, path.clone(), kind, &label);
+        if items.len() > before {
+            let user_scope = kind == ItemKind::GlobalInstructions;
+            imports.expand(&mut items, &path, kind, user_scope, 1);
         }
     }
 
@@ -157,24 +184,9 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     // `mcpServers` is only a legacy fallback. First definition of a name wins
     // (local > project > user > legacy).
     let mut sources: Vec<(PathBuf, Vec<(String, serde_json::Value)>)> = Vec::new();
-    let user_val = read_json_logged(&user_json);
-    // Claude Code keys projects by absolute path.
-    let proj_abs: Option<PathBuf> =
-        project.map(|p| fs::canonicalize(p).unwrap_or_else(|_| absolute_path(p)));
-    let local_proj = match (&user_val, project) {
-        (Some(val), Some(given)) => project_keys(proj_abs.as_deref(), given)
-            .iter()
-            .find_map(|k| val.get("projects").and_then(|p| p.get(k.as_str())))
-            .cloned(),
-        _ => None,
-    };
     // Repo-controlled settings may approve .mcp.json servers only when the
     // user has trusted this folder in Claude Code.
-    let trusted = local_proj
-        .as_ref()
-        .and_then(|p| p.get("hasTrustDialogAccepted"))
-        .and_then(|b| b.as_bool())
-        == Some(true);
+    let trusted = project_flag("hasTrustDialogAccepted");
     if let Some(local) = local_proj
         .as_ref()
         .and_then(|p| p.get("mcpServers"))
@@ -269,6 +281,174 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     }
 
     Ok(items)
+}
+
+/// Maximum `@path` import depth (hops from the importing CLAUDE.md).
+const MAX_IMPORT_HOPS: usize = 4;
+
+/// CLAUDE.md `@path` import expansion, as Claude Code does it: imports are
+/// recursive up to [`MAX_IMPORT_HOPS`]; a relative path resolves against the
+/// importing file's directory, `~/` against home; every file counts once.
+/// In a project-level file, an import resolving outside the working directory
+/// is external and loads only once the user approved external imports for
+/// the project (`hasClaudeMdExternalIncludesApproved`); imports in the user's
+/// own `~/.claude/CLAUDE.md` load without approval.
+struct Imports<'a> {
+    home: &'a Path,
+    working_dir: Option<&'a Path>,
+    external_approved: bool,
+    seen: std::collections::HashSet<PathBuf>,
+}
+
+impl Imports<'_> {
+    fn expand(
+        &mut self,
+        items: &mut Vec<LedgerItem>,
+        file: &Path,
+        kind: ItemKind,
+        user_scope: bool,
+        hop: usize,
+    ) {
+        if hop > MAX_IMPORT_HOPS {
+            return;
+        }
+        let Some(bytes) = super::read_capped(file) else {
+            return;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let base = file.parent().unwrap_or(Path::new(""));
+        for raw in import_paths(&text) {
+            let target = if let Some(rest) = raw.strip_prefix("~/") {
+                self.home.join(rest)
+            } else {
+                base.join(&raw)
+            };
+            let Ok(canon) = fs::canonicalize(&target) else {
+                continue;
+            };
+            if !canon.is_file() || self.seen.contains(&canon) {
+                continue;
+            }
+            let external = self.working_dir.is_some_and(|w| !canon.starts_with(w));
+            if !user_scope && external && !self.external_approved {
+                ledger_warn!(
+                    "{}: import @{} not counted (external imports not approved)",
+                    file.display(),
+                    printable(&raw)
+                );
+                continue;
+            }
+            self.seen.insert(canon);
+            let label = format!(
+                "@{} (from {})",
+                printable(&raw),
+                file.file_name().unwrap_or_default().to_string_lossy()
+            );
+            let before = items.len();
+            push_file_if_exists(items, target.clone(), kind, &label);
+            if items.len() > before {
+                self.expand(items, &target, kind, user_scope, hop + 1);
+            }
+        }
+    }
+}
+
+/// The `@path` imports in a CLAUDE.md, in order. An import starts with `@`
+/// at the start of a line or after whitespace and ends at the first
+/// unescaped whitespace (`\ ` is a literal space). Fenced code blocks and
+/// code spans are skipped, and a quoted path is not an import.
+fn import_paths(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut fence: Option<(char, usize)> = None;
+    for line in text.lines() {
+        let t = line.trim_start();
+        let run = |c: char| t.chars().take_while(|&x| x == c).count();
+        let opener = ['`', '~']
+            .into_iter()
+            .map(|c| (c, run(c)))
+            .find(|&(_, n)| n >= 3);
+        match (fence, opener) {
+            (Some((c, n)), Some((c2, n2))) if c == c2 && n2 >= n => {
+                fence = None;
+                continue;
+            }
+            (Some(_), _) => continue,
+            (None, Some(f)) => {
+                fence = Some(f);
+                continue;
+            }
+            (None, None) => {}
+        }
+        let chars: Vec<char> = without_code_spans(line).chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '@' && (i == 0 || chars[i - 1].is_whitespace()) {
+                let mut path = String::new();
+                let mut j = i + 1;
+                while j < chars.len() {
+                    match chars[j] {
+                        '\\' if chars.get(j + 1) == Some(&' ') => {
+                            path.push(' ');
+                            j += 2;
+                        }
+                        c if c.is_whitespace() => break,
+                        c => {
+                            path.push(c);
+                            j += 1;
+                        }
+                    }
+                }
+                if !path.is_empty() && !path.starts_with(['"', '\'']) {
+                    out.push(path);
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// `line` with each Markdown code span (a backtick run up to the next run of
+/// the same length) blanked out. An unmatched run stays literal.
+fn without_code_spans(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '`' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let n = chars[i..].iter().take_while(|&&c| c == '`').count();
+        let mut j = i + n;
+        let mut close = None;
+        while j < chars.len() {
+            if chars[j] == '`' {
+                let m = chars[j..].iter().take_while(|&&c| c == '`').count();
+                if m == n {
+                    close = Some(j + m);
+                    break;
+                }
+                j += m;
+            } else {
+                j += 1;
+            }
+        }
+        match close {
+            Some(end) => {
+                out.push(' ');
+                i = end;
+            }
+            None => {
+                out.extend(&chars[i..i + n]);
+                i += n;
+            }
+        }
+    }
+    out
 }
 
 /// Claude Code's approval state for project-scope `.mcp.json` servers.
@@ -559,6 +739,21 @@ mod tests {
             collect(None).unwrap()
         });
         assert!(items.iter().any(|i| i.name == "Global CLAUDE.md"));
+    }
+
+    #[test]
+    fn import_paths_follow_claude_code_syntax() {
+        let md = "See @docs/a.md and @~/b.md.\n\
+                  mail me@example.com\n\
+                  `@not-span.md` and ``x `@n` y`` but @real\\ name.md\n\
+                  @\"quoted.md\"\n\
+                  ```\n@in-fence.md\n```\n\
+                  ~~~~\n@tilde-fence.md\n~~~\n@still-fenced.md\n~~~~\n\
+                  @after.md";
+        assert_eq!(
+            import_paths(md),
+            vec!["docs/a.md", "~/b.md.", "real name.md", "after.md"]
+        );
     }
 
     #[test]
