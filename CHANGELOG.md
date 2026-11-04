@@ -5,10 +5,20 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.1] - 2026-11-04
 
 ### Fixed
 
+- Codex accounts are keyed by email + ChatGPT workspace, so two workspaces under one email no longer overwrite each other; existing entries migrate on load, and labels show the workspace only when an email is shared. Usage requests send the `chatgpt-account-id` header, token expiry follows the access token like the Codex CLI, and login falls back to port 1457 when 1455 is busy.
+- A new sign-in replaces an open sign-in window for the same provider instead of failing on its port; orphaned per-account web sessions are cleaned up; `localhost` redirects bind IPv6 too so another process can't intercept them.
+- A failed refresh only flags re-login if the token it sent is still the saved one. Codex daemon timeouts kill the whole process tree; daemon identity checks are locale/time-zone safe; reset epochs tolerate Codex's jittering reset times.
+- Prepaid balances use each currency's real decimal places and are fetched at most every 10 minutes; tokenless Claude entries are preserved instead of dropped; `~/.claude.json` is parsed once per poll; the credential watcher debounce is bounded; the Windows tray no longer busy-polls.
+- `usagio context` follows each tool's real config rules: opencode config merging, CLAUDE.md `@` imports, Claude plugins, and Codex MCP `env_vars`/`cwd`.
+- Security: rustls 0.23.46, glib VariantStrIter fix (GHSA-wrw7-89jp-8q8g) backported, and website dependencies updated.
+
+### Changed
+
+- Internal restructuring: `main.rs` and `menubar.rs` split into focused modules, the provider trait split into capability traits, and the state lock is now a token required by state-changing functions. No user-visible behaviour change.
 - Sign-in: when the preferred fixed redirect port is taken on either IPv4 or `[::1]`, the login now falls back to the provider's registered fallback port (1457 for Codex) instead of failing.
 - Switching to the already-active Claude account now adopts the vendor slot's token under the state lock, as every other active-account adoption does.
 - An unchanged `state.json` is no longer rewritten (with its rolling backup rotated) just because another process serialized the same state in a different key order.
