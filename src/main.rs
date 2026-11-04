@@ -977,6 +977,10 @@ fn cmd_switch(selector: Option<&str>, launch: Option<Launch>) -> Result<()> {
         if let Some((slug, key)) = resolve_provider_selector(&state, sel) {
             return finish_provider_switch(&slug, &key, launch, true);
         }
+        let other = provider_selector_matches(&state, sel);
+        if other.len() > 1 {
+            bail!(ambiguous_provider_selector(sel, &other));
+        }
         // Surface Claude's own error rather than a bare miss.
         if let Some(Err(e)) = claude {
             return Err(e);
@@ -1091,12 +1095,19 @@ fn finish_claude_switch(email: &str, launch: Option<Launch>, hold: bool) -> Resu
 /// slots instead of one flat list, since account keys are only unique within
 /// a single provider (a Codex and a future provider could share an email).
 pub(crate) fn resolve_provider_selector(state: &State, selector: &str) -> Option<(String, String)> {
+    let mut matches = provider_selector_matches(state, selector);
+    (matches.len() == 1).then(|| matches.remove(0))
+}
+
+/// Every non-Claude `(slug, key)` `selector` matches: the exact matches if
+/// any, else the prefix matches. More than one means the selector is ambiguous.
+fn provider_selector_matches(state: &State, selector: &str) -> Vec<(String, String)> {
     let (scope, sel) = selector
         .trim()
         .split_once(':')
         .map_or((None, selector.trim()), |(slug, key)| (Some(slug), key));
     if sel.is_empty() {
-        return None;
+        return Vec::new();
     }
     let sel_lc = sel.to_lowercase();
     let mut exact: Vec<(String, String)> = Vec::new();
@@ -1114,13 +1125,11 @@ pub(crate) fn resolve_provider_selector(state: &State, selector: &str) -> Option
             }
         }
     }
-    if exact.len() == 1 {
-        return Some(exact.into_iter().next().unwrap());
+    if exact.is_empty() {
+        prefix
+    } else {
+        exact
     }
-    if exact.is_empty() && prefix.len() == 1 {
-        return Some(prefix.into_iter().next().unwrap());
-    }
-    None
 }
 
 /// Make `key` the active login for the non-Claude provider `slug` (state
@@ -2596,16 +2605,28 @@ fn resolve_account_selector(state: &State, sel: &str) -> Result<(String, String)
     // match at all. An ambiguous Claude selector stays an error, and a match in
     // more than one provider must be qualified (this feeds a destructive `rm`).
     let claude = state.resolve(sel);
-    let other = resolve_provider_selector(state, sel);
-    match (claude, other) {
-        (Ok(email), None) => Ok((CLAUDE_SLUG.to_string(), email)),
-        (Ok(email), Some((slug, key))) => bail!(
-            "'{sel}' matches {CLAUDE_SLUG}:{email} and {slug}:{key}; qualify it with a provider prefix"
-        ),
+    let mut other = provider_selector_matches(state, sel);
+    match (claude, other.len()) {
+        (Ok(email), 0) => Ok((CLAUDE_SLUG.to_string(), email)),
+        (Ok(email), _) => {
+            let (slug, key) = &other[0];
+            bail!(
+                "'{sel}' matches {CLAUDE_SLUG}:{email} and {slug}:{key}; qualify it with a provider prefix"
+            )
+        }
         (Err(e), _) if store::is_ambiguous_selector(&e) => Err(e),
-        (Err(_), Some(found)) => Ok(found),
-        (Err(_), None) => bail!("no account matches '{sel}'"),
+        (Err(_), 1) => Ok(other.remove(0)),
+        (Err(_), 0) => bail!("no account matches '{sel}'"),
+        (Err(_), _) => bail!(ambiguous_provider_selector(sel, &other)),
     }
+}
+
+fn ambiguous_provider_selector(sel: &str, matches: &[(String, String)]) -> String {
+    let list: Vec<String> = matches.iter().map(|(s, k)| format!("{s}:{k}")).collect();
+    format!(
+        "'{sel}' matches more than one account ({}); be more specific",
+        list.join(", ")
+    )
 }
 
 fn cmd_rm(selector: Option<&str>) -> Result<()> {

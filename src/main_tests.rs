@@ -7613,3 +7613,20 @@ fn guarded_switch_refuses_a_target_removed_during_phase_one() {
         assert_ne!(keychain_access_token().as_deref(), Some(acct.access_token.as_str()));
     });
 }
+
+#[test]
+fn unqualified_selector_matching_several_providers_must_be_qualified() {
+    let mut state = State::default();
+    state.upsert(claude_account("dev@a.com", 3_600_000));
+    state.upsert_provider_account("codex", codex_account("dev@b.com", None));
+    state.upsert_provider_account("codex", codex_account("dev@c.com", None));
+    // `rm dev` matched three accounts in two providers.
+    let err = resolve_account_selector(&state, "dev").unwrap_err();
+    assert!(err.to_string().contains("qualify"), "{err}");
+    // No Claude match, two Codex matches: ambiguous, not "no account".
+    let mut codex_only = State::default();
+    codex_only.upsert_provider_account("codex", codex_account("dev@b.com", None));
+    codex_only.upsert_provider_account("codex", codex_account("dev@c.com", None));
+    let err = resolve_account_selector(&codex_only, "dev").unwrap_err();
+    assert!(err.to_string().contains("more than one"), "{err}");
+}
