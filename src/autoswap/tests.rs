@@ -1846,3 +1846,20 @@ fn stuck_notice_falls_back_to_the_earliest_window_reset_when_nothing_is_blocked(
         Some(now + Duration::hours(1))
     );
 }
+
+#[test]
+fn stuck_notice_stays_unknown_when_a_blocked_account_has_no_known_unlock() {
+    let now = at(12, 0, 0);
+    // Session maxed with no reset time: blocked indefinitely. Its weekly
+    // window resets in 1h, but nothing unlocks then.
+    let s = snap(
+        now,
+        "a",
+        vec![acct("a", 100.0, 40.0, now)
+            .sreset(None)
+            .wreset(Some(now + Duration::hours(1)))],
+    );
+    let v = assess_all(&s);
+    assert!(v.iter().any(|a| a.blocked));
+    assert_eq!(super::shell::soonest_unlock(&v, now), None);
+}

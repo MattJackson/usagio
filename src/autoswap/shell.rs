@@ -699,7 +699,12 @@ pub(crate) fn soonest_unlock(assessed: &[Assessed], now: DateTime<Utc>) -> Optio
         .filter(|u| *u > now)
         .min()
         // Nothing blocked (e.g. a Draining stay): the earliest upcoming reset.
+        // If any account is blocked with no known unlock, stay unknown rather
+        // than name a reset that does not unlock anything.
         .or_else(|| {
+            if assessed.iter().any(|a| a.blocked) {
+                return None;
+            }
             assessed
                 .iter()
                 .flat_map(|a| a.windows.iter().filter_map(|w| w.resets_at))
