@@ -822,13 +822,11 @@ fn working_mcp_server() -> serde_json::Value {
 }
 
 #[test]
-fn claude_collect_reports_working_mcp_server_skills_and_plugins() {
+fn claude_collect_reports_working_mcp_server_and_skills() {
     with_home(|home| {
         let dir = home.join(".claude");
         fs::create_dir_all(dir.join("skills/my-skill")).unwrap();
         fs::write(dir.join("skills/my-skill/SKILL.md"), "skill body").unwrap();
-        fs::create_dir_all(dir.join("plugins/my-plugin")).unwrap();
-        fs::write(dir.join("plugins/my-plugin/plugin.json"), r#"{"name":"p"}"#).unwrap();
         let settings = serde_json::json!({ "mcpServers": { "good": working_mcp_server() } });
         fs::write(
             dir.join("settings.json"),
@@ -848,10 +846,6 @@ fn claude_collect_reports_working_mcp_server_skills_and_plugins() {
             .items
             .iter()
             .any(|i| i.kind == ItemKind::Skill && i.name == "skill: my-skill"));
-        assert!(l
-            .items
-            .iter()
-            .any(|i| i.kind == ItemKind::PluginManifest && i.name == "plugin: my-plugin"));
     });
 }
 
@@ -1603,5 +1597,137 @@ fn project_claude_md_external_imports_need_approval() {
         assert_eq!(names(None), vec![inside.clone()]);
         assert_eq!(names(Some(false)), vec![inside.clone()]);
         assert_eq!(names(Some(true)), vec![inside, outside]);
+    });
+}
+
+fn write_json(path: &std::path::Path, v: serde_json::Value) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, v.to_string()).unwrap();
+}
+
+#[test]
+fn claude_installed_plugins_contribute_skills_commands_agents_and_mcp() {
+    with_home(|home| {
+        let plugins = home.join(".claude/plugins");
+        let root = plugins.join("cache/mkt/demo/1.0.0");
+        write_json(
+            &root.join(".claude-plugin/plugin.json"),
+            serde_json::json!({ "name": "demo", "agents": ["./custom/rev.md"] }),
+        );
+        fs::create_dir_all(root.join("skills/s1")).unwrap();
+        fs::write(
+            root.join("skills/s1/SKILL.md"),
+            format!(
+                "---\nname: s1\ndescription: d\n---\n{}",
+                "body ".repeat(500)
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("commands")).unwrap();
+        fs::write(
+            root.join("commands/c1.md"),
+            "First line\nlong body ".repeat(50),
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("agents")).unwrap();
+        fs::write(root.join("agents/ignored.md"), "replaced by manifest").unwrap();
+        fs::create_dir_all(root.join("custom")).unwrap();
+        fs::write(
+            root.join("custom/rev.md"),
+            "---\ndescription: reviews\n---\nbody",
+        )
+        .unwrap();
+        let script = format!(
+            "echo ran > \"$0\"; read a; echo '{INIT_OK}'; read b; read c; echo '{TOOLS_OK}'; sleep 5"
+        );
+        write_json(
+            &root.join(".mcp.json"),
+            serde_json::json!({ "mcpServers": { "srv": {
+                "command": "/bin/sh", "args": ["-c", script, "${CLAUDE_PLUGIN_ROOT}/ran"]
+            } } }),
+        );
+        // A disabled plugin and an install for another project contribute nothing.
+        let off = plugins.join("cache/mkt/off/1.0.0");
+        fs::create_dir_all(off.join("skills/x")).unwrap();
+        fs::write(off.join("skills/x/SKILL.md"), "x").unwrap();
+        let other = plugins.join("cache/mkt/other/1.0.0");
+        fs::create_dir_all(other.join("skills/y")).unwrap();
+        fs::write(other.join("skills/y/SKILL.md"), "y").unwrap();
+        // The old guessed layout is not a plugin.
+        write_json(
+            &plugins.join("legacy/plugin.json"),
+            serde_json::json!({"name": "legacy"}),
+        );
+        write_json(
+            &plugins.join("installed_plugins.json"),
+            serde_json::json!({ "version": 2, "plugins": {
+                "demo@mkt": [{ "scope": "user", "installPath": root }],
+                "off@mkt": [{ "scope": "user", "installPath": off }],
+                "other@mkt": [{ "scope": "project", "projectPath": "/elsewhere", "installPath": other }]
+            } }),
+        );
+        write_json(
+            &home.join(".claude/settings.json"),
+            serde_json::json!({ "enabledPlugins": { "off@mkt": false } }),
+        );
+        let l = build_ledger("claude", None).unwrap();
+        let mut names: Vec<_> = l.items.iter().map(|i| i.name.as_str()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "mcp: plugin:demo:srv",
+                "plugin agent: demo:rev",
+                "plugin command: demo:c1",
+                "plugin skill: demo:s1",
+            ]
+        );
+        let by = |n: &str| l.items.iter().find(|i| i.name == n).unwrap();
+        assert_eq!(
+            by("plugin command: demo:c1").content_bytes,
+            "First line".len()
+        );
+        assert_eq!(
+            by("plugin skill: demo:s1").content_bytes,
+            "name: s1\ndescription: d\n".len()
+        );
+        assert_eq!(by("mcp: plugin:demo:srv").tool_count, Some(2));
+        assert_eq!(by("mcp: plugin:demo:srv").path, root.join(".mcp.json"));
+        assert!(
+            fs::canonicalize(&root).unwrap().join("ran").exists(),
+            "${{CLAUDE_PLUGIN_ROOT}} not substituted"
+        );
+    });
+}
+
+#[test]
+fn claude_project_scoped_plugin_needs_trust() {
+    with_home(|home| {
+        let repo = tempdir().unwrap();
+        let proj = fs::canonicalize(repo.path()).unwrap();
+        let root = home.join(".claude/plugins/cache/mkt/team/1.0.0");
+        fs::create_dir_all(root.join("skills/t")).unwrap();
+        fs::write(root.join("skills/t/SKILL.md"), "team skill").unwrap();
+        write_json(
+            &home.join(".claude/plugins/installed_plugins.json"),
+            serde_json::json!({ "plugins": { "team@mkt": [
+                { "scope": "project", "projectPath": proj, "installPath": root }
+            ] } }),
+        );
+        let run = |trusted: bool| {
+            write_json(
+                &home.join(".claude.json"),
+                serde_json::json!({ "projects": { proj.to_str().unwrap(): {
+                    "hasTrustDialogAccepted": trusted
+                } } }),
+            );
+            build_ledger("claude", Some(&proj))
+                .unwrap()
+                .items
+                .iter()
+                .any(|i| i.name == "plugin skill: team:t")
+        };
+        assert!(!run(false), "untrusted project plugin loaded");
+        assert!(run(true), "trusted project plugin missing");
     });
 }
