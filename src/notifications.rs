@@ -173,10 +173,11 @@ pub fn evaluate(prev: &Snapshot, curr: &Snapshot, cfg: &NotificationConfig) -> V
     }
     if cfg.reset_back_enabled {
         for (w, p, c) in pairs {
-            if p.is_none() || c.is_none() {
-                continue;
-            }
-            if is_reset(prev, curr, w) {
+            // Only a window that was meaningfully used announces fresh
+            // headroom; a rollover of a barely-used window still re-arms
+            // crossings (dedup_and_apply) but says nothing.
+            let (Some(p), Some(_)) = (p, c) else { continue };
+            if p > 50.0 && is_reset(prev, curr, w) {
                 out.push(Trigger::ResetBack { window: w });
             }
         }
@@ -194,8 +195,11 @@ fn is_window_reset(prev_pct: f32, curr_pct: f32) -> bool {
 }
 
 /// True iff `curr` shows a reset for `w` relative to `prev`: the window's
-/// reported reset time moved later and the old one had passed by `curr`, or
-/// (when reset times are missing or unchanged) the pct heuristic above.
+/// reported reset time moved later, the old one was still ahead when `prev`
+/// was read and had passed by `curr`, or (when reset times are missing or
+/// unchanged) the pct heuristic above. A reset stamp already past at
+/// `prev.ts` is not a credible upcoming reset: a vendor that reports "now +
+/// 0 s" for an expired window would otherwise roll on every poll.
 /// Public so the watch loop can query it independently of `evaluate` (e.g. to
 /// log a reset even when `reset_back_enabled` is off).
 pub fn is_reset(prev: &Snapshot, curr: &Snapshot, w: Window) -> bool {
@@ -216,7 +220,8 @@ pub fn is_reset(prev: &Snapshot, curr: &Snapshot, w: Window) -> bool {
     let (Some(p), Some(c)) = (p, c) else {
         return false;
     };
-    let rolled = matches!((pr, cr), (Some(pr), Some(cr)) if pr < cr && pr <= curr.ts);
+    let rolled =
+        matches!((pr, cr), (Some(pr), Some(cr)) if pr < cr && pr > prev.ts && pr <= curr.ts);
     rolled || is_window_reset(p, c)
 }
 
@@ -1220,6 +1225,58 @@ mod tests {
         let mut early = curr.clone();
         early.ts = r - Duration::minutes(30);
         assert!(!is_reset(&prev, &early, Window::Weekly));
+    }
+
+    #[test]
+    fn a_rollover_of_a_barely_used_window_rearms_but_does_not_announce() {
+        let r = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+        let mut prev = snap(Some(4.0), None);
+        prev.ts = r - Duration::minutes(5);
+        prev.session_reset = Some(r);
+        let mut curr = snap(Some(1.0), None);
+        curr.ts = r + Duration::minutes(5);
+        curr.session_reset = Some(r + Duration::hours(5));
+        assert!(is_reset(&prev, &curr, Window::Session), "still a rollover");
+        let trig = evaluate(&prev, &curr, &NotificationConfig::default());
+        assert!(
+            !trig.contains(&Trigger::ResetBack {
+                window: Window::Session
+            }),
+            "{trig:?}"
+        );
+        let mut state = NotifState {
+            crossings: [(Window::Session, 70)].into_iter().collect(),
+            ..NotifState::default()
+        };
+        dedup_and_apply(&mut state, &prev, &curr, trig);
+        assert!(state.crossings.is_empty(), "the rollover re-arms crossings");
+    }
+
+    #[test]
+    fn now_relative_reset_stamps_do_not_roll_on_every_poll() {
+        // An expired Codex window reports 0 s left: each fetch stamps the
+        // reset at its own "now".
+        let t0 = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+        let tick = |i: i64, pct: f32| {
+            let mut s = snap(Some(pct), None);
+            s.ts = t0 + Duration::minutes(i);
+            s.session_reset = Some(s.ts);
+            s
+        };
+        let cfg = NotificationConfig::default();
+        let mut state = NotifState::default();
+        let (a, b, c) = (tick(0, 60.0), tick(1, 80.0), tick(2, 80.0));
+        let first = dedup_and_apply(&mut state, &a, &b, evaluate(&a, &b, &cfg));
+        assert_eq!(
+            first,
+            vec![Trigger::Threshold {
+                window: Window::Session,
+                pct: 70
+            }]
+        );
+        assert!(!is_reset(&b, &c, Window::Session));
+        let again = dedup_and_apply(&mut state, &b, &c, evaluate(&b, &c, &cfg));
+        assert!(again.is_empty(), "re-fired on a now-relative stamp: {again:?}");
     }
 
     #[test]
