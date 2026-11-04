@@ -299,6 +299,40 @@ fn mcp_oversized_line_without_newline_rejected() {
 }
 
 #[test]
+fn mcp_notifications_before_responses_are_skipped() {
+    let note = r#"{"jsonrpc":"2.0","method":"notifications/message","params":{}}"#;
+    let req = r#"{"jsonrpc":"2.0","id":9,"method":"roots/list"}"#;
+    let script = format!(
+        "read a; echo '{note}'; echo '{INIT_OK}'; read b; read c; echo '{note}'; echo '{req}'; \
+         echo 'plain log line'; echo '{TOOLS_OK}'; sleep 5"
+    );
+    let s = mcp::fetch_tools(&sh_server(&script)).unwrap();
+    assert_eq!(s.tool_count, 2);
+}
+
+#[test]
+fn mcp_tools_list_follows_next_cursor() {
+    let p1 = r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"t1"}],"nextCursor":"c2"}}"#;
+    let p2 = r#"{"jsonrpc":"2.0","id":3,"result":{"tools":[{"name":"t2"},{"name":"t3"}]}}"#;
+    let script = format!(
+        "read a; echo '{INIT_OK}'; read b; read c; echo '{p1}'; read d; echo '{p2}'; sleep 5"
+    );
+    let s = mcp::fetch_tools(&sh_server(&script)).unwrap();
+    assert_eq!(s.tool_count, 3);
+}
+
+#[test]
+fn mcp_command_expands_env_var_defaults() {
+    let script = format!("read a; echo '{INIT_OK}'; read b; read c; echo '{TOOLS_OK}'; sleep 5");
+    let cfg = serde_json::json!({
+        "command": "${USAGIO_TEST_UNSET_SH:-/bin/sh}",
+        "args": ["-c", script]
+    });
+    let s = mcp::fetch_tools(&cfg).unwrap();
+    assert_eq!(s.tool_count, 2);
+}
+
+#[test]
 fn mcp_initialize_error_surfaced() {
     let script =
         r#"read a; echo '{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"no"}}'; sleep 5"#;
