@@ -1488,6 +1488,21 @@ fn panic_loop_response(restart: &LaunchdRestart) -> PanicLoopResponse {
     }
 }
 
+/// Minimum process uptime before a panic loop may ask launchd for a restart.
+/// A process that was itself just restarted and loops again falls to the slow
+/// respawn path, so a deterministic panic cannot kickstart forever.
+const MIN_UPTIME_FOR_KICKSTART_SECS: u64 = 600;
+
+fn may_kickstart(uptime: Duration) -> bool {
+    uptime.as_secs() >= MIN_UPTIME_FOR_KICKSTART_SECS
+}
+
+/// When this process started (first call wins; the supervisor primes it).
+fn process_uptime() -> Duration {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed()
+}
+
 /// Backoff between respawns once a panic loop was detected and no restart
 /// was possible.
 const PANIC_LOOP_BACKOFF_SECS: u64 = 300;
@@ -1522,6 +1537,7 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// was issued; the plists ship `KeepAlive=false`, so otherwise it keeps
 /// respawning slowly rather than exiting into a dead tray.
 fn poll_loop_supervisor() {
+    let _ = process_uptime(); // start the uptime clock
     let mut panics: Vec<std::time::Instant> = Vec::new();
     loop {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(poll_loop));
@@ -1545,7 +1561,11 @@ fn poll_loop_supervisor() {
                 "event=poll_loop_panic_loop reason=\"more than {MAX_PANICS_PER_WINDOW} panics in \
                  {PANIC_LOOP_WINDOW_SECS}s\" ; asking launchd for a clean restart"
             ));
-            let restart = relaunch_via_launchd();
+            let restart = if may_kickstart(process_uptime()) {
+                relaunch_via_launchd()
+            } else {
+                LaunchdRestart::Failed
+            };
             if panic_loop_response(&restart) == PanicLoopResponse::Exit {
                 // kickstart -k replaces this process; wait to be replaced.
                 std::thread::sleep(Duration::from_secs(3));
@@ -3311,7 +3331,9 @@ fn handle_refresh_now() {
     // decide or switch, so it must not run a cycle (a second engine with
     // independent hysteresis). The owner refreshes on its own schedule.
     if ENGINE_DISPLAY_ONLY.load(std::sync::atomic::Ordering::SeqCst) {
-        notify("Another usagio process is refreshing usage");
+        notify(
+            "Another usagio process owns refreshing; this menu updates from it on its own schedule",
+        );
         return;
     }
     // Shares `poll_loop`'s `SwapGuard`
@@ -3398,8 +3420,37 @@ fn handle_capture(slug: &str) {
     }
     // Capture makes the login active and may hit the network, so it runs like
     // a switch: off the UI thread, ordered against queued switch clicks.
+    // A capture is never dropped by a later click: it is queued, bumps the
+    // generation so OLDER switches yield, and whichever worker gets the swap
+    // guard next (this one or a later switch) runs it first.
+    PENDING_CAPTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .entry(slug.to_string())
+        .and_modify(|n| *n += 1)
+        .or_insert(1);
     let owned = slug.to_string();
-    spawn_latest_switch(slug, move |_| capture_serialized(&owned));
+    spawn_latest_switch(slug, move |_| run_pending_captures(&owned));
+}
+
+/// Captures clicked but not yet run, per provider.
+static PENDING_CAPTURES: std::sync::Mutex<Option<std::collections::HashMap<String, usize>>> =
+    std::sync::Mutex::new(None);
+
+/// Run every queued capture for `slug`. Called with the swap guard held, by
+/// the capture's own worker and by every switch worker before its gen check,
+/// so a Switch clicked after a Capture always sees the captured account.
+fn run_pending_captures(slug: &str) {
+    let n = PENDING_CAPTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|m| m.remove(slug))
+        .unwrap_or(0);
+    for _ in 0..n {
+        capture_serialized(slug);
+    }
 }
 
 fn capture_serialized(slug: &str) {
@@ -3453,10 +3504,20 @@ fn renew_login_store(st: &State, slug: &str, key: &str) -> String {
 }
 
 fn handle_renew(slug: &str, key: &str) {
+    if providers::get(slug).is_none() {
+        return;
+    }
+    let (slug, key) = (slug.to_string(), key.to_string());
+    let s = slug.clone();
+    begin_login_after_superseding(&s, move |browser_only| {
+        begin_renew(&slug, &key, browser_only)
+    });
+}
+
+fn begin_renew(slug: &str, key: &str, browser_only: bool) {
     let Some(provider) = providers::get(slug) else {
         return;
     };
-    cancel_previous_login(slug);
     let store = State::load()
         .ok()
         .map(|st| renew_login_store(&st, slug, key))
@@ -3470,7 +3531,13 @@ fn handle_renew(slug: &str, key: &str) {
         Err(e) => notify(&format!("Renew failed: {e:#}")),
     });
     match started {
-        Ok(s) => show_sign_in(&format!("Renew {key} — usagio"), slug, &store, &s),
+        Ok(s) => show_sign_in(
+            &format!("Renew {key} — usagio"),
+            slug,
+            &store,
+            &s,
+            browser_only,
+        ),
         Err(e) => notify(&format!("Renew failed: {e:#}")),
     }
 }
@@ -3524,10 +3591,19 @@ fn spawn_claim(key: String) {
 /// fresh sign-in window store, adding whichever account signs in (never
 /// switching to it). The account remembers that store for its renewals.
 fn handle_sign_in(slug: &str) {
+    if providers::get(slug).is_none() {
+        return;
+    }
+    let owned = slug.to_string();
+    begin_login_after_superseding(slug, move |browser_only| {
+        begin_sign_in(&owned, browser_only)
+    });
+}
+
+fn begin_sign_in(slug: &str, browser_only: bool) {
     let Some(provider) = providers::get(slug) else {
         return;
     };
-    cancel_previous_login(slug);
     let store = crate::login::new_store_key();
     let target = crate::login::Target::Add {
         store: store.clone(),
@@ -3545,6 +3621,7 @@ fn handle_sign_in(slug: &str) {
             slug,
             &store,
             &s,
+            browser_only,
         ),
         Err(e) => notify(&format!("Sign-in failed: {e:#}")),
     }
@@ -3552,9 +3629,16 @@ fn handle_sign_in(slug: &str) {
 
 /// Show a started login in the sign-in window, or the default browser where
 /// no window can be shown here.
-fn show_sign_in(title: &str, slug: &str, store: &str, started: &crate::login::Started) {
+fn show_sign_in(
+    title: &str,
+    slug: &str,
+    store: &str,
+    started: &crate::login::Started,
+    browser_only: bool,
+) {
     let platform = crate::platform();
-    let in_window = platform.sign_in_window_available()
+    let in_window = !browser_only
+        && platform.sign_in_window_available()
         && match platform.open_sign_in_window(
             title,
             &started.url,
@@ -3602,13 +3686,9 @@ fn login_message(mut msg: String, r: &crate::login::Renewed) -> String {
     msg
 }
 
-/// Run `work` on a worker thread while holding the shared swap guard. The
-/// poller holds that guard for a whole `run_cycle` (network fetches, token
-/// refreshes), so taking it on the UI thread would freeze the tray; the
-/// worker waits instead, keeping the serialization with the poller.
 /// The in-flight browser-fallback login per provider. Nothing else can stop
 /// its loopback listener (Codex's fixed port 1455 included) once the tab is
-/// closed, so a newer sign-in for the same provider cancels it first.
+/// closed, so a newer sign-in for the same provider supersedes it first.
 static BROWSER_LOGINS: std::sync::Mutex<
     Option<std::collections::HashMap<String, std::sync::Arc<crate::login::Progress>>>,
 > = std::sync::Mutex::new(None);
@@ -3621,22 +3701,51 @@ fn track_browser_login(slug: &str, progress: std::sync::Arc<crate::login::Progre
         .insert(slug.to_string(), progress);
 }
 
-/// Cancel the previous browser login for `slug` and give its worker a moment
-/// to drop the listener, so the new flow can bind the same port.
-fn cancel_previous_login(slug: &str) {
+/// Supersede the previous browser login for `slug`, if any. Never blocks; the
+/// caller waits for the listener to be released ([`wait_released`]) off the UI
+/// thread before binding the same port again.
+fn supersede_previous_login(slug: &str) -> Option<std::sync::Arc<crate::login::Progress>> {
     let prev = BROWSER_LOGINS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_mut()
-        .and_then(|m| m.remove(slug));
-    let Some(prev) = prev else { return };
-    prev.cancel();
-    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        .and_then(|m| m.remove(slug))?;
+    prev.supersede();
+    Some(prev)
+}
+
+/// Wait (briefly) until a superseded flow's worker has released its listener.
+fn wait_released(prev: &crate::login::Progress) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while !prev.is_finished() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
 }
 
+/// Run `begin(browser_only)` for a new sign-in on `slug`. With nothing to
+/// supersede it runs inline (the UI thread, window allowed). Otherwise the
+/// wait for the old listener happens on a worker, and since no window can be
+/// opened off the main thread, the new flow uses the browser.
+fn begin_login_after_superseding(slug: &str, begin: impl FnOnce(bool) + Send + 'static) {
+    match supersede_previous_login(slug) {
+        None => begin(false),
+        Some(prev) => {
+            #[cfg(test)]
+            let home = crate::store::home_override();
+            std::thread::spawn(move || {
+                #[cfg(test)]
+                crate::store::set_home_override(home);
+                wait_released(&prev);
+                begin(true);
+            });
+        }
+    }
+}
+
+/// Run `work` on a worker thread while holding the shared swap guard. The
+/// poller holds that guard for a whole `run_cycle` (network fetches, token
+/// refreshes), so taking it on the UI thread would freeze the tray; the
+/// worker waits instead, keeping the serialization with the poller.
 fn spawn_serialized_with_poller(work: impl FnOnce(&mut SwapGuards) + Send + 'static) {
     let shared = shared_swap_guard();
     // Unit tests scope the config dir per thread; carry it to the worker.
@@ -3677,6 +3786,7 @@ fn spawn_latest_switch(slug: &str, work: impl FnOnce(&mut SwapGuards) + Send + '
     };
     let slug = slug.to_string();
     spawn_serialized_with_poller(move |guard| {
+        run_pending_captures(&slug);
         let current = SWITCH_GEN
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -8263,8 +8373,12 @@ mod tests {
         let other = std::sync::Arc::new(crate::login::Progress::default());
         track_browser_login("t-login-a", old.clone());
         track_browser_login("t-login-b", other.clone());
-        cancel_previous_login("t-login-a");
-        assert!(old.is_cancelled(), "previous flow must be cancelled");
+        let prev = supersede_previous_login("t-login-a").expect("tracked");
+        assert!(std::sync::Arc::ptr_eq(&prev, &old));
+        assert!(
+            old.is_cancelled() && old.is_superseded(),
+            "previous flow ends quietly"
+        );
         assert!(!other.is_cancelled(), "other providers are untouched");
     }
 
@@ -8366,5 +8480,49 @@ mod tests {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         let (res, _) = run_cycle_checked(&mut g, true, &LoopOpts::default());
         assert!(res.is_err(), "an aborted cycle must not look like success");
+    }
+
+    #[test]
+    fn launchd_restart_is_allowed_once_per_incident() {
+        assert!(!may_kickstart(Duration::from_secs(60)), "fresh restart");
+        assert!(!may_kickstart(Duration::from_secs(599)));
+        assert!(may_kickstart(Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn a_queued_capture_is_never_dropped_by_a_later_switch() {
+        let _l = POLL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::store::ScopedConfigDir::new();
+        let dir = tempfile::tempdir().unwrap();
+        crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+            let auth = dir.path().join("auth.json");
+            std::fs::write(&auth, codex_auth_json("a@example.com")).unwrap();
+            let _ = wait_for_poll_request(Duration::ZERO);
+            handle_click("capture:codex");
+            for _ in 0..200 {
+                if wait_for_poll_request(Duration::from_millis(50)) {
+                    break;
+                }
+            }
+            std::fs::write(&auth, codex_auth_json("b@example.com")).unwrap();
+            let shared = shared_swap_guard();
+            let held = shared.lock().unwrap_or_else(|e| e.into_inner());
+            handle_click("capture:codex");
+            handle_click("switch:codex:a@example.com");
+            drop(held);
+            let mut ok = false;
+            for _ in 0..200 {
+                let st = State::load().unwrap();
+                let pa = st.provider_accounts("codex").unwrap();
+                if st.find_provider_account("codex", "b@example.com").is_some()
+                    && pa.active.as_deref() == Some("a@example.com")
+                {
+                    ok = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(ok, "capture must run first, then the switch to a@");
+        });
     }
 }

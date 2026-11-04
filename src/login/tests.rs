@@ -353,3 +353,24 @@ fn transient_accept_errors_are_retried_not_fatal() {
         assert!(!is_transient_accept_error(k), "{k:?} must stay fatal");
     }
 }
+
+#[test]
+fn a_cancelled_flow_frees_its_port_before_it_returns() {
+    let lb = Loopback::bind(&spec("http://unused", TokenRequestStyle::Form)).unwrap();
+    let port = lb.listener.local_addr().unwrap().port();
+    let cancel = AtomicBool::new(true);
+    let r = wait_and_release(lb, "st", Duration::from_secs(5), &cancel);
+    assert!(r.is_err());
+    TcpListener::bind(("127.0.0.1", port)).expect("port must be bindable right after cancel");
+}
+
+#[test]
+fn supersede_cancels_and_marks_the_flow() {
+    let p = Progress::default();
+    assert!(!p.is_superseded());
+    p.supersede();
+    assert!(p.is_cancelled() && p.is_superseded());
+    let q = Progress::default();
+    q.cancel();
+    assert!(!q.is_superseded(), "a closed window is not a supersede");
+}
