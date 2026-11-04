@@ -131,10 +131,11 @@ pub(crate) fn user_home() -> Option<PathBuf> {
     let [first, second] = crate::platform().paths().home_env_order();
     #[cfg(test)]
     {
-        // Test isolation: only env vars a test explicitly scoped count. With
-        // none scoped, use the thread's HOME_OVERRIDE, else fail loudly like
+        // Test isolation: only env vars a test explicitly scoped count, and
+        // never another thread's scope over this thread's own config dir. With
+        // none visible, use the thread's HOME_OVERRIDE, else fail loudly like
         // `store::config_dir` rather than resolve the developer's real home.
-        let any_scoped = crate::env_lock::is_scoped(first) || crate::env_lock::is_scoped(second);
+        let any_scoped = crate::env_lock::is_visible(first) || crate::env_lock::is_visible(second);
         if !any_scoped {
             return Some(crate::store::home_override().expect(
                 "paths::user_home() called from a unit test with neither HOME \
