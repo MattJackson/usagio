@@ -1434,7 +1434,7 @@ mod tests {
                 plan: parse_plan(&body),
                 reported: ReportedUsage::default(),
             };
-            let cache = crate::cached_from_usage_snapshot(&snapshot);
+            let cache = crate::rows::cached_from_usage_snapshot(&snapshot);
             assert_eq!(cache.weekly_pct, Some(40.0));
             assert_eq!(cache.session_pct, secondary_seconds.map(|_| 12.0));
             assert_eq!(

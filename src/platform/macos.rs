@@ -123,7 +123,7 @@ impl Platform for MacOsPlatform {
 /// Our `usagio.app` directory: the bundle we're running from, else the one
 /// the LaunchAgent would launch (Homebrew's sibling bundle).
 fn app_bundle_dir() -> Option<PathBuf> {
-    let exe = crate::launch_agent_exe_path();
+    let exe = crate::cli::install::launch_agent_exe_path();
     exe.ancestors()
         .find(|p| p.extension().is_some_and(|e| e == "app"))
         .map(Path::to_path_buf)

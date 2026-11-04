@@ -459,6 +459,19 @@ pub fn fire_plain(msg: &str) -> Result<()> {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Fire a native "usagio: {msg}" notification (best effort, cross-platform).
+/// Delegates to `notifications::fire_plain`, which routes through notify-rust
+/// so macOS/Linux/Windows all get a real notification — the previous osascript
+/// path silently no-op'd on Linux and Windows. Best-effort: failures are
+/// logged (R2-EH-04) so H6's user-facing notification guarantee has
+/// diagnostic backing when the channel is unavailable (headless SSH, no
+/// notification daemon, denied permission, etc.).
+pub(crate) fn notify(msg: &str) {
+    if let Err(e) = fire_plain(msg) {
+        crate::logging::log(&format!("notify: fire_plain failed: {e}"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

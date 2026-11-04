@@ -1,10 +1,11 @@
 //! Low-frequency plan metadata refresh, independent of usage fetch eligibility.
 
+use crate::logging;
+use crate::poll::plan::notify_subscription_change;
 use crate::providers::claude::usage;
+use crate::state_ops::with_state_lock;
 use crate::store::{Account, State};
-use crate::{
-    identity_matches, logging, notify_subscription_change, update_claude_identity, with_state_lock,
-};
+use crate::switching::identity::{identity_matches, update_claude_identity};
 use chrono::Utc;
 
 const REFRESH_SECS: i64 = 1800;
@@ -146,7 +147,7 @@ fn commit(snapshot: &Account, profile: &serde_json::Value) -> anyhow::Result<boo
         Ok(Some(changed))
     })?;
     if changed == Some(true) {
-        notify_subscription_change(crate::CLAUDE_SLUG, snapshot.key(), !plan.active);
+        notify_subscription_change(crate::providers::CLAUDE_SLUG, snapshot.key(), !plan.active);
     }
     Ok(changed.is_some())
 }

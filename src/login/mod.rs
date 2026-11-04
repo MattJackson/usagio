@@ -12,7 +12,7 @@
 //!    which keeps a separate, persistent cookie store per account, or in the
 //!    default browser as a fallback,
 //! 4. exchange the code, check the account that signed in is the one being
-//!    renewed, and save it (`crate::persist_login`).
+//!    renewed, and save it (`crate::cli::capture::persist_login`).
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -600,7 +600,7 @@ pub fn start(
                 &provider.account_identifier(&captured.identity),
                 target.expected(),
             )?;
-            crate::persist_login(provider, captured, target.new_store())
+            crate::cli::capture::persist_login(provider, captured, target.new_store())
         })();
         worker.finished.store(true, Ordering::SeqCst);
         crate::logging::log(&match &result {

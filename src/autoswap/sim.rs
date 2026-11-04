@@ -363,7 +363,8 @@ impl World {
                     true
                 } else {
                     let max = c.s.unwrap_or(0.0).max(c.w);
-                    let floor = crate::v2_active_floor_secs(Some(max), trigger, 180) as i64;
+                    let floor =
+                        crate::poll::claude::v2_active_floor_secs(Some(max), trigger, 180) as i64;
                     let backoff = self
                         .last_active_attempt
                         .is_some_and(|(t, failed)| failed && now_ts - t < self.cur as i64);
@@ -415,11 +416,17 @@ impl World {
                 if let Some(p) = self.manual.as_mut() {
                     if !p.settled_by_fresh && now_ts <= p.at + policy::MANUAL_PICK_SETTLE_S {
                         let c = self.cache[ai].as_ref().unwrap();
-                        p.pick.settled = crate::tier_for_pct(c.s.unwrap_or(0.0).max(c.w), trigger);
+                        p.pick.settled = crate::switching::manual_pick::tier_for_pct(
+                            c.s.unwrap_or(0.0).max(c.w),
+                            trigger,
+                        );
                         p.settled_by_fresh = true;
                     } else if let Some(c) = self.cache[ai].as_ref() {
                         // The hold ends once the pick's tier improves (0.12.1).
-                        let t = crate::tier_for_pct(c.s.unwrap_or(0.0).max(c.w), trigger);
+                        let t = crate::switching::manual_pick::tier_for_pct(
+                            c.s.unwrap_or(0.0).max(c.w),
+                            trigger,
+                        );
                         if t < p.pick.settled {
                             p.pick.settled = t;
                         }
@@ -679,7 +686,12 @@ pub fn run(sc: Scenario) -> Trace {
             let i = w.idx(&key);
             let settled = w.cache[i]
                 .as_ref()
-                .map(|c| crate::tier_for_pct(c.s.unwrap_or(0.0).max(c.w), w.sc.trigger))
+                .map(|c| {
+                    crate::switching::manual_pick::tier_for_pct(
+                        c.s.unwrap_or(0.0).max(c.w),
+                        w.sc.trigger,
+                    )
+                })
                 .unwrap_or(Tier::Ready);
             w.note_switch(&from, &key, t, ChangeKind::Manual);
             w.manual = Some(SimPick {
@@ -736,7 +748,7 @@ pub fn run(sc: Scenario) -> Trace {
                 w.cur = policy::ACTIVE_TIGHT_FLOOR_S;
                 5
             } else {
-                w.cur = crate::next_interval_v2(
+                w.cur = crate::watch::cadence::next_interval_v2(
                     w.cur,
                     180,
                     rate_limited,

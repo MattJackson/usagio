@@ -691,7 +691,7 @@ stream_max_retries = 0
             provider
                 .write_active_account(&first.secret_blob, &first.identity)
                 .unwrap();
-            crate::capture_current_generic("codex").unwrap();
+            crate::cli::capture::capture_current_generic("codex").unwrap();
             start_and_verify(&first.identity).unwrap();
             let session = with_control("ws://localhost/", |socket| {
                 inspect(socket)?;
@@ -719,8 +719,12 @@ stream_max_retries = 0
                 .expect("Codex did not reach the local response server");
             let before = probe().unwrap().unwrap();
             assert!(before.busy);
-            crate::switch_to_provider_account("codex", "a@example.com", true).unwrap();
-            assert!(!crate::provider_switch_pending("codex", "a@example.com"));
+            crate::switching::provider::switch_to_provider_account("codex", "a@example.com", true)
+                .unwrap();
+            assert!(!crate::switching::provider::provider_switch_pending(
+                "codex",
+                "a@example.com"
+            ));
             let unchanged = probe().unwrap().unwrap();
             assert!(unchanged.busy);
             assert_eq!(unchanged.instance_token, before.instance_token);
@@ -730,9 +734,13 @@ stream_max_retries = 0
                     "account-b",
                 ))
                 .unwrap();
-            crate::persist_login(&provider, second, None).unwrap();
-            crate::switch_to_provider_account("codex", "b@example.com", true).unwrap();
-            assert!(!crate::provider_switch_pending("codex", "b@example.com"));
+            crate::cli::capture::persist_login(&provider, second, None).unwrap();
+            crate::switching::provider::switch_to_provider_account("codex", "b@example.com", true)
+                .unwrap();
+            assert!(!crate::switching::provider::provider_switch_pending(
+                "codex",
+                "b@example.com"
+            ));
             verify_stopped(before.instance_token.as_deref().unwrap()).unwrap();
             let _ = release.send(());
             assert_eq!(

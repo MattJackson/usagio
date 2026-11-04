@@ -193,6 +193,12 @@ pub(crate) fn log_watched_fields(provider: &str, body: &serde_json::Value, paths
     }
 }
 
+/// Slug of the sole first-class provider in v1 (state.json is still keyed as
+/// a flat list of Claude accounts). Any code that needs to resolve "the
+/// provider for this account" today uses this; phase 3 (state v2) replaces
+/// the constant with a per-account lookup keyed on the containing bucket.
+pub(crate) const CLAUDE_SLUG: &str = "claude";
+
 #[cfg(test)]
 mod watch_tests {
     use super::watched_values;

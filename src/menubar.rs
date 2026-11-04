@@ -38,17 +38,23 @@ use {
     objc2_foundation::NSTimer,
 };
 
+use crate::cli::capture::{capture_current, capture_current_generic};
 use crate::countdown::{self, AccountUsage, BlockingWindow, DisplayState};
+use crate::display::age_str;
+use crate::env_override::env_override_active;
+use crate::notifications::notify;
+use crate::picking::optimize_now;
+use crate::poll::trackers::set_current_loop_interval_secs;
 use crate::providers::trait_def::{Credits, ReportedUsage, ResetGrant, UsageShare, UsageWindow};
+use crate::providers::CLAUDE_SLUG;
 use crate::providers::{self, CaptureMode, Provider, SeverityBands};
+use crate::rows::{row_from_account, row_from_provider_account, Row};
+use crate::state_ops::{remove_account, remove_provider_account_generic, with_state_lock};
 use crate::store::State;
-use crate::{
-    age_str, capture_current, capture_current_generic, env_override_active, notify, optimize_now,
-    remove_account, remove_provider_account_generic, row_from_account, row_from_provider_account,
-    set_current_loop_interval_secs, switch_to, switch_to_provider_account, watch_cycle,
-    with_state_lock, Cadence, CycleOutcome, Row, SwapGuards, CLAUDE_SLUG, TRIGGER_PCT,
-    WATCH_INTERVAL_SECS,
-};
+use crate::switching::claude::switch_to;
+use crate::switching::provider::switch_to_provider_account;
+use crate::watch::cadence::{Cadence, TRIGGER_PCT, WATCH_INTERVAL_SECS};
+use crate::watch::cycle::{watch_cycle, CycleOutcome, SwapGuards};
 
 /// Exact title of the disabled section row inserted when a provider's env
 /// override is active. A named constant so `menu_tree_from_snapshot` and the
@@ -989,7 +995,7 @@ pub fn run() -> Result<()> {
 
     // Remember the binary we launched from so the timer can notice a `brew
     // upgrade` replacing it and relaunch into the new version.
-    let start_exe = std::fs::canonicalize(crate::stable_exe_path()).ok();
+    let start_exe = std::fs::canonicalize(crate::cli::install::stable_exe_path()).ok();
 
     // Build the tray on the main thread and keep it alive for the app's lifetime.
     // muri 0.11: the native `Tray` API (customization lives here, not in the
@@ -1400,7 +1406,7 @@ pub(crate) fn poll_loop_with(opts: &LoopOpts) {
         // uses the correct horizon under 429 backoff (see main.rs).
         set_current_loop_interval_secs(cadence.current_for(CLAUDE_SLUG));
         for p in providers::all() {
-            crate::set_provider_interval_secs(
+            crate::poll::trackers::set_provider_interval_secs(
                 p.provider_id(),
                 cadence.current_for(p.provider_id()),
             );
@@ -1656,7 +1662,7 @@ fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
         *g = Some(Instant::now());
     }
 
-    let stable = crate::stable_exe_path();
+    let stable = crate::cli::install::stable_exe_path();
     let Ok(now) = std::fs::canonicalize(&stable) else {
         return;
     };
@@ -1776,7 +1782,7 @@ pub(crate) fn watchdog_self_restart() -> bool {
 #[cfg(unix)]
 fn relaunch_via_launchd_kickstart() -> LaunchdRestart {
     let uid = unsafe { libc::getuid() };
-    let target = format!("gui/{uid}/{}", crate::AUTOSTART_LABEL);
+    let target = format!("gui/{uid}/{}", crate::cli::install::AUTOSTART_LABEL);
     crate::logging::log(&format!("relaunching via launchctl kickstart -k {target}"));
     match std::process::Command::new("launchctl")
         .args(["kickstart", "-k", &target])
@@ -1812,7 +1818,7 @@ fn is_launchd_managed() -> bool {
 
 /// Pure predicate behind `is_launchd_managed`, split out for testing.
 fn launchd_managed_from_env(xpc_service_name: Option<&str>) -> bool {
-    xpc_service_name == Some(crate::AUTOSTART_LABEL)
+    xpc_service_name == Some(crate::cli::install::AUTOSTART_LABEL)
 }
 
 /// Like [`run_cycle`], keeping the failure (logged either way) so an explicit
@@ -1852,7 +1858,7 @@ fn run_cycle(guards: &mut SwapGuards, force: bool, opts: &LoopOpts) -> (CycleOut
 }
 
 /// Whether the provider currently under an env-override that would defeat any
-/// switch we make. Delegates to the shared `crate::env_override_active` so
+/// switch we make. Delegates to the shared `crate::env_override::env_override_active` so
 /// the menu display and the `choose_swap_target` auto-swap filter can never
 /// disagree, and so tests can toggle overrides through one hook.
 fn env_override_for(provider_id: &str) -> bool {
@@ -2343,7 +2349,10 @@ fn scoped_limit_row(w: &UsageWindow) -> Option<String> {
     let pct = w.utilization.filter(|p| p.is_finite() && *p > 0.0)?;
     let mut row = format!("{} · {}%", w.label, pct.round() as i64);
     if let Some(reset) = w.resets_at {
-        row.push_str(&format!(" · resets in {}", crate::humanize_until(reset)));
+        row.push_str(&format!(
+            " · resets in {}",
+            crate::display::humanize_until(reset)
+        ));
     }
     Some(row)
 }
@@ -2366,7 +2375,10 @@ fn reset_grant_row(g: &ResetGrant) -> Option<String> {
     let state = if g.usable_now { "ready" } else { "banked" };
     let mut row = format!("🎁 {} {noun} {state}", g.resets_left);
     if let Some(exp) = g.expires_at {
-        row.push_str(&format!(" · expires in {}", crate::humanize_until(exp)));
+        row.push_str(&format!(
+            " · expires in {}",
+            crate::display::humanize_until(exp)
+        ));
     }
     Some(row)
 }
@@ -3673,17 +3685,19 @@ fn handle_claim_with(
 }
 
 fn spawn_claim(key: String) {
-    std::thread::spawn(move || match crate::claim_claude_reset(&key) {
-        Ok(crate::providers::claude::usage::ClaimOutcome::Reset) => {
-            notify(&format!("Reset claimed for {key} — limits cleared"));
-            request_poll_now();
-        }
-        Ok(crate::providers::claude::usage::ClaimOutcome::NoChange(status)) => {
-            notify(&format!("No reset applied for {key}: {status}"));
-            request_poll_now();
-        }
-        Err(e) => notify(&format!("Claim failed for {key}: {e}")),
-    });
+    std::thread::spawn(
+        move || match crate::switching::claude::claim_claude_reset(&key) {
+            Ok(crate::providers::claude::usage::ClaimOutcome::Reset) => {
+                notify(&format!("Reset claimed for {key} — limits cleared"));
+                request_poll_now();
+            }
+            Ok(crate::providers::claude::usage::ClaimOutcome::NoChange(status)) => {
+                notify(&format!("No reset applied for {key}: {status}"));
+                request_poll_now();
+            }
+            Err(e) => notify(&format!("Claim failed for {key}: {e}")),
+        },
+    );
 }
 
 /// "Sign in to a new <Provider> account…": the same login as Renew, in a
@@ -4042,7 +4056,7 @@ fn switch_serialized(guard: &mut SwapGuards, slug: &str, key: &str) {
     };
     match result {
         Ok(label) => {
-            if crate::provider_switch_pending(slug, key) {
+            if crate::switching::provider::provider_switch_pending(slug, key) {
                 notify(&format!("Switch to {label} queued until idle"));
             } else {
                 let g = guard.for_provider(slug);
@@ -4613,7 +4627,7 @@ mod cross_platform {
         let mut last_sig = menu_signature(&initial);
         let mut last_title = title_for(&initial);
         let mut last_icon = Some(initial_icon_bytes(&initial));
-        let start_exe = std::fs::canonicalize(crate::stable_exe_path()).ok();
+        let start_exe = std::fs::canonicalize(crate::cli::install::stable_exe_path()).ok();
         loop {
             std::thread::sleep(Duration::from_millis(750));
             if let Some(start) = &start_exe {
@@ -6057,7 +6071,9 @@ mod tests {
 
     #[test]
     fn launchd_managed_detects_matching_service_name() {
-        assert!(launchd_managed_from_env(Some(crate::AUTOSTART_LABEL)));
+        assert!(launchd_managed_from_env(Some(
+            crate::cli::install::AUTOSTART_LABEL
+        )));
         assert!(!launchd_managed_from_env(Some("com.other.service")));
         assert!(!launchd_managed_from_env(None));
     }
@@ -6172,7 +6188,7 @@ mod tests {
         // consults to populate each section's flag — must now report true,
         // and a section rebuilt with that flag must produce a different
         // `menu_signature` (so the tray redraws and shows the disabled row).
-        crate::with_env_override_hook(&[CLAUDE_SLUG], || {
+        crate::env_override::with_env_override_hook(&[CLAUDE_SLUG], || {
             assert!(env_override_for(CLAUDE_SLUG));
             assert!(!env_override_for("codex"));
             snap.sections[0].env_override_active = env_override_for(CLAUDE_SLUG);
@@ -7502,11 +7518,11 @@ mod tests {
 
     #[test]
     fn acctview_from_row_orders_windows_and_flags_the_active_account() {
-        let cell = |p: f64| crate::Cell {
+        let cell = |p: f64| crate::rows::Cell {
             pct: Some(p),
             resets_at: None,
         };
-        let row = crate::Row {
+        let row = crate::rows::Row {
             provider_id: CLAUDE_SLUG.to_string(),
             needs_relogin: false,
             no_subscription: false,
@@ -8286,9 +8302,13 @@ mod tests {
     #[test]
     fn launchd_managed_follows_the_xpc_service_name_env() {
         use crate::env_lock::scoped_env_var;
-        scoped_env_var("XPC_SERVICE_NAME", Some(crate::AUTOSTART_LABEL), || {
-            assert!(is_launchd_managed());
-        });
+        scoped_env_var(
+            "XPC_SERVICE_NAME",
+            Some(crate::cli::install::AUTOSTART_LABEL),
+            || {
+                assert!(is_launchd_managed());
+            },
+        );
         scoped_env_var("XPC_SERVICE_NAME", Some("com.apple.Terminal"), || {
             assert!(!is_launchd_managed());
         });
@@ -8314,7 +8334,8 @@ mod tests {
         // The binary on disk is the one we started from → no relaunch. (A
         // wrongly-taken relaunch path logs first, which panics here without a
         // scoped config dir — deliberately not set up.)
-        let start = std::fs::canonicalize(crate::stable_exe_path()).expect("test exe path");
+        let start =
+            std::fs::canonicalize(crate::cli::install::stable_exe_path()).expect("test exe path");
         maybe_relaunch_after_upgrade(&start);
     }
 

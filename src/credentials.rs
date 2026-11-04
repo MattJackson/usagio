@@ -305,7 +305,7 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
                     // fires when the save fails; it is skipped only when the
                     // token rotated or the account was already flagged.
                     let alert = || {
-                        crate::notify(&format!(
+                        crate::notifications::notify(&format!(
                             "{email}: re-login required — run `usagio capture`"
                         ))
                     };

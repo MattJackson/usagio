@@ -823,7 +823,7 @@ pub fn config_dir() -> Result<PathBuf> {
     }
 
     if let Some(home) = home_override() {
-        let p = home.join(".config").join(crate::APP_SLUG);
+        let p = home.join(".config").join(crate::paths::APP_SLUG);
         // security-01 (v0.5.2 audit): harden the top-level config dir itself,
         // not just `backups/` beneath it — see the non-override branch below
         // for the full rationale.
@@ -831,7 +831,7 @@ pub fn config_dir() -> Result<PathBuf> {
         return Ok(p);
     }
 
-    let p = crate::platform().paths().config_dir(crate::APP_SLUG);
+    let p = crate::platform().paths().config_dir(crate::paths::APP_SLUG);
     // Guard against a platform Paths impl returning an empty or relative path
     // because e.g. HOME is unset. Every downstream call to `config_dir()`
     // joins onto this, so a bad root would silently create state under CWD —
@@ -1262,7 +1262,7 @@ impl State {
     }
 
     fn still_active<'a>(&self, slug: &str, key: &'a str) -> Option<&'a str> {
-        let active = if slug == crate::CLAUDE_SLUG {
+        let active = if slug == crate::providers::CLAUDE_SLUG {
             self.active.as_deref()
         } else {
             self.provider_accounts(slug)?.active.as_deref()

@@ -1,5 +1,92 @@
 use super::*;
-use chrono::{Duration, Utc};
+use chrono::Duration;
+use chrono::{DateTime, Utc};
+
+use crate::claude_local::{
+    claude_json_mode, claude_json_path, keychain_account, keychain_read, keychain_write,
+    read_claude_identity, read_claude_json_raw, write_claude_identity, write_claude_identity_with,
+    CLAUDE_IDENTITY_READS,
+};
+use crate::cli::capture::{
+    capture_current, capture_current_generic, cmd_capture, merged_cached_usage, persist_login,
+};
+use crate::cli::context::{cmd_context, parse_context_args};
+use crate::cli::install::{
+    launch_agent_exe_path, migrate_launchd_if_needed, resolve_launch_agent_exe, run_with_deadline,
+    sibling_app_bundle_exe, stable_exe_path, LEGACY_AUTOSTART_LABEL,
+};
+use crate::cli::internal::{cmd_render_shot, cmd_secrets_selftest};
+use crate::cli::list::{cmd_list, render_table};
+use crate::cli::renew::{cmd_renew, resolve_provider_renew_key, strip_renew_qualifier};
+use crate::cli::report::{
+    cmd_report, consumption_deltas, pace_targets, print_bars, report_swap_count, Sample,
+};
+use crate::cli::rm::cmd_rm;
+use crate::cli::switch::{cmd_switch, ensure_switch_landed, wait_for_queued_provider_switch};
+use crate::cli::token::{cmd_token, poll_active_cas, token_active_cas, token_selector};
+use crate::cli::watch::parse_watch_opts;
+use crate::display::{age_str, bar, humanize_until, truncate};
+use crate::env_override::{
+    env_override_active, env_override_var_for, with_env_override_hook, CLAUDE_ENV_OVERRIDE_VAR,
+};
+use crate::history::{append_history, history_path, log_event};
+use crate::lifecycle::{active_refresh_cas, refresh_provider_active_account, ActiveRefreshOutcome};
+use crate::picking::{auto_pick_v2, menu_order, optimize_now};
+use crate::poll::claude::{
+    cache_crossed_reset, merge_poll_update, refresh_usage_cache, replay_row, v2_active_fetch_skip,
+    RefreshOutcome, MAX_LOCKED_STALENESS_SECS,
+};
+use crate::poll::plan::{
+    detect_lapsed_plan, persist_plan, plan_after_failed_fetch, recheck_lapsed_plan, Recheck,
+    SUBSCRIPTION_RECHECK_SECS,
+};
+use crate::poll::providers::{persist_provider_observation, refresh_provider_usage_caches};
+use crate::poll::trackers::{
+    claim_subscription_check, clear_inactive_fetch_backoff, fetch_tracker_key,
+    get_usage_fetch_tracker, inactive_fetch_backoff_secs, note_polled_active,
+    note_polled_provider_active, note_refresh_error, record_fetch_attempt_failed,
+    record_inactive_fetch_failure, record_usage_fetch_429, record_usage_fetch_non_429,
+    record_usage_fetch_success, reset_usage_fetch_tracker, INACTIVE_FETCH_FLOOR_SECS,
+    INACTIVE_FETCH_MAX_BACKOFF_SECS,
+};
+use crate::providers::claude::{oauth, usage};
+use crate::providers::trait_def::{PlanStatus, TokenGrant, UsageSnapshot};
+use crate::providers::CLAUDE_SLUG;
+use crate::rows::{
+    attach_prepaid_balance_with, cached_from_usage, cached_from_usage_snapshot, claude_plan_label,
+    provider_rows, row_from_account, row_from_provider_account, Cell, Row, PREPAID_REFRESH_SECS,
+};
+use crate::selectors::{resolve_account_selector, resolve_provider_selector, select_email};
+use crate::state_ops::{
+    provider_active, remove_provider_account_generic, save_if_changed, with_state_lock,
+};
+use crate::store::{Account, CachedUsage, ProviderAccount, State};
+use crate::switching::claude::{
+    apply_account, claim_refresh_token, ensure_fresh_with_fallback, flag_needs_relogin,
+    resolve_identity, switch_to, switch_to_guarded, switch_to_if_still_active,
+};
+use crate::switching::identity::{
+    identity_matches, mirror_inactive_rotation, sync_active_claude_identity,
+    sync_active_from_keychain, update_claude_identity,
+};
+use crate::switching::manual_pick::{
+    pick_holds, release_reset_hold, settle_manual_pick, settle_manual_picks,
+};
+use crate::switching::provider::{
+    commit_provider_switch, commit_provider_switch_guarded, provider_account_label,
+    provider_supports_swap, recover_obsolete_pending_switch, switch_if_still_active,
+    switch_provider_expecting, switch_provider_if_still_active, switch_to_provider_account,
+    try_provider_switch_pending,
+};
+use crate::watch::cadence::{
+    cadence_max_pct, next_interval, next_interval_v2, Cadence, NEXT_CHECK_MIN_SECS,
+    WATCH_BACKSTOP_INTERVAL_SECS, WATCH_INTERVAL_SECS, WATCH_MAX_INTERVAL_SECS,
+    WATCH_MIDDLE_INTERVAL_SECS, WATCH_RELAXED_INTERVAL_SECS, WATCH_TIGHT_INTERVAL_SECS,
+};
+use crate::watch::cycle::{
+    provider_swap_cycle, watch_cycle, CycleOutcome, ProviderCycle, SwapGuard, SwapGuards,
+};
+use crate::{autoswap, lifecycle, logging, login, notifications, providers, store, usage_log};
 
 // --- bar ---
 
