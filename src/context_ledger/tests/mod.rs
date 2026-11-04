@@ -231,7 +231,6 @@ fn codex_global_and_project_files_counted() {
             got,
             vec![
                 ("Global AGENTS.md", ItemKind::GlobalInstructions, 13),
-                ("Global instructions.md", ItemKind::GlobalInstructions, 22),
                 ("Project AGENTS.md", ItemKind::ProjectInstructions, 14),
             ]
         );
@@ -461,4 +460,187 @@ fn not_stale_when_tracked_file_missing_or_ledger_empty() {
     let mut empty = l.clone();
     empty.items.clear();
     assert!(!is_stale(&empty));
+}
+
+// ---- codeaudit r1 C4 regressions ---------------------------------------
+
+#[test]
+fn codex_instructions_md_is_only_a_fallback() {
+    with_home(|home| {
+        let dir = home.join(".codex");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("instructions.md"), "old style").unwrap();
+        let l = build_ledger("codex", None).unwrap();
+        let names: Vec<_> = l.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["Global instructions.md"]);
+    });
+}
+
+#[test]
+fn codex_dir_honours_codex_home() {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    let home = Some(PathBuf::from("/h"));
+    assert_eq!(
+        codex::resolve_codex_dir(Some(OsString::from("/c")), home.clone()),
+        Some(PathBuf::from("/c"))
+    );
+    assert_eq!(
+        codex::resolve_codex_dir(Some(OsString::new()), home.clone()),
+        Some(PathBuf::from("/h/.codex"))
+    );
+    assert_eq!(
+        codex::resolve_codex_dir(None, home),
+        Some(PathBuf::from("/h/.codex"))
+    );
+}
+
+#[test]
+fn claude_skill_counts_only_frontmatter() {
+    with_home(|home| {
+        let dir = home.join(".claude").join("skills").join("s");
+        fs::create_dir_all(&dir).unwrap();
+        let body = "x ".repeat(5000);
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: s\ndescription: does a thing\nmodel: opus\n---\n{body}"),
+        )
+        .unwrap();
+        let l = build_ledger("claude", None).unwrap();
+        assert_eq!(l.items.len(), 1);
+        assert_eq!(
+            l.items[0].content_bytes,
+            "name: s\ndescription: does a thing\n".len()
+        );
+    });
+}
+
+#[test]
+fn claude_mcp_servers_read_from_dot_claude_json_and_project_mcp_json() {
+    with_home(|home| {
+        let proj = tempdir().unwrap();
+        let server = |tools: &str| {
+            let script =
+                format!("read a; echo '{INIT_OK}'; read b; read c; echo '{tools}'; sleep 5");
+            serde_json::json!({ "command": "/bin/sh", "args": ["-c", script] })
+        };
+        fs::write(
+            home.join(".claude.json"),
+            serde_json::to_string(
+                &serde_json::json!({ "mcpServers": { "user-srv": server(TOOLS_OK) } }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            proj.path().join(".mcp.json"),
+            serde_json::to_string(
+                &serde_json::json!({ "mcpServers": { "proj-srv": server(TOOLS_OK) } }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let l = build_ledger("claude", Some(proj.path())).unwrap();
+        let mut names: Vec<_> = l
+            .items
+            .iter()
+            .filter(|i| i.kind == ItemKind::McpTools)
+            .map(|i| i.name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["mcp: proj-srv", "mcp: user-srv"]);
+    });
+}
+
+#[test]
+fn opencode_local_mcp_entry_is_translated_and_disabled_skipped() {
+    with_home(|home| {
+        let dir = home.join(".config").join("opencode");
+        fs::create_dir_all(&dir).unwrap();
+        let script =
+            format!("read a; echo '{INIT_OK}'; read b; read c; echo '{TOOLS_OK}'; sleep 5");
+        let cfg = serde_json::json!({
+            "mcp": {
+                "local-srv": { "type": "local", "command": ["/bin/sh", "-c", script], "environment": {"A": "b"} },
+                "off-srv": { "type": "local", "command": ["/bin/sh", "-c", "exit 1"], "enabled": false }
+            }
+        });
+        fs::write(dir.join("opencode.json"), cfg.to_string()).unwrap();
+        let l = build_ledger("opencode", None).unwrap();
+        let names: Vec<_> = l.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["mcp: local-srv"]);
+        assert_eq!(l.items[0].tool_count, Some(2));
+    });
+}
+
+#[test]
+fn opencode_jsonc_trailing_commas_and_instructions_and_global_agents_md() {
+    with_home(|home| {
+        let dir = home.join(".config").join("opencode");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("AGENTS.md"), "global rules").unwrap();
+        let proj = tempdir().unwrap();
+        fs::write(proj.path().join("extra.md"), "extra instructions").unwrap();
+        fs::write(
+            dir.join("opencode.jsonc"),
+            r#"{
+  // trailing commas are legal JSONC
+  "prompt": "hi, there",
+  "instructions": ["extra.md",],
+}"#,
+        )
+        .unwrap();
+        let l = build_ledger("opencode", Some(proj.path())).unwrap();
+        let names: Vec<_> = l.items.iter().map(|i| i.name.as_str()).collect();
+        assert!(names.contains(&"opencode prompt"), "{names:?}");
+        assert!(names.contains(&"Global AGENTS.md"), "{names:?}");
+        assert!(names.contains(&"instructions: extra.md"), "{names:?}");
+    });
+}
+
+#[test]
+fn out_of_range_mtime_does_not_panic() {
+    let far = std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::MAX / 2);
+    assert!(utc_from_system_time(far).is_none());
+    assert!(utc_from_system_time(std::time::UNIX_EPOCH).is_some());
+}
+
+#[test]
+fn read_capped_rejects_non_regular_files() {
+    let td = tempdir().unwrap();
+    assert!(read_capped(td.path()).is_none(), "directory");
+    assert!(
+        read_capped(std::path::Path::new("/dev/zero")).is_none(),
+        "device"
+    );
+    let f = td.path().join("f");
+    fs::write(&f, "ok").unwrap();
+    assert_eq!(read_capped(&f).unwrap(), b"ok");
+}
+
+#[test]
+fn mcp_servers_are_probed_concurrently() {
+    let slow =
+        format!("read a; sleep 1; echo '{INIT_OK}'; read b; read c; echo '{TOOLS_OK}'; sleep 5");
+    let servers: Vec<_> = (0..4)
+        .map(|i| (format!("s{i}"), sh_server(&slow)))
+        .collect();
+    let t = std::time::Instant::now();
+    let out = probe_servers(servers);
+    assert!(out.iter().all(|(_, r)| r.is_ok()), "{out:?}");
+    assert!(
+        t.elapsed() < std::time::Duration::from_millis(3000),
+        "took {:?}",
+        t.elapsed()
+    );
+    let names: Vec<_> = out.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, vec!["s0", "s1", "s2", "s3"]);
+}
+
+#[test]
+fn cli_run_fails_when_no_provider_could_be_built() {
+    with_home(|_| {
+        assert!(cli::run(Some("nope".into()), None).is_err());
+        assert!(cli::run(Some("codex".into()), None).is_ok());
+    });
 }

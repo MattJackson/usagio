@@ -1,7 +1,9 @@
 //! `usagio context [--provider <slug>] [--project <path>]` subcommand.
 //!
-//! When no `--provider` is given, iterates the built-in known-CLI list.
-//! Providers not registered in the trait registry are silently skipped.
+//! When no `--provider` is given, iterates the fixed built-in list (claude,
+//! codex, opencode); it is not tied to the provider trait registry. An
+//! unknown provider name prints `unknown provider` to stderr, and the command
+//! exits non-zero if no provider produced a ledger at all.
 
 use super::{build_ledger, render_terminal};
 use std::path::PathBuf;
@@ -42,7 +44,7 @@ pub fn run(provider: Option<String>, project: Option<PathBuf>) -> anyhow::Result
         }
     }
     if !printed_any {
-        println!("Context Ledger — no context items discovered for any provider.");
+        anyhow::bail!("no context ledger could be built for the requested provider(s)");
     }
     Ok(())
 }

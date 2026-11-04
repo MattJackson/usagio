@@ -58,7 +58,7 @@ pub fn terminal(ledger: &Ledger) -> String {
                 .map(|n| format!(" ({} tools)", n))
                 .unwrap_or_default();
             out.push_str(&format!(
-                "    {:name_col$}{:>10} tok{}\n",
+                "    {:name_col$}   {:>10} tok{}\n",
                 item.name,
                 fmt_thousands(item.token_count),
                 tool_hint,
@@ -220,12 +220,12 @@ mod tests {
         let expected = [
             "Context Ledger — Claude Code",
             "  Global instructions           250 tok",
-            "    Global CLAUDE.md         250 tok",
+            "    Global CLAUDE.md            250 tok",
             "  Skills                      2,000 tok",
-            "    skill: a               1,500 tok",
-            "    skill: b                 500 tok",
+            "    skill: a                  1,500 tok",
+            "    skill: b                    500 tok",
             "  MCP servers                12,345 tok",
-            "    mcp: srv              12,345 tok (4 tools)",
+            "    mcp: srv                 12,345 tok (4 tools)",
             "  ----------------------------------------",
             "  Total baseline per turn       14,595 tok",
             "  Est. cost per turn     $   0.0123",

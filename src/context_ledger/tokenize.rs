@@ -44,12 +44,11 @@ fn openai_tokens(_text: &str) -> Option<usize> {
 }
 
 /// Anthropic + fallback approximation. English averages ~3.6 chars per token
-/// for modern BPE tokenizers; use 3 for slight over-estimate (safer to show
-/// "worse" numbers in a quota UI than to under-report).
+/// for modern BPE tokenizers; we use chars*11/40 (~3.64 chars/token), which
+/// tracks empirical Claude/GPT counts rather than deliberately over-estimating.
 fn approx(text: &str) -> usize {
     let chars = text.chars().count();
-    // 3 chars/token → tokens = chars * 1/3, but do it as chars*11/40 ≈ 0.275
-    // to land ~3.6 chars/token which matches empirical Claude/GPT counts.
+    // 11/40 = 0.275 tokens/char ≈ 3.64 chars/token.
     (chars * 11).div_ceil(40)
 }
 
