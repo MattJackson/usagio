@@ -169,6 +169,33 @@ pub fn absorb_all_lagging(provider: &dyn Provider) -> Vec<AccountKey> {
     seen
 }
 
+/// Case-insensitive "is `key` the active account" — matches every other
+/// identity check in `State` (`find`, `still_active`, `from_value`).
+fn is_active_key(key: &str, active: Option<&str>) -> bool {
+    active.is_some_and(|a| a.eq_ignore_ascii_case(key))
+}
+
+/// Set `needs_relogin` on `email` under the state lock, but only if the
+/// account still holds `failed_refresh_token` (the grant that just got
+/// `invalid_grant`). Returns whether the flag was newly set.
+pub(crate) fn flag_needs_relogin_if_unchanged(
+    email: &str,
+    failed_refresh_token: &str,
+) -> Result<bool> {
+    with_state_lock(|| {
+        let mut st = State::load()?;
+        let Some(a) = st.find_mut(email) else {
+            return Ok(false);
+        };
+        if a.refresh_token != failed_refresh_token || a.needs_relogin {
+            return Ok(false);
+        }
+        a.needs_relogin = true;
+        st.save()?;
+        Ok(true)
+    })
+}
+
 /// Proactively refresh any INACTIVE Claude account whose stored access
 /// token is within REFRESH_SKEW_SECS of expiry. The active account is
 /// deliberately skipped — let the vendor CLI own its own rotation so our
@@ -198,7 +225,7 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
                 .accounts
                 .iter()
                 .filter(|a| !a.needs_relogin)
-                .filter(|a| Some(a.key()) != active.as_deref())
+                .filter(|a| !is_active_key(a.key(), active.as_deref()))
                 .cloned()
                 .collect();
             Ok((accounts, active))
@@ -216,7 +243,7 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
         // below re-checks `active` under the lock immediately before saving
         // and no-ops if so — so a stale skip decision here can only cause a
         // harmless extra refresh attempt, never a clobbered write.
-        if active_at_snapshot.as_deref() == Some(email.as_str()) {
+        if is_active_key(&email, active_at_snapshot.as_deref()) {
             continue;
         }
         match crate::providers::claude::oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
@@ -235,30 +262,23 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
                     crate::logging::log(&format!(
                         "event=needs_relogin account={email} reason=invalid_grant"
                     ));
-                    // Alert on the TRANSITION into needs_relogin. The snapshot
-                    // at the top of this fn already filters out accounts that
-                    // were ALREADY flagged (`.filter(|a| !a.needs_relogin)`), so
-                    // any account reaching this branch is flipping clear→flagged
-                    // right now — a stuck account never re-notifies on later
-                    // polls. Without this the account silently freezes and its
-                    // cached numbers rot for days (the exact "no notification,
-                    // just stale" failure this path was patched for).
-                    crate::notify(&format!(
-                        "{email}: re-login required — run `usagio capture`"
-                    ));
-                    // R2-EH-01 (round-2 codeaudit): mirror flag_needs_relogin's
-                    // logging on save-Err so a state.json write failure here is
-                    // visible instead of being silently discarded.
-                    if let Err(e) = with_state_lock(|| {
-                        let mut st = State::load()?;
-                        if let Some(a) = st.find_mut(&email) {
-                            a.needs_relogin = true;
-                        }
-                        st.save()
-                    }) {
-                        crate::logging::log(&format!(
+                    // R2-EH-01 (round-2 codeaudit): log a state.json write
+                    // failure instead of discarding it. The flag is only set
+                    // if the account still holds the refresh token that just
+                    // failed (a concurrent rotation/re-login must not be
+                    // clobbered), and the alert fires only after a successful
+                    // flag, on the clear->flagged transition.
+                    match flag_needs_relogin_if_unchanged(&email, &acct.refresh_token) {
+                        Ok(true) => crate::notify(&format!(
+                            "{email}: re-login required — run `usagio capture`"
+                        )),
+                        Ok(false) => crate::logging::log(&format!(
+                            "credentials: {email}: refresh token changed since the \
+                             invalid_grant; not flagging needs_relogin"
+                        )),
+                        Err(e) => crate::logging::log(&format!(
                             "credentials: flag_needs_relogin({email}): save failed: {e:#}"
-                        ));
+                        )),
                     }
                 }
             }
@@ -338,8 +358,8 @@ pub fn last_chance_fallback(provider: &dyn Provider, target: &AccountKey) -> boo
 }
 
 /// Handle emitted by `spawn_watchers`. Dropping it drops the underlying
-/// notify::RecommendedWatcher and stops the background thread.
-#[allow(dead_code)]
+/// notify::RecommendedWatcher and stops the background thread. Owned by
+/// `WATCHER_REGISTRY` once installed via [`install_watchers`].
 pub struct WatcherHandle {
     // The watcher must outlive the thread, so we keep it here. The thread
     // owns the receiver end and shuts down when we drop the sender-carrying
@@ -350,9 +370,9 @@ pub struct WatcherHandle {
 
 /// Spawn a background thread that fsnotifies every provider's credential
 /// paths and calls `absorb_all_lagging` + `refresh_inactive_if_stale` on
-/// change. Returns a `WatcherHandle` whose Drop shuts everything down —
-/// callers that want the watcher to live for the process lifetime should
-/// `Box::leak` or store the handle in a `OnceLock`.
+/// change. Returns a `WatcherHandle` whose Drop shuts everything down.
+/// Daemon callers should go through [`install_watchers`], which stores the
+/// handle in `WATCHER_REGISTRY` for the process lifetime.
 ///
 /// Errors from watch setup are logged and swallowed: the daemon must not
 /// crash if `~/.claude/` doesn't exist yet on a fresh install.
@@ -391,7 +411,7 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
     // maxing out RLIMIT_NOFILE (256 on stock macOS) within days. Any
     // credential file whose parent lands here (e.g. `~/.claude.json` under
     // `$HOME`) is picked up by the periodic `absorb_all_lagging` poll every
-    // watch cycle instead. Latency goes from ~2s to ~30s for that one file;
+    // watch cycle instead. Latency goes from ~2s to one watch interval (`WATCH_INTERVAL_SECS`, 180s) for that one file;
     // capture still works.
     let home_dir = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let root_dir = std::path::PathBuf::from("/");
@@ -440,7 +460,7 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
                 let _ = crate::platform::current().secure_permissions(&parent);
             }
             // R2-EH-02: log watch failures (EMFILE/ENOSPC/permission/unsupported
-            // FS) so a silent watch drop doesn't degrade us to the 150s poll
+            // FS) so a silent watch drop doesn't degrade us to the periodic (180s) poll
             // cadence with no diagnostic.
             match watcher.watch(&parent, RecursiveMode::NonRecursive) {
                 Ok(()) => {
@@ -550,7 +570,7 @@ const WATCHER_PANIC_BACKOFF: Duration = Duration::from_millis(500);
 /// `identify_credential`/`credential_freshness`/`absorb_credential` (or in
 /// `refresh_inactive_if_stale`) can't silently kill the whole watcher thread.
 /// Without this, a single panicking event permanently degrades real-time
-/// credential absorption to the slow (150s) poll path for the rest of the
+/// credential absorption to the slow (180s) poll path for the rest of the
 /// process's life, with no diagnostic (errors-03, v0.5.2 audit).
 fn fsnotify_watcher_supervisor(
     rx: mpsc::Receiver<notify::Event>,

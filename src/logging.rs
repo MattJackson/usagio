@@ -73,6 +73,28 @@ pub fn rotate_if_large(path: &std::path::Path, max_bytes: u64) {
     if m.len() <= max_bytes {
         return;
     }
+    // Serialise rotation across threads/processes with a try-lock sidecar:
+    // two writers that both saw size>max must not both rename (the second
+    // would move the fresh small log over the just-rotated `.1`). Whoever
+    // loses the lock skips (the winner is rotating); the winner re-stats
+    // under the lock in case it lost a race before acquiring it.
+    let mut lock_ext = path.extension().unwrap_or_default().to_os_string();
+    lock_ext.push(".rotate.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path.with_extension(lock_ext))
+        .ok();
+    if let Some(lf) = &lock_file {
+        if fs2::FileExt::try_lock_exclusive(lf).is_err() {
+            return;
+        }
+        match std::fs::metadata(path) {
+            Ok(m) if m.len() > max_bytes => {}
+            _ => return,
+        }
+    }
     let rotated_name = |gen: u32| -> std::path::PathBuf {
         let mut ext = path.extension().unwrap_or_default().to_os_string();
         if gen <= 1 {
@@ -136,8 +158,15 @@ pub fn log(msg: &str) {
 
     if let Ok(mut f) = open_append_private(&path) {
         let ts = chrono::Utc::now().to_rfc3339();
-        let _ = writeln!(f, "{ts} {msg}");
+        // One write_all of the whole line: `writeln!` on an unbuffered File
+        // issues several write syscalls, which concurrent writers (threads
+        // or processes) could interleave mid-line even with O_APPEND.
+        let _ = f.write_all(format_log_line(&ts, msg).as_bytes());
     }
+}
+
+fn format_log_line(ts: &str, msg: &str) -> String {
+    format!("{ts} {msg}\n")
 }
 
 #[cfg(test)]
@@ -204,6 +233,38 @@ mod tests {
             contents.contains("event=log_rotation_failed"),
             "expected the rotation-failed event to be appended, got: {contents}"
         );
+    }
+
+    /// log-rotate-race: a writer that loses the rotation lock must skip
+    /// instead of renaming over a generation another process is rotating.
+    #[test]
+    fn rotate_if_large_skips_when_another_rotator_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usagio.log");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.path().join("usagio.log.rotate.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
+        rotate_if_large(&path, 5);
+        assert!(
+            path.exists(),
+            "must not rotate while another rotator holds the lock"
+        );
+        assert!(!dir.path().join("usagio.log.1").exists());
+        fs2::FileExt::unlock(&lock).unwrap();
+        rotate_if_large(&path, 5);
+        assert!(!path.exists() && dir.path().join("usagio.log.1").exists());
+    }
+
+    /// log-line-interleave: the whole line is formatted up front so it can be
+    /// emitted in a single write.
+    #[test]
+    fn format_log_line_is_one_newline_terminated_line() {
+        assert_eq!(format_log_line("T", "hello"), "T hello\n");
     }
 
     /// Cross-platform: the handle must be a real append-mode file at `path`

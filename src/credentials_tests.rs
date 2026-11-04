@@ -1260,3 +1260,41 @@ fn install_then_respawn_watchers_rebuilds_the_registered_watcher() {
         reg.providers.clear();
     }
 }
+
+// -----------------------------------------------------------------------------
+// relogin-flag-race / active-case-compare (codeaudit r1 C4)
+// -----------------------------------------------------------------------------
+
+fn claude_account_with_refresh(email: &str, refresh: &str) -> crate::store::Account {
+    let blob = format!(
+        r#"{{"claudeAiOauth":{{"accessToken":"at","refreshToken":"{refresh}","expiresAt":123}}}}"#
+    );
+    let mut a = crate::store::Account::from_keychain_blob(&blob).unwrap();
+    a.email = Some(email.to_string());
+    a
+}
+
+#[test]
+fn flag_needs_relogin_skips_account_whose_refresh_token_rotated() {
+    with_isolated_home(|| {
+        let mut st = State::default();
+        st.accounts
+            .push(claude_account_with_refresh("a@e.com", "new-rt"));
+        st.save().unwrap();
+        // The invalid_grant verdict was for the OLD token; another process
+        // has since rotated it. Must not flag.
+        let flagged = flag_needs_relogin_if_unchanged("a@e.com", "old-rt").unwrap();
+        assert!(!flagged, "stale verdict must not flag a rotated account");
+        assert!(!State::load().unwrap().accounts[0].needs_relogin);
+        // Same token that failed -> flag.
+        assert!(flag_needs_relogin_if_unchanged("a@e.com", "new-rt").unwrap());
+        assert!(State::load().unwrap().accounts[0].needs_relogin);
+    });
+}
+
+#[test]
+fn active_key_comparison_is_case_insensitive() {
+    assert!(is_active_key("Alice@E.com", Some("alice@e.com")));
+    assert!(!is_active_key("b@e.com", Some("alice@e.com")));
+    assert!(!is_active_key("b@e.com", None));
+}
