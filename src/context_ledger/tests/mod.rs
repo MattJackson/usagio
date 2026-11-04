@@ -945,3 +945,23 @@ fn repo_settings_can_still_disable_servers_when_untrusted() {
         assert!(!canon.join("ran").exists());
     });
 }
+
+#[test]
+fn claude_project_instructions_found_in_all_documented_locations() {
+    with_home(|_home| {
+        let root = tempdir().unwrap();
+        let proj = root.path().join("sub");
+        fs::create_dir_all(proj.join(".claude")).unwrap();
+        fs::write(proj.join(".claude").join("CLAUDE.md"), "dot claude").unwrap();
+        fs::write(proj.join("CLAUDE.local.md"), "local").unwrap();
+        fs::write(root.path().join("CLAUDE.md"), "ancestor").unwrap();
+        let l = build_ledger("claude", Some(&proj)).unwrap();
+        let names: Vec<_> = l.items.iter().map(|i| i.name.as_str()).collect();
+        assert!(names.contains(&"Project .claude/CLAUDE.md"), "{names:?}");
+        assert!(names.contains(&"Project CLAUDE.local.md"), "{names:?}");
+        assert!(
+            names.iter().any(|n| n.starts_with("CLAUDE.md (")),
+            "{names:?}"
+        );
+    });
+}

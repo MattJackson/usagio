@@ -2,7 +2,9 @@
 //!
 //! Claude loads context from a well-documented set of locations:
 //! - ~/.claude/CLAUDE.md — global instructions
-//! - <project>/CLAUDE.md — project instructions
+//! - <project>/CLAUDE.md, <project>/.claude/CLAUDE.md, <project>/CLAUDE.local.md,
+//!   and CLAUDE.md / CLAUDE.local.md in every ancestor directory — project
+//!   instructions
 //! - ~/.claude/skills/*/SKILL.md — skill definitions; only the frontmatter
 //!   `name`/`description` is injected per turn (the body loads on use)
 //! - ~/.claude/agents/*.md — subagent definitions (likewise frontmatter only)
@@ -32,14 +34,35 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
         "Global CLAUDE.md",
     );
 
-    // Project CLAUDE.md
-    if let Some(proj) = project {
-        push_file_if_exists(
-            &mut items,
-            proj.join("CLAUDE.md"),
-            ItemKind::ProjectInstructions,
-            "Project CLAUDE.md",
-        );
+    // Claude Code keys projects by absolute path.
+    let proj_abs: Option<PathBuf> =
+        project.map(|p| fs::canonicalize(p).unwrap_or_else(|_| absolute_path(p)));
+
+    // Project instructions: ./CLAUDE.md, ./.claude/CLAUDE.md, ./CLAUDE.local.md,
+    // plus CLAUDE.md / CLAUDE.local.md in every ancestor directory.
+    if let Some(proj) = &proj_abs {
+        for (rel, label) in [
+            ("CLAUDE.md", "Project CLAUDE.md"),
+            (".claude/CLAUDE.md", "Project .claude/CLAUDE.md"),
+            ("CLAUDE.local.md", "Project CLAUDE.local.md"),
+        ] {
+            push_file_if_exists(
+                &mut items,
+                proj.join(rel),
+                ItemKind::ProjectInstructions,
+                label,
+            );
+        }
+        for dir in proj.ancestors().skip(1) {
+            for f in ["CLAUDE.md", "CLAUDE.local.md"] {
+                push_file_if_exists(
+                    &mut items,
+                    dir.join(f),
+                    ItemKind::ProjectInstructions,
+                    &format!("{f} ({})", dir.display()),
+                );
+            }
+        }
     }
 
     // Skills — ~/.claude/skills/<name>/SKILL.md
