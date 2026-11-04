@@ -330,12 +330,28 @@ pub fn exchange(
 pub struct Progress {
     finished: AtomicBool,
     cancelled: AtomicBool,
+    superseded: AtomicBool,
 }
 
 impl Progress {
     /// The flow ended (success or failure) — close the sign-in page.
     pub fn is_finished(&self) -> bool {
         self.finished.load(Ordering::SeqCst)
+    }
+    /// The sign-in page was closed, or a newer login superseded this flow.
+    #[cfg(test)]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+    /// A newer login for the same provider replaced this flow.
+    pub fn is_superseded(&self) -> bool {
+        self.superseded.load(Ordering::SeqCst)
+    }
+    /// Stop this flow because a newer one is starting: like [`cancel`](Self::cancel),
+    /// but the flow ends quietly (no failure notification).
+    pub fn supersede(&self) {
+        self.superseded.store(true, Ordering::SeqCst);
+        self.cancel();
     }
     /// The user closed the sign-in page — stop waiting.
     pub fn cancel(&self) {
@@ -391,6 +407,20 @@ pub fn new_store_key() -> String {
     format!("new:{}", random_token(12))
 }
 
+/// Wait for the redirect, then release the listener (and its port) before
+/// returning: the caller signals completion only afterwards, so a successor
+/// that binds the same fixed port (Codex: 1455) never races a live listener.
+fn wait_and_release(
+    loopback: Loopback,
+    state: &str,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<String> {
+    let code = loopback.wait_for_code(state, timeout, cancel);
+    drop(loopback);
+    code
+}
+
 /// Begin a login for `provider`. `on_done` runs on the worker thread once the
 /// flow ends.
 pub fn start(
@@ -411,12 +441,13 @@ pub fn start(
         &loopback.redirect_uri,
         target.expected(),
     )?;
+    let redirect_uri = loopback.redirect_uri.clone();
     let progress = Arc::new(Progress::default());
     let worker = Arc::clone(&progress);
     std::thread::spawn(move || {
         let result = (|| {
-            let code = loopback.wait_for_code(&state, LOGIN_TIMEOUT, &worker.cancelled)?;
-            let tokens = exchange(&spec, &code, &pkce.verifier, &state, &loopback.redirect_uri)?;
+            let code = wait_and_release(loopback, &state, LOGIN_TIMEOUT, &worker.cancelled)?;
+            let tokens = exchange(&spec, &code, &pkce.verifier, &state, &redirect_uri)?;
             let captured = provider
                 .complete_login(&tokens)
                 .map_err(|e| anyhow!("{e}"))?;
@@ -439,6 +470,11 @@ pub fn start(
                 provider.provider_id()
             ),
         });
+        // A flow replaced by a newer sign-in ends quietly: its failure
+        // notice would read as an error beside the new attempt.
+        if worker.is_superseded() && result.is_err() {
+            return;
+        }
         on_done(result);
     });
     Ok(Started { url, progress })
