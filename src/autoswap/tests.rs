@@ -1706,3 +1706,69 @@ fn blocked_manual_pick_prepares_earlier_session_reset_after_cooldown() {
         );
     }
 }
+
+#[test]
+fn stuck_notice_names_the_soonest_unlock_not_the_soonest_weekly_reset() {
+    let now = at(12, 0, 0);
+    // Both session-blocked, weekly has room and resets days out.
+    let s = snap(
+        now,
+        "a",
+        vec![
+            acct("a", 100.0, 40.0, now).sreset(Some(now + Duration::hours(1))),
+            acct("b", 100.0, 70.0, now).sreset(Some(now + Duration::hours(3))),
+        ],
+    );
+    let soonest = super::shell::soonest_unlock(&assess_all(&s), now);
+    assert_eq!(soonest, Some(now + Duration::hours(1)));
+    // A block whose reset already passed is not "soonest".
+    assert_eq!(
+        super::shell::soonest_unlock(&assess_all(&s), now + Duration::hours(2)),
+        Some(now + Duration::hours(3))
+    );
+}
+
+#[test]
+fn stale_stuck_decision_never_touches_the_new_actives_memory() {
+    use super::shell::stuck_update;
+    let now = at(12, 0, 0);
+    let s = snap(
+        now,
+        "a",
+        vec![
+            acct("a", 100.0, 100.0, now).sreset(Some(now + Duration::hours(1))),
+            acct("b", 100.0, 100.0, now).sreset(Some(now + Duration::hours(2))),
+        ],
+    );
+    let d = decide(&s);
+    assert!(d.stuck, "{d:?}");
+    // A concurrent manual switch moved the memory on to "b".
+    let mut m = SwapMemory {
+        last_seen_active: Some("b".to_string()),
+        ..Default::default()
+    };
+    assert!(!stuck_update(&mut m, &d, "a"));
+    assert!(!m.stuck_notified && m.real_tier.is_none() && m.draining.is_none());
+    // The matching active still arms and fires as before.
+    m.last_seen_active = Some("a".to_string());
+    assert!(stuck_update(&mut m, &d, "a"));
+}
+
+#[test]
+fn a_pick_set_after_the_cycle_began_is_detected() {
+    use crate::store::State;
+    let before = State {
+        active: Some("a@x.io".to_string()),
+        ..Default::default()
+    };
+    let mut after = before.clone();
+    assert!(!super::shell::pick_changed(&before, &after, "claude"));
+    after.set_manual_pick("claude", Some("a@x.io"));
+    assert!(super::shell::pick_changed(&before, &after, "claude"));
+}
+
+#[test]
+fn a_missing_pct_is_shown_as_a_dash_not_zero() {
+    assert_eq!(super::shell::fmt_pct(None), "—");
+    assert_eq!(super::shell::fmt_pct(Some(41.6)), "42%");
+}
