@@ -1276,7 +1276,10 @@ mod tests {
         );
         assert!(!is_reset(&b, &c, Window::Session));
         let again = dedup_and_apply(&mut state, &b, &c, evaluate(&b, &c, &cfg));
-        assert!(again.is_empty(), "re-fired on a now-relative stamp: {again:?}");
+        assert!(
+            again.is_empty(),
+            "re-fired on a now-relative stamp: {again:?}"
+        );
     }
 
     #[test]

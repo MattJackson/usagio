@@ -4758,7 +4758,9 @@ static LAST_REFRESH_ERRORS: std::sync::Mutex<Option<std::collections::HashMap<St
     std::sync::Mutex::new(None);
 
 fn note_refresh_error(key: &str, err: Option<String>) {
-    let mut g = LAST_REFRESH_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = LAST_REFRESH_ERRORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let m = g.get_or_insert_with(Default::default);
     match err {
         Some(e) => {

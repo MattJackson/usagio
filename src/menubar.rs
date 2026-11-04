@@ -3440,7 +3440,11 @@ fn handle_refresh_now() {
                 // would be a quiet lie for those rows.
                 let fetched = outcome.providers.iter().map(|p| p.fetched).sum();
                 let failed = outcome.providers.iter().map(|p| p.failed).sum();
-                notify(&refresh_summary(fetched, failed, &accounts_needing_relogin()));
+                notify(&refresh_summary(
+                    fetched,
+                    failed,
+                    &accounts_needing_relogin(),
+                ));
             }
         });
     })
