@@ -7313,7 +7313,11 @@ fn claim_for_the_active_account_falls_back_to_the_stored_token_on_state_error() 
         Account::from_keychain_blob(&mock_claude_blob("stored-at", "stored-rt", 1_000)).unwrap();
     acct.email = Some("active@example.com".into());
     // An unreadable state.json makes the locked CAS fail to load.
-    std::fs::write(crate::store::config_dir().unwrap().join("state.json"), "{ not json").unwrap();
+    std::fs::write(
+        crate::store::config_dir().unwrap().join("state.json"),
+        "{ not json",
+    )
+    .unwrap();
     claim_refresh_token(provider, "active@example.com", &mut acct, true)
         .expect("a CAS that cannot run must degrade to the stored token");
     assert_eq!(acct.access_token, "stored-at");

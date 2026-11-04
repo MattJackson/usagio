@@ -20,7 +20,10 @@ use std::path::{Path, PathBuf};
 /// credential-store resolver uses. (An empty `$CODEX_HOME` is treated as unset
 /// here, as Codex itself does.)
 fn codex_dir() -> Option<PathBuf> {
-    resolve_codex_dir(crate::paths::path_env_var("CODEX_HOME"), crate::paths::user_home())
+    resolve_codex_dir(
+        crate::paths::path_env_var("CODEX_HOME"),
+        crate::paths::user_home(),
+    )
 }
 
 pub(crate) fn resolve_codex_dir(
