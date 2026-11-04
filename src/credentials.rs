@@ -177,7 +177,7 @@ pub fn absorb_all_lagging(provider: &dyn Provider) -> Vec<AccountKey> {
 
 /// Case-insensitive "is `key` the active account" — matches every other
 /// identity check in `State` (`find`, `still_active`, `from_value`).
-fn is_active_key(key: &str, active: Option<&str>) -> bool {
+pub(crate) fn is_active_key(key: &str, active: Option<&str>) -> bool {
     active.is_some_and(|a| a.eq_ignore_ascii_case(key))
 }
 

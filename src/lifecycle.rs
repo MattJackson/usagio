@@ -493,7 +493,7 @@ pub(crate) fn ensure_claude_fresh(
 /// account is the vendor-owned active one.
 fn adopt_saved_rotation(acct: &mut Account) -> Result<(bool, bool)> {
     let st = crate::store::State::load()?;
-    let active = st.active.as_deref() == Some(acct.key());
+    let active = crate::credentials::is_active_key(acct.key(), st.active.as_deref());
     let adopted = match st.find(acct.key()) {
         Some(saved) if saved.refresh_token != acct.refresh_token => {
             acct.adopt_tokens_if_newer(saved)
@@ -509,7 +509,7 @@ fn adopt_saved_rotation(acct: &mut Account) -> Result<(bool, bool)> {
 fn save_rotation(acct: &Account, sent: &str) -> anyhow::Result<()> {
     crate::credentials::with_state_lock(|| {
         let mut st = crate::store::State::load()?;
-        if st.active.as_deref() == Some(acct.key()) {
+        if crate::credentials::is_active_key(acct.key(), st.active.as_deref()) {
             return Ok(());
         }
         if let Some(a) = st.find_mut(acct.key()) {

@@ -1163,6 +1163,40 @@ fn ensure_fresh_never_spends_the_grant_of_an_account_that_went_active() {
 }
 
 #[test]
+fn active_key_case_mismatch_still_blocks_every_refresh_site() {
+    use crate::store::State;
+    with_isolated_home(|| {
+        seed_state(
+            vec![expired_account("now-active@example.com")],
+            Some("Now-Active@Example.com"),
+        );
+        let (url, hits) = spawn_token_server(200, || {});
+        let _u = TokenUrlGuard::set(&url);
+
+        // lifecycle::adopt_saved_rotation / save_rotation via ensure_fresh.
+        let mut stale = expired_account("now-active@example.com");
+        let changed = crate::providers::claude::oauth::ensure_fresh(&mut stale, 900).unwrap();
+        assert!(!changed);
+        // credentials.rs background refresh.
+        refresh_inactive_if_stale(None);
+
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the vendor-owned active account's grant must never be POSTed"
+        );
+        assert_eq!(
+            State::load()
+                .unwrap()
+                .find("now-active@example.com")
+                .unwrap()
+                .refresh_token,
+            "stale-rt"
+        );
+    });
+}
+
+#[test]
 fn refresh_inactive_if_stale_skips_accounts_already_flagged_needs_relogin() {
     use crate::store::State;
     with_isolated_home(|| {
