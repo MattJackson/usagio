@@ -251,6 +251,18 @@ impl MenuHandle for WindowsMenuHandle {
 #[derive(Clone, Default)]
 struct LoopWaker(Arc<std::sync::atomic::AtomicU32>);
 
+/// The running tray loop's waker, for [`wake_ui_thread`].
+static UI_WAKER: Mutex<Option<LoopWaker>> = Mutex::new(None);
+
+/// Wake the running tray loop so it drains `menubar::run_ui_tasks` now
+/// rather than at the wait backstop. A no-op before the loop starts.
+pub(super) fn wake_ui_thread() {
+    let waker = UI_WAKER.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+}
+
 /// Thread message used only to end the tray loop's wait.
 const WM_USAGIO_WAKE: u32 = ::windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x55;
 
@@ -462,6 +474,7 @@ impl MenuBackend for WindowsMenu {
         // From here a sender's wake reaches this thread; anything sent before
         // is drained by the first pass below.
         self.wake.bind_current_thread();
+        *UI_WAKER.lock().unwrap_or_else(|e| e.into_inner()) = Some(self.wake.clone());
         loop {
             if self.quit.load(Ordering::SeqCst) {
                 break;
@@ -472,13 +485,16 @@ impl MenuBackend for WindowsMenu {
                     crate::logging::log(&format!("windows tray: UI command failed: {e}"));
                 }
             }
+            // Work a worker handed back to this (the UI) thread.
+            crate::menubar::run_ui_tasks();
             while let Ok(ev) = menu_rx.try_recv() {
                 if let Some(cb) = self.click_cb.lock().unwrap().as_ref() {
                     cb(&ev.id.0);
                 }
             }
             // Menu clicks are dispatched on this thread by the pump above;
-            // UI commands and quit requests from other threads post a wake.
+            // UI commands, UI tasks and quit requests from other threads post
+            // a wake.
             if self.quit.load(Ordering::SeqCst) {
                 break;
             }

@@ -132,6 +132,13 @@ pub trait Platform: Send + Sync + 'static {
     fn open_url(&self, url: &str) -> Result<()> {
         sign_in::open_url(url)
     }
+
+    /// Delete every sign-in window cookie store (see `crate::login::store_id`)
+    /// not in `keep` and not used by an open sign-in window. UI thread only;
+    /// best-effort (failures are logged, and the next sweep retries).
+    fn sweep_sign_in_stores(&self, keep: std::collections::HashSet<[u8; 16]>) {
+        sign_in::sweep(keep)
+    }
 }
 
 // ---------- MenuBackend ---------------------------------------------------
@@ -393,6 +400,14 @@ mod linux;
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
+
+/// Wake the tray's UI-thread loop so work queued for it (see
+/// `menubar::run_ui_tasks`) runs now. Only the Windows loop blocks between
+/// ticks; the macOS and GTK loops tick on a timer, so this is a no-op there.
+pub(crate) fn wake_ui_thread() {
+    #[cfg(target_os = "windows")]
+    windows::wake_ui_thread();
+}
 
 // The single IR→muri menu translator, shared by every platform's tray backend
 // (macOS's bespoke run loop in `menubar`, plus the Linux/Windows `MenuBackend`

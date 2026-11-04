@@ -2587,10 +2587,21 @@ fn flag_needs_relogin_marks_only_that_account() {
         ],
         None,
     );
-    flag_needs_relogin("dead@e.com");
+    flag_needs_relogin("dead@e.com", "rt-dead@e.com");
     let st = State::load().unwrap();
     assert!(st.find("dead@e.com").unwrap().needs_relogin);
     assert!(!st.find("fine@e.com").unwrap().needs_relogin);
+}
+
+#[test]
+fn flag_needs_relogin_spares_an_account_whose_grant_was_replaced() {
+    // The rejected grant is not the one saved now (a renewal or rotation
+    // landed meanwhile): the saved login is healthy and must stay unflagged.
+    let _g = crate::store::ScopedConfigDir::new();
+    seed_claude_state(vec![claude_account("renewed@e.com", 3_600_000)], None);
+    flag_needs_relogin("renewed@e.com", "an-older-rt");
+    let st = State::load().unwrap();
+    assert!(!st.find("renewed@e.com").unwrap().needs_relogin);
 }
 
 #[test]
@@ -7396,19 +7407,6 @@ fn claim_for_the_active_account_uses_the_slot_token_without_posting() {
 }
 
 #[test]
-fn stored_refresh_token_tracks_a_fallback_adoption() {
-    let _g = crate::store::ScopedConfigDir::new();
-    let mut st = State::default();
-    let mut a = acct_with_cache(None);
-    a.email = Some("rt@e.com".into());
-    a.refresh_token = "T2".into();
-    st.upsert(a);
-    st.save().unwrap();
-    assert_eq!(stored_refresh_token("rt@e.com", "T1"), "T2");
-    assert_eq!(stored_refresh_token("nobody@e.com", "T1"), "T1");
-}
-
-#[test]
 fn note_polled_provider_active_reports_only_a_change_per_slug() {
     let slug = "polled-active-test";
     assert!(note_polled_provider_active(slug, Some("a")));
@@ -8187,4 +8185,50 @@ fn a_failed_prepaid_fetch_keeps_the_previous_balance_and_is_not_retried_every_po
         );
     }
     assert_eq!(fetches.get(), 1);
+}
+
+#[test]
+fn a_provider_account_added_by_sign_in_keeps_its_store_through_a_sweep() {
+    // "Sign in to a new Codex account…" used a fresh store; its renewals must
+    // reopen that session, so the store sweep must keep it.
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let provider = MockActiveSlotProvider::new("outgoing");
+    let slug = provider.provider_id();
+    let k = "added@example.com";
+    let captured = providers::trait_def::CapturedAccount {
+        identity: providers::IdentitySnapshot {
+            email: Some(k.into()),
+            uuid: None,
+            display_name: None,
+            native_blob: serde_json::Value::Null,
+        },
+        secret_blob: "added".into(),
+        tokens: providers::trait_def::TokenGrant {
+            access: "added-at".into(),
+            refresh: Some("added-rt".into()),
+            expires_in_secs: 3600,
+        },
+    };
+    persist_login(&provider, captured, Some("new:fresh")).unwrap();
+    let state = State::load().unwrap();
+    assert_eq!(
+        crate::menubar::renew_login_store(&state, slug, k),
+        "new:fresh",
+        "a renew must reopen the store the account signed in with"
+    );
+    let keep = crate::menubar::sign_in_stores_to_keep(&state);
+    assert!(
+        keep.contains(&login::store_id(slug, "new:fresh")),
+        "the sweep would delete the account's working sign-in session"
+    );
+    // Removing the account forgets the store, so the sweep reclaims it.
+    remove_provider_account_generic(slug, k).unwrap();
+    let state = State::load().unwrap();
+    assert!(state
+        .provider_accounts(slug)
+        .unwrap()
+        .login_stores
+        .is_empty());
+    assert!(!crate::menubar::sign_in_stores_to_keep(&state)
+        .contains(&login::store_id(slug, "new:fresh")));
 }

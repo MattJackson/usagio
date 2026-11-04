@@ -871,6 +871,8 @@ impl MenuBackend for LinuxMenu {
             if quit_flag.load(std::sync::atomic::Ordering::SeqCst) {
                 loop_for_quit.quit();
             }
+            // Work a worker handed back to this (the GTK) thread.
+            crate::menubar::run_ui_tasks();
             // Menu-item clicks arrive on tray-icon's own global channel.
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 if let Some(cb) = click_cb.lock().unwrap().as_ref() {
