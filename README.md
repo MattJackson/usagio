@@ -143,31 +143,38 @@ Notes:
 
 ## Menu bar app
 
-`usagio menubar` is the primary interface: a status-bar item showing your
-active account's **session %** at a glance. Click it for a dropdown:
+`usagio menubar` is the primary interface: a status-bar item showing the
+`%` of the account at risk (or the provider you pin under **Settings ▸ Tray
+Icon**). Click it for a dropdown:
 
-- **One submenu per account**, labelled `email` on the left with `S% / W%`
-  right-aligned battery-menu style. Accounts are **ordered by swap priority** — the
-  account you'd use next is at the top, maxed-out ones sink to the bottom — so the
-  list reads top-to-bottom as "use this first, then this." The **active account is
-  bold**; any percentage in a danger band is colored (amber ≥80%, red ≥95%) so a
-  nearly-spent account jumps out. Each opens:
-  - **Switch to this account** (the active account shows a disabled **✓ Active**
-    here instead)
-  - a stats block — `Session X% · resets in …`, `Weekly X% · resets in …`, Opus if
-    present, and `updated Xm ago`
+- **Accounts, grouped by provider** (Claude, Codex, … in alphabetical order),
+  each provider under a header row. Each account is a submenu labelled `email`
+  on the left with `S% / W%` right-aligned battery-menu style. Within a provider,
+  accounts are **ordered by swap priority** — usable accounts by soonest weekly
+  reset, then locked accounts by when they unlock — so the list reads
+  top-to-bottom as "use this first, then this." The **active account is bold with
+  a checkmark**; any percentage in a danger band is colored (amber ≥80%, red
+  ≥95%) so a nearly-spent account jumps out. A locked account shows its unlock
+  countdown instead of the percentages. Each submenu opens:
+  - a stats block — which window binds and when it frees (`Weekly locked ·
+    unlocks in …`, `Session renews in …`), the plan, and `updated Xm ago`
   - anything extra the provider itself reports, only when there's something to
     show: the spendable credit balance (`Credits · 120`,
     `Credits · unlimited`; never spend or a cap), where this week's usage went
     (`This week · Claude Code 82% · Chats 18%`), and per-model weekly limits in
     use (`Fable 7d · 42% · resets in 2d 3h`). Never estimated.
+  - **Switch to this account** (not shown for the active account)
   - **Renew login…** — sign this account in again in usagio's own window
   - **Remove…**
-- **Auto-swap at high usage ▸ Off / 70% / 85% / 95% / 98%**, plus **Switch to best
-  account now** (jump immediately to the account with room that resets soonest)
-- **Sign in to a new Claude account…** / **Capture current login…**
-- **Launch at login** (toggle)
+- **Sign in to a new account ▸** and **Capture current login ▸**, one entry per
+  provider
+- **Settings ▸** **Refresh usage now**, **Auto-swap ▸** (Off / 70% / 85% / 95% /
+  98%, **Use credits when every plan is used up**, **Switch to best account
+  now**), **Tray Icon ▸** (At risk, or pin one provider), **Backups ▸**
+  (Save… / Restore…) and **Notifications ▸**
 - **Quit**
+
+Starting at login is not a menu item: use `usagio install` / `usagio uninstall`.
 
 The menu bar also runs the auto-swap daemon in the same process. `usagio
 install` registers a `launchd` agent so it starts at every login (and runs
