@@ -5864,7 +5864,14 @@ fn codex_inactive_refresh_persists_complete_credential_without_touching_active_f
         assert_eq!(saved["tokens"], fresh_value["tokens"]);
         assert_eq!(account.access_token, "new-at-b");
         assert_eq!(account.refresh_token, "new-rt-b");
-        assert_eq!(account.expires_at, 4_000_000_001);
+        // Opaque access token: due 8 days after this refresh (the Codex
+        // client's cadence), not at the id_token's exp.
+        let due = chrono::Utc::now().timestamp() + 8 * 86_400;
+        assert!(
+            (due - 120..=due).contains(&account.expires_at),
+            "{}",
+            account.expires_at
+        );
         assert_eq!(hit_count(&hits), 1);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("auth.json")).unwrap(),

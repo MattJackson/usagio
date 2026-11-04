@@ -126,14 +126,8 @@ fn capture_blob(blob: String) -> PResult<CapturedAccount> {
     let tokens = TokenGrant {
         access: parsed.tokens.access_token.clone(),
         refresh: parsed.tokens.refresh_token.clone(),
-        // The vendor blob doesn't record `expires_in` directly; use the
-        // JWT's `exp` claim minus `now` when present, else default to
-        // "expired" so callers refresh eagerly.
-        expires_in_secs: id_claims
-            .get("exp")
-            .and_then(|x| x.as_i64())
-            .map(|exp| exp.saturating_sub(Utc::now().timestamp()))
-            .unwrap_or(0),
+        // Unknown expiry reads as "expired" so callers refresh eagerly.
+        expires_in_secs: expires_in_secs(blob_access_expires_at(&parsed)),
     };
     Ok(CapturedAccount {
         identity,
@@ -521,20 +515,11 @@ impl Provider for CodexProvider {
 
     fn parse_stored_blob(&self, blob: &str) -> PResult<TokenGrant> {
         let parsed = parse_codex_blob(blob)?;
-        let id_claims = parsed
-            .tokens
-            .id_token
-            .as_deref()
-            .and_then(jwt_payload_claims)
-            .unwrap_or_default();
+        let expires_in_secs = expires_in_secs(blob_access_expires_at(&parsed));
         Ok(TokenGrant {
             access: parsed.tokens.access_token,
             refresh: parsed.tokens.refresh_token,
-            expires_in_secs: id_claims
-                .get("exp")
-                .and_then(|x| x.as_i64())
-                .map(|exp| exp.saturating_sub(Utc::now().timestamp()))
-                .unwrap_or(0),
+            expires_in_secs,
         })
     }
 
@@ -798,15 +783,17 @@ impl Provider for CodexProvider {
         let Ok(parsed) = serde_json::from_str::<AuthDotJson>(blob) else {
             return CredentialFreshness::Invalid;
         };
-        let Some(claims) = parsed
+        // No decodable id_token: the blob cannot be attributed to an account.
+        if parsed
             .tokens
             .id_token
             .as_deref()
             .and_then(jwt_payload_claims)
-        else {
+            .is_none()
+        {
             return CredentialFreshness::Invalid;
-        };
-        let Some(exp) = claims.get("exp").and_then(|x| x.as_i64()) else {
+        }
+        let Some(exp) = blob_access_expires_at(&parsed) else {
             return CredentialFreshness::Unknown;
         };
         let now = Utc::now().timestamp();
@@ -839,13 +826,7 @@ impl Provider for CodexProvider {
             Ok(p) => p,
             Err(_) => return Ok(()), // not a usable token blob; nothing to absorb
         };
-        let id_claims = parsed
-            .tokens
-            .id_token
-            .as_deref()
-            .and_then(jwt_payload_claims)
-            .unwrap_or_default();
-        let expires_at = id_claims.get("exp").and_then(|x| x.as_i64()).unwrap_or(0);
+        let expires_at = blob_access_expires_at(&parsed).unwrap_or(0);
         let access = parsed.tokens.access_token.clone();
         // A blob without a refresh token must not wipe the stored grant (or
         // clear needs_relogin); Claude's absorb refuses such blobs too.
@@ -903,9 +884,9 @@ pub(super) struct AuthDotJson {
     #[serde(default)]
     pub(super) tokens: TokenData,
     /// RFC 3339 timestamp of the last successful refresh. Absent on a blob
-    /// that has never been refreshed since login. Used by `oauth.rs` to
-    /// enforce the same ~8-day proactive-refresh cadence the vendor CLI uses
-    /// independently of the access token's own expiry.
+    /// that has never been refreshed since login. With an opaque access
+    /// token, the 8-day cadence from here is the refresh due time
+    /// (`access_expires_at`), as in the Codex client.
     #[serde(default)]
     pub(super) last_refresh: Option<String>,
 }
@@ -920,6 +901,46 @@ pub(super) struct TokenData {
     pub(super) refresh_token: Option<String>,
     #[serde(default)]
     pub(super) account_id: Option<String>,
+}
+
+/// Codex's proactive refresh cadence for an access token whose expiry it
+/// cannot read (`TOKEN_REFRESH_INTERVAL`, 8 days, in openai/codex
+/// `login/src/auth/manager.rs`).
+pub(super) const REFRESH_INTERVAL_SECS: i64 = 8 * 86_400;
+
+/// When a Codex access token is due for refresh (unix seconds), judged the
+/// way the Codex client judges it (`proactive_refresh_reason`): the access
+/// token's own JWT `exp`; else `last_refresh` plus the 8-day cadence. The
+/// id_token's `exp` describes the ID token, not the access token, so it is
+/// only a last resort for a blob with neither (it errs early). `None` when
+/// nothing is known.
+pub(super) fn access_expires_at(
+    access_token: &str,
+    last_refresh: Option<&str>,
+    id_token: Option<&str>,
+) -> Option<i64> {
+    let exp_of = |jwt: &str| jwt_payload_claims(jwt)?.get("exp")?.as_i64();
+    exp_of(access_token)
+        .or_else(|| {
+            let at = chrono::DateTime::parse_from_rfc3339(last_refresh?).ok()?;
+            Some(at.timestamp().saturating_add(REFRESH_INTERVAL_SECS))
+        })
+        .or_else(|| exp_of(id_token?))
+}
+
+fn blob_access_expires_at(parsed: &AuthDotJson) -> Option<i64> {
+    access_expires_at(
+        &parsed.tokens.access_token,
+        parsed.last_refresh.as_deref(),
+        parsed.tokens.id_token.as_deref(),
+    )
+}
+
+/// Seconds from now until `expires_at`; 0 (refresh now) when unknown.
+pub(super) fn expires_in_secs(expires_at: Option<i64>) -> i64 {
+    expires_at
+        .map(|exp| exp.saturating_sub(Utc::now().timestamp()))
+        .unwrap_or(0)
 }
 
 /// The Codex workspace id of a parsed blob: `tokens.account_id`, else the
@@ -1845,6 +1866,45 @@ mod tests {
         assert_eq!(
             CodexProvider.credential_freshness(&blob),
             CredentialFreshness::Expired
+        );
+    }
+
+    #[test]
+    fn access_token_expiry_comes_from_the_access_token_not_the_id_token() {
+        // The Codex client judges the access token by its own `exp`; an
+        // expired id_token says nothing about it.
+        let now = Utc::now().timestamp();
+        let blob = serde_json::json!({
+            "tokens": {
+                "id_token": make_id_token("u@e.com", 1),
+                "access_token": make_id_token("u@e.com", now + 7200),
+                "refresh_token": "rt",
+            }
+        })
+        .to_string();
+        assert_eq!(
+            CodexProvider.credential_freshness(&blob),
+            CredentialFreshness::Fresh
+        );
+        let grant = CodexProvider.parse_stored_blob(&blob).unwrap();
+        assert!((7100..=7200).contains(&grant.expires_in_secs), "{grant:?}");
+        // An opaque access token is due 8 days after `last_refresh`, the
+        // Codex client's scheduled-refresh cadence.
+        let last = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let blob = serde_json::json!({
+            "tokens": {
+                "id_token": make_id_token("u@e.com", 1),
+                "access_token": "opaque",
+                "refresh_token": "rt",
+            },
+            "last_refresh": last,
+        })
+        .to_string();
+        let grant = CodexProvider.parse_stored_blob(&blob).unwrap();
+        let seven_days = 7 * 86_400;
+        assert!(
+            (seven_days - 60..=seven_days).contains(&grant.expires_in_secs),
+            "{grant:?}"
         );
     }
 
