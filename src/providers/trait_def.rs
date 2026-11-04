@@ -849,6 +849,15 @@ pub trait Provider: Send + Sync + 'static {
         None
     }
 
+    /// Last-resort identification for a blob `identify_credential` could not
+    /// place (e.g. tokens but no embedded identity). May perform ONE network
+    /// request, so it is only called from the invalid_grant last-chance
+    /// fallback, never from polling or watcher paths. Default is `None`.
+    fn identify_credential_online(&self, blob: &str) -> Option<AccountKey> {
+        let _ = blob;
+        None
+    }
+
     /// Report how fresh the blob's access token is right now. Used to pick
     /// the freshest of several observed rotations, and to decide when to
     /// pre-emptively refresh an inactive account.

@@ -21,6 +21,8 @@ struct FakeProvider {
     /// Map blob -> (AccountKey identifier, freshness) for identify + freshness.
     routing: Vec<(String, Option<AccountKey>, CredentialFreshness)>,
     absorbed: Arc<Mutex<Vec<(AccountKey, String)>>>,
+    /// Blobs `identify_credential_online` can place (blob -> key).
+    online: Vec<(String, AccountKey)>,
 }
 
 impl FakeProvider {
@@ -30,7 +32,12 @@ impl FakeProvider {
             paths: Vec::new(),
             routing: Vec::new(),
             absorbed: Arc::new(Mutex::new(Vec::new())),
+            online: Vec::new(),
         }
+    }
+    fn route_online(mut self, blob: &str, key: AccountKey) -> Self {
+        self.online.push((blob.to_string(), key));
+        self
     }
     fn with_path(mut self, p: PathBuf) -> Self {
         self.paths.push(p);
@@ -85,6 +92,12 @@ impl Provider for FakeProvider {
             .iter()
             .find(|(b, _, _)| b == blob)
             .and_then(|(_, k, _)| k.clone())
+    }
+    fn identify_credential_online(&self, blob: &str) -> Option<AccountKey> {
+        self.online
+            .iter()
+            .find(|(b, _)| b == blob)
+            .map(|(_, k)| k.clone())
     }
     fn credential_freshness(&self, blob: &str) -> CredentialFreshness {
         self.routing
@@ -221,6 +234,27 @@ fn last_chance_fallback_adopts_freshest_matching_blob() {
         absorbs.iter().filter(|(k, _)| k == &target).collect();
     assert_eq!(target_absorbs.len(), 1);
     assert_eq!(target_absorbs[0].1, "FRESH_A");
+}
+
+#[test]
+fn last_chance_fallback_identifies_unlabelled_blob_online() {
+    // A blob with tokens but no embedded identity is placed via the
+    // provider's online identification, and only on the last-chance path.
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_blob(dir.path(), "creds.json", "TOKENS_ONLY");
+    let target = AccountKey::new("fake", "a@e.com");
+    let prov = FakeProvider::new("fake")
+        .with_path(path)
+        .route("TOKENS_ONLY", None, CredentialFreshness::Fresh)
+        .route_online("TOKENS_ONLY", target.clone());
+    // The watcher/absorb path never makes the extra request.
+    assert!(absorb_all_lagging(&prov).is_empty());
+    assert!(prov.absorbs().is_empty());
+    assert!(last_chance_fallback(&prov, &target));
+    let absorbs = prov.absorbs();
+    assert_eq!(absorbs.len(), 1);
+    assert_eq!(absorbs[0].1, "TOKENS_ONLY");
 }
 
 #[test]
