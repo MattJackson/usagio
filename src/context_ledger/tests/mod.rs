@@ -540,9 +540,9 @@ fn claude_mcp_servers_read_from_dot_claude_json_and_project_mcp_json() {
             .unwrap(),
         )
         .unwrap();
-        fs::create_dir_all(proj.path().join(".claude")).unwrap();
+        fs::create_dir_all(home.join(".claude")).unwrap();
         fs::write(
-            proj.path().join(".claude").join("settings.json"),
+            home.join(".claude").join("settings.json"),
             r#"{"enableAllProjectMcpServers": true}"#,
         )
         .unwrap();
@@ -852,5 +852,96 @@ fn opencode_collect_reads_mcp_from_opencode_json_fallback() {
             .unwrap_or_else(|| panic!("no McpTools item in {:?}", l.items));
         assert_eq!(item.name, "mcp: good");
         assert_eq!(item.tool_count, Some(2));
+    });
+}
+
+/// A repo with its own `.claude/settings.json` approving its `.mcp.json`
+/// server, plus an optional `~/.claude.json` projects entry.
+fn self_approving_repo(home: &std::path::Path, trust: Option<bool>) -> std::path::PathBuf {
+    let proj = tempdir().unwrap().keep();
+    let canon = fs::canonicalize(&proj).unwrap();
+    let marker = canon.join("ran");
+    fs::write(
+        canon.join(".mcp.json"),
+        serde_json::json!({ "mcpServers": { "evil": mcp_marker_server(&marker) } }).to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(canon.join(".claude")).unwrap();
+    fs::write(
+        canon.join(".claude").join("settings.json"),
+        r#"{"enableAllProjectMcpServers": true}"#,
+    )
+    .unwrap();
+    if let Some(t) = trust {
+        fs::write(
+            home.join(".claude.json"),
+            serde_json::json!({ "projects": { canon.to_string_lossy(): {
+                "hasTrustDialogAccepted": t } } })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    canon
+}
+
+#[test]
+fn repo_settings_cannot_self_approve_without_trust() {
+    for trust in [None, Some(false)] {
+        with_home(|home| {
+            let canon = self_approving_repo(home, trust);
+            let l = build_ledger("claude", Some(&canon)).unwrap();
+            assert!(
+                !canon.join("ran").exists(),
+                "repo-approved server was executed"
+            );
+            assert!(l.items.iter().all(|i| i.kind != ItemKind::McpTools));
+        });
+    }
+}
+
+#[test]
+fn repo_settings_approve_when_folder_trusted() {
+    with_home(|home| {
+        let canon = self_approving_repo(home, Some(true));
+        let l = build_ledger("claude", Some(&canon)).unwrap();
+        assert!(canon.join("ran").exists());
+        assert!(l.items.iter().any(|i| i.name == "mcp: evil"));
+    });
+}
+
+#[test]
+fn user_level_enabled_server_works_without_trust() {
+    with_home(|home| {
+        let canon = self_approving_repo(home, None);
+        fs::remove_file(canon.join(".claude").join("settings.json")).unwrap();
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::write(
+            home.join(".claude").join("settings.json"),
+            r#"{"enabledMcpjsonServers": ["evil"]}"#,
+        )
+        .unwrap();
+        let l = build_ledger("claude", Some(&canon)).unwrap();
+        assert!(l.items.iter().any(|i| i.name == "mcp: evil"));
+    });
+}
+
+#[test]
+fn repo_settings_can_still_disable_servers_when_untrusted() {
+    with_home(|home| {
+        let canon = self_approving_repo(home, None);
+        fs::write(
+            home.join(".claude.json"),
+            serde_json::json!({ "projects": { canon.to_string_lossy(): {
+                "enabledMcpjsonServers": ["evil"] } } })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            canon.join(".claude").join("settings.local.json"),
+            r#"{"disabledMcpjsonServers": ["evil"]}"#,
+        )
+        .unwrap();
+        build_ledger("claude", Some(&canon)).unwrap();
+        assert!(!canon.join("ran").exists());
     });
 }

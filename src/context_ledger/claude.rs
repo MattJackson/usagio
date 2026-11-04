@@ -102,24 +102,22 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     let user_json = home.join(".claude.json");
     let user_val = read_json_logged(&user_json);
     // Claude Code keys projects by absolute path.
-    let proj_abs: Option<PathBuf> = project.map(|p| {
-        fs::canonicalize(p).unwrap_or_else(|_| {
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                std::env::current_dir()
-                    .map(|c| c.join(p))
-                    .unwrap_or_else(|_| p.to_path_buf())
-            }
-        })
-    });
-    let local_proj = match (&user_val, &proj_abs) {
-        (Some(val), Some(proj)) => val
-            .get("projects")
-            .and_then(|p| p.get(proj.to_string_lossy().as_ref()))
+    let proj_abs: Option<PathBuf> =
+        project.map(|p| fs::canonicalize(p).unwrap_or_else(|_| absolute_path(p)));
+    let local_proj = match (&user_val, project) {
+        (Some(val), Some(given)) => project_keys(proj_abs.as_deref(), given)
+            .iter()
+            .find_map(|k| val.get("projects").and_then(|p| p.get(k.as_str())))
             .cloned(),
         _ => None,
     };
+    // Repo-controlled settings may approve .mcp.json servers only when the
+    // user has trusted this folder in Claude Code.
+    let trusted = local_proj
+        .as_ref()
+        .and_then(|p| p.get("hasTrustDialogAccepted"))
+        .and_then(|b| b.as_bool())
+        == Some(true);
     if let Some(local) = local_proj
         .as_ref()
         .and_then(|p| p.get("mcpServers"))
@@ -129,16 +127,16 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     }
     let mut approval = McpApproval::default();
     if let Some(lp) = &local_proj {
-        approval.absorb(lp, true);
+        approval.absorb(lp, true, true);
     }
     let settings_val = read_json_logged(&settings);
     if let Some(v) = &settings_val {
-        approval.absorb(v, false);
+        approval.absorb(v, false, true);
     }
     if let Some(proj) = &proj_abs {
         for f in ["settings.json", "settings.local.json"] {
             if let Some(v) = read_json_logged(&proj.join(".claude").join(f)) {
-                approval.absorb(&v, false);
+                approval.absorb(&v, false, trusted);
             }
         }
         let mcp_json = proj.join(".mcp.json");
@@ -219,7 +217,10 @@ struct McpApproval {
 impl McpApproval {
     /// Fold in a settings object (or a `~/.claude.json` `projects.<path>`
     /// entry, which additionally carries `disabledMcpServers`).
-    fn absorb(&mut self, v: &serde_json::Value, project_entry: bool) {
+    ///
+    /// `allow_approvals` is false for repo-controlled files in an untrusted
+    /// folder: those may only add to the disabled lists, never approve.
+    fn absorb(&mut self, v: &serde_json::Value, project_entry: bool, allow_approvals: bool) {
         let strs = |k: &str| -> Vec<String> {
             v.get(k)
                 .and_then(|x| x.as_array())
@@ -230,13 +231,15 @@ impl McpApproval {
                 })
                 .unwrap_or_default()
         };
-        if v.get("enableAllProjectMcpServers")
-            .and_then(|b| b.as_bool())
-            == Some(true)
-        {
-            self.enable_all = true;
+        if allow_approvals {
+            if v.get("enableAllProjectMcpServers")
+                .and_then(|b| b.as_bool())
+                == Some(true)
+            {
+                self.enable_all = true;
+            }
+            self.enabled.extend(strs("enabledMcpjsonServers"));
         }
-        self.enabled.extend(strs("enabledMcpjsonServers"));
         self.disabled.extend(strs("disabledMcpjsonServers"));
         if project_entry {
             self.disabled.extend(strs("disabledMcpServers"));
@@ -246,6 +249,54 @@ impl McpApproval {
     fn project_server_approved(&self, name: &str) -> bool {
         !self.disabled.contains(name) && (self.enable_all || self.enabled.contains(name))
     }
+}
+
+/// An absolute spelling of `p` without touching the filesystem.
+fn absolute_path(p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|c| c.join(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    }
+}
+
+/// Strip the Windows verbatim prefix (`\\?\C:\x` -> `C:\x`,
+/// `\\?\UNC\h\s` -> `\\h\s`); other paths are returned unchanged.
+fn strip_verbatim(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Candidate `~/.claude.json` `projects.<path>` keys for a project, most
+/// specific first: the canonical path, its non-verbatim form (Windows
+/// `canonicalize` yields `\\?\C:\...`, which Claude Code never writes), the
+/// forward-slash spelling Claude Code also uses on Windows, and the path as
+/// given.
+fn project_keys(canonical: Option<&Path>, given: &Path) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    let mut push = |k: String| {
+        if !keys.contains(&k) {
+            keys.push(k);
+        }
+    };
+    let abs = absolute_path(given);
+    for p in canonical.into_iter().chain(std::iter::once(abs.as_path())) {
+        let plain = strip_verbatim(&p.to_string_lossy());
+        push(p.to_string_lossy().into_owned());
+        push(plain.clone());
+        if plain.contains('\\') {
+            push(plain.replace('\\', "/"));
+        }
+    }
+    push(given.to_string_lossy().into_owned());
+    keys
 }
 
 fn object_entries(
@@ -346,3 +397,18 @@ fn push_file_if_exists(items: &mut Vec<LedgerItem>, path: PathBuf, kind: ItemKin
 }
 
 use super::file_mtime;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_verbatim_project_path_maps_to_plain_keys() {
+        assert_eq!(strip_verbatim(r"\\?\C:\Users\me\proj"), r"C:\Users\me\proj");
+        assert_eq!(strip_verbatim(r"\\?\UNC\host\share\p"), r"\\host\share\p");
+        assert_eq!(strip_verbatim("/home/me/p"), "/home/me/p");
+        let keys = project_keys(Some(Path::new(r"\\?\C:\Users\me\proj")), Path::new("proj"));
+        assert!(keys.contains(&r"C:\Users\me\proj".to_string()), "{keys:?}");
+        assert!(keys.contains(&"C:/Users/me/proj".to_string()), "{keys:?}");
+    }
+}
