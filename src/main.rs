@@ -5383,7 +5383,7 @@ fn migrate_launchd_if_needed() {
 /// runs meaningfully on macOS — `platform().autostart()` is the thing that's
 /// actually OS-gated, via the `Platform` trait in `src/platform/`). No
 /// `#[cfg(target_os)]` here on purpose: `tests/strict_cfg.rs` restricts that
-/// attribute to `src/platform/*`, and spawning a nonexistent `timeout`/
+/// attribute to `src/platform/*`, and spawning a nonexistent
 /// `osascript` binary on a non-macOS host is already a silent, swallowed
 /// `Err` — `Command::spawn`'s ordinary "not found" failure mode — so the
 /// unconditional call is a no-op there without needing an explicit gate.
@@ -5391,16 +5391,31 @@ fn migrate_launchd_if_needed() {
 /// exiting non-zero in that case is the expected, swallowed outcome.
 fn purge_legacy_login_items() {
     for name in ["usagio", "claude-usage"] {
-        let _ = std::process::Command::new("timeout")
+        // Bounded in-process (3s): `timeout(1)` is not on stock macOS. A
+        // missing `osascript` (non-macOS host) is a swallowed spawn error.
+        let child = std::process::Command::new("osascript")
             .args([
-                "3",
-                "osascript",
                 "-e",
                 &format!("tell application \"System Events\" to delete login item \"{name}\""),
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status();
+            .spawn();
+        let Ok(mut child) = child else { continue };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            match child.try_wait() {
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Ok(None) | Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                Ok(Some(_)) => break,
+            }
+        }
     }
 }
 

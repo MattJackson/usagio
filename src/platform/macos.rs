@@ -305,6 +305,29 @@ impl SecurityRun {
     }
 }
 
+/// How long the legacy login-item purge may run (a first-run TCC Automation
+/// dialog must not hang uninstall).
+const LOGIN_ITEM_PURGE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Delete the System Events login item `name` with `program` (normally
+/// `osascript`), bounded by `LOGIN_ITEM_PURGE_TIMEOUT` natively. A non-zero
+/// exit (item already absent) is the desired state and is not an error; only a
+/// failure to spawn is.
+fn purge_login_item(program: &str, name: &str) -> Result<()> {
+    let child = Command::new(program)
+        .args([
+            "-e",
+            &format!("tell application \"System Events\" to delete login item \"{name}\""),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .with_context(|| format!("spawning `{program}`"))?;
+    run_with_timeout(child, LOGIN_ITEM_PURGE_TIMEOUT).map(|_| ())
+}
+
 /// Run `security(1)` with `args` under the native hang guard. stdout/stderr
 /// are captured; stdin is closed so an interactive prompt can't block on
 /// input while we wait.
@@ -479,6 +502,16 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
     // differently-ACL'd existing item ever happens.
     let mut timed_out = false;
     let result = (|| -> Result<()> {
+        // Remember the current value so a failed add (after the delete has
+        // already succeeded) can put it back instead of leaving no credential.
+        let prior = run_security(&["find-generic-password", "-s", service, "-a", account, "-w"])
+            .ok()
+            .filter(|r| r.success())
+            .map(|r| {
+                String::from_utf8_lossy(&r.stdout)
+                    .trim_end_matches('\n')
+                    .to_string()
+            });
         let del = run_security(&["delete-generic-password", "-s", service, "-a", account])
             .context("running `security delete-generic-password` (pre-set)")?;
         if del.timed_out {
@@ -508,6 +541,9 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
             secret,
         ])
         .context("running `security add-generic-password`")?;
+        if out.timed_out || !out.success() {
+            restore_prior_secret(service, account, prior.as_deref());
+        }
         if out.timed_out {
             timed_out = true;
             bail!(
@@ -517,7 +553,13 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
             );
         }
         if !out.success() {
-            bail!("`security add-generic-password` failed for service={service} account={account}");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            bail!(
+                "`security add-generic-password` failed (exit {:?}) for \
+                 service={service} account={account}: {}",
+                out.code(),
+                stderr.trim(),
+            );
         }
         Ok(())
     })();
@@ -534,6 +576,53 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
         }
     ));
     result
+}
+
+/// Best-effort: re-add the secret that `real_set` deleted when the following
+/// add failed, so the keychain isn't left with no credential at all.
+fn restore_prior_secret(service: &str, account: &str, prior: Option<&str>) {
+    let Some(prior) = prior else { return };
+    let ok = run_security(&[
+        "add-generic-password",
+        "-s",
+        service,
+        "-a",
+        account,
+        "-w",
+        prior,
+    ])
+    .map(|r| r.success())
+    .unwrap_or(false);
+    crate::logging::log(&format!(
+        "event=keychain_write_restore svc={service} acct={account} result={}",
+        if ok { "ok" } else { "failed" }
+    ));
+}
+
+/// Run `launchctl bootout` and return its output (stderr included).
+#[cfg(unix)]
+fn launchctl_bootout(uid: u32, label: &str) -> std::io::Result<std::process::Output> {
+    Command::new("launchctl")
+        .args(launchctl_bootout_argv(uid, label))
+        .output()
+}
+
+/// Surface a failed bootout (spawn error or non-zero exit) in the log instead
+/// of dropping it.
+#[cfg(unix)]
+fn log_bootout_failure(label: &str, out: std::io::Result<std::process::Output>) {
+    let why = match out {
+        Ok(o) if o.status.success() => return,
+        Ok(o) => format!(
+            "exit {:?}: {}",
+            o.status.code(),
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => e.to_string(),
+    };
+    crate::logging::log(&format!(
+        "event=launchd_bootout label={label} result=err:{why}"
+    ));
 }
 
 fn real_delete(service: &str, account: &str) -> Result<()> {
@@ -947,9 +1036,7 @@ impl Autostart for MacOsAutostart {
                 // fresh plist. bootout is the modern form and should succeed
                 // here; a real failure now is worth seeing (unlike the
                 // spurious "nothing loaded" error we used to emit).
-                let _ = Command::new("launchctl")
-                    .args(launchctl_bootout_argv(uid, label))
-                    .output();
+                log_bootout_failure(label, launchctl_bootout(uid, label));
             }
             // If NOT loaded we skip both bootout AND the legacy `unload`
             // entirely: there is nothing to unload, and the legacy `unload`
@@ -972,15 +1059,23 @@ impl Autostart for MacOsAutostart {
             // emit). When it IS loaded, a real failure is worth surfacing.
             if is_agent_loaded(uid, label) {
                 // Bootout is the modern counterpart to `unload`.
-                let _ = Command::new("launchctl")
-                    .args(launchctl_bootout_argv(uid, label))
-                    .output();
+                log_bootout_failure(label, launchctl_bootout(uid, label));
                 // Also drop any legacy `load`-registered entry before removing
                 // the file, so a switch from an older usagio that used the
                 // legacy form doesn't leave a stale live job behind.
                 let _ = Command::new("launchctl")
                     .args(["unload", &path.to_string_lossy()])
                     .status();
+                if is_agent_loaded(uid, label) {
+                    crate::logging::log(&format!(
+                        "event=launchd_uninstall label={label} result=err:agent still loaded \
+                         after bootout/unload; it runs until logout"
+                    ));
+                    eprintln!(
+                        "warning: launch agent {label} is still loaded after uninstall; \
+                         it will stop at next logout"
+                    );
+                }
             }
         }
         if path.exists() {
@@ -993,22 +1088,17 @@ impl Autostart for MacOsAutostart {
         // is gone — the exact bug that had usagio silently respawning
         // post-uninstall. Best-effort: osascript exits non-zero if the item
         // is already absent (the desired state), so all output is swallowed.
-        // Wrap in `timeout(1) 3` so a first-run TCC Automation dialog can't
-        // hang `brew uninstall` indefinitely — this login-item purge is
-        // best-effort defense-in-depth; if TCC prompts and the user doesn't
-        // dismiss it in 3 seconds, we move on (the plist deletion above is
-        // what actually stops autostart).
+        // Bounded natively (3s, process-group kill) rather than via
+        // `timeout(1)`, which stock macOS does not ship: a first-run TCC
+        // Automation dialog can't hang `brew uninstall`, and the purge still
+        // actually runs. Best-effort defense-in-depth; the plist deletion
+        // above is what actually stops autostart.
         for name in ["usagio", "claude-usage"] {
-            let _ = Command::new("timeout")
-                .args([
-                    "3",
-                    "osascript",
-                    "-e",
-                    &format!("tell application \"System Events\" to delete login item \"{name}\""),
-                ])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            if let Err(e) = purge_login_item("osascript", name) {
+                crate::logging::log(&format!(
+                    "event=legacy_login_item_purge name={name} result=err:{e:#}"
+                ));
+            }
         }
         Ok(())
     }
@@ -1084,6 +1174,36 @@ mod tests {
                 std::path::PathBuf::from("/tmp/platform-test-home/Library/Caches/usagio")
             );
         });
+    }
+
+    fn fake_osascript(dir: &std::path::Path, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-osascript");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// mac-uninstall-timeout-missing: the purge must actually run the
+    /// osascript program (no dependency on `timeout(1)`).
+    #[test]
+    fn purge_login_item_runs_the_program_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let prog = fake_osascript(dir.path(), &format!("echo \"$2\" > {}", marker.display()));
+        purge_login_item(&prog, "usagio").expect("purge");
+        let got = std::fs::read_to_string(&marker).expect("program must have run");
+        assert!(got.contains("delete login item \"usagio\""), "{got}");
+    }
+
+    /// The purge is bounded: a hung osascript is killed at the deadline.
+    #[test]
+    fn purge_login_item_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let prog = fake_osascript(dir.path(), "sleep 30");
+        let start = Instant::now();
+        purge_login_item(&prog, "usagio").expect("purge");
+        assert!(start.elapsed() < Duration::from_secs(10));
     }
 
     /// Helper: spawn an arbitrary command with captured pipes so the
