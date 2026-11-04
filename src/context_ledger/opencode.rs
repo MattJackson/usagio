@@ -1,12 +1,15 @@
 //! Discovery for the opencode CLI (SST).
 //!
-//! Opencode context sources:
-//! - ~/.config/opencode/opencode.jsonc (or opencode.json) — top-level config
+//! Opencode context sources (`<cfg>` is `$XDG_CONFIG_HOME/opencode`, else
+//! `~/.config/opencode`):
+//! - <cfg>/opencode.jsonc (or opencode.json) — top-level config
 //!   with optional `prompt` / `rules` strings, an `instructions` list of
 //!   file paths, and an `mcp` server map
-//! - ~/.config/opencode/AGENTS.md — global rules
-//! - ~/.config/opencode/agent/*.md — subagent definitions
-//! - <project>/AGENTS.md — sometimes read via project convention
+//! - <cfg>/AGENTS.md — global rules
+//! - <cfg>/agent/*.md — subagent definitions; only the frontmatter
+//!   description is injected per turn (the body is the agent's own prompt)
+//! - project rules: every AGENTS.md from <project> up to its git root (else
+//!   CLAUDE.md, else CONTEXT.md, found the same way)
 //!
 //! `.jsonc` may contain comments and trailing commas — strip both before
 //! parsing.
@@ -17,10 +20,11 @@ use std::path::{Path, PathBuf};
 
 pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     let mut items = Vec::new();
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = crate::paths::user_home() else {
         return Ok(items);
     };
-    let cfg_dir = home.join(".config").join("opencode");
+    let cfg_dir =
+        config_base(crate::paths::path_env_var("XDG_CONFIG_HOME"), &home).join("opencode");
 
     // opencode.jsonc / opencode.json
     let config_candidates = ["opencode.jsonc", "opencode.json"];
@@ -46,11 +50,11 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
             .ok_or_else(|| "not a regular file or unreadable".to_string())
             .and_then(|b| String::from_utf8(b).map_err(|e| e.to_string()));
         match read {
-            Err(e) => eprintln!("could not read {}: {}", config_path.display(), e),
+            Err(e) => ledger_warn!("could not read {}: {}", config_path.display(), e),
             Ok(raw) => {
                 let stripped = strip_jsonc_trailing_commas(&strip_jsonc_comments(&raw));
                 match serde_json::from_str::<serde_json::Value>(&stripped) {
-                    Err(e) => eprintln!("could not parse {}: {}", config_path.display(), e),
+                    Err(e) => ledger_warn!("could not parse {}: {}", config_path.display(), e),
                     Ok(val) => collect_from_config(&mut items, &val, &config_path, project, &home),
                 }
             }
@@ -67,7 +71,7 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "agent".to_string());
-                push_file_if_exists(
+                super::claude::push_frontmatter_if_exists(
                     &mut items,
                     path,
                     ItemKind::SubagentDef,
@@ -77,17 +81,42 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
         }
     }
 
-    // Project AGENTS.md (opencode also reads this by convention on some paths)
+    // Project rules: every AGENTS.md from the project up to its git root;
+    // CLAUDE.md, then CONTEXT.md, only when no AGENTS.md is found.
     if let Some(proj) = project {
-        push_file_if_exists(
-            &mut items,
-            proj.join("AGENTS.md"),
-            ItemKind::ProjectInstructions,
-            "Project AGENTS.md",
-        );
+        let proj = fs::canonicalize(proj).unwrap_or_else(|_| proj.to_path_buf());
+        let dirs = super::dirs_up_to_git_root(&proj);
+        for fname in ["AGENTS.md", "CLAUDE.md", "CONTEXT.md"] {
+            let before = items.len();
+            for dir in &dirs {
+                let label = if *dir == proj.as_path() {
+                    format!("Project {fname}")
+                } else {
+                    format!("{fname} ({})", dir.display())
+                };
+                push_file_if_exists(
+                    &mut items,
+                    dir.join(fname),
+                    ItemKind::ProjectInstructions,
+                    &label,
+                );
+            }
+            if items.len() > before {
+                break;
+            }
+        }
     }
 
     Ok(items)
+}
+
+/// opencode's global config base: `$XDG_CONFIG_HOME` when set to an absolute
+/// path, else `~/.config` (as its xdg-basedir lookup does).
+fn config_base(xdg: Option<std::ffi::OsString>, home: &Path) -> PathBuf {
+    match xdg.map(PathBuf::from) {
+        Some(p) if p.is_absolute() => p,
+        _ => home.join(".config"),
+    }
 }
 
 fn collect_from_config(
@@ -138,7 +167,7 @@ fn collect_from_config(
     if let Some(list) = val.get("instructions").and_then(|v| v.as_array()) {
         for entry in list.iter().filter_map(|v| v.as_str()) {
             if entry.contains(['*', '?', '[']) || entry.starts_with("http") {
-                eprintln!("opencode instructions entry '{}' skipped (glob/URL)", entry);
+                ledger_warn!("opencode instructions entry '{}' skipped (glob/URL)", entry);
                 continue;
             }
             let path = if let Some(rest) = entry.strip_prefix("~/") {
@@ -176,7 +205,7 @@ fn collect_from_config(
                     content_bytes: summary.byte_count,
                     tool_count: Some(summary.tool_count),
                 }),
-                Err(err) => eprintln!("opencode mcp {} skipped: {}", name, err),
+                Err(err) => ledger_warn!("opencode mcp {} skipped: {}", name, err),
             }
         }
     }

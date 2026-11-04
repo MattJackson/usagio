@@ -5,9 +5,13 @@
 //! - <project>/CLAUDE.md, <project>/.claude/CLAUDE.md, <project>/CLAUDE.local.md,
 //!   and CLAUDE.md / CLAUDE.local.md in every ancestor directory — project
 //!   instructions
-//! - ~/.claude/skills/*/SKILL.md — skill definitions; only the frontmatter
-//!   `name`/`description` is injected per turn (the body loads on use)
-//! - ~/.claude/agents/*.md — subagent definitions (likewise frontmatter only)
+//! - ~/.claude/skills/*/SKILL.md, and <dir>/.claude/skills/*/SKILL.md for the
+//!   project and each ancestor up to its git root — skill definitions; only
+//!   the frontmatter `name`/`description` is injected per turn (the body
+//!   loads on use). A personal skill wins over a same-named project skill.
+//! - ~/.claude/agents/*.md and <project>/.claude/agents/*.md — subagent
+//!   definitions (likewise frontmatter only; a project agent wins over a
+//!   same-named personal one)
 //! - ~/.claude/plugins/*/plugin.json — plugin manifests (legacy layout)
 //! - MCP servers, each contributing its tool schemas: `~/.claude.json`
 //!   (`mcpServers` + `projects.<path>.mcpServers`), `<project>/.mcp.json`,
@@ -19,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     let mut items = Vec::new();
-    let home = match dirs::home_dir() {
+    let home = match crate::paths::user_home() {
         Some(h) => h,
         None => return Ok(items),
     };
@@ -68,12 +72,28 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
         }
     }
 
-    // Skills — ~/.claude/skills/<name>/SKILL.md
-    let skills_dir = claude_dir.join("skills");
-    if let Ok(entries) = fs::read_dir(&skills_dir) {
+    // Skills — ~/.claude/skills/<name>/SKILL.md, then project-scope
+    // .claude/skills from the project up to its git root (personal wins).
+    let mut skill_dirs = vec![claude_dir.join("skills")];
+    if let Some(proj) = &proj_abs {
+        skill_dirs.extend(
+            super::dirs_up_to_git_root(proj)
+                .into_iter()
+                .map(|d| d.join(".claude").join("skills")),
+        );
+    }
+    let mut seen_skills = std::collections::HashSet::new();
+    for skills_dir in skill_dirs {
+        let Ok(entries) = fs::read_dir(&skills_dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             let skill_md = entry.path().join("SKILL.md");
+            if seen_skills.contains(&name) || !skill_md.is_file() {
+                continue;
+            }
+            seen_skills.insert(name.clone());
             push_frontmatter_if_exists(
                 &mut items,
                 skill_md,
@@ -83,9 +103,18 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
         }
     }
 
-    // Subagents — ~/.claude/agents/*.md
-    let agents_dir = claude_dir.join("agents");
-    if let Ok(entries) = fs::read_dir(&agents_dir) {
+    // Subagents — <project>/.claude/agents/*.md, then ~/.claude/agents/*.md
+    // (a project agent overrides a same-named personal one).
+    let mut agent_dirs = Vec::new();
+    if let Some(proj) = &proj_abs {
+        agent_dirs.push(proj.join(".claude").join("agents"));
+    }
+    agent_dirs.push(claude_dir.join("agents"));
+    let mut seen_agents = std::collections::HashSet::new();
+    for agents_dir in agent_dirs {
+        let Ok(entries) = fs::read_dir(&agents_dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("md") {
@@ -93,6 +122,9 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "agent".to_string());
+                if !seen_agents.insert(name.clone()) {
+                    continue;
+                }
                 push_frontmatter_if_exists(
                     &mut items,
                     path,
@@ -172,14 +204,14 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
                     if trusted && approval.project_server_approved(name) {
                         approved.push((name.clone(), cfg.clone()));
                     } else if !trusted {
-                        eprintln!(
+                        ledger_warn!(
                             "mcp {}: not started (folder not trusted in Claude Code)",
                             printable(name)
                         );
                     } else {
                         // Never execute repo-controlled commands Claude Code
                         // itself would not start.
-                        eprintln!("mcp {}: not approved (not started)", printable(name));
+                        ledger_warn!("mcp {}: not approved (not started)", printable(name));
                     }
                 }
                 sources.push((mcp_json, approved));
@@ -202,7 +234,7 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     for (path, entries) in sources {
         for (name, cfg) in entries {
             if approval.project_disabled.contains(&name) {
-                eprintln!(
+                ledger_warn!(
                     "mcp {}: disabled for this project (not started)",
                     printable(&name)
                 );
@@ -231,7 +263,7 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
             Err(err) => {
                 // Skip failed MCP servers — timeout / crash / bad config.
                 // In a follow-up we surface a "?" row with the error.
-                eprintln!("mcp {} skipped: {}", printable(&name), err);
+                ledger_warn!("mcp {} skipped: {}", printable(&name), err);
             }
         }
     }
@@ -375,7 +407,7 @@ fn read_json_logged(path: &Path) -> Option<serde_json::Value> {
         Some(b) => b,
         None => {
             if path.exists() {
-                eprintln!("could not read {}", path.display());
+                ledger_warn!("could not read {}", path.display());
             }
             return None;
         }
@@ -383,7 +415,7 @@ fn read_json_logged(path: &Path) -> Option<serde_json::Value> {
     match serde_json::from_slice(&bytes) {
         Ok(v) => Some(v),
         Err(e) => {
-            eprintln!("could not parse {}: {}", path.display(), e);
+            ledger_warn!("could not parse {}: {}", path.display(), e);
             None
         }
     }
@@ -417,7 +449,7 @@ fn injected_frontmatter(text: &str) -> Option<String> {
     None // unterminated frontmatter
 }
 
-fn push_frontmatter_if_exists(
+pub(super) fn push_frontmatter_if_exists(
     items: &mut Vec<LedgerItem>,
     path: PathBuf,
     kind: ItemKind,
@@ -487,6 +519,7 @@ mod tests {
 
     #[test]
     fn exported_claude_config_dir_is_ignored_unless_scoped_by_the_test() {
+        let _home = crate::store::ScopedConfigDir::new();
         let cfg = tempfile::tempdir().unwrap();
         let marker = cfg.path().join("ran");
         std::fs::write(
@@ -518,6 +551,7 @@ mod tests {
 
     #[test]
     fn scoped_claude_config_dir_relocates_claude_md() {
+        let _home = crate::store::ScopedConfigDir::new();
         let cfg = tempfile::tempdir().unwrap();
         std::fs::write(cfg.path().join("CLAUDE.md"), "hello from cfg dir").unwrap();
         let d = cfg.path().to_str().unwrap().to_string();

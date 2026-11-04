@@ -477,14 +477,15 @@ fn not_stale_when_tracked_file_missing_or_ledger_empty() {
 // ---- codeaudit r1 C4 regressions ---------------------------------------
 
 #[test]
-fn codex_instructions_md_is_only_a_fallback() {
+fn codex_legacy_instructions_md_is_not_counted() {
     with_home(|home| {
         let dir = home.join(".codex");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("instructions.md"), "old style").unwrap();
         let l = build_ledger("codex", None).unwrap();
         let names: Vec<_> = l.items.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(names, vec!["Global instructions.md"]);
+        // Current (Rust) Codex never reads the legacy TS CLI's instructions.md.
+        assert!(names.is_empty(), "{names:?}");
     });
 }
 
@@ -1065,4 +1066,221 @@ fn mcpjson_rejection_does_not_hide_same_named_user_server() {
             "user server dropped"
         );
     });
+}
+
+/// Set several env vars (HOME, XDG_CONFIG_HOME, ...) for `f` under the
+/// crate-wide ENV_LOCK (`scoped_env_var` is not reentrant), restoring after.
+fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
+    let _l = crate::env_lock::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    struct Restore(Vec<(String, Option<std::ffi::OsString>)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            for (k, v) in self.0.drain(..).rev() {
+                #[allow(clippy::disallowed_methods)]
+                match v {
+                    Some(v) => std::env::set_var(&k, v),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+    }
+    let mut restore = Restore(Vec::new());
+    let mut marks = Vec::new();
+    for (k, v) in vars {
+        restore.0.push((k.to_string(), std::env::var_os(k)));
+        #[allow(clippy::disallowed_methods)]
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+        marks.push(crate::env_lock::mark_scoped(k));
+    }
+    f();
+    drop(marks);
+    drop(restore);
+}
+
+#[test]
+fn claude_project_skills_and_agents_counted() {
+    with_home(|home| {
+        // Personal skill wins over a same-named project skill.
+        let user_skill = home.join(".claude/skills/deploy");
+        fs::create_dir_all(&user_skill).unwrap();
+        fs::write(
+            user_skill.join("SKILL.md"),
+            "---\nname: deploy\ndescription: mine\n---\nbody",
+        )
+        .unwrap();
+        let repo = tempdir().unwrap();
+        fs::create_dir_all(repo.path().join(".git")).unwrap();
+        for (skill, desc) in [("deploy", "theirs, longer"), ("lint", "lints")] {
+            let d = repo.path().join(".claude/skills").join(skill);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(
+                d.join("SKILL.md"),
+                format!("---\nname: {skill}\ndescription: {desc}\n---\nbody"),
+            )
+            .unwrap();
+        }
+        let proj = repo.path().join("pkg");
+        fs::create_dir_all(proj.join(".claude/agents")).unwrap();
+        fs::write(
+            proj.join(".claude/agents/reviewer.md"),
+            format!(
+                "---\nname: reviewer\ndescription: reviews\n---\n{}",
+                "x".repeat(4000)
+            ),
+        )
+        .unwrap();
+        let l = build_ledger("claude", Some(&proj)).unwrap();
+        let names: Vec<_> = l.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(
+            names.iter().filter(|n| **n == "skill: deploy").count(),
+            1,
+            "{names:?}"
+        );
+        assert!(names.contains(&"skill: lint"), "{names:?}");
+        let deploy = l.items.iter().find(|i| i.name == "skill: deploy").unwrap();
+        assert_eq!(
+            deploy.content_bytes,
+            "name: deploy\ndescription: mine\n".len()
+        );
+        let agent = l
+            .items
+            .iter()
+            .find(|i| i.name == "agent: reviewer")
+            .unwrap_or_else(|| panic!("project agent missing: {names:?}"));
+        assert_eq!(agent.kind, ItemKind::SubagentDef);
+        assert!(agent.content_bytes < 100, "only frontmatter counted");
+    });
+}
+
+#[test]
+fn codex_blank_override_suppresses_that_directorys_agents_md() {
+    with_home(|_| {
+        let proj = tempdir().unwrap();
+        fs::create_dir_all(proj.path().join(".git")).unwrap();
+        fs::write(proj.path().join("AGENTS.override.md"), "  \n").unwrap();
+        fs::write(proj.path().join("AGENTS.md"), "shared rules").unwrap();
+        let l = build_ledger("codex", Some(proj.path())).unwrap();
+        assert!(l.items.is_empty(), "{:?}", l.items);
+    });
+}
+
+#[test]
+fn codex_project_override_is_labelled_by_the_file_counted() {
+    with_home(|_| {
+        let repo = tempdir().unwrap();
+        fs::create_dir_all(repo.path().join(".git")).unwrap();
+        fs::write(repo.path().join("AGENTS.override.md"), "root override").unwrap();
+        fs::write(repo.path().join("AGENTS.md"), "root shared").unwrap();
+        let proj = repo.path().join("pkg");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("AGENTS.override.md"), "short").unwrap();
+        fs::write(proj.join("AGENTS.md"), "x".repeat(2000)).unwrap();
+        let l = build_ledger("codex", Some(&proj)).unwrap();
+        let names: Vec<_> = l.items.iter().map(|i| i.name.as_str()).collect();
+        assert!(names.contains(&"Project AGENTS.override.md"), "{names:?}");
+        assert!(
+            names.iter().any(|n| n.starts_with("AGENTS.override.md (")),
+            "{names:?}"
+        );
+    });
+}
+
+#[test]
+fn opencode_config_dir_honours_xdg_config_home() {
+    let home = tempdir().unwrap();
+    let xdg = tempdir().unwrap();
+    let cfg = xdg.path().join("opencode");
+    fs::create_dir_all(&cfg).unwrap();
+    fs::write(cfg.join("AGENTS.md"), "xdg rules").unwrap();
+    with_env(
+        &[
+            ("HOME", home.path().to_str()),
+            ("XDG_CONFIG_HOME", xdg.path().to_str()),
+        ],
+        || {
+            let l = build_ledger("opencode", None).unwrap();
+            let names: Vec<_> = l.items.iter().map(|i| i.name.as_str()).collect();
+            assert_eq!(names, vec!["Global AGENTS.md"]);
+        },
+    );
+}
+
+#[test]
+fn opencode_agent_counts_only_frontmatter() {
+    with_home(|home| {
+        let dir = home.join(".config/opencode/agent");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("reviewer.md"),
+            format!(
+                "---\ndescription: reviews code\nmode: subagent\n---\n{}",
+                "prompt ".repeat(1000)
+            ),
+        )
+        .unwrap();
+        let l = build_ledger("opencode", None).unwrap();
+        assert_eq!(l.items.len(), 1);
+        assert_eq!(
+            l.items[0].content_bytes,
+            "description: reviews code\n".len()
+        );
+    });
+}
+
+#[test]
+fn opencode_project_rules_found_walking_up_to_the_repo_root() {
+    with_home(|_| {
+        let repo = tempdir().unwrap();
+        fs::create_dir_all(repo.path().join(".git")).unwrap();
+        fs::write(repo.path().join("AGENTS.md"), "root rules").unwrap();
+        let proj = repo.path().join("packages/api");
+        fs::create_dir_all(&proj).unwrap();
+        let l = build_ledger("opencode", Some(&proj)).unwrap();
+        let names: Vec<_> = l.items.iter().map(|i| i.name.as_str()).collect();
+        assert!(
+            names.iter().any(|n| n.starts_with("AGENTS.md (")),
+            "{names:?}"
+        );
+
+        // No AGENTS.md anywhere: CLAUDE.md is the fallback.
+        let repo2 = tempdir().unwrap();
+        fs::create_dir_all(repo2.path().join(".git")).unwrap();
+        fs::write(repo2.path().join("CLAUDE.md"), "claude rules").unwrap();
+        let l = build_ledger("opencode", Some(repo2.path())).unwrap();
+        let names: Vec<_> = l.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["Project CLAUDE.md"]);
+    });
+}
+
+#[test]
+fn opencode_home_resolves_like_the_rest_of_the_crate() {
+    // HOME empty counts as unset, so `paths::user_home()` falls back to
+    // USERPROFILE; `~/` instruction paths must resolve under it.
+    let profile = tempdir().unwrap();
+    fs::write(profile.path().join("rules.md"), "profile rules").unwrap();
+    let xdg = tempdir().unwrap();
+    let cfg = xdg.path().join("opencode");
+    fs::create_dir_all(&cfg).unwrap();
+    fs::write(
+        cfg.join("opencode.json"),
+        r#"{"instructions":["~/rules.md"]}"#,
+    )
+    .unwrap();
+    with_env(
+        &[
+            ("HOME", Some("")),
+            ("USERPROFILE", profile.path().to_str()),
+            ("XDG_CONFIG_HOME", xdg.path().to_str()),
+        ],
+        || {
+            let l = build_ledger("opencode", None).unwrap();
+            let names: Vec<_> = l.items.iter().map(|i| i.name.as_str()).collect();
+            assert_eq!(names, vec!["instructions: ~/rules.md"]);
+        },
+    );
 }
