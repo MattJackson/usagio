@@ -7027,10 +7027,14 @@ mod tests {
         }
         // The usage-log reader is mtime-cached process-wide; drop entries other
         // tests (or the empty read above) left behind so ours is parsed fresh.
-        crate::usage_log::invalidate_cache();
+        crate::usage_log::evict_recent_months();
         let rows = account_extra_info_rows(&sec, &a);
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows[0].starts_with("Weekly · "), "{rows:?}");
+        assert_ne!(
+            rows[0], "Weekly · 60% · —",
+            "a real pace, not the no-history fallback"
+        );
         assert_eq!(rows[1], "updated 1m ago");
 
         // Weekly already locked → the burn forecast is redundant and skipped.

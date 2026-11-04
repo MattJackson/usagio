@@ -518,7 +518,7 @@ mod tests {
             use std::io::Write;
             writeln!(f, "{}", serde_json::to_string(&snap).unwrap()).unwrap();
         }
-        crate::usage_log::invalidate_cache();
+        crate::usage_log::evict_recent_months();
         (
             lock,
             guard,
