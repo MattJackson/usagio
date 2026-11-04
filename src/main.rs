@@ -2529,6 +2529,41 @@ fn token_selector(sel: &str) -> Result<&str> {
     }
 }
 
+/// `usagio token` for the account it saw active. GUARANTEE: never POST /token
+/// for the ACTIVE account (single-use refresh token would invalidate the live
+/// vendor CLI's copy → forced re-login): ADOPT the vendor slot's current token
+/// instead, so a script gets the same bearer the vendor CLI is using. If the
+/// slot is unreadable the stored token is returned rather than POST. Returns
+/// `None` once the account is no longer active. Runs under the state lock
+/// (`active_refresh_cas` may write the slot), like `claim_refresh_token`.
+fn token_active_cas(
+    provider: &dyn Provider,
+    email: &str,
+) -> Result<Option<(ActiveRefreshOutcome, Account)>> {
+    with_state_lock(|| {
+        let mut st = State::load()?;
+        if !st
+            .active
+            .as_deref()
+            .is_some_and(|a| a.eq_ignore_ascii_case(email))
+        {
+            return Ok(None);
+        }
+        let Some(a) = st.find_mut(email) else {
+            return Ok(None);
+        };
+        let before = serde_json::to_value(&*a).ok();
+        let outcome = active_refresh_cas(provider, a);
+        let changed = serde_json::to_value(&*a).ok() != before;
+        let acct = a.clone();
+        if changed {
+            st.save()
+                .context("recording the adopted token in state.json failed")?;
+        }
+        Ok(Some((outcome, acct)))
+    })
+}
+
 fn cmd_token(selector: Option<&str>) -> Result<()> {
     let state = State::load()?;
     let email = match selector.map(token_selector).transpose()? {
@@ -2539,63 +2574,49 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
             _ => bail!("multiple accounts; specify one by email or prefix"),
         },
     };
-    // Phase 1 (no lock): refresh if near expiry. Network I/O stays OUTSIDE the
-    // cross-process lock so a slow/hung token endpoint can't stall the daemon
-    // poll or a concurrent switch (which all take the same lock).
-    let mut acct = State::load()?
-        .find(&email)
-        .cloned()
-        .with_context(|| format!("no account matches '{email}'"))?;
-    // Reactive path: try the disk fallback before flagging so a rotation the
-    // vendor CLI wrote to ~/.claude/.credentials.json (or that fsnotify missed)
-    // is adopted here instead of tripping needs_relogin on a token that's
-    // already been superseded on disk.
     let provider = providers::get(CLAUDE_SLUG)
         .ok_or_else(|| anyhow!("internal: provider '{CLAUDE_SLUG}' not registered"))?;
-    let adopted = if state.active.as_deref() == Some(email.as_str()) {
-        // GUARANTEE: never POST /token for the ACTIVE account (single-use refresh
-        // token would invalidate the live vendor CLI's copy → forced re-login).
-        // `usagio token` for the active account ADOPTS the vendor slot's current
-        // token instead of minting one; a script gets the same bearer the vendor
-        // CLI is using. If the slot is unreadable we return the stored token
-        // rather than POST. See `active_refresh_cas`'s doc.
-        match active_refresh_cas(provider, &mut acct) {
-            ActiveRefreshOutcome::Adopted => true,
-            ActiveRefreshOutcome::RefreshFailed => {
-                logging::log(&format!(
-                    "token: active account {email} slot unreadable; returning stored \
-                     token (never POST /token for the active account)"
-                ));
-                false
-            }
-        }
+    let active = if state.active.as_deref() == Some(email.as_str()) {
+        token_active_cas(provider, &email)?
     } else {
-        match ensure_fresh_with_fallback(provider, &email, &mut acct) {
-            // `ensure_fresh` saved any rotation itself.
-            Ok(_) => false,
-            Err(oauth::RefreshError::InvalidGrant) => {
-                flag_needs_relogin(&email);
-                bail!(
-                    "account {email} needs re-login (refresh token rejected); run \
-                     `claude /login` for it or click the account row in the menu"
-                );
+        None
+    };
+    let acct = match active {
+        Some((ActiveRefreshOutcome::Adopted, fresh)) => fresh,
+        Some((ActiveRefreshOutcome::RefreshFailed, stored)) => {
+            logging::log(&format!(
+                "token: active account {email} slot unreadable; returning stored \
+                 token (never POST /token for the active account)"
+            ));
+            stored
+        }
+        None => {
+            // Network I/O stays OUTSIDE the cross-process lock so a slow/hung
+            // token endpoint can't stall the daemon poll or a concurrent
+            // switch (which all take the same lock).
+            let mut acct = State::load()?
+                .find(&email)
+                .cloned()
+                .with_context(|| format!("no account matches '{email}'"))?;
+            // Reactive path: try the disk fallback before flagging so a
+            // rotation the vendor CLI wrote to ~/.claude/.credentials.json (or
+            // that fsnotify missed) is adopted here instead of tripping
+            // needs_relogin on a token that's already been superseded on disk.
+            match ensure_fresh_with_fallback(provider, &email, &mut acct) {
+                // `ensure_fresh` saved any rotation itself.
+                Ok(_) => acct,
+                Err(oauth::RefreshError::InvalidGrant) => {
+                    flag_needs_relogin(&email);
+                    bail!(
+                        "account {email} needs re-login (refresh token rejected); run \
+                         `claude /login` for it or click the account row in the menu"
+                    );
+                }
+                Err(e) => bail!("token refresh for {email} failed: {e}"),
             }
-            Err(e) => bail!("token refresh for {email} failed: {e}"),
         }
     };
     let token = acct.access_token.clone();
-    // Phase 2 (locked): persist the vendor slot's token we just adopted,
-    // without clobbering a fresher one.
-    if adopted {
-        with_state_lock(|| {
-            let mut st = State::load()?;
-            if let Some(a) = st.find_mut(&email) {
-                a.adopt_tokens_if_newer(&acct);
-            }
-            st.save()
-                .context("recording the adopted token in state.json failed")
-        })?;
-    }
     println!("{token}");
     Ok(())
 }

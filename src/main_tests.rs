@@ -7697,3 +7697,23 @@ fn a_just_switched_to_locked_codex_account_is_refetched() {
     assert_eq!(codex_one(&k, cu_locked(2 * 3600), true, false), 1);
     reset_usage_fetch_tracker(&fetch_tracker_key("codex", &k));
 }
+
+#[test]
+fn token_for_a_no_longer_active_account_never_rewrites_the_slot() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    // The slot still holds A's old grant; A carries a failed-publish marker.
+    let provider = MockActiveSlotProvider::new(&mock_claude_blob("old-at", "old-rt", 5));
+    let mut a = Account::from_keychain_blob(&mock_claude_blob("new-at", "new-rt", 6)).unwrap();
+    a.email = Some(provider.email.clone());
+    a.live_write_pending = Some(crate::logging::token_fingerprint(&a.refresh_token));
+    let mut b = claude_account("b@e.com", 3_600_000);
+    b.email = Some("b@e.com".into());
+    // `usagio token A` saw A active; a switch to B committed since.
+    seed_claude_state(vec![a, b], Some("b@e.com"));
+    let _ = token_active_cas(&provider, &provider.email.clone());
+    assert_eq!(
+        provider.writes.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "reverted the committed switch in the slot"
+    );
+}
