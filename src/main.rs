@@ -1015,18 +1015,33 @@ fn finish_provider_switch(slug: &str, key: &str, launch: Option<Launch>, hold: b
         if launch.is_none() {
             return Ok(());
         }
-        // Each re-drive probes the client (a subprocess for Codex), so back
-        // off from 1s to 5s while it is still busy.
-        let mut wait = 1;
-        while try_provider_switch_pending(slug, key)? {
-            std::thread::sleep(std::time::Duration::from_secs(wait));
-            switch_provider_with_intent(slug, key, hold)?;
-            wait = (wait + 1).min(5);
-        }
+        wait_for_queued_provider_switch(slug, key, hold, |secs| {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+        })?;
         ensure_switch_landed(slug, key, &label)?;
     }
     println!("Active login is now {label} ({slug}).");
     launch_selected_client(provider, launch)
+}
+
+/// Re-drive the queued switch to `key` until it leaves the queue, calling
+/// `pause(secs)` between attempts. Each re-drive probes the client (a
+/// subprocess for Codex), so back off from 1s to 5s while it is still busy.
+fn wait_for_queued_provider_switch(
+    slug: &str,
+    key: &str,
+    hold: bool,
+    mut pause: impl FnMut(u64),
+) -> Result<()> {
+    let mut wait = 1;
+    while let Some(pending) = queued_provider_switch(slug, key)? {
+        pause(wait);
+        // Compare-and-set on the intent seen before the pause: a newer pick
+        // queued meanwhile wins, and the loop ends on the next check.
+        switch_provider_expecting(slug, key, hold, Some(&pending))?;
+        wait = (wait + 1).min(5);
+    }
+    Ok(())
 }
 
 /// After waiting out a queued switch: bail unless `key` really became active
@@ -1177,11 +1192,16 @@ fn switch_provider_expecting(
 /// Whether a switch to `key` is still queued; a state read failure is an error
 /// (not "no longer pending").
 fn try_provider_switch_pending(slug: &str, key: &str) -> Result<bool> {
+    Ok(queued_provider_switch(slug, key)?.is_some())
+}
+
+/// `slug`'s queued switch, if it is the one to `key`.
+fn queued_provider_switch(slug: &str, key: &str) -> Result<Option<store::PendingSwitch>> {
     let state = State::load()?;
     Ok(state
         .provider_accounts(slug)
-        .and_then(|pa| pa.pending_switch.as_ref())
-        .is_some_and(|pending| pending.key.eq_ignore_ascii_case(key)))
+        .and_then(|pa| pa.pending_switch.clone())
+        .filter(|pending| pending.key.eq_ignore_ascii_case(key)))
 }
 
 pub(crate) fn provider_switch_pending(slug: &str, key: &str) -> bool {

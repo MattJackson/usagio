@@ -7546,3 +7546,42 @@ fn failed_live_write_leaves_a_marker_and_the_poll_republishes_it() {
     a.adopt_login(&Account::from_keychain_blob(&mock_claude_blob("m-at", "m-rt", 6)).unwrap());
     assert_eq!(a.live_write_pending, None);
 }
+
+#[test]
+fn cli_wait_loop_does_not_replay_its_pick_over_a_newer_queued_one() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+        let (a, b) = ("a@e.com", "b@e.com");
+        let fresh = |key: &str| {
+            let mut acct = codex_account(key, None);
+            acct.expires_at = Utc::now().timestamp() + 86_400;
+            acct
+        };
+        let pending = |key: &str| crate::store::PendingSwitch {
+            renewal: false,
+            key: key.into(),
+            manual: true,
+            from: None,
+            drain_token: None,
+            credentials_written: false,
+            leave_latch: None,
+            renewed_account: None,
+        };
+        let mut state = State::default();
+        state.upsert_provider_account("codex", fresh(a));
+        state.upsert_provider_account("codex", fresh(b));
+        state.provider_accounts_mut("codex").pending_switch = Some(pending(a));
+        state.save().unwrap();
+        // While the CLI sleeps, the user picks B in the menu.
+        let _ = wait_for_queued_provider_switch("codex", a, true, |_| {
+            let mut st = State::load().unwrap();
+            st.provider_accounts_mut("codex").pending_switch = Some(pending(b));
+            st.save().unwrap();
+        });
+        let after = State::load().unwrap();
+        let now = after.provider_accounts("codex").unwrap();
+        assert_ne!(now.active.as_deref(), Some(a), "stale CLI pick replaced the newer one");
+        assert_eq!(now.pending_switch.as_ref().map(|p| p.key.as_str()), Some(b));
+    });
+}
