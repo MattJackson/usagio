@@ -3156,7 +3156,7 @@ fn accounts_needing_relogin() -> Vec<String> {
             st.providers
                 .values()
                 .flat_map(|p| p.accounts.iter())
-                .filter(|a| a.needs_relogin)
+                .filter(|a| a.needs_relogin && !a.no_subscription)
                 .map(|a| a.key.clone()),
         )
         .collect();
@@ -3271,13 +3271,25 @@ fn handle_capture(slug: &str) {
 /// "Renew login…": run the provider's own login in usagio's sign-in window —
 /// the default browser where no window can be shown — and save the result
 /// (see `crate::login`). Runs on the UI thread; the wait happens off it.
+/// Sign-in window store for a renew. `State::find` searches Claude accounts
+/// only, so its `login_store` applies only to a Claude renew; any other
+/// provider keys its store by the account key.
+fn renew_login_store(st: &State, slug: &str, key: &str) -> String {
+    if slug == CLAUDE_SLUG {
+        if let Some(store) = st.find(key).and_then(|a| a.login_store.clone()) {
+            return store;
+        }
+    }
+    key.to_string()
+}
+
 fn handle_renew(slug: &str, key: &str) {
     let Some(provider) = providers::get(slug) else {
         return;
     };
     let store = State::load()
         .ok()
-        .and_then(|st| st.find(key).and_then(|a| a.login_store.clone()))
+        .map(|st| renew_login_store(&st, slug, key))
         .unwrap_or_else(|| key.to_string());
     let target = crate::login::Target::Renew(key.to_string());
     let started = crate::login::start(provider, target, |result| match result {
@@ -7387,6 +7399,17 @@ mod tests {
     }
 
     #[test]
+    fn renew_login_store_only_uses_claude_store_for_claude() {
+        let _g = crate::store::ScopedConfigDir::new();
+        let mut st = State::default();
+        let mut a = restore_test_acct("me@x.com");
+        a.login_store = Some("s-abc".into());
+        st.accounts.push(a);
+        assert_eq!(renew_login_store(&st, CLAUDE_SLUG, "me@x.com"), "s-abc");
+        assert_eq!(renew_login_store(&st, "codex", "me@x.com"), "me@x.com");
+    }
+
+    #[test]
     fn accounts_needing_relogin_lists_claude_and_provider_accounts_sorted() {
         let _g = crate::store::ScopedConfigDir::new();
         let mut st = State::default();
@@ -7398,6 +7421,14 @@ mod tests {
         c.needs_relogin = true;
         st.upsert_provider_account("codex", c);
         st.upsert_provider_account("codex", codex_state_acct("ok@x.com"));
+        st.save().unwrap();
+        assert_eq!(accounts_needing_relogin(), ["c@x.com", "z@x.com"]);
+
+        // A lapsed (Free) provider account renders its plan, not "re-login".
+        let mut lapsed = codex_state_acct("free@x.com");
+        lapsed.needs_relogin = true;
+        lapsed.no_subscription = true;
+        st.upsert_provider_account("codex", lapsed);
         st.save().unwrap();
         assert_eq!(accounts_needing_relogin(), ["c@x.com", "z@x.com"]);
 
