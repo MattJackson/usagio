@@ -630,6 +630,17 @@ fn trailing_usage_for_account(
             return (format!("{} credits", left.display_whole()), Vec::new());
         }
     }
+    // A maxed window with unknown reset: the other window's unlock time is
+    // not when the account frees up, so show the percentages, not a countdown.
+    let usage = account_usage_for(a);
+    let display = if countdown::has_indefinite_block(&usage) {
+        DisplayState::Usage {
+            session_pct: usage.session_pct,
+            weekly_pct: usage.weekly_pct,
+        }
+    } else {
+        display
+    };
     match display {
         DisplayState::Locked {
             until,
@@ -3434,7 +3445,12 @@ fn login_message(mut msg: String, r: &crate::login::Renewed) -> String {
 /// worker waits instead, keeping the serialization with the poller.
 fn spawn_serialized_with_poller(work: impl FnOnce(&mut SwapGuards) + Send + 'static) {
     let shared = shared_swap_guard();
+    // Unit tests scope the config dir per thread; carry it to the worker.
+    #[cfg(test)]
+    let home = crate::store::home_override();
     std::thread::spawn(move || {
+        #[cfg(test)]
+        crate::store::set_home_override(home);
         let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
         work(&mut guard);
     });
@@ -3445,7 +3461,37 @@ fn handle_switch(slug: &str, key: &str) {
     // poller so it cannot immediately undo the choice with an older decision;
     // off the UI thread, since the guard can be held across network fetches.
     let (slug, key) = (slug.to_string(), key.to_string());
-    spawn_serialized_with_poller(move |guard| switch_serialized(guard, &slug, &key));
+    let provider = slug.clone();
+    spawn_latest_switch(&provider, move |guard| {
+        switch_serialized(guard, &slug, &key)
+    });
+}
+
+/// Latest requested switch per provider. `std::sync::Mutex` is not FIFO, so
+/// workers queued behind the poller can wake in any order; each carries the
+/// generation it was requested at and skips if a newer click superseded it.
+static SWITCH_GEN: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
+
+fn spawn_latest_switch(slug: &str, work: impl FnOnce(&mut SwapGuards) + Send + 'static) {
+    let gen = {
+        let mut m = SWITCH_GEN.lock().unwrap_or_else(|e| e.into_inner());
+        let n = m.get_or_insert_with(Default::default);
+        let g = n.entry(slug.to_string()).or_insert(0);
+        *g += 1;
+        *g
+    };
+    let slug = slug.to_string();
+    spawn_serialized_with_poller(move |guard| {
+        let current = SWITCH_GEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|m| m.get(&slug).copied());
+        if current == Some(gen) {
+            work(guard);
+        }
+    });
 }
 
 fn switch_serialized(guard: &mut SwapGuards, slug: &str, key: &str) {
@@ -4370,6 +4416,25 @@ mod tests {
 
         // Clean up so later tests in this binary see the flag cleared.
         REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn only_the_latest_queued_switch_runs() {
+        let shared = shared_swap_guard();
+        let held = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        for name in ["A", "B"] {
+            let tx = tx.clone();
+            spawn_latest_switch("latest-test", move |_| {
+                let _ = tx.send(name);
+            });
+        }
+        drop(held);
+        let mut ran = Vec::new();
+        while let Ok(n) = rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            ran.push(n);
+        }
+        assert_eq!(ran, ["B"], "superseded switch must not run");
     }
 
     #[test]
@@ -6540,6 +6605,22 @@ mod tests {
     }
 
     #[test]
+    fn restore_dropped_list_is_stable_across_calls_with_several_provider_slugs() {
+        use crate::store::{accounts_dropped_by, ScopedConfigDir, State};
+        let _g = ScopedConfigDir::new();
+        let mut current = State::default();
+        for slug in ["codex", "zed", "alpha", "mid"] {
+            current.upsert_provider_account(slug, codex_state_acct("k@x.com"));
+        }
+        current.save().unwrap();
+        let first = accounts_dropped_by(&State::default()).unwrap();
+        assert_eq!(first.len(), 4, "{first:?}");
+        for _ in 0..40 {
+            assert_eq!(accounts_dropped_by(&State::default()).unwrap(), first);
+        }
+    }
+
+    #[test]
     fn restore_that_only_adds_an_account_reports_no_drops() {
         use crate::store::{accounts_dropped_by, ScopedConfigDir, State};
         let _g = ScopedConfigDir::new();
@@ -7667,6 +7748,15 @@ mod tests {
             );
 
             handle_click("switch:codex:a@example.com");
+            // The switch runs on a worker thread; wait for it to land.
+            for _ in 0..500 {
+                let st = State::load().unwrap();
+                if st.provider_accounts("codex").unwrap().active.as_deref() == Some("a@example.com")
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
             let st = State::load().unwrap();
             assert_eq!(
                 st.provider_accounts("codex").unwrap().active.as_deref(),
@@ -7677,7 +7767,8 @@ mod tests {
                 blob_a
             );
         });
-        let _ = wait_for_poll_request(Duration::ZERO); // the switch asked for a poll
+        // The worker asks for a poll after switching; consume it.
+        let _ = wait_for_poll_request(Duration::from_secs(5));
     }
 
     #[test]
