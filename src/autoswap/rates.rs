@@ -15,15 +15,15 @@ use chrono::{DateTime, Utc};
 
 /// An account's measured rates, pct/min. `None` = not enough samples.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct AccountRate {
-    pub session: Option<f64>,
-    pub weekly: Option<f64>,
-    pub peak_session: Option<f64>,
-    pub peak_weekly: Option<f64>,
+pub(crate) struct AccountRate {
+    pub(crate) session: Option<f64>,
+    pub(crate) weekly: Option<f64>,
+    pub(crate) peak_session: Option<f64>,
+    pub(crate) peak_weekly: Option<f64>,
 }
 
 /// The default (and floor) rate of a window.
-pub fn default_rate(w: WindowId) -> f64 {
+fn default_rate(w: WindowId) -> f64 {
     match w {
         WindowId::Session => DEFAULT_RATE_SESSION,
         WindowId::Weekly => DEFAULT_RATE_WEEKLY,
@@ -32,7 +32,7 @@ pub fn default_rate(w: WindowId) -> f64 {
 
 impl AccountRate {
     /// The measured rate, if any (the display uses this: "at current pace").
-    pub fn own(&self, w: WindowId) -> Option<f64> {
+    pub(crate) fn own(&self, w: WindowId) -> Option<f64> {
         match w {
             WindowId::Session => self.session,
             WindowId::Weekly => self.weekly,
@@ -40,17 +40,17 @@ impl AccountRate {
     }
 
     /// The measured rate, or the default when there is no data yet.
-    pub fn effective(&self, w: WindowId) -> f64 {
+    pub(crate) fn effective(&self, w: WindowId) -> f64 {
         self.own(w).unwrap_or_else(|| default_rate(w)).max(0.0)
     }
 
     /// `max(rate, DEFAULT)`: candidate runway, drain gain and I2 use this.
-    pub fn floored(&self, w: WindowId) -> f64 {
+    pub(crate) fn floored(&self, w: WindowId) -> f64 {
         self.effective(w).max(default_rate(w))
     }
 
     /// The 5-minute peak in the last hour (0 when unknown).
-    pub fn peak(&self, w: WindowId) -> f64 {
+    pub(crate) fn peak(&self, w: WindowId) -> f64 {
         match w {
             WindowId::Session => self.peak_session,
             WindowId::Weekly => self.peak_weekly,
@@ -62,10 +62,10 @@ impl AccountRate {
 
 /// One reading: unix seconds and the two window percentages.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Point {
-    pub t: i64,
-    pub session: Option<f64>,
-    pub weekly: Option<f64>,
+pub(crate) struct Point {
+    pub(crate) t: i64,
+    pub(crate) session: Option<f64>,
+    pub(crate) weekly: Option<f64>,
 }
 
 fn pick(p: &Point, w: WindowId) -> Option<f64> {
@@ -136,7 +136,7 @@ fn window_peak(points: &[Point], w: WindowId, now_ts: i64) -> Option<f64> {
 }
 
 /// Rates from readings (any order, duplicates allowed).
-pub fn rates_from_points(points: &[Point], now: DateTime<Utc>) -> AccountRate {
+pub(crate) fn rates_from_points(points: &[Point], now: DateTime<Utc>) -> AccountRate {
     let now_ts = now.timestamp();
     let mut pts: Vec<Point> = points.to_vec();
     pts.sort_by_key(|p| p.t);
@@ -152,7 +152,7 @@ pub fn rates_from_points(points: &[Point], now: DateTime<Utc>) -> AccountRate {
 /// Rates for `key` from usage-log rows: only successful readings (rows with
 /// no outcome are pre-0.12.2 readings), only while the account was active (or
 /// not marked), timed by `fetched_at` when the row has it.
-pub fn rates_from_samples(
+fn rates_from_samples(
     samples: &[crate::usage_log::Snapshot],
     key: &str,
     now: DateTime<Utc>,
@@ -171,7 +171,7 @@ pub fn rates_from_samples(
 }
 
 /// Rates for one account from the on-disk usage log (last day of rows).
-pub fn rates_for(provider: &str, key: &str, now: DateTime<Utc>) -> AccountRate {
+pub(crate) fn rates_for(provider: &str, key: &str, now: DateTime<Utc>) -> AccountRate {
     let rows = crate::usage_log::last_n_days(&crate::usage_log::AccountKey::new(provider, key), 1);
     rates_from_samples(&rows, key, now)
 }

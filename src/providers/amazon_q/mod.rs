@@ -13,19 +13,20 @@
 //!  - Note: new signups end 2026-05-15, full end-of-support 2027-04-30
 //!    (Kiro migration) — flag as sunsetting.
 
-#![allow(dead_code)]
+use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
-use crate::providers::trait_def::{
-    Capabilities, CaptureMode, CapturedAccount, PResult, Provider, ProviderError, SecretBackend,
-    TokenGrant,
-};
-
-pub fn new() -> Box<dyn Provider> {
+pub(crate) fn new() -> Box<dyn Provider> {
     Box::new(AmazonQProvider)
 }
 
-pub struct AmazonQProvider;
+struct AmazonQProvider;
 
+// Not wired yet (no capability exposed):
+// TODO: open the SQLite DB at
+// `~/Library/Application Support/amazon-q/data.sqlite3`, read the
+// `auth_kv` row with key `codewhisperer:odic:token`, and parse the
+// JSON `BuilderIdToken` for `access_token` / `refresh_token`. Email
+// is not on disk — an SSO/IdC API call would be needed to attach it.
 impl Provider for AmazonQProvider {
     fn provider_id(&self) -> &'static str {
         "amazon-q"
@@ -45,23 +46,6 @@ impl Provider for AmazonQProvider {
             secret_backend: SecretBackend::Sqlite,
             capture_mode: CaptureMode::CredsOnDisk,
         }
-    }
-
-    fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
-        // TODO: open the SQLite DB at
-        // `~/Library/Application Support/amazon-q/data.sqlite3`, read the
-        // `auth_kv` row with key `codewhisperer:odic:token`, and parse the
-        // JSON `BuilderIdToken` for `access_token` / `refresh_token`. Email
-        // is not on disk — an SSO/IdC API call would be needed to attach it.
-        Err(ProviderError::Unsupported)
-    }
-
-    fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
-        Err(ProviderError::Unsupported)
-    }
-
-    fn patch_stored_blob(&self, _blob: &str, _grant: &TokenGrant) -> PResult<String> {
-        Err(ProviderError::Unsupported)
     }
 }
 
@@ -84,9 +68,6 @@ mod tests {
 
     #[test]
     fn capture_returns_none_placeholder() {
-        assert!(matches!(
-            AmazonQProvider.capture_current_login(),
-            Err(ProviderError::Unsupported)
-        ));
+        assert!(AmazonQProvider.login_capture().is_none());
     }
 }

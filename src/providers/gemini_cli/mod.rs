@@ -10,19 +10,18 @@
 //!  - Usage endpoint: POST `https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist`.
 //!  - Single-slot; second Google login overwrites the keychain entry.
 
-#![allow(dead_code)]
+use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
-use crate::providers::trait_def::{
-    Capabilities, CaptureMode, CapturedAccount, PResult, Provider, ProviderError, SecretBackend,
-    TokenGrant,
-};
-
-pub fn new() -> Box<dyn Provider> {
+pub(crate) fn new() -> Box<dyn Provider> {
     Box::new(GeminiCliProvider)
 }
 
-pub struct GeminiCliProvider;
+struct GeminiCliProvider;
 
+// Not wired yet (no capability exposed):
+// TODO: read the macOS Keychain entry `gemini-cli-oauth`/`main-account`
+// (falling back to `~/.gemini/oauth_creds.json`) and pair the
+// credentials with the email cached in `~/.gemini/google_accounts.json`.
 impl Provider for GeminiCliProvider {
     fn provider_id(&self) -> &'static str {
         "gemini-cli"
@@ -42,21 +41,6 @@ impl Provider for GeminiCliProvider {
             secret_backend: SecretBackend::Keychain,
             capture_mode: CaptureMode::CredsOnDisk,
         }
-    }
-
-    fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
-        // TODO: read the macOS Keychain entry `gemini-cli-oauth`/`main-account`
-        // (falling back to `~/.gemini/oauth_creds.json`) and pair the
-        // credentials with the email cached in `~/.gemini/google_accounts.json`.
-        Err(ProviderError::Unsupported)
-    }
-
-    fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
-        Err(ProviderError::Unsupported)
-    }
-
-    fn patch_stored_blob(&self, _blob: &str, _grant: &TokenGrant) -> PResult<String> {
-        Err(ProviderError::Unsupported)
     }
 }
 
@@ -79,9 +63,6 @@ mod tests {
 
     #[test]
     fn capture_returns_none_placeholder() {
-        assert!(matches!(
-            GeminiCliProvider.capture_current_login(),
-            Err(ProviderError::Unsupported)
-        ));
+        assert!(GeminiCliProvider.login_capture().is_none());
     }
 }

@@ -73,10 +73,10 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_LINE_BYTES: u64 = 1 << 20;
 
 #[derive(Debug)]
-pub struct McpSummary {
-    pub tool_count: usize,
-    pub token_count: usize,
-    pub byte_count: usize,
+pub(crate) struct McpSummary {
+    pub(crate) tool_count: usize,
+    pub(crate) token_count: usize,
+    pub(crate) byte_count: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,7 +88,35 @@ struct StdioConfig {
     env: std::collections::HashMap<String, String>,
 }
 
-pub fn fetch_tools(config: &Value) -> Result<McpSummary, String> {
+/// A fully resolved stdio server launch: exactly what gets spawned.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Launch {
+    pub(crate) command: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) env: Vec<(String, String)>,
+    /// Start from an empty environment (Codex) instead of inheriting ours.
+    pub(crate) clear_env: bool,
+    pub(crate) cwd: Option<std::path::PathBuf>,
+}
+
+/// Probe a Claude-Code-shaped server config (`{type?, command, args, env}`).
+/// Test-only, and only the unix test suite (which spawns `sh` servers) uses it.
+#[cfg(all(test, unix))]
+pub(crate) fn fetch_tools(config: &Value) -> Result<McpSummary, String> {
+    fetch_launch(&claude_launch(config)?)
+}
+
+/// Resolve a Claude Code MCP config to a launch. Only stdio servers are
+/// probed: any other `type` (`sse`, `http`, `ws`, ...) is a remote transport
+/// even when its `url` is missing, and must never fall through to spawning a
+/// `command` it happens to carry.
+pub(crate) fn claude_launch(config: &Value) -> Result<Launch, String> {
+    match config.get("type") {
+        None => {}
+        Some(Value::String(t)) if t == "stdio" => {}
+        Some(Value::String(t)) => return Err(format!("{t} transport not yet supported")),
+        Some(other) => return Err(format!("bad server type: {other}")),
+    }
     // Only stdio-transport servers supported here. HTTP transport (URL-based)
     // is out of scope for the first ledger pass — flag and skip.
     if config.get("url").is_some() {
@@ -96,20 +124,177 @@ pub fn fetch_tools(config: &Value) -> Result<McpSummary, String> {
     }
     let cfg: StdioConfig =
         serde_json::from_value(config.clone()).map_err(|e| format!("bad stdio config: {}", e))?;
-
-    let start = Instant::now();
     // Claude Code expands `${VAR}` / `${VAR:-default}` in command, args and env
     // values of MCP server configs; do the same so we spawn what it would.
-    let command = expand_env_vars(&cfg.command);
-    let args: Vec<String> = cfg.args.iter().map(|a| expand_env_vars(a)).collect();
-    let env: std::collections::HashMap<&String, String> = cfg
-        .env
+    Ok(Launch {
+        command: expand_env_vars(&cfg.command),
+        args: cfg.args.iter().map(|a| expand_env_vars(a)).collect(),
+        env: cfg
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), expand_env_vars(v)))
+            .collect(),
+        clear_env: false,
+        cwd: None,
+    })
+}
+
+/// Variables Codex passes from its own environment to every stdio MCP server
+/// (`rmcp-client` `DEFAULT_ENV_VARS`); the child otherwise starts empty.
+#[cfg(unix)]
+const CODEX_DEFAULT_ENV_VARS: &[&str] = &[
+    "HOME",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "USER",
+    "__CF_USER_TEXT_ENCODING",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "TMPDIR",
+    "TZ",
+];
+#[cfg(windows)]
+const CODEX_DEFAULT_ENV_VARS: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "SHELL",
+    "COMSPEC",
+    "SYSTEMROOT",
+    "WINDIR",
+    "SYSTEMDRIVE",
+    "USERNAME",
+    "USERDOMAIN",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMW6432",
+    "PROGRAMDATA",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "POWERSHELL",
+    "PWSH",
+];
+
+/// Resolve a Codex `[mcp_servers.<name>]` table (as JSON) to a launch, the
+/// way Codex starts it: a `url` server is streamable HTTP; a `command` server
+/// runs in an EMPTY environment holding only Codex's default variables, the
+/// `env_vars` names (plain strings or `{name, source}`) copied from ours, and
+/// then `env`; in `cwd`, else `fallback_cwd` (the session directory). Codex
+/// does no `${VAR}` expansion.
+pub(crate) fn codex_launch(
+    config: &Value,
+    fallback_cwd: Option<&std::path::Path>,
+) -> Result<Launch, String> {
+    if config.get("url").is_some() {
+        return Err("http transport not yet supported".into());
+    }
+    let command = match config.get("command") {
+        Some(Value::String(c)) => c.clone(),
+        _ => return Err("bad stdio config: missing string `command`".into()),
+    };
+    let strings = |key: &str| -> Result<Vec<String>, String> {
+        match config.get(key) {
+            None => Ok(Vec::new()),
+            Some(Value::Array(a)) => a
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(String::from)
+                        .ok_or_else(|| format!("bad stdio config: `{key}` entries must be strings"))
+                })
+                .collect(),
+            Some(_) => Err(format!("bad stdio config: `{key}` must be an array")),
+        }
+    };
+    let args = strings("args")?;
+    let mut names: Vec<String> = CODEX_DEFAULT_ENV_VARS
         .iter()
-        .map(|(k, v)| (k, expand_env_vars(v)))
+        .map(|s| s.to_string())
         .collect();
-    let mut cmd = Command::new(&command);
-    cmd.args(&args)
-        .envs(env)
+    match config.get("env_vars") {
+        None => {}
+        Some(Value::Array(a)) => {
+            for v in a {
+                let (name, source) = match v {
+                    Value::String(n) => (n.clone(), None),
+                    Value::Object(o) => match o.get("name").and_then(|n| n.as_str()) {
+                        Some(n) => (n.to_string(), o.get("source").and_then(|s| s.as_str())),
+                        None => {
+                            return Err("bad stdio config: env_vars entry without `name`".into())
+                        }
+                    },
+                    _ => return Err("bad stdio config: bad env_vars entry".into()),
+                };
+                match source {
+                    None | Some("local") => names.push(name),
+                    Some("remote") => {
+                        return Err(format!(
+                        "env_vars entry `{name}` uses source `remote` (remote stdio, not probed)"
+                    ))
+                    }
+                    Some(other) => {
+                        return Err(format!("unsupported env_vars source `{other}`"));
+                    }
+                }
+            }
+        }
+        Some(_) => return Err("bad stdio config: `env_vars` must be an array".into()),
+    }
+    let mut env: Vec<(String, String)> = Vec::new();
+    let mut set = |k: String, v: String| {
+        env.retain(|(ek, _)| ek != &k);
+        env.push((k, v));
+    };
+    for name in names {
+        if let Ok(v) = std::env::var(&name) {
+            set(name, v);
+        }
+    }
+    match config.get("env") {
+        None => {}
+        Some(Value::Object(o)) => {
+            for (k, v) in o {
+                let v = v
+                    .as_str()
+                    .ok_or_else(|| format!("bad stdio config: env `{k}` must be a string"))?;
+                set(k.clone(), v.to_string());
+            }
+        }
+        Some(_) => return Err("bad stdio config: `env` must be a table".into()),
+    }
+    let cwd = match config.get("cwd") {
+        None => fallback_cwd.map(|p| p.to_path_buf()),
+        Some(Value::String(c)) => Some(std::path::PathBuf::from(c)),
+        Some(_) => return Err("bad stdio config: `cwd` must be a string".into()),
+    };
+    Ok(Launch {
+        command,
+        args,
+        env,
+        clear_env: true,
+        cwd,
+    })
+}
+
+/// Spawn `launch` and count the tool schemas it lists.
+pub(crate) fn fetch_launch(launch: &Launch) -> Result<McpSummary, String> {
+    let start = Instant::now();
+    let mut cmd = Command::new(&launch.command);
+    if launch.clear_env {
+        cmd.env_clear();
+    }
+    if let Some(dir) = &launch.cwd {
+        cmd.current_dir(dir);
+    }
+    cmd.args(&launch.args)
+        .envs(launch.env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());

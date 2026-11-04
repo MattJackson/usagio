@@ -465,6 +465,7 @@ fn save_state_safe_backup_dir_is_0700_and_file_is_0600() {
     assert_eq!(file_mode, 0o600, "backup file is 0600");
 }
 
+#[cfg(unix)]
 #[test]
 fn config_dir_itself_is_0700() {
     // security-01 (v0.5.2 audit): the top-level `~/.config/usagio` dir must
@@ -590,7 +591,7 @@ fn reconciler_never_persists_silent_account_drop() {
 // ---------------------------------------------------------------------------
 // H2 (v0.5.0 codeaudit) — restore flow: accounts_dropped_by / save_state_restore
 // / stash_pre_restore. Exercises the store-level building blocks that
-// `menubar::handle_backup_restore_dialog` composes; the dialog itself opens a
+// `menubar::backup::handle_backup_restore_dialog` composes; the dialog itself opens a
 // native file picker + osascript confirm, so it isn't unit-testable, but its
 // entire safety-relevant behaviour lives in these three functions.
 // ---------------------------------------------------------------------------
@@ -640,7 +641,8 @@ fn save_state_restore_succeeds_when_only_adding_accounts() {
     // test is that adding an account via restore never needs a
     // confirmation / never gets refused.
     let restore_target = make_state_with(&["a@e.com", "b@e.com"]);
-    save_state_restore(restore_target).expect("restore that only adds accounts must succeed");
+    crate::credentials::with_state_lock(|lock| save_state_restore(lock, restore_target))
+        .expect("restore that only adds accounts must succeed");
 
     let on_disk = State::load().unwrap();
     let keys: Vec<String> = on_disk
@@ -663,7 +665,8 @@ fn save_state_restore_authorizes_drops_that_a_plain_save_would_refuse() {
     // authorized path (the caller — the Restore… dialog — already confirmed
     // the drop with the user by the time this is called).
     let restore_target = make_state_with(&["a@e.com"]);
-    save_state_restore(restore_target).expect("save_state_restore must authorize the drop");
+    crate::credentials::with_state_lock(|lock| save_state_restore(lock, restore_target))
+        .expect("save_state_restore must authorize the drop");
 
     let on_disk = State::load().unwrap();
     let keys: Vec<String> = on_disk
@@ -1681,4 +1684,153 @@ fn write_private_tightens_a_preexisting_wide_file() {
         std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
         0o600
     );
+}
+
+#[test]
+fn tokenless_claude_entry_survives_saves_and_is_guarded() {
+    let _g = ScopedConfigDir::new();
+    // A state.json with one usable account and one entry missing its tokens.
+    let raw = serde_json::json!({
+        "schema_version": 2,
+        "accounts": [
+            { "email": "a@e.com", "access_token": "acc", "refresh_token": "ref", "expires_at": 1 },
+            { "email": "half@e.com", "expires_at": 5 }
+        ]
+    });
+    let path = config_dir().unwrap().join("state.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+
+    // Loading keeps the tokenless entry raw; an ordinary save neither drops
+    // it nor is refused.
+    let mut st = State::load().unwrap();
+    assert_eq!(st.accounts.len(), 1);
+    assert_eq!(st.unparsed_accounts.len(), 1);
+    st.trigger_pct = Some(90.0);
+    st.save()
+        .expect("save with a preserved tokenless entry succeeds");
+    let on_disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(on_disk["unparsed_accounts"][0]["email"], "half@e.com");
+
+    // A blank in-memory state that would erase it is refused.
+    let mut bad = State::default();
+    bad.accounts.push(acct("a@e.com"));
+    let msg = format!("{:#}", bad.save().unwrap_err());
+    assert!(msg.contains("half@e.com"), "{msg}");
+
+    // An explicit remove() authorises dropping it.
+    let mut st = State::load().unwrap();
+    assert!(st.remove("half@e.com"));
+    st.save().unwrap();
+    assert!(State::load().unwrap().unparsed_accounts.is_empty());
+}
+
+#[test]
+fn tokenless_claude_entry_is_superseded_by_a_capture() {
+    let _g = ScopedConfigDir::new();
+    let raw = serde_json::json!({ "accounts": [ { "email": "half@e.com" } ] });
+    let st = State::from_value(&raw);
+    assert_eq!(st.unparsed_accounts.len(), 1);
+    let mut st = st;
+    st.upsert(acct("half@e.com"));
+    assert!(st.unparsed_accounts.is_empty());
+    // A repaired raw entry loads as a real account.
+    let repaired = serde_json::json!({ "unparsed_accounts": [
+        { "email": "r@e.com", "access_token": "x", "refresh_token": "y" } ] });
+    let st = State::from_value(&repaired);
+    assert_eq!(st.accounts.len(), 1);
+    assert!(st.unparsed_accounts.is_empty());
+}
+
+#[test]
+fn routine_saves_do_not_rotate_the_backup_history() {
+    let g = ScopedConfigDir::new();
+    let backups_dir = g.home().join(".config/usagio/backups");
+    let count = || {
+        std::fs::read_dir(&backups_dir)
+            .map(|rd| rd.count())
+            .unwrap_or(0)
+    };
+    let mut st = make_state_with(&["a@e.com"]);
+    st.save().unwrap();
+    // A membership change is always backed up.
+    st.accounts.push(acct("b@e.com"));
+    st.save().unwrap();
+    assert_eq!(count(), 1);
+    // An identical save is a no-op: no rewrite, no backup.
+    st.save().unwrap();
+    assert_eq!(count(), 1);
+    // A same-accounts change within the interval writes the file but not a
+    // fresh backup.
+    st.trigger_pct = Some(80.0);
+    st.save().unwrap();
+    assert_eq!(count(), 1);
+    assert_eq!(State::load().unwrap().trigger_pct, Some(80.0));
+    // Once the newest backup is older than the interval, the next one lands.
+    let old =
+        std::time::SystemTime::now() - BACKUP_MIN_INTERVAL - std::time::Duration::from_secs(5);
+    for e in std::fs::read_dir(&backups_dir).unwrap().flatten() {
+        std::fs::File::options()
+            .write(true)
+            .open(e.path())
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+    st.trigger_pct = Some(70.0);
+    st.save().unwrap();
+    assert_eq!(count(), 2);
+}
+
+use crate::test_support::mock_claude_blob;
+
+#[test]
+fn manual_holds_migrate_to_the_v2_pick_tier() {
+    let v = serde_json::json!({
+        "accounts": [],
+        "manual_holds": {"claude": "held@e.com", "codex": "stale@e.com"},
+        "manual_picks": {"claude": "held@e.com", "codex": "newer@e.com"},
+    });
+    let st = State::from_value(&v);
+    assert_eq!(
+        st.manual_pick_tier.get("claude").map(String::as_str),
+        Some("draining")
+    );
+    assert!(
+        !st.manual_pick_tier.contains_key("codex"),
+        "the hold no longer matches the pick"
+    );
+    // An explicit tier wins over the legacy hold.
+    let v = serde_json::json!({
+        "manual_holds": {"claude": "a@e.com"},
+        "manual_pick_tier": {"claude": "blocked"},
+    });
+    assert_eq!(
+        State::from_value(&v)
+            .manual_pick_tier
+            .get("claude")
+            .map(String::as_str),
+        Some("blocked")
+    );
+}
+
+#[test]
+fn legacy_classic_setting_is_ignored_on_load() {
+    let state = State::from_value(&serde_json::json!({"accounts": [], "autoswap_engine": "v1"}));
+    assert!(serde_json::to_value(state)
+        .unwrap()
+        .get("autoswap_engine")
+        .is_none());
+}
+
+#[test]
+fn failed_live_write_leaves_a_marker_and_the_poll_republishes_it() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    // Marker bookkeeping on the account itself; the write path is covered by
+    // the CAS test above.
+    let mut a = Account::from_keychain_blob(&mock_claude_blob("n-at", "n-rt", 5)).unwrap();
+    a.live_write_pending = Some("x".into());
+    a.adopt_login(&Account::from_keychain_blob(&mock_claude_blob("m-at", "m-rt", 6)).unwrap());
+    assert_eq!(a.live_write_pending, None);
 }

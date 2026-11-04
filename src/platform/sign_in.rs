@@ -8,6 +8,8 @@
 //! closes itself once the flow finishes; closing it first cancels the flow.
 //! Reached through `Platform::open_sign_in_window`.
 
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -16,6 +18,88 @@ use crate::login::Progress;
 
 pub(super) fn available() -> bool {
     imp::available()
+}
+
+thread_local! {
+    /// Cookie stores of the sign-in windows open on this (the UI) thread. A
+    /// sweep never deletes these: the window's web view still uses them.
+    static OPEN: RefCell<Vec<[u8; 16]>> = const { RefCell::new(Vec::new()) };
+}
+
+fn window_opened(id: [u8; 16]) {
+    OPEN.with(|o| o.borrow_mut().push(id));
+}
+
+/// The window using store `id` closed (its web view is dropped): sweep, so a
+/// failed or cancelled "Sign in to a new account…" leaves no store behind.
+fn window_closed(id: [u8; 16]) {
+    OPEN.with(|o| {
+        let mut o = o.borrow_mut();
+        if let Some(i) = o.iter().position(|x| *x == id) {
+            o.remove(i);
+        }
+    });
+    crate::menubar::signin::sweep_sign_in_stores_later();
+}
+
+fn is_open(id: &[u8; 16]) -> bool {
+    OPEN.with(|o| o.borrow().contains(id))
+}
+
+pub(super) fn sweep(keep: HashSet<[u8; 16]>) {
+    if !imp::available() {
+        return;
+    }
+    imp::sweep(keep);
+}
+
+/// The store id a per-account web data folder is named for (32 lowercase hex
+/// digits, see `crate::login::store_dir`); `None` for anything else.
+fn store_id_of_dir_name(name: &str) -> Option<[u8; 16]> {
+    if name.len() != 32 || !name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    let mut id = [0u8; 16];
+    for (i, byte) in id.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&name[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(id)
+}
+
+/// Remove the store folders in `dir` that `drop` selects. Only folders named
+/// like a store id are touched. Returns how many were removed.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn sweep_store_dirs(dir: &std::path::Path, drop: impl Fn(&[u8; 16]) -> bool) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(id) = name.to_str().and_then(store_id_of_dir_name) else {
+            continue;
+        };
+        if !drop(&id) || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(e) => crate::logging::log(&format!(
+                "event=sign_in_store_remove_failed store={} reason={e}",
+                name.to_string_lossy()
+            )),
+        }
+    }
+    removed
+}
+
+/// [`sweep_store_dirs`] over `<config>/webview` (Windows/Linux).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn sweep_webview_dir(keep: &HashSet<[u8; 16]>) {
+    let Ok(dir) = crate::store::config_dir().map(|d| d.join("webview")) else {
+        return;
+    };
+    sweep_store_dirs(&dir, |id| !keep.contains(id) && !is_open(id));
 }
 
 pub(super) fn open(
@@ -101,9 +185,33 @@ mod imp {
     use raw_window_handle::{
         AppKitWindowHandle, HandleError, HasWindowHandle, RawWindowHandle, WindowHandle,
     };
-    use wry::{WebViewBuilder, WebViewBuilderExtDarwin};
+    use wry::{WebView, WebViewBuilder, WebViewBuilderExtDarwin, WebViewExtDarwin};
 
     use super::{Progress, HEIGHT, POLL_MS, WIDTH};
+
+    /// Remove every WebKit data store of this app not in `keep` and not used
+    /// by an open window. Both calls complete on the main run loop.
+    pub(crate) fn sweep(keep: std::collections::HashSet<[u8; 16]>) {
+        let listed = WebView::fetch_data_store_identifiers(move |ids| {
+            for id in ids {
+                if keep.contains(&id) || super::is_open(&id) {
+                    continue;
+                }
+                WebView::remove_data_store(&id, move |r| {
+                    let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+                    crate::logging::log(&match r {
+                        Ok(()) => format!("event=sign_in_store_removed store={hex}"),
+                        Err(e) => {
+                            format!("event=sign_in_store_remove_failed store={hex} reason={e}")
+                        }
+                    });
+                });
+            }
+        });
+        if let Err(e) = listed {
+            crate::logging::log(&format!("event=sign_in_store_sweep_failed reason={e}"));
+        }
+    }
 
     struct ViewHandle(NonNull<c_void>);
 
@@ -117,7 +225,7 @@ mod imp {
 
     /// Per-identifier WebKit data stores need macOS 14; before that wry would
     /// silently share one store across every account.
-    pub fn available() -> bool {
+    pub(crate) fn available() -> bool {
         NSProcessInfo::processInfo().isOperatingSystemAtLeastVersion(NSOperatingSystemVersion {
             majorVersion: 14,
             minorVersion: 0,
@@ -161,7 +269,7 @@ mod imp {
         app.setMainMenu(Some(&main));
     }
 
-    pub fn open(
+    pub(crate) fn open(
         title: &str,
         url: &str,
         slug: &str,
@@ -193,11 +301,13 @@ mod imp {
             .contentView()
             .context("sign-in window has no content view")?;
         let handle = ViewHandle(NonNull::from(&*view).cast());
+        let store = crate::login::store_id(slug, key);
         let webview = WebViewBuilder::new()
             .with_url(url)
-            .with_data_store_identifier(crate::login::store_id(slug, key))
+            .with_data_store_identifier(store)
             .build(&handle)
             .context("creating the sign-in web view")?;
+        super::window_opened(store);
         ensure_edit_menu(mtm);
         window.makeKeyAndOrderFront(None);
         // A menu-bar (accessory) app must activate to bring a window forward.
@@ -223,6 +333,7 @@ mod imp {
             if let Some((window, webview)) = slot.take() {
                 drop(webview);
                 window.close();
+                super::window_closed(store);
             }
             // SAFETY: the run loop retains the timer while it is scheduled.
             unsafe { timer.as_ref().invalidate() };
@@ -253,11 +364,15 @@ mod imp {
 
     use super::{Progress, HEIGHT, POLL_MS, WIDTH};
 
-    pub fn available() -> bool {
+    pub(crate) fn available() -> bool {
         gtk::is_initialized_main_thread()
     }
 
-    pub fn open(
+    pub(crate) fn sweep(keep: std::collections::HashSet<[u8; 16]>) {
+        super::sweep_webview_dir(&keep);
+    }
+
+    pub(crate) fn open(
         title: &str,
         url: &str,
         slug: &str,
@@ -297,6 +412,8 @@ mod imp {
                 return Err(e);
             }
         };
+        let store_id = crate::login::store_id(slug, key);
+        super::window_opened(store_id);
         window.show_all();
         window.present();
 
@@ -322,6 +439,7 @@ mod imp {
                 if !closed.get() {
                     window.close();
                 }
+                super::window_closed(store_id);
             }
             glib::ControlFlow::Break
         });
@@ -360,6 +478,7 @@ mod imp {
         _webview: WebView,
         _context: WebContext,
         progress: Arc<Progress>,
+        store: [u8; 16],
     }
 
     thread_local! {
@@ -377,11 +496,15 @@ mod imp {
         }
     }
 
-    pub fn available() -> bool {
+    pub(crate) fn available() -> bool {
         true
     }
 
-    pub fn open(
+    pub(crate) fn sweep(keep: std::collections::HashSet<[u8; 16]>) {
+        super::sweep_webview_dir(&keep);
+    }
+
+    pub(crate) fn open(
         title: &str,
         url: &str,
         slug: &str,
@@ -435,6 +558,8 @@ mod imp {
             let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = SetForegroundWindow(hwnd);
             SetTimer(Some(hwnd), TIMER_ID, POLL_MS as u32, None);
+            let store = crate::login::store_id(slug, key);
+            super::window_opened(store);
             OPEN.with(|m| {
                 m.borrow_mut().insert(
                     hwnd.0 as isize,
@@ -442,6 +567,7 @@ mod imp {
                         _webview: webview,
                         _context: context,
                         progress,
+                        store,
                     },
                 )
             });
@@ -482,10 +608,65 @@ mod imp {
             WM_DESTROY => {
                 let _ = KillTimer(Some(hwnd), TIMER_ID);
                 let entry = OPEN.with(|m| m.borrow_mut().remove(&(hwnd.0 as isize)));
+                let store = entry.as_ref().map(|e| e.store);
                 drop(entry);
+                if let Some(store) = store {
+                    super::window_closed(store);
+                }
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex(id: &[u8; 16]) -> String {
+        id.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn store_dir_names_round_trip_and_nothing_else_parses() {
+        let id = crate::login::store_id("claude", "dev@example.com");
+        assert_eq!(store_id_of_dir_name(&hex(&id)), Some(id));
+        assert_eq!(store_id_of_dir_name("not-a-store"), None);
+        assert_eq!(store_id_of_dir_name(&hex(&id).to_uppercase()), None);
+        assert_eq!(store_id_of_dir_name(&hex(&id)[..30]), None);
+    }
+
+    #[test]
+    fn a_sweep_removes_only_unkept_store_folders() {
+        let td = tempfile::tempdir().unwrap();
+        let kept = crate::login::store_id("claude", "kept@example.com");
+        let orphan = crate::login::store_id("codex", "gone@example.com");
+        for id in [&kept, &orphan] {
+            std::fs::create_dir_all(td.path().join(hex(id)).join("Cookies")).unwrap();
+        }
+        std::fs::create_dir(td.path().join("unrelated")).unwrap();
+        let removed = sweep_store_dirs(td.path(), |id| *id != kept);
+        assert_eq!(removed, 1);
+        assert!(td.path().join(hex(&kept)).is_dir());
+        assert!(!td.path().join(hex(&orphan)).exists());
+        assert!(
+            td.path().join("unrelated").is_dir(),
+            "not a store: untouched"
+        );
+    }
+
+    #[test]
+    fn a_sweep_spares_the_store_of_an_open_window() {
+        let _home = crate::store::ScopedConfigDir::new();
+        let dir = crate::store::config_dir().unwrap().join("webview");
+        let open = crate::login::store_id("claude", "open@example.com");
+        std::fs::create_dir_all(dir.join(hex(&open))).unwrap();
+        window_opened(open);
+        sweep_webview_dir(&HashSet::new());
+        assert!(dir.join(hex(&open)).is_dir(), "in use by an open window");
+        OPEN.with(|o| o.borrow_mut().clear());
+        sweep_webview_dir(&HashSet::new());
+        assert!(!dir.join(hex(&open)).exists());
     }
 }

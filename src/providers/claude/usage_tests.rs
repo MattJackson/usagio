@@ -219,8 +219,11 @@ fn metadata_profile_request_handles_http_and_parse_failures() {
         (500, "{}"),
         (200, "not-json"),
     ] {
-        let (url, _) = crate::tests::spawn_mock_usage_server(status, body.into());
-        set_profile_url_override(Some(&format!("{url}/api/oauth/profile")));
+        let (url, _) = crate::test_support::spawn_mock_usage_server(status, body.into());
+        crate::endpoints::set_test_override(
+            crate::endpoints::Endpoint::ClaudeProfile,
+            Some(&format!("{url}/api/oauth/profile")),
+        );
         assert!(
             fetch_profile_metadata("test-access").is_none(),
             "HTTP {status}: {body}"
@@ -228,10 +231,13 @@ fn metadata_profile_request_handles_http_and_parse_failures() {
     }
     let mut expected = sample_profile();
     expected["organization"]["plan_display_name"] = "Ultra".into();
-    let (url, _) = crate::tests::spawn_mock_usage_server(200, expected.to_string());
-    set_profile_url_override(Some(&format!("{url}/api/oauth/profile")));
+    let (url, _) = crate::test_support::spawn_mock_usage_server(200, expected.to_string());
+    crate::endpoints::set_test_override(
+        crate::endpoints::Endpoint::ClaudeProfile,
+        Some(&format!("{url}/api/oauth/profile")),
+    );
     let actual = fetch_profile_metadata("test-access").unwrap();
-    set_profile_url_override(None);
+    crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeProfile, None);
     assert_eq!(actual, expected);
 }
 
@@ -239,13 +245,16 @@ fn metadata_profile_request_handles_http_and_parse_failures() {
 fn fetch_profile_uses_only_the_test_mock() {
     let _cfg = crate::store::ScopedConfigDir::new();
     // No mock: no request at all (tests must never contact Anthropic).
-    set_profile_url_override(None);
+    crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeProfile, None);
     assert!(fetch_profile("test-access").is_none());
     let expected = sample_profile();
-    let (url, _) = crate::tests::spawn_mock_usage_server(200, expected.to_string());
-    set_profile_url_override(Some(&format!("{url}/api/oauth/profile")));
+    let (url, _) = crate::test_support::spawn_mock_usage_server(200, expected.to_string());
+    crate::endpoints::set_test_override(
+        crate::endpoints::Endpoint::ClaudeProfile,
+        Some(&format!("{url}/api/oauth/profile")),
+    );
     let actual = fetch_profile("test-access");
-    set_profile_url_override(None);
+    crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeProfile, None);
     assert_eq!(actual, Some(expected));
 }
 
@@ -557,4 +566,28 @@ fn claim_outcome_from_status_only_reset_is_applied() {
             "{other:?} must not be reported as an applied reset"
         );
     }
+}
+
+#[test]
+fn prepaid_balance_uses_the_currency_minor_unit_count() {
+    // JPY has no minor unit: 1500 minor units is 1500 yen, not 15.00.
+    let jpy = serde_json::json!({ "amount": 1500, "currency": "JPY", "balance": null });
+    let m = prepaid_balance(&jpy).unwrap();
+    assert_eq!(
+        (m.amount_minor, m.exponent, m.unit.as_str()),
+        (1500, 0, "JPY")
+    );
+    // KWD has three decimals (fils).
+    let kwd = serde_json::json!({
+        "currency": "KWD", "balance": { "credits": { "amount_minor": 12345 } }
+    });
+    assert_eq!(prepaid_balance(&kwd).unwrap().exponent, 3);
+    // An explicit exponent still wins; USD and unknowns default to 2.
+    let explicit = serde_json::json!({
+        "currency": "JPY", "balance": { "credits": { "amount_minor": 5, "exponent": 2 } }
+    });
+    assert_eq!(prepaid_balance(&explicit).unwrap().exponent, 2);
+    assert_eq!(super::iso4217_minor_units("usd"), 2);
+    assert_eq!(super::iso4217_minor_units("credits"), 2);
+    assert_eq!(super::iso4217_minor_units("krw"), 0);
 }

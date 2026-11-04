@@ -22,10 +22,10 @@
 
 use std::path::{Path, PathBuf};
 
-pub type Result<T> = anyhow::Result<T>;
+pub(crate) type Result<T> = anyhow::Result<T>;
 
 /// Root platform facade. `current()` returns the concrete impl for this target.
-pub trait Platform: Send + Sync + 'static {
+pub(crate) trait Platform: Send + Sync + 'static {
     fn menu(&self) -> &dyn MenuBackend;
     fn secrets(&self) -> &dyn SecretStore;
     fn autostart(&self) -> &dyn Autostart;
@@ -51,21 +51,21 @@ pub trait Platform: Send + Sync + 'static {
         environment: &[(&str, &std::ffi::OsStr)],
         timeout: std::time::Duration,
     ) -> Result<std::process::ExitStatus> {
-        let mut child = std::process::Command::new(program)
+        let mut command = std::process::Command::new(program);
+        command
             .args(args)
             .envs(environment.iter().copied())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
+            .stderr(std::process::Stdio::null());
+        let mut child = own_process_group(&mut command).spawn()?;
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if let Some(status) = child.try_wait()? {
                 return Ok(status);
             }
             if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_tree(&mut child);
                 anyhow::bail!("independent process start timed out");
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
@@ -132,15 +132,22 @@ pub trait Platform: Send + Sync + 'static {
     fn open_url(&self, url: &str) -> Result<()> {
         sign_in::open_url(url)
     }
+
+    /// Delete every sign-in window cookie store (see `crate::login::store_id`)
+    /// not in `keep` and not used by an open sign-in window. UI thread only;
+    /// best-effort (failures are logged, and the next sweep retries).
+    fn sweep_sign_in_stores(&self, keep: std::collections::HashSet<[u8; 16]>) {
+        sign_in::sweep(keep)
+    }
 }
 
 // ---------- MenuBackend ---------------------------------------------------
 
 /// Opaque handle to a live status-bar item / tray icon. Dropping it removes
 /// the item from the bar.
-pub trait MenuHandle: Send {
-    /// Replace the icon (16pt template PNG bytes on macOS; ICO/BMP on Windows;
-    /// PNG on Linux via ksni).
+pub(crate) trait MenuHandle: Send {
+    /// Replace the icon (PNG bytes on every platform: a 16pt template on
+    /// macOS; decoded via `MuriIcon::from_png` on Windows; ksni on Linux).
     fn set_icon(&self, png_bytes: &[u8]) -> Result<()>;
     /// Replace the tooltip / title shown next to the icon.
     fn set_title(&self, title: &str) -> Result<()>;
@@ -152,12 +159,12 @@ pub trait MenuHandle: Send {
 /// it to a live muri (`muda-compat`) menu — the same translator on every OS.
 /// Kept small and imperative so the renderer has room to lay it out natively.
 #[derive(Debug, Clone)]
-pub struct MenuTree {
-    pub items: Vec<MenuItem>,
+pub(crate) struct MenuTree {
+    pub(crate) items: Vec<MenuItem>,
 }
 
 #[derive(Debug, Clone)]
-pub enum MenuItem {
+pub(crate) enum MenuItem {
     /// Clickable row. `id` is opaque to the backend; dispatched back via
     /// `MenuBackend::on_click`.
     Action {
@@ -209,18 +216,18 @@ pub enum MenuItem {
 /// One colored span of a submenu row's trailing value segment. `start`/`len`
 /// are UTF-16 offsets into the value text (after the `\t`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ValueSpan {
-    pub start: usize,
-    pub len: usize,
-    pub color: ValueColor,
+pub(crate) struct ValueSpan {
+    pub(crate) start: usize,
+    pub(crate) len: usize,
+    pub(crate) color: ValueColor,
 }
 
 /// Severity tint for a submenu row's trailing value segment. Platform-agnostic
 /// so the generic `MenuTree` never names the renderer's color type; each
 /// backend maps it to muri's `Color` (`SystemRed` / `SystemOrange`). Mirrors
-/// `menubar::Severity`'s two bands.
+/// `menubar::model::Severity`'s two bands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ValueColor {
+pub(crate) enum ValueColor {
     Red,
     Amber,
 }
@@ -232,7 +239,7 @@ pub enum ValueColor {
 /// `LinuxMenu` in `linux.rs`). Callers responsible for wiring the menu
 /// backend must arrange the main-thread call sequence documented in
 /// `menubar.rs::run`.
-pub trait MenuBackend: Send + Sync {
+pub(crate) trait MenuBackend: Send + Sync {
     /// Create the status-bar item. Called once at startup. Handle lives for
     /// the process lifetime; the backend owns the event loop.
     fn create_status_item(
@@ -265,7 +272,7 @@ pub trait MenuBackend: Send + Sync {
 /// Kept CLI-shape (String in/out) so macOS keeps its `security(1)` subprocess
 /// contract without a Rust FFI dep, and Linux / Windows can layer their
 /// crates on top.
-pub trait SecretStore: Send + Sync {
+pub(crate) trait SecretStore: Send + Sync {
     fn get(&self, service: &str, account: &str) -> Result<Option<String>>;
     fn set(&self, service: &str, account: &str, secret: &str) -> Result<()>;
     fn delete(&self, service: &str, account: &str) -> Result<()>;
@@ -280,7 +287,7 @@ pub trait SecretStore: Send + Sync {
 
 /// Login-time launch registration. `label` is a reverse-DNS identifier
 /// (`com.mattjackson.usagio.menubar`) reused across install / uninstall.
-pub trait Autostart: Send + Sync {
+pub(crate) trait Autostart: Send + Sync {
     fn install(&self, label: &str, binary: &Path, args: &[&str]) -> Result<()>;
     fn uninstall(&self, label: &str) -> Result<()>;
     fn is_installed(&self, label: &str) -> Result<bool>;
@@ -299,7 +306,7 @@ pub trait Autostart: Send + Sync {
 /// doesn't ripple through every callsite. Legacy code paths that still
 /// resolve the old `"claude-usage"` directory live in
 /// `crate::paths::migrate_config_dir_if_needed`.
-pub trait Paths: Send + Sync {
+pub(crate) trait Paths: Send + Sync {
     fn config_dir(&self, app: &str) -> PathBuf;
     fn data_dir(&self, app: &str) -> PathBuf;
     fn log_dir(&self, app: &str) -> PathBuf;
@@ -321,7 +328,7 @@ pub trait Paths: Send + Sync {
 /// test mock (`MockFileDialog`) intentionally uses `RefCell` — a `Sync`
 /// requirement here would forbid that without buying anything, since nothing
 /// stores `Box<dyn FileDialog>` behind a shared reference across threads.
-pub trait FileDialog {
+pub(crate) trait FileDialog {
     /// Open a SAVE panel defaulting to `default_name` inside `default_dir`
     /// (falls back to the OS's normal default location if `None`). Returns
     /// `None` if the user cancels.
@@ -335,7 +342,7 @@ pub trait FileDialog {
 /// `rfd`-backed `FileDialog`. Stateless — `rfd::FileDialog` is built fresh
 /// per call, so this is a zero-sized marker type wired into every `Platform`
 /// impl via the trait's default method.
-pub struct RfdFileDialog;
+struct RfdFileDialog;
 
 impl FileDialog for RfdFileDialog {
     fn save_file(&self, default_name: &str, default_dir: Option<&Path>) -> Option<PathBuf> {
@@ -362,10 +369,10 @@ impl FileDialog for RfdFileDialog {
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct MockFileDialog {
-    pub save_file_calls: std::cell::RefCell<Vec<(String, Option<PathBuf>)>>,
-    pub save_file_returns: std::cell::RefCell<Option<PathBuf>>,
-    pub pick_file_calls: std::cell::RefCell<Vec<Option<PathBuf>>>,
-    pub pick_file_returns: std::cell::RefCell<Option<PathBuf>>,
+    pub(crate) save_file_calls: std::cell::RefCell<Vec<(String, Option<PathBuf>)>>,
+    save_file_returns: std::cell::RefCell<Option<PathBuf>>,
+    pub(crate) pick_file_calls: std::cell::RefCell<Vec<Option<PathBuf>>>,
+    pub(crate) pick_file_returns: std::cell::RefCell<Option<PathBuf>>,
 }
 
 #[cfg(test)]
@@ -394,6 +401,14 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
+/// Wake the tray's UI-thread loop so work queued for it (see
+/// `menubar::actions::run_ui_tasks`) runs now. Only the Windows loop blocks between
+/// ticks; the macOS and GTK loops tick on a timer, so this is a no-op there.
+pub(crate) fn wake_ui_thread() {
+    #[cfg(target_os = "windows")]
+    windows::wake_ui_thread();
+}
+
 // The single IR→muri menu translator, shared by every platform's tray backend
 // (macOS's bespoke run loop in `menubar`, plus the Linux/Windows `MenuBackend`
 // impls). muri renders identically on all three, so there is exactly one
@@ -403,11 +418,11 @@ pub(crate) mod render;
 // "Renew login…" sign-in window (wry) + default-browser opener.
 mod sign_in;
 
-// Test-only failure-injection seam, shared by ALL platforms' `SecretStore::set`
-// (macOS mock, Linux keyring/fallback, Windows Credential Manager). Lets
-// `main_tests.rs` arm the next `set` to fail so the apply_account rollback path
-// (never a half-applied switch) is exercisable on every CI platform, not just
-// macOS. Not compiled into production builds.
+// Test-only failure-injection seam for the active-slot write, checked once in
+// `providers::claude::active_slot_write` before either backend (keychain or
+// credentials file) is touched. Lets a test arm the next write to fail so the
+// apply_account rollback path (never a half-applied switch) is exercisable on
+// every CI platform. Not compiled into production builds.
 #[cfg(test)]
 pub(crate) mod test_secret_seam {
     use std::cell::Cell;
@@ -426,7 +441,8 @@ pub(crate) mod test_secret_seam {
     }
 }
 
-/// Arm the `cfg(test)` secret store to fail its next `set` on this thread.
+/// Make the next active-slot write on this thread fail (see
+/// `providers::claude::active_slot_write`).
 #[cfg(test)]
 pub(crate) fn arm_keychain_set_failure() {
     test_secret_seam::arm_set_failure();
@@ -451,7 +467,7 @@ fn secure_permissions_unix(path: &Path) -> Result<()> {
 
 /// Return the platform impl for this OS. Panics only in the impossible case
 /// of an unsupported target that got past the cfg guard.
-pub fn current() -> Box<dyn Platform> {
+pub(crate) fn current() -> Box<dyn Platform> {
     #[cfg(target_os = "macos")]
     return Box::new(macos::MacOsPlatform::new());
     #[cfg(target_os = "linux")]
@@ -473,6 +489,97 @@ pub fn current() -> Box<dyn Platform> {
 mod tests {
     use super::secure_permissions_unix;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn process_generation_compares_instants_across_zones() {
+        use super::{compare_generation, parse_lstart, Generation};
+        let utc = chrono::FixedOffset::east_opt(0).unwrap();
+        let plus2 = chrono::FixedOffset::east_opt(2 * 3600).unwrap();
+        let actual = parse_lstart("Tue Nov  3 10:00:00 2026");
+        assert!(actual.is_some());
+        // Recorded in UTC, or in our +02:00 zone: same process either way.
+        assert_eq!(
+            compare_generation("Tue Nov  3 10:00:00 2026", actual, utc),
+            Generation::Same
+        );
+        assert_eq!(
+            compare_generation("Tue Nov  3 12:00:00 2026", actual, plus2),
+            Generation::Same
+        );
+        // A whole-hour gap we can't explain by our zone may be Codex's zone.
+        assert_eq!(
+            compare_generation("Tue Nov  3 15:00:00 2026", actual, utc),
+            Generation::Unknown
+        );
+        // Any other gap is a different process.
+        assert_eq!(
+            compare_generation("Tue Nov  3 10:00:07 2026", actual, utc),
+            Generation::Different
+        );
+        // Another locale's rendering, or no live reading: can't tell.
+        assert_eq!(
+            compare_generation("Di  3 Nov 10:00:00 2026", actual, utc),
+            Generation::Unknown
+        );
+        assert_eq!(
+            compare_generation("Tue Nov  3 10:00:00 2026", None, utc),
+            Generation::Unknown
+        );
+    }
+
+    #[test]
+    fn a_generation_recorded_in_another_locale_and_zone_is_still_alive() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // Codex recorded its start under C/UTC; we run in the user's zone.
+        let output = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC")
+            .output()
+            .unwrap();
+        let start = String::from_utf8(output.stdout).unwrap();
+        let alive = super::daemon_instance_alive(pid, start.trim());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(alive.unwrap(), "a live daemon was reported stopped");
+    }
+
+    #[test]
+    fn kill_tree_kills_a_grandchild_too() {
+        use std::io::BufRead;
+        let mut command = std::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 30 & echo $!; wait"])
+            .stdout(std::process::Stdio::piped());
+        let mut child = super::own_process_group(&mut command).spawn().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let grandchild: libc::pid_t = line.trim().parse().unwrap();
+        super::kill_tree(&mut child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Gone, or an exited zombie awaiting reaping by init.
+        let alive = || {
+            let out = std::process::Command::new("ps")
+                .args(["-p", &grandchild.to_string(), "-o", "stat="])
+                .output()
+                .unwrap();
+            let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            !stat.is_empty() && !stat.starts_with('Z')
+        };
+        while alive() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild {grandchild} survived kill_tree"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
 
     #[test]
     fn daemon_pid_guard_rejects_group_and_wrapping_pids() {
@@ -531,18 +638,21 @@ mod tests {
         let start = String::from_utf8(output.stdout).unwrap();
         let token = serde_json::json!({"pid": pid, "start": start.trim()}).to_string();
         let alive = super::daemon_instance_alive(pid, start.trim());
-        let pending = crate::providers::Provider::verify_handoff_stopped(
+        let pending = crate::providers::ClientHandoff::verify_handoff_stopped(
             &crate::providers::codex::CodexProvider,
             &token,
         );
-        let wrong_generation = super::daemon_instance_alive(pid, "different process generation");
+        let wrong_generation = super::daemon_instance_alive(pid, "Thu Jan  1 00:00:07 1970");
+        let unknown_generation = super::daemon_instance_alive(pid, "not a start time");
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(alive.unwrap());
         assert!(pending.is_err());
         assert!(!wrong_generation.unwrap());
+        // An unparseable record is "can't tell", never "stopped".
+        assert!(unknown_generation.is_err());
         assert!(!super::daemon_instance_alive(pid, start.trim()).unwrap());
-        crate::providers::Provider::verify_handoff_stopped(
+        crate::providers::ClientHandoff::verify_handoff_stopped(
             &crate::providers::codex::CodexProvider,
             &token,
         )
@@ -592,6 +702,43 @@ mod tests {
     }
 }
 
+/// Spawn `command`'s child as the leader of its own process group, so
+/// [`kill_tree`] can reach any descendant it starts (a `codex` launcher shim
+/// runs the real binary as a grandchild). Windows has no group to set up:
+/// `kill_tree` walks the tree there instead.
+pub(crate) fn own_process_group(command: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command
+}
+
+/// Kill `child` and its descendants, then reap `child`. Precondition: the
+/// child was spawned through [`own_process_group`], so on Unix its group id
+/// is its own pid and no unrelated group can be signalled. The child is not
+/// reaped before the group kill, so its pid cannot have been reused.
+pub(crate) fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    // SAFETY: plain syscall on the child's own group; ESRCH is harmless.
+    unsafe {
+        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        // Before the parent dies, so the tree is still linked to it.
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Request a bounded Codex restart after checking the PID generation.
 /// Returns false on hosts that use the daemon control endpoint instead.
 pub(crate) fn graceful_drain_is_idempotent() -> bool {
@@ -632,27 +779,115 @@ pub(crate) fn graceful_daemon_signal(pid: u32, expected_start: &str) -> Result<b
 }
 
 /// A missing control socket is not proof that the process released its sessions.
+///
+/// The recorded generation is Codex's own `ps -o lstart=` rendering, made in
+/// Codex's locale and time zone. An exact match with ours proves the same
+/// process; otherwise both sides are compared as instants (see
+/// [`compare_generation`]). `Ok(false)` only when the process is gone or is
+/// provably a different one; an `Err` when the generation can't be compared,
+/// so a handoff waits rather than treating a live daemon as stopped.
 #[cfg(unix)]
 pub(crate) fn daemon_instance_alive(pid: u32, expected_start: &str) -> Result<bool> {
     anyhow::ensure!(pid > 1 && pid <= i32::MAX as u32, "invalid daemon PID");
     anyhow::ensure!(!expected_start.is_empty(), "missing daemon generation");
-    let output = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "stat=", "-o", "lstart="])
-        .output()?;
+    let Some((status, start)) = ps_status_and_start(pid, false)? else {
+        return Ok(false);
+    };
+    // Zombies have exited and released descriptors, even before parent reaping.
+    if status.starts_with('Z') {
+        return Ok(false);
+    }
+    if start == expected_start.trim() {
+        return Ok(true);
+    }
+    // Same process rendered in another locale/zone? Ask ps again in a fixed
+    // one so our side is an exact instant.
+    let utc_start = match ps_status_and_start(pid, true)? {
+        Some((_, s)) => parse_lstart(&s),
+        // Exited between the two reads.
+        None => return Ok(false),
+    };
+    // Our zone's offset at the moment the process started (DST-correct).
+    let local = utc_start.map_or_else(
+        || *chrono::Local::now().offset(),
+        |a| chrono::TimeZone::offset_from_utc_datetime(&chrono::Local, &a),
+    );
+    match compare_generation(expected_start, utc_start, local) {
+        Generation::Same => Ok(true),
+        Generation::Different => Ok(false),
+        Generation::Unknown => Err(anyhow::anyhow!(
+            "cannot verify the daemon's process generation (recorded start time \
+             {expected_start:?} is not comparable with ps output)"
+        )),
+    }
+}
+
+/// `(stat, lstart)` for `pid`, or `None` when no such process exists. With
+/// `fixed`, ps runs under `LC_ALL=C TZ=UTC` so the start time is a C-locale
+/// UTC rendering.
+#[cfg(unix)]
+fn ps_status_and_start(pid: u32, fixed: bool) -> Result<Option<(String, String)>> {
+    let mut cmd = std::process::Command::new("ps");
+    cmd.args(["-p", &pid.to_string(), "-o", "stat=", "-o", "lstart="]);
+    if fixed {
+        cmd.env("LC_ALL", "C").env("TZ", "UTC");
+    }
+    let output = cmd.output()?;
     if !output.status.success() {
         anyhow::ensure!(
             output.status.code() == Some(1) && output.stdout.is_empty(),
             "could not inspect daemon process"
         );
-        return Ok(false);
+        return Ok(None);
     }
     let actual = String::from_utf8(output.stdout)?;
-    let actual = actual.trim();
     let (status, start) = actual
+        .trim()
         .split_once(char::is_whitespace)
         .ok_or_else(|| anyhow::anyhow!("invalid daemon process status"))?;
-    // Zombies have exited and released descriptors, even before parent reaping.
-    Ok(!status.starts_with('Z') && start.trim() == expected_start)
+    Ok(Some((status.to_string(), start.trim().to_string())))
+}
+
+/// Outcome of comparing a recorded process generation with the live one.
+#[derive(Debug, PartialEq, Eq)]
+enum Generation {
+    Same,
+    Different,
+    /// The two can't be compared (unrecognised format, or an offset that may
+    /// just be a different time zone).
+    Unknown,
+}
+
+/// Parse a C-locale `ps -o lstart` value (`"Tue Nov  3 10:00:00 2026"`).
+fn parse_lstart(s: &str) -> Option<chrono::NaiveDateTime> {
+    let norm = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    chrono::NaiveDateTime::parse_from_str(&norm, "%a %b %e %H:%M:%S %Y").ok()
+}
+
+/// Compare the recorded `expected` lstart with the live process's start
+/// (`actual_utc`, a UTC wall time). `expected` is read as wall time in our
+/// zone (`local`) and in UTC; either landing on the same second is the same
+/// process. A gap that is a whole number of quarter hours within ±14 h could
+/// be Codex running in another zone, so that is `Unknown`, as is a recorded
+/// value in a format we can't parse (another locale) or no live reading.
+fn compare_generation(
+    expected: &str,
+    actual_utc: Option<chrono::NaiveDateTime>,
+    local: chrono::FixedOffset,
+) -> Generation {
+    let (Some(expected), Some(actual)) = (parse_lstart(expected), actual_utc) else {
+        return Generation::Unknown;
+    };
+    let as_local_utc = expected - chrono::Duration::seconds(i64::from(local.local_minus_utc()));
+    if as_local_utc == actual || expected == actual {
+        return Generation::Same;
+    }
+    let gap = (expected - actual).num_seconds().abs();
+    if gap <= 14 * 3600 && gap % (15 * 60) == 0 {
+        Generation::Unknown
+    } else {
+        Generation::Different
+    }
 }
 
 #[cfg(windows)]

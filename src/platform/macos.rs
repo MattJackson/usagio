@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 mod independent;
 
-pub struct MacOsPlatform {
+pub(crate) struct MacOsPlatform {
     // Reachable through the `MenuBackend` trait method below; the compiler's
     // dead-code analysis doesn't see the vtable dispatch. The concrete impl
     // stays a placeholder (see comments below) until the trait-based rewrite
@@ -41,7 +41,7 @@ pub struct MacOsPlatform {
 }
 
 impl MacOsPlatform {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             menu: MacOsMenu::default(),
             secrets: MacOsSecrets,
@@ -123,7 +123,7 @@ impl Platform for MacOsPlatform {
 /// Our `usagio.app` directory: the bundle we're running from, else the one
 /// the LaunchAgent would launch (Homebrew's sibling bundle).
 fn app_bundle_dir() -> Option<PathBuf> {
-    let exe = crate::launch_agent_exe_path();
+    let exe = crate::cli::install::launch_agent_exe_path();
     exe.ancestors()
         .find(|p| p.extension().is_some_and(|e| e == "app"))
         .map(Path::to_path_buf)
@@ -166,7 +166,7 @@ mod launch_services {
     }
 
     /// True if LaunchServices maps `id` to at least one application.
-    pub fn knows_bundle_id(id: &str) -> bool {
+    pub(crate) fn knows_bundle_id(id: &str) -> bool {
         // SAFETY: every CF object created here is checked for null and
         // released exactly once.
         unsafe {
@@ -187,7 +187,7 @@ mod launch_services {
 
     /// Register the bundle at `app` with LaunchServices; returns the OSStatus
     /// (0 = success, -1 = couldn't build the URL).
-    pub fn register(app: &Path) -> i32 {
+    pub(crate) fn register(app: &Path) -> i32 {
         let bytes = app.as_os_str().as_bytes();
         // SAFETY: as above; `bytes` outlives the call that reads it.
         unsafe {
@@ -224,7 +224,7 @@ mod launch_services {
 /// The real trait-based rewrite lands in a follow-up commit — see
 /// `platform/MIGRATION-DRAFT.md` step B.
 #[derive(Default)]
-pub struct MacOsMenu {}
+struct MacOsMenu {}
 
 impl MenuBackend for MacOsMenu {
     fn create_status_item(
@@ -245,7 +245,7 @@ impl MenuBackend for MacOsMenu {
 
 // ---- SecretStore ---------------------------------------------------------
 
-pub struct MacOsSecrets;
+struct MacOsSecrets;
 
 // ---------------------------------------------------------------------------
 // Real (subprocess-backed) implementation. Lives in ordinary free functions —
@@ -423,7 +423,7 @@ fn run_with_timeout(mut child: Child, timeout: Duration) -> Result<SecurityRun> 
                 kill_group_and_reap(&mut child);
                 let _ = out_reader.join();
                 let _ = err_reader.join();
-                return Err(e).context("waiting on `security`");
+                return Err(e).context("waiting on child process");
             }
         }
     };
@@ -784,13 +784,6 @@ impl SecretStore for MacOsSecrets {
     }
 
     fn set(&self, service: &str, account: &str, secret: &str) -> Result<()> {
-        // Failure-injection seam (shared across platforms): a test can arm the
-        // next `set` to fail so the apply_account keychain-write-failure ROLLBACK
-        // path (the guard behind "never a half-applied switch") is exercisable —
-        // the mock otherwise always succeeds and left that branch uncovered.
-        if super::test_secret_seam::take_set_failure() {
-            bail!("injected keychain set failure (test seam)");
-        }
         in_memory::set(service, account, secret);
         Ok(())
     }
@@ -843,7 +836,7 @@ mod in_memory {
 
 // ---- Autostart -----------------------------------------------------------
 
-pub struct MacOsAutostart;
+struct MacOsAutostart;
 
 impl MacOsAutostart {
     fn plist_path(label: &str) -> Result<PathBuf> {
@@ -924,7 +917,7 @@ fn xml_escape(s: &str) -> String {
 /// hands to launchd, without ever invoking `launchctl` for real (v0.5.3 P0 #2:
 /// after brew's `post_install` writes the plist, the LaunchAgent was never
 /// bootstrapped and the menu bar app didn't run until the next reboot).
-pub(crate) fn launchctl_bootstrap_argv(uid: u32, plist_path: &Path) -> Vec<String> {
+fn launchctl_bootstrap_argv(uid: u32, plist_path: &Path) -> Vec<String> {
     vec![
         "bootstrap".to_string(),
         format!("gui/{uid}"),
@@ -934,7 +927,7 @@ pub(crate) fn launchctl_bootstrap_argv(uid: u32, plist_path: &Path) -> Vec<Strin
 
 /// Build the argv for `launchctl bootout gui/<uid>/<label>` (the modern
 /// counterpart to `unload`). Symmetric with `launchctl_bootstrap_argv`.
-pub(crate) fn launchctl_bootout_argv(uid: u32, label: &str) -> Vec<String> {
+fn launchctl_bootout_argv(uid: u32, label: &str) -> Vec<String> {
     vec!["bootout".to_string(), format!("gui/{uid}/{label}")]
 }
 
@@ -945,7 +938,7 @@ pub(crate) fn launchctl_bootout_argv(uid: u32, label: &str) -> Vec<String> {
 /// best-effort legacy `unload` unconditionally, which printed a scary
 /// "Unload failed: 5: Input/output error" to stderr whenever nothing was
 /// loaded — we now only unload/bootout when this probe says the agent is up).
-pub(crate) fn launchctl_print_argv(uid: u32, label: &str) -> Vec<String> {
+fn launchctl_print_argv(uid: u32, label: &str) -> Vec<String> {
     vec!["print".to_string(), format!("gui/{uid}/{label}")]
 }
 
@@ -1217,7 +1210,7 @@ impl Autostart for MacOsAutostart {
 
 // ---- Paths ---------------------------------------------------------------
 
-pub struct MacOsPaths;
+struct MacOsPaths;
 
 impl Paths for MacOsPaths {
     fn home_env_order(&self) -> [&'static str; 2] {

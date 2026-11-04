@@ -106,12 +106,10 @@ fn snap(now: DateTime<Utc>, active: &str, accounts: Vec<AccountIn>) -> Snapshot 
     }
 }
 
-fn pick(key: &str, at: DateTime<Utc>, settled: Tier) -> Option<ManualPick> {
+fn pick(key: &str, _at: DateTime<Utc>, settled: Tier) -> Option<ManualPick> {
     Some(ManualPick {
         key: key.to_string(),
-        at: at.timestamp(),
         settled,
-        settled_by_fresh: true,
     })
 }
 
@@ -2155,4 +2153,45 @@ fn a_hold_or_a_cleared_or_moved_pick_after_the_cycle_began_is_detected() {
     let mut other = before.clone();
     other.set_manual_hold("codex", Some("c@x.io"));
     assert!(!super::shell::pick_changed(&before, &other, "claude"));
+}
+
+#[test]
+fn latch_epoch_tolerates_relative_reset_jitter() {
+    // Codex reports `reset_after_seconds`, so each read's `resets_at` lands a
+    // few seconds apart. The latch must still hold in that epoch, and must
+    // not hold once the reset moves by a real epoch.
+    let now = at(13, 0, 0);
+    let left = at(12, 30, 0);
+    let mut s = snap(
+        now,
+        "B",
+        vec![
+            acct("B", 20.0, 50.0, now - Duration::seconds(30)),
+            acct("A", 20.0, 91.0, now - Duration::seconds(30)),
+        ],
+    );
+    s.memory.left_at.insert("a".to_string(), left.timestamp());
+    s.memory.latch_trigger(
+        "A",
+        latch(
+            WindowId::Weekly,
+            Some(far() - Duration::seconds(7)),
+            91.0,
+            left,
+        ),
+    );
+    assert!(
+        assessed(&s, "A").trigger_latched,
+        "jitter is the same epoch"
+    );
+    s.memory.latch_trigger(
+        "A",
+        latch(
+            WindowId::Weekly,
+            Some(far() - Duration::hours(5)),
+            91.0,
+            left,
+        ),
+    );
+    assert!(!assessed(&s, "A").trigger_latched, "a new epoch voids it");
 }

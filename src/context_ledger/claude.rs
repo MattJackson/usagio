@@ -2,6 +2,8 @@
 //!
 //! Claude loads context from a well-documented set of locations:
 //! - ~/.claude/CLAUDE.md — global instructions
+//! - `@path` imports inside any of those CLAUDE.md files, recursively (see
+//!   [`Imports`])
 //! - <project>/CLAUDE.md, <project>/.claude/CLAUDE.md, <project>/CLAUDE.local.md,
 //!   and CLAUDE.md / CLAUDE.local.md in every ancestor directory — project
 //!   instructions
@@ -12,7 +14,10 @@
 //! - ~/.claude/agents/*.md and <project>/.claude/agents/*.md — subagent
 //!   definitions (likewise frontmatter only; a project agent wins over a
 //!   same-named personal one)
-//! - ~/.claude/plugins/*/plugin.json — plugin manifests (legacy layout)
+//! - installed plugins (`~/.claude/plugins/installed_plugins.json` ->
+//!   each install's `installPath`, e.g. `plugins/cache/<market>/<name>/<ver>`)
+//!   that are enabled: their skills, commands and agents (listing text only)
+//!   and MCP servers — see [`Plugins`]
 //! - MCP servers, each contributing its tool schemas: `~/.claude.json`
 //!   (`mcpServers` + `projects.<path>.mcpServers`), `<project>/.mcp.json`,
 //!   and (legacy fallback) `~/.claude/settings.json` `mcpServers`
@@ -21,7 +26,7 @@ use super::{tokenize, ItemKind, LedgerError, LedgerItem};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
+pub(crate) fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     let mut items = Vec::new();
     let home = match crate::paths::user_home() {
         Some(h) => h,
@@ -33,42 +38,67 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     let claude_dir = config_dir.clone().unwrap_or_else(|| home.join(".claude"));
     let (user_json, settings) = user_config_paths(&home, config_dir);
 
-    // Global CLAUDE.md
-    push_file_if_exists(
-        &mut items,
-        claude_dir.join("CLAUDE.md"),
-        ItemKind::GlobalInstructions,
-        "Global CLAUDE.md",
-    );
-
     // Claude Code keys projects by absolute path.
     let proj_abs: Option<PathBuf> =
         project.map(|p| fs::canonicalize(p).unwrap_or_else(|_| absolute_path(p)));
+    let user_val = read_json_logged(&user_json);
+    let local_proj = match (&user_val, project) {
+        (Some(val), Some(given)) => project_keys(proj_abs.as_deref(), given)
+            .iter()
+            .find_map(|k| val.get("projects").and_then(|p| p.get(k.as_str())))
+            .cloned(),
+        _ => None,
+    };
+    let project_flag = |key: &str| {
+        local_proj
+            .as_ref()
+            .and_then(|p| p.get(key))
+            .and_then(|b| b.as_bool())
+            == Some(true)
+    };
 
-    // Project instructions: ./CLAUDE.md, ./.claude/CLAUDE.md, ./CLAUDE.local.md,
-    // plus CLAUDE.md / CLAUDE.local.md in every ancestor directory.
+    // Instruction files, each with its `@path` imports: the global
+    // CLAUDE.md, then the project's ./CLAUDE.md, ./.claude/CLAUDE.md,
+    // ./CLAUDE.local.md, plus CLAUDE.md / CLAUDE.local.md in every ancestor.
+    let mut roots: Vec<(PathBuf, ItemKind, String)> = vec![(
+        claude_dir.join("CLAUDE.md"),
+        ItemKind::GlobalInstructions,
+        "Global CLAUDE.md".to_string(),
+    )];
     if let Some(proj) = &proj_abs {
         for (rel, label) in [
             ("CLAUDE.md", "Project CLAUDE.md"),
             (".claude/CLAUDE.md", "Project .claude/CLAUDE.md"),
             ("CLAUDE.local.md", "Project CLAUDE.local.md"),
         ] {
-            push_file_if_exists(
-                &mut items,
-                proj.join(rel),
-                ItemKind::ProjectInstructions,
-                label,
-            );
+            roots.push((proj.join(rel), ItemKind::ProjectInstructions, label.into()));
         }
         for dir in proj.ancestors().skip(1) {
             for f in ["CLAUDE.md", "CLAUDE.local.md"] {
-                push_file_if_exists(
-                    &mut items,
+                roots.push((
                     dir.join(f),
                     ItemKind::ProjectInstructions,
-                    &format!("{f} ({})", dir.display()),
-                );
+                    format!("{f} ({})", dir.display()),
+                ));
             }
+        }
+    }
+    let mut imports = Imports {
+        home: &home,
+        working_dir: proj_abs.as_deref(),
+        external_approved: project_flag("hasClaudeMdExternalIncludesApproved"),
+        // A file loaded in its own right is never counted again as an import.
+        seen: roots
+            .iter()
+            .filter_map(|(p, _, _)| fs::canonicalize(p).ok())
+            .collect(),
+    };
+    for (path, kind, label) in roots {
+        let before = items.len();
+        push_file_if_exists(&mut items, path.clone(), kind, &label);
+        if items.len() > before {
+            let user_scope = kind == ItemKind::GlobalInstructions;
+            imports.expand(&mut items, &path, kind, user_scope, 1);
         }
     }
 
@@ -135,46 +165,14 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
         }
     }
 
-    // Plugins — ~/.claude/plugins/**/plugin.json (only depth 2 to avoid runaway walks)
-    let plugins_dir = claude_dir.join("plugins");
-    if let Ok(top) = fs::read_dir(&plugins_dir) {
-        for entry in top.flatten() {
-            let manifest = entry.path().join("plugin.json");
-            if manifest.exists() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                push_file_if_exists(
-                    &mut items,
-                    manifest,
-                    ItemKind::PluginManifest,
-                    &format!("plugin: {}", name),
-                );
-            }
-        }
-    }
-
     // MCP tools. Claude Code keeps user/local-scope servers in ~/.claude.json
     // and project-scope servers in <project>/.mcp.json; settings.json
     // `mcpServers` is only a legacy fallback. First definition of a name wins
     // (local > project > user > legacy).
     let mut sources: Vec<(PathBuf, Vec<(String, serde_json::Value)>)> = Vec::new();
-    let user_val = read_json_logged(&user_json);
-    // Claude Code keys projects by absolute path.
-    let proj_abs: Option<PathBuf> =
-        project.map(|p| fs::canonicalize(p).unwrap_or_else(|_| absolute_path(p)));
-    let local_proj = match (&user_val, project) {
-        (Some(val), Some(given)) => project_keys(proj_abs.as_deref(), given)
-            .iter()
-            .find_map(|k| val.get("projects").and_then(|p| p.get(k.as_str())))
-            .cloned(),
-        _ => None,
-    };
     // Repo-controlled settings may approve .mcp.json servers only when the
     // user has trusted this folder in Claude Code.
-    let trusted = local_proj
-        .as_ref()
-        .and_then(|p| p.get("hasTrustDialogAccepted"))
-        .and_then(|b| b.as_bool())
-        == Some(true);
+    let trusted = project_flag("hasTrustDialogAccepted");
     if let Some(local) = local_proj
         .as_ref()
         .and_then(|p| p.get("mcpServers"))
@@ -190,10 +188,28 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     if let Some(v) = &settings_val {
         approval.absorb(v, false, true);
     }
+    // `enabledPlugins` merges key by key, user < project < local; repo
+    // settings count only in a trusted folder.
+    let mut enabled_plugins = std::collections::HashMap::new();
+    let mut absorb_enabled = |v: &serde_json::Value| {
+        if let Some(m) = v.get("enabledPlugins").and_then(|m| m.as_object()) {
+            for (id, on) in m {
+                if let Some(on) = on.as_bool() {
+                    enabled_plugins.insert(id.clone(), on);
+                }
+            }
+        }
+    };
+    if let Some(v) = &settings_val {
+        absorb_enabled(v);
+    }
     if let Some(proj) = &proj_abs {
         for f in ["settings.json", "settings.local.json"] {
             if let Some(v) = read_json_logged(&proj.join(".claude").join(f)) {
                 approval.absorb(&v, false, trusted);
+                if trusted {
+                    absorb_enabled(&v);
+                }
             }
         }
         let mcp_json = proj.join(".mcp.json");
@@ -227,6 +243,21 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
         if let Some(m) = val.get("mcpServers").and_then(|m| m.as_object()) {
             sources.push((settings.clone(), object_entries(m)));
         }
+    }
+    // Plugins: each installed, enabled plugin's skills, commands and agents
+    // (their listing text) plus its MCP servers.
+    let plugins = Plugins {
+        root: crate::paths::path_env_var("CLAUDE_CODE_PLUGIN_CACHE_DIR")
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| claude_dir.join("plugins")),
+        project: proj_abs.as_deref(),
+        trusted,
+        enabled: &enabled_plugins,
+        approval: &approval,
+    };
+    for (path, name, cfg) in plugins.collect(&mut items) {
+        sources.push((path, vec![(name, cfg)]));
     }
     let mut seen = std::collections::HashSet::new();
     let mut servers = Vec::new();
@@ -269,6 +300,638 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     }
 
     Ok(items)
+}
+
+/// Installed Claude Code plugins, read as Claude Code loads them: the install
+/// records in `<plugins root>/installed_plugins.json` (an id maps to one or
+/// more installs, each with a `scope`, `installPath` and, for `project` /
+/// `local` installs, a `projectPath`), filtered by `enabledPlugins` (else the
+/// manifest's `defaultEnabled`, default on). A plugin root holds an optional
+/// `.claude-plugin/plugin.json` manifest and the standard layout: `skills/`
+/// (plus manifest `skills` dirs), `commands/` and `agents/` (each replaced by
+/// its manifest key), `.mcp.json` (merged with manifest `mcpServers`).
+/// Components are namespaced `<plugin>:<name>`; a component path must start
+/// with `./` and stay inside the plugin root.
+struct Plugins<'a> {
+    root: PathBuf,
+    project: Option<&'a Path>,
+    trusted: bool,
+    enabled: &'a std::collections::HashMap<String, bool>,
+    approval: &'a McpApproval,
+}
+
+/// Bound on agent subfolder depth (agent names include their subfolders).
+const MAX_AGENT_DEPTH: usize = 4;
+
+impl Plugins<'_> {
+    /// Push every enabled plugin's listing items; return its MCP servers as
+    /// `(origin file, "plugin:<plugin>:<server>", config)`.
+    fn collect(&self, items: &mut Vec<LedgerItem>) -> Vec<(PathBuf, String, serde_json::Value)> {
+        let mut servers = Vec::new();
+        for (id, root, project_scoped) in self.installs() {
+            if project_scoped && !self.trusted {
+                ledger_warn!(
+                    "plugin {}: not loaded (folder not trusted in Claude Code)",
+                    printable(&id)
+                );
+                continue;
+            }
+            servers.extend(self.collect_plugin(items, &id, &root, project_scoped));
+        }
+        servers
+    }
+
+    /// `(id, install root, project-scoped)` for each plugin installed for this
+    /// context: a `local` install for this project beats a `project` one,
+    /// which beats the `user` install.
+    fn installs(&self) -> Vec<(String, PathBuf, bool)> {
+        let path = self.root.join("installed_plugins.json");
+        let Some(v) = read_json_logged(&path) else {
+            return Vec::new();
+        };
+        let Some(map) = v.get("plugins").and_then(|m| m.as_object()) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (id, entry) in map {
+            let installs: Vec<&serde_json::Value> = match entry {
+                serde_json::Value::Array(a) => a.iter().collect(),
+                serde_json::Value::Object(_) => vec![entry],
+                _ => Vec::new(),
+            };
+            let pick = installs
+                .into_iter()
+                .filter_map(|i| {
+                    let install = PathBuf::from(i.get("installPath")?.as_str()?);
+                    let scope = i.get("scope").and_then(|s| s.as_str()).unwrap_or("user");
+                    let rank = match scope {
+                        "local" | "project" => {
+                            let pp = Path::new(i.get("projectPath")?.as_str()?);
+                            let proj = self.project?;
+                            let same = pp == proj
+                                || fs::canonicalize(pp).is_ok_and(|c| c.as_path() == proj);
+                            if !same {
+                                return None;
+                            }
+                            usize::from(scope == "project")
+                        }
+                        _ => 2,
+                    };
+                    Some((rank, install))
+                })
+                .min_by_key(|(rank, _)| *rank);
+            if let Some((rank, install)) = pick {
+                out.push((id.clone(), install, rank < 2));
+            }
+        }
+        out
+    }
+
+    fn collect_plugin(
+        &self,
+        items: &mut Vec<LedgerItem>,
+        id: &str,
+        root: &Path,
+        project_scoped: bool,
+    ) -> Vec<(PathBuf, String, serde_json::Value)> {
+        let Ok(canon_root) = fs::canonicalize(root) else {
+            ledger_warn!("plugin {}: not cached at {}", printable(id), root.display());
+            return Vec::new();
+        };
+        let manifest_path = root.join(".claude-plugin").join("plugin.json");
+        let manifest = read_json_logged(&manifest_path).unwrap_or(serde_json::Value::Null);
+        let default_on = manifest
+            .get("defaultEnabled")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(true);
+        if !self.enabled.get(id).copied().unwrap_or(default_on) {
+            return Vec::new();
+        }
+        let name = manifest
+            .get("name")
+            .and_then(|n| n.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| id.split('@').next().unwrap_or(id).to_string());
+        let component = |rel: &str| plugin_component(&canon_root, rel);
+        let declared = |key: &str| -> Option<Vec<String>> {
+            match manifest.get(key)? {
+                serde_json::Value::String(s) => Some(vec![s.clone()]),
+                serde_json::Value::Array(a) => Some(
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect(),
+                ),
+                _ => None,
+            }
+        };
+
+        // Skills: skills/ plus manifest dirs (a dir of <name>/SKILL.md, or
+        // one folder holding SKILL.md). A root SKILL.md alone is one skill.
+        let mut skill_dirs = vec![(canon_root.join("skills"), None)];
+        for rel in declared("skills").unwrap_or_default() {
+            if let Some(d) = component(&rel) {
+                skill_dirs.push((d, Some(rel)));
+            }
+        }
+        let mut seen_skills = std::collections::HashSet::new();
+        for (dir, rel) in &skill_dirs {
+            if dir.join("SKILL.md").is_file() && rel.is_some() {
+                let skill = if *dir == canon_root {
+                    name.clone()
+                } else {
+                    dir.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                if seen_skills.insert(skill.clone()) {
+                    push_frontmatter_if_exists(
+                        items,
+                        dir.join("SKILL.md"),
+                        ItemKind::PluginManifest,
+                        &format!("plugin skill: {}:{}", name, printable(&skill)),
+                    );
+                }
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(dir) else {
+                continue;
+            };
+            let mut entries: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+            entries.sort();
+            for path in entries {
+                let skill_md = path.join("SKILL.md");
+                let skill = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                if skill_md.is_file() && seen_skills.insert(skill.clone()) {
+                    push_frontmatter_if_exists(
+                        items,
+                        skill_md,
+                        ItemKind::PluginManifest,
+                        &format!("plugin skill: {}:{}", name, printable(&skill)),
+                    );
+                }
+            }
+        }
+        if !canon_root.join("skills").exists()
+            && manifest.get("skills").is_none()
+            && canon_root.join("SKILL.md").is_file()
+        {
+            push_frontmatter_if_exists(
+                items,
+                canon_root.join("SKILL.md"),
+                ItemKind::PluginManifest,
+                &format!("plugin skill: {}", name),
+            );
+        }
+
+        // Commands: manifest `commands` (paths or a name map) replaces the
+        // default commands/ scan.
+        let mut command_files: Vec<PathBuf> = Vec::new();
+        match manifest.get("commands") {
+            Some(serde_json::Value::Object(map)) => {
+                for (cmd, entry) in map {
+                    let label = format!("plugin command: {}:{}", name, printable(cmd));
+                    if let Some(src) = entry.get("source").and_then(|s| s.as_str()) {
+                        if let Some(f) = component(src) {
+                            push_listing_text(items, f, &label, entry.get("description"));
+                        }
+                    } else {
+                        let text = entry
+                            .get("description")
+                            .and_then(|d| d.as_str())
+                            .map(String::from)
+                            .or_else(|| {
+                                entry
+                                    .get("content")
+                                    .and_then(|c| c.as_str())
+                                    .and_then(first_line)
+                            })
+                            .unwrap_or_default();
+                        push_text(items, &manifest_path, &label, &text);
+                    }
+                }
+            }
+            _ => {
+                let rels = declared("commands").unwrap_or_else(|| vec!["./commands".into()]);
+                for rel in rels {
+                    let Some(p) = component(&rel) else { continue };
+                    if p.is_dir() {
+                        command_files.extend(md_files(&p, 0, 0));
+                    } else if p.is_file() {
+                        command_files.push(p);
+                    }
+                }
+            }
+        }
+        for f in command_files {
+            let cmd = f
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let label = format!("plugin command: {}:{}", name, printable(&cmd));
+            push_listing_text(items, f, &label, None);
+        }
+
+        // Agents: manifest `agents` (.md files) replaces the default agents/
+        // scan, where subfolders become part of the agent name.
+        let agent_files: Vec<(PathBuf, String)> = match declared("agents") {
+            Some(rels) => rels
+                .iter()
+                .filter_map(|r| component(r))
+                .filter(|p| p.is_file())
+                .map(|p| {
+                    let stem = p
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    (p, stem)
+                })
+                .collect(),
+            None => {
+                let base = canon_root.join("agents");
+                md_files(&base, 0, MAX_AGENT_DEPTH)
+                    .into_iter()
+                    .map(|p| {
+                        let rel = p.strip_prefix(&base).unwrap_or(&p).with_extension("");
+                        let agent = rel
+                            .components()
+                            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join(":");
+                        (p, agent)
+                    })
+                    .collect()
+            }
+        };
+        for (p, agent) in agent_files {
+            push_frontmatter_if_exists(
+                items,
+                p,
+                ItemKind::PluginManifest,
+                &format!("plugin agent: {}:{}", name, printable(&agent)),
+            );
+        }
+
+        // MCP servers: .mcp.json, then manifest `mcpServers` (file paths,
+        // inline maps, or an array of them); a later name replaces an earlier.
+        let mut defs: Vec<(PathBuf, serde_json::Map<String, serde_json::Value>)> = Vec::new();
+        let mcp_file = |p: &Path| {
+            let v = read_json_logged(p)?;
+            let m = v.get("mcpServers").cloned().unwrap_or(v);
+            m.as_object().cloned()
+        };
+        if let Some(m) = mcp_file(&canon_root.join(".mcp.json")) {
+            defs.push((root.join(".mcp.json"), m));
+        }
+        let declared_mcp: Vec<serde_json::Value> = match manifest.get("mcpServers") {
+            Some(serde_json::Value::Array(a)) => a.clone(),
+            Some(v) => vec![v.clone()],
+            None => Vec::new(),
+        };
+        for d in declared_mcp {
+            match d {
+                serde_json::Value::String(rel) if rel.ends_with(".json") => {
+                    if let Some(p) = component(&rel) {
+                        if let Some(m) = mcp_file(&p) {
+                            defs.push((p, m));
+                        }
+                    }
+                }
+                serde_json::Value::String(rel) => {
+                    ledger_warn!("plugin {}: MCP bundle {} not probed", name, printable(&rel))
+                }
+                serde_json::Value::Object(m) => defs.push((manifest_path.clone(), m)),
+                _ => {}
+            }
+        }
+        let data_dir = self.root.join("data").join(
+            id.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect::<String>(),
+        );
+        let mut vars = vec![
+            (
+                "CLAUDE_PLUGIN_ROOT",
+                canon_root.to_string_lossy().into_owned(),
+            ),
+            (
+                "CLAUDE_PLUGIN_DATA",
+                data_dir.to_string_lossy().into_owned(),
+            ),
+        ];
+        if let Some(p) = self.project {
+            vars.push(("CLAUDE_PROJECT_DIR", p.to_string_lossy().into_owned()));
+        }
+        let mut merged: Vec<(String, (PathBuf, serde_json::Value))> = Vec::new();
+        for (origin, map) in defs {
+            for (server, cfg) in map {
+                merged.retain(|(n, _)| *n != server);
+                merged.push((server, (origin.clone(), cfg)));
+            }
+        }
+        let mut out = Vec::new();
+        for (server, (origin, mut cfg)) in merged {
+            if project_scoped && !self.approval.project_server_approved(&server) {
+                ledger_warn!(
+                    "mcp plugin:{}:{}: not approved (not started)",
+                    name,
+                    printable(&server)
+                );
+                continue;
+            }
+            substitute_plugin_vars(&mut cfg, &vars);
+            if let Some(obj) = cfg.as_object_mut() {
+                if obj.contains_key("command") {
+                    let env = obj.entry("env").or_insert_with(|| serde_json::json!({}));
+                    if let Some(env) = env.as_object_mut() {
+                        for (k, v) in &vars {
+                            env.entry(k.to_string()).or_insert_with(|| v.clone().into());
+                        }
+                    }
+                }
+            }
+            out.push((origin, format!("plugin:{name}:{server}"), cfg));
+        }
+        out
+    }
+}
+
+/// A manifest component path, resolved inside the plugin root: it must start
+/// with `./` (or be `.`), and may not escape the root (`..`, symlinks out,
+/// or — off Windows — a backslash anywhere).
+fn plugin_component(canon_root: &Path, rel: &str) -> Option<PathBuf> {
+    let inner = if rel == "." || rel == "./" {
+        ""
+    } else {
+        rel.strip_prefix("./")?
+    };
+    if (cfg!(not(windows)) && rel.contains('\\'))
+        || Path::new(inner)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let p = fs::canonicalize(canon_root.join(inner)).ok()?;
+    p.starts_with(canon_root).then_some(p)
+}
+
+/// `.md` files under `dir` (sorted), descending at most `max_depth` levels.
+fn md_files(dir: &Path, depth: usize, max_depth: usize) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    let mut out = Vec::new();
+    for p in paths {
+        if p.is_dir() {
+            if depth < max_depth {
+                out.extend(md_files(&p, depth + 1, max_depth));
+            }
+        } else if p.extension().and_then(|e| e.to_str()) == Some("md") {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Replace `${CLAUDE_PLUGIN_ROOT}`-style references in every string of an MCP
+/// server config (Claude Code resolves them in command, args, env and url).
+fn substitute_plugin_vars(v: &mut serde_json::Value, vars: &[(&str, String)]) {
+    match v {
+        serde_json::Value::String(s) => {
+            for (k, val) in vars {
+                *s = s.replace(&format!("${{{k}}}"), val);
+            }
+        }
+        serde_json::Value::Array(a) => a.iter_mut().for_each(|x| substitute_plugin_vars(x, vars)),
+        serde_json::Value::Object(o) => {
+            o.values_mut().for_each(|x| substitute_plugin_vars(x, vars))
+        }
+        _ => {}
+    }
+}
+
+fn first_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(String::from)
+}
+
+/// A command's listing text: its `description` override, else its
+/// frontmatter, else its first non-empty line.
+fn push_listing_text(
+    items: &mut Vec<LedgerItem>,
+    path: PathBuf,
+    label: &str,
+    description: Option<&serde_json::Value>,
+) {
+    if let Some(d) = description.and_then(|d| d.as_str()) {
+        push_text(items, &path, label, d);
+        return;
+    }
+    let Some(bytes) = super::read_capped(&path) else {
+        return;
+    };
+    let full = String::from_utf8_lossy(&bytes);
+    let text = injected_frontmatter(&full)
+        .or_else(|| first_line(&full))
+        .unwrap_or_default();
+    push_text(items, &path, label, &text);
+}
+
+fn push_text(items: &mut Vec<LedgerItem>, path: &Path, label: &str, text: &str) {
+    items.push(LedgerItem {
+        kind: ItemKind::PluginManifest,
+        name: label.to_string(),
+        path: path.to_path_buf(),
+        mtime: file_mtime(path),
+        token_count: tokenize::count_tokens(text, tokenize::TokenizerHint::Anthropic),
+        content_bytes: text.len(),
+        tool_count: None,
+    });
+}
+
+/// Maximum `@path` import depth (hops from the importing CLAUDE.md).
+const MAX_IMPORT_HOPS: usize = 4;
+
+/// CLAUDE.md `@path` import expansion, as Claude Code does it: imports are
+/// recursive up to [`MAX_IMPORT_HOPS`]; a relative path resolves against the
+/// importing file's directory, `~/` against home; every file counts once.
+/// In a project-level file, an import resolving outside the working directory
+/// is external and loads only once the user approved external imports for
+/// the project (`hasClaudeMdExternalIncludesApproved`); imports in the user's
+/// own `~/.claude/CLAUDE.md` load without approval.
+struct Imports<'a> {
+    home: &'a Path,
+    working_dir: Option<&'a Path>,
+    external_approved: bool,
+    seen: std::collections::HashSet<PathBuf>,
+}
+
+impl Imports<'_> {
+    fn expand(
+        &mut self,
+        items: &mut Vec<LedgerItem>,
+        file: &Path,
+        kind: ItemKind,
+        user_scope: bool,
+        hop: usize,
+    ) {
+        if hop > MAX_IMPORT_HOPS {
+            return;
+        }
+        let Some(bytes) = super::read_capped(file) else {
+            return;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let base = file.parent().unwrap_or(Path::new(""));
+        for raw in import_paths(&text) {
+            let target = if let Some(rest) = raw.strip_prefix("~/") {
+                self.home.join(rest)
+            } else {
+                base.join(&raw)
+            };
+            let Ok(canon) = fs::canonicalize(&target) else {
+                continue;
+            };
+            if !canon.is_file() || self.seen.contains(&canon) {
+                continue;
+            }
+            let external = self.working_dir.is_some_and(|w| !canon.starts_with(w));
+            if !user_scope && external && !self.external_approved {
+                ledger_warn!(
+                    "{}: import @{} not counted (external imports not approved)",
+                    file.display(),
+                    printable(&raw)
+                );
+                continue;
+            }
+            self.seen.insert(canon);
+            let label = format!(
+                "@{} (from {})",
+                printable(&raw),
+                file.file_name().unwrap_or_default().to_string_lossy()
+            );
+            let before = items.len();
+            push_file_if_exists(items, target.clone(), kind, &label);
+            if items.len() > before {
+                self.expand(items, &target, kind, user_scope, hop + 1);
+            }
+        }
+    }
+}
+
+/// The `@path` imports in a CLAUDE.md, in order. An import starts with `@`
+/// at the start of a line or after whitespace and ends at the first
+/// unescaped whitespace (`\ ` is a literal space). Fenced code blocks and
+/// code spans are skipped, and a quoted path is not an import.
+fn import_paths(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut fence: Option<(char, usize)> = None;
+    for line in text.lines() {
+        let t = line.trim_start();
+        let run = |c: char| t.chars().take_while(|&x| x == c).count();
+        let opener = ['`', '~']
+            .into_iter()
+            .map(|c| (c, run(c)))
+            .find(|&(_, n)| n >= 3);
+        match (fence, opener) {
+            (Some((c, n)), Some((c2, n2))) if c == c2 && n2 >= n => {
+                fence = None;
+                continue;
+            }
+            (Some(_), _) => continue,
+            (None, Some(f)) => {
+                fence = Some(f);
+                continue;
+            }
+            (None, None) => {}
+        }
+        let chars: Vec<char> = without_code_spans(line).chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '@' && (i == 0 || chars[i - 1].is_whitespace()) {
+                let mut path = String::new();
+                let mut j = i + 1;
+                while j < chars.len() {
+                    match chars[j] {
+                        '\\' if chars.get(j + 1) == Some(&' ') => {
+                            path.push(' ');
+                            j += 2;
+                        }
+                        c if c.is_whitespace() => break,
+                        c => {
+                            path.push(c);
+                            j += 1;
+                        }
+                    }
+                }
+                if !path.is_empty() && !path.starts_with(['"', '\'']) {
+                    out.push(path);
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// `line` with each Markdown code span (a backtick run up to the next run of
+/// the same length) blanked out. An unmatched run stays literal.
+fn without_code_spans(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '`' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let n = chars[i..].iter().take_while(|&&c| c == '`').count();
+        let mut j = i + n;
+        let mut close = None;
+        while j < chars.len() {
+            if chars[j] == '`' {
+                let m = chars[j..].iter().take_while(|&&c| c == '`').count();
+                if m == n {
+                    close = Some(j + m);
+                    break;
+                }
+                j += m;
+            } else {
+                j += 1;
+            }
+        }
+        match close {
+            Some(end) => {
+                out.push(' ');
+                i = end;
+            }
+            None => {
+                out.extend(&chars[i..i + n]);
+                i += n;
+            }
+        }
+    }
+    out
 }
 
 /// Claude Code's approval state for project-scope `.mcp.json` servers.
@@ -559,6 +1222,39 @@ mod tests {
             collect(None).unwrap()
         });
         assert!(items.iter().any(|i| i.name == "Global CLAUDE.md"));
+    }
+
+    #[test]
+    fn import_paths_follow_claude_code_syntax() {
+        let md = "See @docs/a.md and @~/b.md.\n\
+                  mail me@example.com\n\
+                  `@not-span.md` and ``x `@n` y`` but @real\\ name.md\n\
+                  @\"quoted.md\"\n\
+                  ```\n@in-fence.md\n```\n\
+                  ~~~~\n@tilde-fence.md\n~~~\n@still-fenced.md\n~~~~\n\
+                  @after.md";
+        assert_eq!(
+            import_paths(md),
+            vec!["docs/a.md", "~/b.md.", "real name.md", "after.md"]
+        );
+    }
+
+    #[test]
+    fn plugin_component_paths_stay_inside_the_plugin() {
+        let td = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(td.path()).unwrap().join("p");
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::write(td.path().join("outside.md"), "x").unwrap();
+        assert_eq!(plugin_component(&root, "./a"), Some(root.join("a")));
+        assert_eq!(plugin_component(&root, "."), Some(root.clone()));
+        assert_eq!(plugin_component(&root, "a"), None, "needs ./");
+        assert_eq!(plugin_component(&root, "./../outside.md"), None);
+        assert_eq!(plugin_component(&root, "./a/../../outside.md"), None);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(td.path().join("outside.md"), root.join("link.md")).unwrap();
+            assert_eq!(plugin_component(&root, "./link.md"), None, "symlink escape");
+        }
     }
 
     #[test]

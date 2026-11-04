@@ -17,21 +17,21 @@ use super::WindowId;
 /// in. Void in any other epoch (a different `resets_at`, or a lower pct than
 /// when it was latched — an early or claimed reset).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Latch {
+pub(crate) struct Latch {
     /// The window it was left in.
-    pub window: WindowId,
+    pub(crate) window: WindowId,
     /// That window's reported reset (unix secs), identifying the epoch.
     #[serde(default)]
-    pub resets_at: Option<i64>,
+    pub(crate) resets_at: Option<i64>,
     /// The window's pct when latched; a lower reading means a new epoch.
-    pub pct: f64,
+    pub(crate) pct: f64,
     /// When the latch was set (unix secs), for the 8-day prune.
-    pub at: i64,
+    pub(crate) at: i64,
 }
 
 /// Which latch a leave sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LatchKind {
+pub(crate) enum LatchKind {
     /// Left by Trigger: not a Trigger/Rebalance target again this epoch.
     Trigger,
     /// Left by Drain or Serve: not a drain target again this epoch.
@@ -40,7 +40,7 @@ pub enum LatchKind {
 
 /// How an active-account change happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChangeKind {
+pub(crate) enum ChangeKind {
     /// The engine switched (`switch_if_still_active`).
     Auto,
     /// The user switched (menu or CLI).
@@ -51,33 +51,33 @@ pub enum ChangeKind {
 
 /// Swap memory for one provider.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct SwapMemory {
+pub(crate) struct SwapMemory {
     /// Last change of active account (auto, manual or external), unix secs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_switch_at: Option<i64>,
+    pub(crate) last_switch_at: Option<i64>,
     /// Account → when we last left it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub left_at: BTreeMap<String, i64>,
+    pub(crate) left_at: BTreeMap<String, i64>,
     /// Account → the epoch it was left in by a Trigger move.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub trigger_left: BTreeMap<String, Latch>,
+    pub(crate) trigger_left: BTreeMap<String, Latch>,
     /// Account → the epoch it was left in by a Drain or Serve move.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub drained: BTreeMap<String, Latch>,
+    pub(crate) drained: BTreeMap<String, Latch>,
     /// The stuck notice was sent and hasn't re-armed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub stuck_notified: bool,
+    pub(crate) stuck_notified: bool,
     /// The active key as of the last note (External detection).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_seen_active: Option<String>,
+    pub(crate) last_seen_active: Option<String>,
     /// The active account the engine last judged Draining (re-entry to Ready
     /// needs a Real reading under `limit − 1`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub draining: Option<String>,
+    pub(crate) draining: Option<String>,
     /// The active account's tier as of its last Real reading (the stuck
     /// notice re-arms on a Real-backed tier change).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub real_tier: Option<String>,
+    pub(crate) real_tier: Option<String>,
 }
 
 /// How far past `now` a stored timestamp may sit before it is treated as bogus.
@@ -90,7 +90,13 @@ fn lc(s: &str) -> String {
 impl SwapMemory {
     /// Record a change of active account `from → to` at `now`. Only call when
     /// the key really changed; same-account token adoption is not a change.
-    pub fn note_active_change(&mut self, from: Option<&str>, to: &str, now: i64, kind: ChangeKind) {
+    pub(crate) fn note_active_change(
+        &mut self,
+        from: Option<&str>,
+        to: &str,
+        now: i64,
+        kind: ChangeKind,
+    ) {
         let _ = kind; // the pick itself is set/cleared by the caller's state write
         if let Some(from) = from.filter(|f| !f.eq_ignore_ascii_case(to)) {
             self.left_at.insert(lc(from), now);
@@ -103,7 +109,7 @@ impl SwapMemory {
     }
 
     /// Set the leave latch `kind` on `key`.
-    pub fn apply_latch(&mut self, key: &str, kind: LatchKind, latch: Latch) {
+    pub(crate) fn apply_latch(&mut self, key: &str, kind: LatchKind, latch: Latch) {
         match kind {
             LatchKind::Trigger => self.latch_trigger(key, latch),
             LatchKind::Drained => self.latch_drained(key, latch),
@@ -113,7 +119,7 @@ impl SwapMemory {
     /// External detection: the active key differs from the last noted one.
     /// Returns the account that was left, if this is a real change. A memory
     /// that has never seen an active key just starts tracking (no change).
-    pub fn detect_external(&mut self, active: Option<&str>, now: i64) -> Option<String> {
+    pub(crate) fn detect_external(&mut self, active: Option<&str>, now: i64) -> Option<String> {
         let active = active?;
         match self.last_seen_active.clone() {
             None => {
@@ -128,29 +134,29 @@ impl SwapMemory {
         }
     }
 
-    pub fn left_at(&self, key: &str) -> Option<i64> {
+    pub(crate) fn left_at(&self, key: &str) -> Option<i64> {
         self.left_at.get(&lc(key)).copied()
     }
 
-    pub fn trigger_latch(&self, key: &str) -> Option<&Latch> {
+    pub(crate) fn trigger_latch(&self, key: &str) -> Option<&Latch> {
         self.trigger_left.get(&lc(key))
     }
 
-    pub fn drained_latch(&self, key: &str) -> Option<&Latch> {
+    pub(crate) fn drained_latch(&self, key: &str) -> Option<&Latch> {
         self.drained.get(&lc(key))
     }
 
-    pub fn latch_trigger(&mut self, key: &str, latch: Latch) {
+    pub(crate) fn latch_trigger(&mut self, key: &str, latch: Latch) {
         self.trigger_left.insert(lc(key), latch);
     }
 
-    pub fn latch_drained(&mut self, key: &str, latch: Latch) {
+    pub(crate) fn latch_drained(&mut self, key: &str, latch: Latch) {
         self.drained.insert(lc(key), latch);
     }
 
     /// Drop latches whose epoch reset has passed or that are older than 8
     /// days, and `left_at` entries older than 8 days.
-    pub fn prune(&mut self, now: DateTime<Utc>) {
+    pub(crate) fn prune(&mut self, now: DateTime<Utc>) {
         let now_ts = now.timestamp();
         let max_age = LATCH_MAX_AGE_DAYS * 86_400;
         // A timestamp from the future (clock was ahead when it was written)
@@ -179,7 +185,7 @@ impl SwapMemory {
     /// keeping the max per key, `last_switch_at` is the max. `stuck_notified`,
     /// `draining` and `last_seen_active` stay this (the engine owner's) value.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn merge_from(&mut self, other: &SwapMemory) {
+    pub(crate) fn merge_from(&mut self, other: &SwapMemory) {
         for (k, v) in &other.left_at {
             let e = self.left_at.entry(k.clone()).or_insert(*v);
             *e = (*e).max(*v);

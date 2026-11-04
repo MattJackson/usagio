@@ -2,7 +2,7 @@
 
 use super::{ItemKind, Ledger};
 
-pub fn terminal(ledger: &Ledger) -> String {
+pub(crate) fn terminal(ledger: &Ledger) -> String {
     let mut out = String::new();
     let project = ledger
         .project
@@ -88,11 +88,9 @@ pub fn terminal(ledger: &Ledger) -> String {
 }
 
 fn display_provider(slug: &str) -> &str {
-    match slug {
-        "claude" | "claude-code" => "Claude Code",
-        "codex" => "Codex",
-        "opencode" => "opencode",
-        other => other,
+    match super::Cli::from_slug(slug) {
+        Some(cli) => cli.display_name(),
+        None => slug,
     }
 }
 

@@ -26,14 +26,14 @@ use crate::usage_log::{AccountKey, PaceEstimate, Snapshot};
 /// human-inspectable.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum Window {
+pub(crate) enum Window {
     Session,
     Weekly,
 }
 
 impl Window {
     /// Short human label used in notification bodies.
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Window::Session => "Session (5h)",
             Window::Weekly => "Weekly (7d)",
@@ -45,7 +45,7 @@ impl Window {
 /// was crossed so the same window can fire twice per cycle (e.g. 70 then 90).
 /// `WeeklyPace` carries the projected 100%-hit time so the body can name it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Trigger {
+pub(crate) enum Trigger {
     /// The `window`'s utilization just crossed `pct` upward (typ. 70 or 90).
     Threshold { window: Window, pct: u8 },
     /// The `window` just reset — utilization dropped from a non-trivial prior
@@ -67,10 +67,10 @@ pub enum Trigger {
 /// experimental and defaults off (the user opts in from Settings ▸
 /// Notifications).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NotificationConfig {
-    pub threshold_enabled: bool,
-    pub reset_back_enabled: bool,
-    pub pace_enabled: bool,
+pub(crate) struct NotificationConfig {
+    pub(crate) threshold_enabled: bool,
+    pub(crate) reset_back_enabled: bool,
+    pub(crate) pace_enabled: bool,
 }
 
 impl Default for NotificationConfig {
@@ -89,31 +89,31 @@ impl Default for NotificationConfig {
 /// deterministic across saves — a state.json diff shouldn't churn on set
 /// iteration order.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NotifState {
+pub(crate) struct NotifState {
     /// Thresholds already fired since the last reset of their window.
     #[serde(default)]
-    pub crossings: BTreeSet<(Window, u8)>,
+    pub(crate) crossings: BTreeSet<(Window, u8)>,
     /// True if this account has already fired a WeeklyPace notification
     /// during its current weekly window.
     #[serde(default)]
-    pub pace_fired_this_window: bool,
+    pub(crate) pace_fired_this_window: bool,
     /// The login expiry (unix millis) already warned about. A renewal moves
     /// the expiry, so the next approach warns again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub login_expiry_warned: Option<i64>,
+    pub(crate) login_expiry_warned: Option<i64>,
     /// Reset-grant ids we've already announced ("you got a reset!"), so the
     /// arrival notification fires once per grant, not every poll.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub reset_grants_seen: BTreeSet<String>,
+    pub(crate) reset_grants_seen: BTreeSet<String>,
     /// Reset-grant ids we've already announced as usable-now, so the
     /// "claim it now" notification fires once per grant.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub reset_grants_usable_fired: BTreeSet<String>,
+    pub(crate) reset_grants_usable_fired: BTreeSet<String>,
     /// State-driven notifications whose one retry after a failed delivery has
     /// been spent ("pace", "avail:<id>", "usable:<id>"); a second failure
     /// commits the dedup bit instead of retrying forever.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub retry_spent: BTreeSet<String>,
+    pub(crate) retry_spent: BTreeSet<String>,
 }
 
 /// Thresholds we check on every tick, ascending so a `Vec<Trigger>` from
@@ -151,7 +151,7 @@ pub(crate) fn threshold_alert_label() -> String {
 /// A field that's `None` on either side of the pair produces no trigger for
 /// that window — first-boot after a capture shouldn't blast the user with
 /// "you crossed 70" for percentages that were simply unknown before.
-pub fn evaluate(prev: &Snapshot, curr: &Snapshot, cfg: &NotificationConfig) -> Vec<Trigger> {
+pub(crate) fn evaluate(prev: &Snapshot, curr: &Snapshot, cfg: &NotificationConfig) -> Vec<Trigger> {
     let mut out = Vec::new();
     let pairs = [
         (Window::Session, prev.session_pct, curr.session_pct),
@@ -202,7 +202,7 @@ fn is_window_reset(prev_pct: f32, curr_pct: f32) -> bool {
 /// 0 s" for an expired window would otherwise roll on every poll.
 /// Public so the watch loop can query it independently of `evaluate` (e.g. to
 /// log a reset even when `reset_back_enabled` is off).
-pub fn is_reset(prev: &Snapshot, curr: &Snapshot, w: Window) -> bool {
+fn is_reset(prev: &Snapshot, curr: &Snapshot, w: Window) -> bool {
     let (p, c, pr, cr) = match w {
         Window::Session => (
             prev.session_pct,
@@ -232,7 +232,7 @@ pub fn is_reset(prev: &Snapshot, curr: &Snapshot, w: Window) -> bool {
 /// intended), and — for a weekly reset — clears `pace_fired_this_window` too.
 /// Reset detection uses the (prev, curr) pair directly (not just the
 /// Trigger stream) so it fires even when `cfg.reset_back_enabled` is false.
-pub fn dedup_and_apply(
+pub(crate) fn dedup_and_apply(
     state: &mut NotifState,
     prev: &Snapshot,
     curr: &Snapshot,
@@ -286,7 +286,7 @@ pub fn dedup_and_apply(
 /// after `now` (a projection into the past means the fit is degenerate).
 /// Returns the trigger to consider firing; the caller still runs it through
 /// `dedup_and_apply` to actually flip the "fired" bit.
-pub fn evaluate_pace(
+pub(crate) fn evaluate_pace(
     pace: Option<&PaceEstimate>,
     curr: &Snapshot,
     cfg: &NotificationConfig,
@@ -323,7 +323,7 @@ pub fn evaluate_pace(
 /// was raised for. Threshold/reset crossings are edge-triggered on the
 /// (prev, curr) pair, which advances regardless, so they are not retried
 /// (fire is documented best-effort).
-pub fn release_dedup(state: &mut NotifState, trigger: &Trigger, grant_id: Option<&str>) {
+pub(crate) fn release_dedup(state: &mut NotifState, trigger: &Trigger, grant_id: Option<&str>) {
     let key = match (trigger, grant_id) {
         (Trigger::WeeklyPace { .. }, _) => "pace".to_string(),
         (Trigger::ResetGrantAvailable { .. }, Some(id)) => format!("avail:{id}"),
@@ -359,7 +359,7 @@ pub fn release_dedup(state: &mut NotifState, trigger: &Trigger, grant_id: Option
 /// correct even on the first poll after launch. Ids are never pruned: a grant
 /// that's been spent drops out of `grants` (its `resets_left` hits 0) and
 /// shouldn't re-announce if it transiently reappears.
-pub fn reset_grant_triggers(state: &mut NotifState, grants: &[ResetGrant]) -> Vec<Trigger> {
+pub(crate) fn reset_grant_triggers(state: &mut NotifState, grants: &[ResetGrant]) -> Vec<Trigger> {
     let mut out = Vec::new();
     for g in grants.iter().filter(|g| g.is_available()) {
         if state.reset_grants_seen.insert(g.id.clone()) {
@@ -382,7 +382,7 @@ pub fn reset_grant_triggers(state: &mut NotifState, grants: &[ResetGrant]) -> Ve
 
 /// Golden-tested (summary, body) pair for a Trigger. Kept separate from `fire`
 /// so tests can assert the exact wording without dragging in notify-rust.
-pub fn format_message(trigger: &Trigger, account: &AccountKey) -> (String, String) {
+fn format_message(trigger: &Trigger, account: &AccountKey) -> (String, String) {
     let summary = format!("{} · {}", account.provider, account.account);
     let body = match trigger {
         Trigger::Threshold { window, pct } => {
@@ -423,7 +423,7 @@ pub fn format_message(trigger: &Trigger, account: &AccountKey) -> (String, Strin
 /// shown should assert against `format_message` directly instead — it's the
 /// pure half of this function and is exercised by the golden-message tests
 /// further down.
-pub fn fire(trigger: &Trigger, account: &AccountKey) -> Result<()> {
+pub(crate) fn fire(trigger: &Trigger, account: &AccountKey) -> Result<()> {
     let (summary, body) = format_message(trigger, account);
     null_notifier_or_real(&summary, &body)
 }
@@ -448,16 +448,29 @@ fn null_notifier_or_real(_summary: &str, _body: &str) -> Result<()> {
 
 /// Fire a plain "usagio: <msg>" notification, without going through the
 /// `Trigger`/`AccountKey` pipeline. Used for one-off diagnostics (auto-swap,
-/// stuck-account, migration failures) from `main::notify`. Cross-platform via
-/// notify-rust — replaces the older macOS-only `osascript display notification`
-/// path that silently no-op'd on Linux/Windows.
-pub fn fire_plain(msg: &str) -> Result<()> {
+/// stuck-account, migration failures) from `main::notify`. Routes through the
+/// `Platform` trait's `notify` (notify-rust on macOS/Linux; a deliberate no-op
+/// on Windows, see the note above).
+fn fire_plain(msg: &str) -> Result<()> {
     null_notifier_or_real("usagio", msg)
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Fire a native "usagio: {msg}" notification (best effort, cross-platform).
+/// Delegates to `notifications::fire_plain`, which routes through notify-rust
+/// so macOS/Linux/Windows all get a real notification — the previous osascript
+/// path silently no-op'd on Linux and Windows. Best-effort: failures are
+/// logged (R2-EH-04) so H6's user-facing notification guarantee has
+/// diagnostic backing when the channel is unavailable (headless SSH, no
+/// notification daemon, denied permission, etc.).
+pub(crate) fn notify(msg: &str) {
+    if let Err(e) = fire_plain(msg) {
+        crate::logging::log(&format!("notify: fire_plain failed: {e}"));
+    }
+}
 
 #[cfg(test)]
 mod tests {

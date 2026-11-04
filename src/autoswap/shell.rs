@@ -16,8 +16,9 @@ use super::{
     assess::Assessed, assess_all, decide, AccountIn, Action, Decision, Kind, ManualPick, Policy,
     Reason, Snapshot, Tier, Urgency, WindowIn,
 };
+use crate::logging;
+use crate::rows::Row;
 use crate::store::State;
-use crate::{logging, Row};
 
 // ---------------------------------------------------------------------------
 // Request budget (§5.7)
@@ -25,7 +26,7 @@ use crate::{logging, Row};
 
 /// Why a read was deferred.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Defer {
+pub(crate) enum Defer {
     PerMinute,
     PerCycle,
     PerAccount,
@@ -34,7 +35,7 @@ pub enum Defer {
 }
 
 impl Defer {
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Defer::PerMinute => "per_minute",
             Defer::PerCycle => "per_cycle",
@@ -47,7 +48,7 @@ impl Defer {
 
 /// One provider's usage-request budget.
 #[derive(Debug, Clone, Default)]
-pub struct Budget {
+pub(crate) struct Budget {
     /// Active + verification request times (unix secs).
     requests: Vec<i64>,
     /// Verification read times, last hour.
@@ -55,7 +56,7 @@ pub struct Budget {
     last_verify: HashMap<String, i64>,
     last_429: Option<i64>,
     /// Reads deferred so far (for the log).
-    pub deferred: usize,
+    deferred: usize,
 }
 
 impl Budget {
@@ -67,18 +68,18 @@ impl Budget {
     }
 
     /// An active-account usage request was made at `now` (by the poller).
-    pub fn note_request(&mut self, now: i64) {
+    pub(crate) fn note_request(&mut self, now: i64) {
         self.trim(now);
         self.requests.push(now);
     }
 
     /// A 429 on any of the provider's tokens at `now` (storm guard).
-    pub fn note_429(&mut self, now: i64) {
+    pub(crate) fn note_429(&mut self, now: i64) {
         self.last_429 = Some(self.last_429.map_or(now, |t| t.max(now)));
     }
 
     /// Requests counted in the last 60 s.
-    pub fn requests_last_minute(&self, now: i64) -> usize {
+    pub(crate) fn requests_last_minute(&self, now: i64) -> usize {
         self.requests
             .iter()
             .filter(|t| (0..60).contains(&(now - **t)))
@@ -86,7 +87,7 @@ impl Budget {
     }
 
     /// Verification reads in the last hour.
-    pub fn verify_reads_last_hour(&self, now: i64) -> usize {
+    pub(crate) fn verify_reads_last_hour(&self, now: i64) -> usize {
         self.verify_reads
             .iter()
             .filter(|t| (0..3600).contains(&(now - **t)))
@@ -94,7 +95,7 @@ impl Budget {
     }
 
     /// May a read of `key` be made now?
-    pub fn allow(
+    pub(crate) fn allow(
         &self,
         key: &str,
         now: i64,
@@ -132,7 +133,7 @@ impl Budget {
     }
 
     /// Count a read of `key` made at `now`.
-    pub fn record_read(&mut self, key: &str, now: i64, is_active: bool) {
+    pub(crate) fn record_read(&mut self, key: &str, now: i64, is_active: bool) {
         self.trim(now);
         self.requests.push(now);
         if !is_active {
@@ -148,7 +149,7 @@ impl Budget {
 
 /// What a read returned.
 #[derive(Debug, Clone)]
-pub enum ReadResult {
+pub(crate) enum ReadResult {
     /// A fresh reading: the account's new windows / fetched_at / credits.
     Ok(Box<AccountIn>),
     RateLimited,
@@ -157,11 +158,11 @@ pub enum ReadResult {
 
 /// One read the loop made or deferred.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ReadLog {
-    pub key: String,
-    pub is_active: bool,
+pub(crate) struct ReadLog {
+    pub(crate) key: String,
+    pub(crate) is_active: bool,
     /// `"ok"`, `"429"`, `"err"` or `"defer:<why>"`.
-    pub outcome: String,
+    pub(crate) outcome: String,
 }
 
 fn has_pending(a: &AccountIn, now: DateTime<Utc>) -> bool {
@@ -175,7 +176,7 @@ fn has_pending(a: &AccountIn, now: DateTime<Utc>) -> bool {
 /// until the decision is a `Stay` or a `Switch`. Every account a decision
 /// asked for is marked `attempted` (a deferred read counts as failed), so the
 /// loop terminates. `read(key, is_active)` performs one fetch.
-pub fn decide_with_reads(
+pub(crate) fn decide_with_reads(
     snap: &mut Snapshot,
     budget: &mut Budget,
     read: &mut dyn FnMut(&str, bool) -> ReadResult,
@@ -276,13 +277,13 @@ pub fn decide_with_reads(
 /// Remembers the last logged (action, reason, target) so a decision is logged
 /// once per change (plus every switch).
 #[derive(Debug, Clone, Default)]
-pub struct DecisionLog {
+pub(crate) struct DecisionLog {
     last: Option<(String, String, Option<String>)>,
 }
 
 impl DecisionLog {
     /// Whether `d` should be logged, recording it if so.
-    pub fn should_log(&mut self, d: &Decision) -> bool {
+    pub(crate) fn should_log(&mut self, d: &Decision) -> bool {
         let key = (
             d.action_str().to_string(),
             d.reason.as_str().to_string(),
@@ -302,12 +303,12 @@ impl DecisionLog {
 
 /// Per-provider in-memory shell state, carried in `SwapGuard` across cycles.
 #[derive(Debug, Clone, Default)]
-pub struct ShellState {
-    pub budget: Budget,
-    pub log: DecisionLog,
+pub(crate) struct ShellState {
+    pub(crate) budget: Budget,
+    pub(crate) log: DecisionLog,
     /// The (target, failure kind) of the last failed auto-switch that was
     /// already notified; cleared by a successful switch.
-    pub last_failure: Option<(String, &'static str)>,
+    last_failure: Option<(String, &'static str)>,
 }
 
 /// Coarse class of a failed switch, for notification dedup. The target's
@@ -363,7 +364,7 @@ static SLEEP_GAPS: std::sync::Mutex<Vec<(i64, i64)>> = std::sync::Mutex::new(Vec
 
 /// Record a detected system sleep `(from, to)` (unix secs); the blind
 /// projection excludes it. Keeps the last day.
-pub fn note_sleep(from: i64, to: i64) {
+pub(crate) fn note_sleep(from: i64, to: i64) {
     let mut g = SLEEP_GAPS.lock().unwrap_or_else(|e| e.into_inner());
     g.retain(|&(_, b)| to - b < 86_400);
     g.push((from, to));
@@ -398,7 +399,7 @@ pub(crate) fn account_in_from_row(r: &Row, rate: super::AccountRate) -> AccountI
 }
 
 /// The manual pick of `slug`, as the engine sees it.
-pub(crate) fn manual_pick_of(state: &State, slug: &str) -> Option<ManualPick> {
+fn manual_pick_of(state: &State, slug: &str) -> Option<ManualPick> {
     let key = state.manual_pick(slug)?.to_string();
     let settled = state
         .manual_pick_tier
@@ -409,12 +410,7 @@ pub(crate) fn manual_pick_of(state: &State, slug: &str) -> Option<ManualPick> {
         } else {
             Tier::Ready
         });
-    Some(ManualPick {
-        at: state.manual_pick_at.get(slug).copied().unwrap_or(0),
-        settled_by_fresh: !state.manual_pick_at.contains_key(slug),
-        key,
-        settled,
-    })
+    Some(ManualPick { key, settled })
 }
 
 /// `build_snapshot` (§8.1): the switchable-filtered rows of `slug` plus the
@@ -431,8 +427,8 @@ pub(crate) fn build_snapshot(
     now: DateTime<Utc>,
     rate_of: &dyn Fn(&str) -> super::AccountRate,
 ) -> Snapshot {
-    let env_override = crate::env_override_active(slug);
-    let switchable = crate::provider_supports_swap(slug) && !env_override;
+    let env_override = crate::env_override::env_override_active(slug);
+    let switchable = crate::switching::provider::provider_supports_swap(slug) && !env_override;
     let accounts: Vec<AccountIn> = rows
         .iter()
         .filter(|r| {
@@ -442,7 +438,8 @@ pub(crate) fn build_snapshot(
         .map(|r| {
             let mut a = account_in_from_row(r, rate_of(&r.email));
             if r.email.eq_ignore_ascii_case(active) {
-                a.in_backoff = crate::active_fetch_in_backoff(slug, &r.email, now.timestamp());
+                a.in_backoff =
+                    crate::poll::trackers::active_fetch_in_backoff(slug, &r.email, now.timestamp());
             }
             a
         })
@@ -469,16 +466,16 @@ pub(crate) fn build_snapshot(
 /// What one v2 cycle did, for `watch_cycle` and the cadence.
 #[derive(Debug, Clone)]
 pub(crate) struct CycleResult {
-    pub swapped: Option<(String, String)>,
-    pub actionable: bool,
-    pub urgency: Urgency,
-    pub next_check_at: Option<DateTime<Utc>>,
+    pub(crate) swapped: Option<(String, String)>,
+    pub(crate) actionable: bool,
+    pub(crate) urgency: Urgency,
+    pub(crate) next_check_at: Option<DateTime<Utc>>,
 }
 
 /// Apply `f` to `slug`'s swap memory under the state lock (reload, mutate,
 /// save) — never from a pre-fetch copy (§3.5).
 pub(crate) fn update_memory(slug: &str, f: impl FnOnce(&mut SwapMemory)) -> Result<SwapMemory> {
-    crate::with_state_lock(|| {
+    crate::state_ops::with_state_lock(|_| {
         let mut st = State::load()?;
         let m = st.swap_memory.entry(slug.to_string()).or_default();
         let before = m.clone();
@@ -495,9 +492,9 @@ pub(crate) fn update_memory(slug: &str, f: impl FnOnce(&mut SwapMemory)) -> Resu
 /// key changed with no Auto/Manual note → `left_at`, cooldown, pick cleared)
 /// and pruning.
 pub(crate) fn begin_cycle(slug: &str, now: DateTime<Utc>) -> Result<State> {
-    crate::with_state_lock(|| {
+    crate::state_ops::with_state_lock(|_| {
         let mut st = State::load()?;
-        let active = crate::provider_active(&st, slug);
+        let active = crate::state_ops::provider_active(&st, slug);
         let m = st.swap_memory.entry(slug.to_string()).or_default();
         let before = m.clone();
         let left = m.detect_external(active.as_deref(), now.timestamp());
@@ -585,7 +582,7 @@ pub(crate) fn run_cycle(
     let (d, reads) = {
         let rows_ref = &mut *rows;
         let mut read = |key: &str, _is_active: bool| -> ReadResult {
-            match crate::verify_swap_target_detailed(slug, key) {
+            match crate::watch::cycle::verify_swap_target_detailed(slug, key) {
                 Ok(fresh) => {
                     let a = account_in_from_row(&fresh, Default::default());
                     if let Some(r) = rows_ref
@@ -642,7 +639,7 @@ pub(crate) fn run_cycle(
             Ok(None)
         } else {
             let _pick = arm_expected_pick(slug, &state);
-            crate::switch_if_still_active_latched(slug, to, active, latch)
+            crate::switching::provider::switch_if_still_active_latched(slug, to, active, latch)
         };
         match moved {
             Ok(Some(label)) => {
@@ -650,7 +647,7 @@ pub(crate) fn run_cycle(
                 switch_outcome = Some("switched".to_string());
                 shell.last_failure = None;
                 let kind = *kind;
-                crate::log_event(&serde_json::json!({
+                crate::history::log_event(&serde_json::json!({
                     "ts": now.timestamp(),
                     "event": "swap",
                     "provider": slug,
@@ -662,13 +659,13 @@ pub(crate) fn run_cycle(
                     "weekly": pick_w,
                 }));
                 match kind {
-                    Kind::Prepare => crate::notify(&format!(
+                    Kind::Prepare => crate::notifications::notify(&format!(
                         "Prepared {label} for its next reset — usage is still blocked."
                     )),
-                    Kind::Rebalance => crate::notify(&format!(
+                    Kind::Rebalance => crate::notifications::notify(&format!(
                         "Flipped back to {label} — {pick_s_txt} / {pick_w_txt}"
                     )),
-                    _ => crate::notify(&format!(
+                    _ => crate::notifications::notify(&format!(
                         "Switched to {label} — {pick_s_txt} / {pick_w_txt}"
                     )),
                 }
@@ -685,7 +682,7 @@ pub(crate) fn run_cycle(
                 let fk = failure_kind(&e, to);
                 switch_outcome = Some(format!("failed:{fk}"));
                 if should_notify_failure(&mut shell.last_failure, to, fk) {
-                    crate::notify(&format!(
+                    crate::notifications::notify(&format!(
                         "Auto-swap to {to} failed ({fk}) — staying on {active}. See the log."
                     ));
                 }
@@ -717,7 +714,7 @@ pub(crate) fn run_cycle(
     // Stuck notice + the Draining hysteresis memory, in one locked write.
     if !switched_ok {
         let soonest = soonest_unlock(&assessed, now)
-            .map(crate::humanize_until)
+            .map(crate::display::humanize_until)
             .unwrap_or_else(|| "unknown".to_string());
         let mut fire = false;
         let act_key = active.to_string();
@@ -727,7 +724,7 @@ pub(crate) fn run_cycle(
         if let Err(e) = res {
             logging::log(&format!("swap memory save failed: {e:#}"));
         } else if fire {
-            crate::notify(&format!(
+            crate::notifications::notify(&format!(
                 "staying on {active} — no better target available (soonest reset in {soonest})"
             ));
         }
@@ -786,7 +783,7 @@ pub(crate) fn soonest_unlock(assessed: &[Assessed], now: DateTime<Utc>) -> Optio
 /// Keep `manual_holds[slug]` ⇔ (pick settled tier ≥ Draining), so a rollback
 /// to the classic engine holds the same picks.
 pub(crate) fn dual_write_hold(slug: &str) {
-    let res = crate::with_state_lock(|| {
+    let res = crate::state_ops::with_state_lock(|_| {
         let mut st = State::load()?;
         let Some(key) = st.manual_pick(slug).map(str::to_string) else {
             return Ok(());
@@ -814,7 +811,7 @@ pub(crate) fn dual_write_hold(slug: &str) {
 /// is Ready or held, or on a tier change backed by a Real reading — not on a
 /// 429 streak making the active account Unknown for a while. Returns whether
 /// to send the notice now.
-pub fn stuck_update(m: &mut SwapMemory, d: &Decision, active: &str) -> bool {
+pub(crate) fn stuck_update(m: &mut SwapMemory, d: &Decision, active: &str) -> bool {
     // The active account changed under this cycle (a concurrent manual
     // switch already reset the memory for the new one): this decision is
     // about the old account, so it must not touch the new one's memory.

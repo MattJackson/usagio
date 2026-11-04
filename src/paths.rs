@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 // -------------------------------------------------------------------------
 
 #[derive(Debug)]
-pub enum MigrationResult {
+pub(crate) enum MigrationResult {
     /// Neither the old nor new config directory existed. Fresh install.
     FreshInstall,
     /// The new directory already exists; nothing to do.
@@ -34,7 +34,7 @@ pub enum MigrationResult {
 // new tree as populated. Suppress the "field never read" lint file-locally.
 #[allow(dead_code)]
 #[derive(Debug)]
-pub enum MigrationError {
+pub(crate) enum MigrationError {
     /// Neither `$XDG_CONFIG_HOME` nor `$HOME` resolved to a usable base dir.
     NoConfigBase,
     /// Creating the parent config base (usually `~/.config/`) failed.
@@ -54,20 +54,20 @@ pub enum MigrationError {
 /// rename in whatever the Platform's Paths backend considers the config base
 /// (macOS: `~/.config`; Linux: `$XDG_CONFIG_HOME` or `~/.config`; Windows:
 /// `%APPDATA%`). L9 (round-1 codeaudit): the two slug names come from the
-/// module-level constants in `main.rs` (`LEGACY_APP_SLUG` and `APP_SLUG`) so
+/// module-level constants below (`LEGACY_APP_SLUG` and `APP_SLUG`) so
 /// renaming the app is a single-point edit.
 ///
 /// Windows note: the legacy `claude-usage` binary never shipped on Windows,
 /// so `migrate_between` will observe `(false, ...)` for the old dir and
 /// return `FreshInstall` / `AlreadyMigrated`. No false "config migration
 /// FAILED" message can fire from a stock Windows install without `$HOME` set.
-pub fn migrate_config_dir_if_needed() -> Result<MigrationResult, MigrationError> {
+pub(crate) fn migrate_config_dir_if_needed() -> Result<MigrationResult, MigrationError> {
     // Route through the Platform trait so each OS's real config dir is used —
     // NOT a hardcoded `$HOME/.config`. Both dirs share the same parent (the
     // `parent()` of the new-slug config dir is the base we'd have joined
     // `LEGACY_APP_SLUG` onto), so we derive the base by trimming the app
     // segment off `platform().paths().config_dir(APP_SLUG)`.
-    migrate_for_config_dir(crate::platform().paths().config_dir(crate::APP_SLUG))
+    migrate_for_config_dir(crate::platform().paths().config_dir(APP_SLUG))
 }
 
 /// Migrate the legacy sibling of `new_dir` into it.
@@ -82,11 +82,11 @@ fn migrate_for_config_dir(new_dir: PathBuf) -> Result<MigrationResult, Migration
         .parent()
         .ok_or(MigrationError::NoConfigBase)?
         .to_path_buf();
-    migrate_between(&base.join(crate::LEGACY_APP_SLUG), &new_dir)
+    migrate_between(&base.join(LEGACY_APP_SLUG), &new_dir)
 }
 
 /// Test-friendly form: caller supplies the exact old and new paths.
-pub fn migrate_between(old: &Path, new: &Path) -> Result<MigrationResult, MigrationError> {
+fn migrate_between(old: &Path, new: &Path) -> Result<MigrationResult, MigrationError> {
     // Use symlink_metadata so a symlink at `old` is treated as the entity
     // being moved (we rename the link itself, not chase its target).
     let old_exists = old.symlink_metadata().is_ok();
@@ -278,6 +278,17 @@ fn preserve_mode(_src_meta: &std::fs::Metadata, _dst: &Path) -> io::Result<()> {
 // -------------------------------------------------------------------------
 // Tests
 // -------------------------------------------------------------------------
+
+/// App slug used everywhere we ask the platform for a per-app directory
+/// (`~/.config/usagio` on macOS, `$XDG_CONFIG_HOME/usagio` on Linux,
+/// `%APPDATA%\usagio` on Windows). The one-shot rename from `claude-usage`
+/// → `usagio` migrates the on-disk directory transparently at first run
+/// (see `paths::migrate_config_dir_if_needed`).
+pub(crate) const APP_SLUG: &str = "usagio";
+/// Previous slug (pre-v0.4.0). Referenced only by the one-shot migration
+/// in `paths::migrate_config_dir_if_needed` — do not use for any live
+/// path construction.
+const LEGACY_APP_SLUG: &str = "claude-usage";
 
 #[cfg(test)]
 mod tests {
@@ -501,14 +512,10 @@ mod tests {
     fn relative_config_dir_is_never_migrated() {
         let cwd = tempfile::tempdir_in(".").unwrap();
         let rel = PathBuf::from(cwd.path().file_name().unwrap());
-        write(
-            &rel.join(crate::LEGACY_APP_SLUG).join("state.json"),
-            b"{}",
-            0o600,
-        );
-        let r = migrate_for_config_dir(rel.join(crate::APP_SLUG)).unwrap();
+        write(&rel.join(LEGACY_APP_SLUG).join("state.json"), b"{}", 0o600);
+        let r = migrate_for_config_dir(rel.join(APP_SLUG)).unwrap();
         assert!(matches!(r, MigrationResult::FreshInstall), "{r:?}");
-        assert!(rel.join(crate::LEGACY_APP_SLUG).join("state.json").exists());
+        assert!(rel.join(LEGACY_APP_SLUG).join("state.json").exists());
     }
 
     // --- user_home ---

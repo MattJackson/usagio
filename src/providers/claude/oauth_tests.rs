@@ -85,12 +85,12 @@ fn post_token_read_timeout_fails_fast_not_forever() {
         }
     });
     let url = format!("http://{addr}/oauth/token");
-    set_token_url_override(Some(&url));
+    crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeToken, Some(&url));
     let start = std::time::Instant::now();
     let mut a = acct_expiring_at(0);
     let err = refresh(&mut a).expect_err("stalled server must not succeed");
     let elapsed = start.elapsed();
-    set_token_url_override(None);
+    crate::endpoints::set_test_override(crate::endpoints::Endpoint::ClaudeToken, None);
     assert!(
         matches!(err, RefreshError::Transient(_)),
         "expected a transient (timeout) error, got {err:?}"

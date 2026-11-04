@@ -15,11 +15,10 @@
 // The trait implementation is only reachable through the registry, which is
 // not yet wired into any command handler. Silence dead-code warnings until
 // later phases start routing through `providers::get`.
-#![allow(dead_code)]
 
-pub mod config;
-pub mod oauth;
-pub mod usage;
+pub(crate) mod config;
+pub(crate) mod oauth;
+pub(crate) mod usage;
 
 use std::process::ExitStatus;
 
@@ -36,11 +35,19 @@ use crate::providers::trait_def::{
     LaunchMode, LoginSpec, PResult, Provider, ProviderError, SecretBackend, TokenGrant,
     TokenRequestStyle, UsageSnapshot, UsageWindow,
 };
+use crate::providers::ActiveSlot;
+use crate::providers::CredentialSync;
+use crate::providers::Launcher;
+use crate::providers::LoginCapture;
+use crate::providers::LoginFlow;
+use crate::providers::PlanCheck;
+use crate::providers::TokenLifecycle;
+use crate::providers::UsageSource;
 
 /// Read/write timeout applied to every outbound HTTP call this provider
 /// makes. The default `ureq::Agent` only bounds the TCP *connect* (30s); a
 /// server or proxy that accepts the connection but then stalls mid-response
-/// (or mid-request-write) would otherwise hang `menubar::poll_loop`'s
+/// (or mid-request-write) would otherwise hang `menubar::poller::poll_loop`'s
 /// network thread forever with no diagnostics. 15s is generous for a
 /// legitimate slow response but tight enough to fail fast and let the next
 /// poll tick retry.
@@ -88,11 +95,11 @@ const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 static ACTIVE_SLOT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Constructor called from `providers::build()` behind the `claude` feature.
-pub fn new() -> Box<dyn Provider> {
+pub(crate) fn new() -> Box<dyn Provider> {
     Box::new(ClaudeProvider)
 }
 
-pub struct ClaudeProvider;
+pub(crate) struct ClaudeProvider;
 
 impl Provider for ClaudeProvider {
     fn provider_id(&self) -> &'static str {
@@ -119,18 +126,40 @@ impl Provider for ClaudeProvider {
         &["session", "weekly", "opus"]
     }
 
-    /// Claude's refresh grant is also a plain, programmatic HTTPS POST (see
-    /// `oauth::refresh`) — `main.rs::active_refresh_cas` has driven a
-    /// compare-and-swap on the ACTIVE account's keychain slot since v0.4.0,
-    /// it just didn't previously go through this trait method to decide
-    /// whether to run. `main.rs`'s poll cycle now checks
-    /// `supports_active_refresh()` before invoking that CAS for ANY
-    /// provider (Claude included), so this must stay `true` to keep today's
-    /// behavior — see the call site's doc comment.
-    fn supports_active_refresh(&self) -> bool {
-        true
+    fn login_capture(&self) -> Option<&dyn LoginCapture> {
+        Some(self)
     }
 
+    fn login_flow(&self) -> Option<&dyn LoginFlow> {
+        Some(self)
+    }
+
+    fn token_lifecycle(&self) -> Option<&dyn TokenLifecycle> {
+        Some(self)
+    }
+
+    fn usage_source(&self) -> Option<&dyn UsageSource> {
+        Some(self)
+    }
+
+    fn plan_check(&self) -> Option<&dyn PlanCheck> {
+        Some(self)
+    }
+
+    fn active_slot(&self) -> Option<&dyn ActiveSlot> {
+        Some(self)
+    }
+
+    fn launcher(&self) -> Option<&dyn Launcher> {
+        Some(self)
+    }
+
+    fn credential_sync(&self) -> Option<&dyn CredentialSync> {
+        Some(self)
+    }
+}
+
+impl LoginCapture for ClaudeProvider {
     // --- Capture / listing --------------------------------------------------
 
     fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
@@ -197,15 +226,18 @@ impl Provider for ClaudeProvider {
             tokens,
         }))
     }
+}
 
+impl LoginFlow for ClaudeProvider {
     /// Claude Code's own `/login` (claude.ai account), run by usagio.
-    fn login_spec(&self) -> Option<LoginSpec> {
-        Some(LoginSpec {
+    fn login_spec(&self) -> LoginSpec {
+        LoginSpec {
             authorize_url: config::AUTHORIZE_URL,
             token_url: config::TOKEN_URL,
             client_id: config::CLIENT_ID,
             scopes: config::LOGIN_SCOPES,
             redirect_port: None,
+            fallback_redirect_port: None,
             redirect_host: "localhost",
             redirect_path: "/callback",
             extra_authorize_params: &[("code", "true")],
@@ -213,7 +245,7 @@ impl Provider for ClaudeProvider {
             token_request: TokenRequestStyle::Json {
                 include_state: true,
             },
-        })
+        }
     }
 
     fn complete_login(&self, token_response: &Value) -> PResult<CapturedAccount> {
@@ -229,6 +261,20 @@ impl Provider for ClaudeProvider {
             &profile,
             chrono::Utc::now().timestamp_millis(),
         )
+    }
+}
+
+impl TokenLifecycle for ClaudeProvider {
+    /// Claude's refresh grant is also a plain, programmatic HTTPS POST (see
+    /// `oauth::refresh`) — `main.rs::active_refresh_cas` has driven a
+    /// compare-and-swap on the ACTIVE account's keychain slot since v0.4.0,
+    /// it just didn't previously go through this trait method to decide
+    /// whether to run. `main.rs`'s poll cycle now checks
+    /// `supports_active_refresh()` before invoking that CAS for ANY
+    /// provider (Claude included), so this must stay `true` to keep today's
+    /// behavior — see the call site's doc comment.
+    fn supports_active_refresh(&self) -> bool {
+        true
     }
 
     // --- Token lifecycle ----------------------------------------------------
@@ -321,7 +367,9 @@ impl Provider for ClaudeProvider {
             expires_in_secs: tok.expires_in,
         })
     }
+}
 
+impl UsageSource for ClaudeProvider {
     // --- Usage --------------------------------------------------------------
 
     fn fetch_usage(&self, access_token: &str) -> PResult<UsageSnapshot> {
@@ -344,11 +392,15 @@ impl Provider for ClaudeProvider {
             reported: usage::reported_usage(&u),
         })
     }
+}
 
+impl PlanCheck for ClaudeProvider {
     fn check_plan(&self, access_token: &str) -> Option<crate::providers::trait_def::PlanStatus> {
         usage::plan_status_from_profile(&usage::fetch_profile(access_token)?)
     }
+}
 
+impl ActiveSlot for ClaudeProvider {
     // --- Switching ----------------------------------------------------------
 
     fn write_active_account(&self, blob: &str, identity: &IdentitySnapshot) -> PResult<()> {
@@ -428,14 +480,6 @@ impl Provider for ClaudeProvider {
         }))
     }
 
-    fn launch_client(&self, mode: LaunchMode) -> PResult<ExitStatus> {
-        let mut cmd = std::process::Command::new("claude");
-        if matches!(mode, LaunchMode::Continue) {
-            cmd.arg("--continue");
-        }
-        cmd.status().map_err(ProviderError::Io)
-    }
-
     /// Mirror a rotated blob (from an INACTIVE-account refresh) to wherever
     /// Claude Code actually reads its credentials from on this OS. Claude
     /// Code only uses the OS keychain on macOS (via the `security` CLI,
@@ -448,8 +492,8 @@ impl Provider for ClaudeProvider {
     /// strict-cfg rule that OS forks outside `src/platform/` must route
     /// through `Platform`.
     ///
-    /// Overridden (rather than inheriting the trait default) because the
-    /// default routes through `write_active_account`, which requires a full
+    /// Overridden (rather than inheriting the `ActiveSlot` default) because
+    /// the default routes through `write_active_account`, which requires a full
     /// `IdentitySnapshot` to rebuild `~/.claude.json` too — but mirroring a
     /// rotated token must NOT touch identity at all, only the token bytes.
     fn mirror_rotated_token(&self, blob: &str) -> PResult<()> {
@@ -482,7 +526,19 @@ impl Provider for ClaudeProvider {
     fn read_active_slot(&self) -> PResult<Option<String>> {
         active_slot_read()
     }
+}
 
+impl Launcher for ClaudeProvider {
+    fn launch_client(&self, mode: LaunchMode) -> PResult<ExitStatus> {
+        let mut cmd = std::process::Command::new("claude");
+        if matches!(mode, LaunchMode::Continue) {
+            cmd.arg("--continue");
+        }
+        cmd.status().map_err(ProviderError::Io)
+    }
+}
+
+impl CredentialSync for ClaudeProvider {
     // --- Credential sync ---------------------------------------------------
 
     fn credential_paths(&self) -> Vec<PathBuf> {
@@ -589,7 +645,7 @@ fn identify_via_profile(
 /// Reach into a JSON blob and pull the Claude account email from wherever
 /// Claude decided to put it. Pure so the tests can hit both shapes without
 /// touching disk.
-pub(crate) fn extract_claude_email(v: &Value) -> Option<String> {
+fn extract_claude_email(v: &Value) -> Option<String> {
     // Top-level oauthAccount (identity file / capture blob shape).
     if let Some(e) = v
         .get("oauthAccount")
@@ -831,16 +887,16 @@ pub(crate) fn active_slot_read() -> PResult<Option<String>> {
 /// (keychain on macOS, 0600 `~/.claude/.credentials.json` elsewhere).
 pub(crate) fn active_slot_write(blob: &str) -> PResult<()> {
     let _guard = ACTIVE_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if slot_is_keychain() {
-        return keychain_write(blob);
-    }
-    // Test-only failure seam (shared one-shot with `SecretStore::set`) so the
-    // apply_account rollback stays exercised off macOS.
+    // The one test seam for a failed slot write, before either backend is
+    // touched, so the apply_account rollback is exercised on every OS.
     #[cfg(test)]
     if crate::platform::test_secret_seam::take_set_failure() {
         return Err(ProviderError::Other(
             "injected active-slot write failure".into(),
         ));
+    }
+    if slot_is_keychain() {
+        return keychain_write(blob);
     }
     let path = claude_credentials_json_path()
         .ok_or_else(|| ProviderError::Other("could not resolve HOME".into()))?;
@@ -930,11 +986,7 @@ fn restore_claude_json_raw(bytes: &[u8], mode: u32) -> PResult<()> {
     write_bytes_atomic_mode(&path, bytes, mode)
 }
 
-pub(crate) fn write_bytes_atomic_mode(
-    path: &std::path::Path,
-    bytes: &[u8],
-    mode: u32,
-) -> PResult<()> {
+fn write_bytes_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> PResult<()> {
     let tmp = path.with_extension("json.usagio.tmp");
     if let Err(e) = crate::store::write_private(&tmp, bytes) {
         let _ = std::fs::remove_file(&tmp);
@@ -1164,7 +1216,10 @@ mod tests {
 
     #[test]
     fn claude_publishes_its_login_spec() {
-        let spec = ClaudeProvider.login_spec().expect("claude can renew");
+        let spec = ClaudeProvider
+            .login_flow()
+            .expect("claude can renew")
+            .login_spec();
         assert_eq!(spec.client_id, config::CLIENT_ID);
         assert_eq!(spec.token_url, config::TOKEN_URL);
         assert_eq!(spec.redirect_path, "/callback");
@@ -1616,7 +1671,7 @@ mod tests {
         expires_at: i64,
     ) -> crate::store::ScopedConfigDir {
         let cfg = crate::store::ScopedConfigDir::new();
-        crate::credentials::with_state_lock(|| {
+        crate::credentials::with_state_lock(|_| {
             let mut st = crate::store::State::load()?;
             let mut a = crate::store::Account::from_keychain_blob(&blob_with(access, expires_at))?;
             a.email = Some(email.into());
@@ -1963,7 +2018,7 @@ mod tests {
         let oa = serde_json::json!({"emailAddress":"a@e.com"});
         // No stored account: allowed.
         assert!(ensure_unverified_capture_is_safe("rt-live", Some(&oa)).is_ok());
-        crate::credentials::with_state_lock(|| {
+        crate::credentials::with_state_lock(|_| {
             let mut st = crate::store::State::load()?;
             let mut a = crate::store::Account::from_keychain_blob(
                 &serde_json::json!({"claudeAiOauth":{"accessToken":"at","refreshToken":"rt-stored","expiresAt":1i64}}).to_string(),
@@ -2076,5 +2131,29 @@ mod tests {
     fn claude_json_mode_falls_back_to_0600_when_unreadable() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(claude_json_mode(&dir.path().join("missing.json")), 0o600);
+    }
+
+    use crate::providers::Provider;
+
+    // --- write_bytes_atomic_mode (rollback mode preservation) ---
+
+    #[cfg(unix)]
+    #[test]
+    fn write_bytes_atomic_mode_applies_requested_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // Use a mode DISTINCT from write_private's hardcoded 0o600 default, so this
+        // proves the `mode` argument controls the final mode (not write_private's
+        // default) — deleting the set_permissions call would make this fail.
+        let path = dir.path().join("claude.json");
+        crate::providers::claude::write_bytes_atomic_mode(&path, b"{\"x\":1}", 0o640).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"x\":1}");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o640,
+            "the requested mode must be applied to the final file"
+        );
+        // No temp file left behind.
+        assert!(!path.with_extension("json.usagio.tmp").exists());
     }
 }
