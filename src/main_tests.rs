@@ -6526,3 +6526,37 @@ fn run_with_deadline_kills_an_overrunning_child_without_timeout_binary() {
     let cmd = std::process::Command::new("/usr/bin/true");
     assert!(run_with_deadline(cmd, std::time::Duration::from_secs(5)).unwrap());
 }
+
+#[test]
+fn pending_switch_check_reports_a_state_read_failure() {
+    let cfg = crate::store::ScopedConfigDir::new();
+    let mut state = State::default();
+    state.provider_accounts_mut("codex").pending_switch = Some(store::PendingSwitch {
+        key: "a@example.com".into(),
+        manual: true,
+        from: None,
+        drain_token: None,
+        credentials_written: false,
+        renewed_account: None,
+        leave_latch: None,
+    });
+    state.save().unwrap();
+    assert!(try_provider_switch_pending("codex", "a@example.com").unwrap());
+    std::fs::write(store::config_dir().unwrap().join("state.json"), "{not json").unwrap();
+    assert!(try_provider_switch_pending("codex", "a@example.com").is_err());
+    drop(cfg);
+}
+
+#[test]
+fn pace_report_covers_non_claude_accounts() {
+    let mut state = State::default();
+    state
+        .provider_accounts_mut("codex")
+        .accounts
+        .push(codex_account("dev@example.com", None));
+    let targets = pace_targets(&state);
+    assert_eq!(
+        targets,
+        vec![("codex".to_string(), "dev@example.com".to_string())]
+    );
+}

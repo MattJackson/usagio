@@ -953,12 +953,12 @@ fn finish_provider_switch(slug: &str, key: &str, launch: Option<Launch>, hold: b
         bail!("launching {} is not supported", provider.display_name());
     }
     let label = switch_to_provider_account(slug, key, hold)?;
-    if provider_switch_pending(slug, key) {
+    if try_provider_switch_pending(slug, key)? {
         println!("Switch to {label} ({slug}) is queued until the client finishes its work.");
         if launch.is_none() {
             return Ok(());
         }
-        while provider_switch_pending(slug, key) {
+        while try_provider_switch_pending(slug, key)? {
             std::thread::sleep(std::time::Duration::from_secs(1));
             switch_provider_with_intent(slug, key, hold)?;
         }
@@ -1070,15 +1070,18 @@ fn switch_provider_with_intent(slug: &str, key: &str, manual: bool) -> Result<St
     commit_provider_switch(provider, slug, key, manual, manual)
 }
 
+/// Whether a switch to `key` is still queued; a state read failure is an error
+/// (not "no longer pending").
+fn try_provider_switch_pending(slug: &str, key: &str) -> Result<bool> {
+    let state = State::load()?;
+    Ok(state
+        .provider_accounts(slug)
+        .and_then(|pa| pa.pending_switch.as_ref())
+        .is_some_and(|pending| pending.key.eq_ignore_ascii_case(key)))
+}
+
 pub(crate) fn provider_switch_pending(slug: &str, key: &str) -> bool {
-    State::load()
-        .ok()
-        .and_then(|state| {
-            state
-                .provider_accounts(slug)
-                .and_then(|pa| pa.pending_switch.clone())
-        })
-        .is_some_and(|pending| pending.key.eq_ignore_ascii_case(key))
+    try_provider_switch_pending(slug, key).unwrap_or(false)
 }
 
 fn complete_pending_switches() {
@@ -5235,23 +5238,42 @@ fn cmd_report(args: &[String]) -> Result<()> {
 // Reuses the burn_rate module, so the CLI stays a thin renderer over the same
 // data the menu bar consumes.
 
+/// `(slug, key)` of every captured account `report --pace` covers: Claude's
+/// (those with an email) then every other provider's.
+fn pace_targets(state: &State) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = state
+        .accounts
+        .iter()
+        .filter_map(|a| a.email.clone())
+        .map(|e| (CLAUDE_SLUG.to_string(), e))
+        .collect();
+    for (slug, pa) in &state.providers {
+        if slug != CLAUDE_SLUG {
+            out.extend(pa.accounts.iter().map(|a| (slug.clone(), a.key.clone())));
+        }
+    }
+    out
+}
+
 fn cmd_report_pace() -> Result<()> {
     use crate::providers::trait_def::Window;
     use crate::usage_log::AccountKey;
     let state = State::load()?;
-    if state.accounts.is_empty() {
+    let targets = pace_targets(&state);
+    if targets.is_empty() {
         println!("No accounts captured yet — run `usagio capture` first.");
         return Ok(());
     }
     println!("\nBurn-rate forecast");
     println!("  Projection from recent usage history, not a guarantee.\n");
     let now = Utc::now();
-    for acct in &state.accounts {
-        let Some(email) = acct.email.clone() else {
-            continue;
-        };
-        let key = AccountKey::new(CLAUDE_SLUG, &email);
-        println!("  {email}");
+    for (slug, email) in &targets {
+        let key = AccountKey::new(slug, email);
+        if slug == CLAUDE_SLUG {
+            println!("  {email}");
+        } else {
+            println!("  {slug}:{email}");
+        }
         for window in [Window::Session, Window::Weekly] {
             if let Some(est) = crate::burn_rate::estimate(&key, window, now) {
                 println!("    {}", crate::burn_rate::format_menu_row(&est));
