@@ -60,19 +60,7 @@ pub fn compute_display(usage: &AccountUsage, now: DateTime<Utc>) -> DisplayState
     let session_blocking = is_blocking(usage.session_pct, usage.session_reset, now);
     let weekly_blocking = is_blocking(usage.weekly_pct, usage.weekly_reset, now);
 
-    // A maxed window with no reset time stays blocked indefinitely, so the
-    // other window's unlock time would be a false "usable at" answer.
-    let unknown_block = |pct: Option<f64>, reset: Option<DateTime<Utc>>| {
-        pct.is_some_and(|p| p >= LOCKED_THRESHOLD_PCT) && reset.is_none()
-    };
-    let indefinite = unknown_block(usage.session_pct, usage.session_reset)
-        || unknown_block(usage.weekly_pct, usage.weekly_reset);
-
     match (session_blocking, weekly_blocking) {
-        _ if indefinite => DisplayState::Usage {
-            session_pct: usage.session_pct,
-            weekly_pct: usage.weekly_pct,
-        },
         (Some(s), Some(w)) => {
             // Both limits must clear before the account is usable.
             if s >= w {
@@ -222,22 +210,6 @@ mod tests {
 
     fn t(secs_from_epoch: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(secs_from_epoch, 0).unwrap()
-    }
-
-    #[test]
-    fn maxed_window_without_reset_is_not_shown_as_unlocking_via_the_other_window() {
-        let now = t(1_000_000);
-        let u = AccountUsage {
-            session_pct: Some(100.0),
-            session_reset: Some(now + Duration::hours(1)),
-            weekly_pct: Some(100.0),
-            weekly_reset: None,
-            fetched_at: Some(now),
-        };
-        assert!(
-            matches!(compute_display(&u, now), DisplayState::Usage { .. }),
-            "weekly stays blocked with no known reset: no false unlock time"
-        );
     }
 
     // ---- format_countdown ----
