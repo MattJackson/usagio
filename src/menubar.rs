@@ -8541,4 +8541,29 @@ mod tests {
             assert!(ok, "capture must run first, then the switch to a@");
         });
     }
+
+    #[test]
+    fn a_weekly_lock_whose_reset_passed_is_not_shown_locked_in_the_submenu() {
+        let now = now_utc();
+        let mut a = acct("stale@x.com", Some(20.0), Some(100.0), false);
+        a.weekly_reset_at = Some(now - chrono::Duration::minutes(1));
+        a.fetched_at = Some(now - chrono::Duration::minutes(10));
+        let items = submenu_info_items(&claude_section(), &a);
+        assert!(
+            !items
+                .iter()
+                .any(|(r, locked)| *locked || r.contains("locked")),
+            "a stale 100% weekly was shown locked: {items:?}"
+        );
+        assert!(
+            items.iter().any(|(r, _)| r.contains("awaiting")),
+            "{items:?}"
+        );
+        assert!(
+            items.contains(&("Session renews in 3h".to_string(), false)),
+            "the session row was dropped: {items:?}"
+        );
+        // The stale weekly does not lead: the session row keeps its place.
+        assert!(items[0].0.starts_with("Session"), "{items:?}");
+    }
 }
