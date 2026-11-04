@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows: resolve the home directory from `HOME`, else `USERPROFILE` (empty `HOME` counts as unset) for `~/.claude.json`, Claude credential watching and the Codex `auth.json`.
+- Linux/Windows: Claude account switch and capture now use `~/.claude/.credentials.json`, the file Claude Code reads, instead of the OS secret store. A stale "Claude Code-credentials" secret-store entry from earlier versions is orphaned and harmless.
+
 ## [1.0.8] - 2026-10-31
 
 ### Fixed

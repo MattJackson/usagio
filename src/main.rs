@@ -55,7 +55,6 @@ use store::{Account, CachedUsage, ProviderAccount, State};
 /// the constant with a per-account lookup keyed on the containing bucket.
 const CLAUDE_SLUG: &str = "claude";
 
-const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 /// App slug used everywhere we ask the platform for a per-app directory
 /// (`~/.config/usagio` on macOS, `$XDG_CONFIG_HOME/usagio` on Linux,
 /// `%APPDATA%\usagio` on Windows). The one-shot rename from `claude-usage`
@@ -2638,6 +2637,9 @@ fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
 // Keychain helpers — delegate to the platform SecretStore
 // ---------------------------------------------------------------------------
 
+// Only the keychain-account unit test uses this now; the live slot logic is
+// `providers::claude::active_slot_{read,write}`.
+#[cfg(test)]
 fn keychain_account() -> String {
     std::env::var("USER").unwrap_or_else(|_| "claude".to_string())
 }
@@ -2651,21 +2653,15 @@ fn keychain_account() -> String {
 // single-user threat model. TODO: switch back to security-framework once we
 // ship a code-signed (Developer ID) build, where "Always Allow" persists.
 fn keychain_read() -> Option<String> {
-    platform()
-        .secrets()
-        .get(KEYCHAIN_SERVICE, &keychain_account())
-        .ok()
-        .flatten()
+    providers::claude::active_slot_read().ok().flatten()
 }
 
 fn keychain_write(blob: &str) -> Result<()> {
-    let result = platform()
-        .secrets()
-        .set(KEYCHAIN_SERVICE, &keychain_account(), blob);
+    let result = providers::claude::active_slot_write(blob).map_err(|e| anyhow!("{e}"));
     // Feed the keychain-write health signal the watchdog watches: a run of
     // consecutive failures is the fingerprint of the fd-exhaustion EMFILE that
-    // silently broke account switching (see `src/watchdog.rs`). A success
-    // resets the counter.
+    // silently broke account switching (see `src/watchdog.rs`). File writes
+    // hit EMFILE the same way. A success resets the counter.
     watchdog::record_keychain_result(result.is_ok());
     result
 }

@@ -134,7 +134,7 @@ impl Provider for ClaudeProvider {
     // --- Capture / listing --------------------------------------------------
 
     fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
-        let Some(blob) = keychain_read() else {
+        let Some(blob) = active_slot_read()? else {
             return Ok(None);
         };
         let (access, refresh, expires_at) = parse_claude_blob(&blob)?;
@@ -370,7 +370,7 @@ impl Provider for ClaudeProvider {
         let prior = read_claude_json_raw();
         write_claude_identity(&oauth_account, user_id.as_deref())
             .map_err(|e| ProviderError::Other(e.to_string()))?;
-        if let Err(e) = keychain_write(blob) {
+        if let Err(e) = active_slot_write(blob) {
             if let Some((bytes, mode)) = &prior {
                 let _ = restore_claude_json_raw(bytes, *mode);
             }
@@ -434,31 +434,12 @@ impl Provider for ClaudeProvider {
     /// rotated token must NOT touch identity at all, only the token bytes.
     fn mirror_rotated_token(&self, blob: &str) -> PResult<()> {
         parse_claude_blob(blob)?;
-        // concurrency-01: serialize against every other in-process reader/
-        // writer of this same slot (see `ACTIVE_SLOT_LOCK`'s doc comment).
-        // Poisoning here would mean a prior holder panicked mid-write; still
-        // proceed rather than deadlock the whole credential path forever —
-        // recovering the guard is safe since the lock only protects
-        // interleaving of independent read/write syscalls, not any shared
-        // in-memory invariant.
-        let _guard = ACTIVE_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let to = if crate::platform::current().os_display_name() == "macOS" {
+        let to = if slot_is_keychain() {
             "keychain:Claude Code-credentials"
         } else {
             "file:~/.claude/.credentials.json"
         };
-        let result = if crate::platform::current().os_display_name() == "macOS" {
-            keychain_write(blob)
-        } else {
-            (|| {
-                let path = claude_credentials_json_path()
-                    .ok_or_else(|| ProviderError::Other("could not resolve HOME".into()))?;
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).map_err(ProviderError::Io)?;
-                }
-                write_bytes_atomic_mode(&path, blob.as_bytes(), 0o600)
-            })()
-        };
+        let result = active_slot_write(blob);
         let account = extract_claude_email(&serde_json::from_str(blob).unwrap_or(Value::Null))
             .unwrap_or_else(|| "<unknown>".to_string());
         crate::logging::log(&format!(
@@ -476,23 +457,7 @@ impl Provider for ClaudeProvider {
     /// the exact same slot `mirror_rotated_token` writes: macOS keychain, or
     /// the plaintext credentials file on Linux/Windows.
     fn read_active_slot(&self) -> PResult<Option<String>> {
-        // concurrency-01: same lock `mirror_rotated_token` takes, so an
-        // in-process reader can never observe the transient delete-then-add
-        // gap opened by an in-process writer.
-        let _guard = ACTIVE_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // On macOS `keychain_read` routes through `Platform::secrets().get()`
-        // (`MacOsSecrets::get`), which already emits the structured
-        // `event=keychain_read` line — no need to duplicate it here.
-        if crate::platform::current().os_display_name() == "macOS" {
-            return Ok(keychain_read());
-        }
-        let path = claude_credentials_json_path()
-            .ok_or_else(|| ProviderError::Other("could not resolve HOME".into()))?;
-        match std::fs::read_to_string(&path) {
-            Ok(s) => Ok(Some(s)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(ProviderError::Io(e)),
-        }
+        active_slot_read()
     }
 
     // --- Credential sync ---------------------------------------------------
@@ -755,6 +720,61 @@ fn keychain_write(blob: &str) -> PResult<()> {
         .secrets()
         .set(KEYCHAIN_SERVICE, &keychain_account(), blob)
         .map_err(|e| ProviderError::Other(format!("{e:#}")))
+}
+
+// ---- Active slot: where Claude Code itself reads its login ----------------
+//
+// Claude Code uses the OS keychain only on macOS; on Linux and Windows it
+// reads the plaintext `~/.claude/.credentials.json`. Every read/write of the
+// ACTIVE login goes through these two helpers so the slot can never disagree
+// with itself. Branches on `Platform::os_display_name()` (not `cfg`) per the
+// strict-cfg rule. They take `ACTIVE_SLOT_LOCK` themselves, so callers must
+// NOT hold it (it is not re-entrant). `cmd_secrets_selftest` deliberately
+// keeps using `platform().secrets()` directly.
+
+fn slot_is_keychain() -> bool {
+    crate::platform::current().os_display_name() == "macOS"
+}
+
+/// Read the active Claude login blob from the slot Claude Code uses.
+pub(crate) fn active_slot_read() -> PResult<Option<String>> {
+    // concurrency-01: serialize against in-process writers (see
+    // `ACTIVE_SLOT_LOCK`). Recovering a poisoned guard is safe: the lock only
+    // orders independent syscalls, it guards no in-memory invariant.
+    let _guard = ACTIVE_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if slot_is_keychain() {
+        return Ok(keychain_read());
+    }
+    let path = claude_credentials_json_path()
+        .ok_or_else(|| ProviderError::Other("could not resolve HOME".into()))?;
+    match std::fs::read_to_string(&path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(ProviderError::Io(e)),
+    }
+}
+
+/// Write the active Claude login blob to the slot Claude Code uses
+/// (keychain on macOS, 0600 `~/.claude/.credentials.json` elsewhere).
+pub(crate) fn active_slot_write(blob: &str) -> PResult<()> {
+    let _guard = ACTIVE_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if slot_is_keychain() {
+        return keychain_write(blob);
+    }
+    // Test-only failure seam (shared one-shot with `SecretStore::set`) so the
+    // apply_account rollback stays exercised off macOS.
+    #[cfg(test)]
+    if crate::platform::test_secret_seam::take_set_failure() {
+        return Err(ProviderError::Other(
+            "injected active-slot write failure".into(),
+        ));
+    }
+    let path = claude_credentials_json_path()
+        .ok_or_else(|| ProviderError::Other("could not resolve HOME".into()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(ProviderError::Io)?;
+    }
+    write_bytes_atomic_mode(&path, blob.as_bytes(), 0o600)
 }
 
 // ---- ~/.claude.json identity read/write (mirrors main.rs helpers) --------
@@ -1094,14 +1114,12 @@ mod tests {
     fn credential_paths_includes_both_files_when_home_is_set() {
         // The order is [~/.claude.json, ~/.claude/.credentials.json] — the
         // last-chance fallback iterates in this order.
-        let home = std::env::var_os("HOME");
-        if home.is_none() {
-            return; // headless CI without HOME — trivial pass
-        }
-        let paths = ClaudeProvider.credential_paths();
-        assert_eq!(paths.len(), 2);
-        assert!(paths[0].ends_with(".claude.json"));
-        assert!(paths[1].ends_with(".credentials.json"));
+        crate::env_lock::scoped_env_var("HOME", Some("/some/home"), || {
+            let paths = ClaudeProvider.credential_paths();
+            assert_eq!(paths.len(), 2);
+            assert!(paths[0].ends_with(".claude.json"));
+            assert!(paths[1].ends_with(".credentials.json"));
+        });
     }
 
     #[test]
@@ -1440,6 +1458,29 @@ mod tests {
         });
         crate::env_lock::scoped_env_var("HOME", None, || {
             assert_eq!(claude_json_path(), None);
+        });
+    }
+
+    /// Off macOS the active slot is `$HOME/.claude/.credentials.json` at 0600,
+    /// and both helpers (which take the slot lock themselves) agree on it.
+    #[test]
+    fn active_slot_helpers_use_the_credentials_file_off_macos() {
+        if crate::platform::current().os_display_name() == "macOS" {
+            return; // the slot is the (mocked) keychain there
+        }
+        let dir = tempfile::tempdir().unwrap();
+        crate::env_lock::scoped_env_var("HOME", Some(dir.path().to_str().unwrap()), || {
+            assert_eq!(active_slot_read().unwrap(), None);
+            active_slot_write("blob-1").unwrap();
+            let path = dir.path().join(".claude").join(".credentials.json");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "blob-1");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600);
+            }
+            assert_eq!(active_slot_read().unwrap().as_deref(), Some("blob-1"));
         });
     }
 

@@ -2688,8 +2688,39 @@ fn prime_active_account(account: &Account) {
     prime_active_slot(&account.keychain_blob);
 }
 
+/// The vendor-visible active token. On macOS that is the keychain; elsewhere
+/// it is `$HOME/.claude/.credentials.json`, read DIRECTLY from disk (not via
+/// `active_slot_read`, which would be tautological with the writer).
 fn keychain_access_token() -> Option<String> {
-    keychain_read().map(|b| Account::from_keychain_blob(&b).unwrap().access_token)
+    let blob = if cfg!(target_os = "macos") {
+        keychain_read()
+    } else {
+        let home = std::env::var_os("HOME").expect("HOME is scoped by with_claude_home");
+        std::fs::read_to_string(
+            std::path::PathBuf::from(home)
+                .join(".claude")
+                .join(".credentials.json"),
+        )
+        .ok()
+    };
+    blob.map(|b| Account::from_keychain_blob(&b).unwrap().access_token)
+}
+
+#[test]
+fn apply_account_writes_the_slot_claude_code_reads() {
+    with_claude_home("old@e.com", |_| {
+        let acct = claude_account_with_identity("new@e.com", 1_000);
+        let identity = acct.oauth_account.clone().unwrap();
+        apply_account(
+            providers::get(CLAUDE_SLUG).unwrap(),
+            &acct,
+            &identity,
+            Some("old@e.com"),
+            "new@e.com",
+        )
+        .unwrap();
+        assert_eq!(keychain_access_token().as_deref(), Some("at-new@e.com"));
+    });
 }
 
 #[test]
@@ -2999,7 +3030,7 @@ fn keychain_rotation_is_adopted_only_for_the_matching_identity() {
     };
     // The vendor CLI is logged in as a@: its rotation is ours.
     with_claude_home("a@e.com", |_| {
-        keychain_write(&rotated_blob.keychain_blob).unwrap();
+        prime_active_slot(&rotated_blob.keychain_blob);
         let mut st = make_state();
         sync_active_from_keychain(provider, &mut st);
         let a = st.find("a@e.com").unwrap();
@@ -3008,7 +3039,7 @@ fn keychain_rotation_is_adopted_only_for_the_matching_identity() {
     });
     // Logged in as someone else: the keychain is not our account, hands off.
     with_claude_home("stranger@e.com", |_| {
-        keychain_write(&rotated_blob.keychain_blob).unwrap();
+        prime_active_slot(&rotated_blob.keychain_blob);
         let mut st = make_state();
         sync_active_from_keychain(provider, &mut st);
         assert_eq!(st.find("a@e.com").unwrap().access_token, "at-a@e.com");
