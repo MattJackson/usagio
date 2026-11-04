@@ -207,8 +207,10 @@ jobs:
         run: |
           dbus-run-session -- bash -c '
             set -euo pipefail
-            echo -n "" | gnome-keyring-daemon --unlock --components=secrets
-            eval "$(echo -n "" | gnome-keyring-daemon --start --components=secrets)"
+            # The unlock password must be a newline: `echo -n ""` sends no
+            # password, no `login` collection is created, and every keyring
+            # call falls back to the file (the test asserts it did not).
+            eval "$(printf "\n" | gnome-keyring-daemon --unlock --components=secrets)"
             export GNOME_KEYRING_CONTROL
             cargo test --test integration_linux_secrets --all-features -- --ignored --test-threads=1
           '
