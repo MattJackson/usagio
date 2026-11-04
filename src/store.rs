@@ -502,6 +502,21 @@ fn parse_provider_accounts_raw(slug: &str, val: &serde_json::Value) -> Option<Pr
     Some(pa)
 }
 
+/// The key a raw Claude `accounts[]` entry would load under: its `email`,
+/// else `oauth_account.emailAddress`, else the legacy `name`.
+fn raw_account_key(e: &serde_json::Value) -> Option<String> {
+    e.get("email")
+        .and_then(|x| x.as_str())
+        .or_else(|| {
+            e.get("oauth_account")
+                .and_then(|o| o.get("emailAddress"))
+                .and_then(|x| x.as_str())
+        })
+        .or_else(|| e.get("name").and_then(|x| x.as_str()))
+        .filter(|k| !k.is_empty())
+        .map(String::from)
+}
+
 /// Lowercased `(slug, key)` of every provider account held in memory,
 /// including raw `unparsed_accounts` entries.
 fn provider_keys_in_state(state: &State) -> HashSet<(String, String)> {
@@ -623,6 +638,14 @@ pub struct State {
     pub schema_version: u32,
     #[serde(default)]
     pub accounts: Vec<Account>,
+    /// Raw Claude `accounts[]` entries that are not usable accounts (no
+    /// `access_token`/`refresh_token`, e.g. a half-written or hand-edited
+    /// entry). Kept verbatim and written back so a save never silently erases
+    /// them, and so the overwrite guard can count them without refusing every
+    /// save while one exists. Re-tried on each load: an entry that gains its
+    /// tokens is restored as a real account.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unparsed_accounts: Vec<serde_json::Value>,
     /// Email of the account currently written to the keychain, if known.
     #[serde(default)]
     pub active: Option<String>,
@@ -835,18 +858,28 @@ impl State {
         // Map an old `name` -> resolved email so a legacy `active` (a name) can be
         // migrated to the new email key.
         let mut name_to_email: Vec<(String, String)> = Vec::new();
+        let mut unparsed_accounts: Vec<serde_json::Value> = Vec::new();
 
-        if let Some(arr) = v.get("accounts").and_then(|a| a.as_array()) {
-            for obj in arr {
+        // Real entries first, then preserved raw ones (which may have been
+        // repaired since); a raw entry whose key a real one already holds is
+        // dropped by the dedup below in favour of the usable copy.
+        let entries = ["accounts", "unparsed_accounts"]
+            .into_iter()
+            .filter_map(|f| v.get(f).and_then(|a| a.as_array()))
+            .flatten();
+        for obj in entries {
+            {
                 let access_token = obj.get("access_token").and_then(|x| x.as_str());
                 let refresh_token = obj.get("refresh_token").and_then(|x| x.as_str());
                 let (Some(access_token), Some(refresh_token)) = (access_token, refresh_token)
                 else {
                     crate::logging::log(&format!(
-                        "warn: skipping state.json accounts[] entry without access_token/\
-                         refresh_token (email={:?}); it will not be loaded",
+                        "warn: state.json accounts[] entry without access_token/\
+                         refresh_token (email={:?}); keeping it untouched, the account is \
+                         unusable until it is re-captured",
                         obj.get("email").and_then(|x| x.as_str())
                     ));
+                    unparsed_accounts.push(obj.clone());
                     continue; // not a usable account entry
                 };
                 let legacy_name = obj.get("name").and_then(|x| x.as_str());
@@ -999,9 +1032,16 @@ impl State {
             })
             .unwrap_or_default();
 
+        // A raw entry superseded by a usable account of the same key is stale.
+        unparsed_accounts.retain(|e| {
+            raw_account_key(e)
+                .is_none_or(|k| !accounts.iter().any(|a| a.key().eq_ignore_ascii_case(&k)))
+        });
+
         State {
             schema_version: STATE_SCHEMA_VERSION,
             accounts,
+            unparsed_accounts,
             active,
             providers,
             autoswap_disabled: v
@@ -1189,6 +1229,9 @@ impl State {
 
     pub fn upsert(&mut self, acct: Account) {
         let key = acct.key().to_string();
+        // A fresh capture supersedes a stale unusable copy of the same key.
+        self.unparsed_accounts
+            .retain(|e| raw_account_key(e).is_none_or(|k| !k.eq_ignore_ascii_case(&key)));
         if let Some(existing) = self.find_mut(&key) {
             *existing = acct;
         } else {
@@ -1213,10 +1256,17 @@ impl State {
             .collect();
         self.accounts
             .retain(|a| !a.key().eq_ignore_ascii_case(email));
-        let changed = self.accounts.len() != before;
+        let raw_before = self.unparsed_accounts.len();
+        self.unparsed_accounts
+            .retain(|e| raw_account_key(e).is_none_or(|k| !k.eq_ignore_ascii_case(email)));
+        let raw_dropped = self.unparsed_accounts.len() != raw_before;
+        let changed = self.accounts.len() != before || raw_dropped;
         if changed {
             for k in removed_keys {
                 self.pending_removals.insert(k);
+            }
+            if raw_dropped {
+                self.pending_removals.insert(email.to_lowercase());
             }
         }
         changed
@@ -1353,17 +1403,24 @@ pub fn save_state_safe(state: &State) -> Result<()> {
         }
         if let Ok(v) = parsed {
             let old = State::from_value(&v);
+            // Usable accounts and preserved raw (tokenless) entries both
+            // count, on each side: an entry kept raw in memory is not a drop.
             let new_keys: HashSet<String> = state
                 .accounts
                 .iter()
                 .map(|a| a.key().to_lowercase())
+                .chain(state.unparsed_accounts.iter().filter_map(raw_account_key))
+                .map(|k| k.to_lowercase())
                 .collect();
-            let unauthorized: Vec<String> = old
+            let mut unauthorized: Vec<String> = old
                 .accounts
                 .iter()
                 .map(|a| a.key().to_lowercase())
+                .chain(old.unparsed_accounts.iter().filter_map(raw_account_key))
+                .map(|k| k.to_lowercase())
                 .filter(|k| !new_keys.contains(k) && !state.pending_removals.contains(k))
                 .collect();
+            unauthorized.dedup();
             // Same guard, scoped to each non-Claude provider's slot: a
             // provider-account key present on disk but missing from the
             // in-memory state (without an explicit `remove_provider_account`

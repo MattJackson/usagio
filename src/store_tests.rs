@@ -1682,3 +1682,60 @@ fn write_private_tightens_a_preexisting_wide_file() {
         0o600
     );
 }
+
+#[test]
+fn tokenless_claude_entry_survives_saves_and_is_guarded() {
+    let _g = ScopedConfigDir::new();
+    // A state.json with one usable account and one entry missing its tokens.
+    let raw = serde_json::json!({
+        "schema_version": 2,
+        "accounts": [
+            { "email": "a@e.com", "access_token": "acc", "refresh_token": "ref", "expires_at": 1 },
+            { "email": "half@e.com", "expires_at": 5 }
+        ]
+    });
+    let path = config_dir().unwrap().join("state.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+
+    // Loading keeps the tokenless entry raw; an ordinary save neither drops
+    // it nor is refused.
+    let mut st = State::load().unwrap();
+    assert_eq!(st.accounts.len(), 1);
+    assert_eq!(st.unparsed_accounts.len(), 1);
+    st.trigger_pct = Some(90.0);
+    st.save()
+        .expect("save with a preserved tokenless entry succeeds");
+    let on_disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(on_disk["unparsed_accounts"][0]["email"], "half@e.com");
+
+    // A blank in-memory state that would erase it is refused.
+    let mut bad = State::default();
+    bad.accounts.push(acct("a@e.com"));
+    let msg = format!("{:#}", bad.save().unwrap_err());
+    assert!(msg.contains("half@e.com"), "{msg}");
+
+    // An explicit remove() authorises dropping it.
+    let mut st = State::load().unwrap();
+    assert!(st.remove("half@e.com"));
+    st.save().unwrap();
+    assert!(State::load().unwrap().unparsed_accounts.is_empty());
+}
+
+#[test]
+fn tokenless_claude_entry_is_superseded_by_a_capture() {
+    let _g = ScopedConfigDir::new();
+    let raw = serde_json::json!({ "accounts": [ { "email": "half@e.com" } ] });
+    let st = State::from_value(&raw);
+    assert_eq!(st.unparsed_accounts.len(), 1);
+    let mut st = st;
+    st.upsert(acct("half@e.com"));
+    assert!(st.unparsed_accounts.is_empty());
+    // A repaired raw entry loads as a real account.
+    let repaired = serde_json::json!({ "unparsed_accounts": [
+        { "email": "r@e.com", "access_token": "x", "refresh_token": "y" } ] });
+    let st = State::from_value(&repaired);
+    assert_eq!(st.accounts.len(), 1);
+    assert!(st.unparsed_accounts.is_empty());
+}
