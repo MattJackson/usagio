@@ -7304,6 +7304,46 @@ fn active_cas_rewrites_the_slot_only_for_a_pending_live_write() {
 }
 
 #[test]
+fn claim_for_the_active_account_falls_back_to_the_stored_token_on_state_error() {
+    let _g = crate::store::ScopedConfigDir::new();
+    let provider: &'static MockActiveSlotProvider = Box::leak(Box::new(
+        MockActiveSlotProvider::new(&mock_claude_blob("cc-at", "cc-rt", 9_999_999_999_999)),
+    ));
+    let mut acct =
+        Account::from_keychain_blob(&mock_claude_blob("stored-at", "stored-rt", 1_000)).unwrap();
+    acct.email = Some("active@example.com".into());
+    // An unreadable state.json makes the locked CAS fail to load.
+    std::fs::write(crate::store::config_dir().unwrap().join("state.json"), "{ not json").unwrap();
+    claim_refresh_token(provider, "active@example.com", &mut acct, true)
+        .expect("a CAS that cannot run must degrade to the stored token");
+    assert_eq!(acct.access_token, "stored-at");
+}
+
+#[test]
+fn claim_for_the_active_account_does_not_save_state_when_nothing_changed() {
+    let _g = crate::store::ScopedConfigDir::new();
+    let provider: &'static MockActiveSlotProvider = Box::leak(Box::new(
+        MockActiveSlotProvider::new(&mock_claude_blob("x", "y", 1)),
+    ));
+    *provider.slot.lock().unwrap() = None; // slot empty: the CAS fails
+    let mut acct =
+        Account::from_keychain_blob(&mock_claude_blob("stored-at", "stored-rt", 1_000)).unwrap();
+    acct.email = Some("active@example.com".into());
+    let mut st = State::default();
+    st.upsert(acct.clone());
+    st.active = Some("active@example.com".into());
+    st.save().unwrap();
+    st.save().unwrap(); // second save so a rolling backup exists
+    let dir = crate::store::config_dir().unwrap().join("backups");
+    let count = || std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+    let before = count();
+    // Backups are named to the second; wait so a save would add one.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    claim_refresh_token(provider, "active@example.com", &mut acct, true).unwrap();
+    assert_eq!(count(), before, "an unchanged state was re-saved");
+}
+
+#[test]
 fn claim_for_the_active_account_uses_the_slot_token_without_posting() {
     let _g = crate::store::ScopedConfigDir::new();
     let (base_url, hits) = spawn_mock_token_server();
