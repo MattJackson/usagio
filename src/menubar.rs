@@ -521,8 +521,17 @@ fn login_expiring_in(a: &AcctView, now: DateTime<Utc>) -> Option<chrono::Duratio
     (left <= chrono::Duration::seconds(crate::login::RENEW_WINDOW_SECS)).then_some(left)
 }
 
+/// A login whose expiry has already passed (it can't be renewed in place by
+/// a refresh any more; the renew flow is the only way back).
+fn login_expired(left: chrono::Duration) -> bool {
+    left <= chrono::Duration::zero()
+}
+
 /// Coarse "time left" for a login expiry: days, then hours.
 fn login_left_label(left: chrono::Duration) -> String {
+    if login_expired(left) {
+        return "expired".to_string();
+    }
     match (left.num_days(), left.num_hours()) {
         (d, _) if d >= 1 => format!("{d}d"),
         (_, h) if h >= 1 => format!("{h}h"),
@@ -617,6 +626,12 @@ fn trailing_usage_for_account(
     // A login about to die outranks usage: once it's gone the numbers freeze
     // and the account can't be switched to. Full detail is in the submenu.
     if let Some(left) = login_expiring_in(a, now) {
+        // Already past its expiry: the same treatment as a rejected login.
+        if login_expired(left) {
+            let t = "⚠ renew".to_string();
+            let len = u16len(&t);
+            return (t, vec![(0, len, Severity::Red)]);
+        }
         let t = format!("renew · {}", login_left_label(left));
         let len = u16len(&t);
         return (t, vec![(0, len, Severity::Amber)]);
@@ -2401,13 +2416,15 @@ fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)
         return rows;
     }
     if let Some(left) = login_expiring_in(a, now_utc()) {
-        rows.push((
+        let row = if login_expired(left) {
+            "⚠ Login expired — Renew login… below".to_string()
+        } else {
             format!(
                 "Login expires in {} — Renew login… below",
                 login_left_label(left)
-            ),
-            true,
-        ));
+            )
+        };
+        rows.push((row, true));
     }
     if let Some(err) = &a.error {
         rows.push((format!("⚠ Refresh error: {err}"), true));
@@ -5158,6 +5175,21 @@ mod tests {
         assert_eq!(trailing_for_account(&a, bands(), now).0, "⚠ renew");
         let rows = submenu_info_rows(&claude_section(), &a);
         assert_eq!(rows, vec!["⚠ Login expired — Renew login… below"]);
+    }
+
+    #[test]
+    fn a_lapsed_renewable_login_reads_expired_not_under_an_hour() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        with_now(now, || {
+            let mut a = acct("dev@example.com", Some(10.0), Some(20.0), false);
+            a.renewable = true;
+            a.login_expires_at = Some(now - chrono::Duration::hours(3));
+            let (t, colors) = trailing_for_account(&a, bands(), now);
+            assert_eq!(t, "⚠ renew");
+            assert_eq!(colors[0].2, Severity::Red);
+            let rows = submenu_info_rows(&claude_section(), &a);
+            assert_eq!(rows[0], "⚠ Login expired — Renew login… below", "{rows:?}");
+        });
     }
 
     #[test]
