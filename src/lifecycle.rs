@@ -384,7 +384,7 @@ pub(crate) fn refresh_provider_active_account(slug: &str) {
                     if let Some(r) = grant.refresh.clone() {
                         a.refresh_token = r;
                     }
-                    a.expires_at = Utc::now().timestamp() + grant.expires_in_secs;
+                    a.expires_at = Utc::now().timestamp().saturating_add(grant.expires_in_secs);
                     a.needs_relogin = false;
                 }
                 state.save()?;
