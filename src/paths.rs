@@ -535,10 +535,34 @@ mod tests {
     fn user_home_reads_the_platform_env_order_first() {
         // Whatever variable the platform ranks first wins over the second,
         // even when the second is set to something else.
-        let [first, _second] = crate::platform().paths().home_env_order();
-        crate::env_lock::scoped_env_var(first, Some("/usagio-first-home"), || {
-            assert_eq!(user_home(), Some(PathBuf::from("/usagio-first-home")));
-        });
+        let [first, second] = crate::platform().paths().home_env_order();
+        let _l = crate::env_lock::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct Restore([(&'static str, Option<std::ffi::OsString>); 2]);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (k, v) in &self.0 {
+                    #[allow(clippy::disallowed_methods)]
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+        let _restore = Restore([
+            (first, std::env::var_os(first)),
+            (second, std::env::var_os(second)),
+        ]);
+        #[allow(clippy::disallowed_methods)]
+        {
+            std::env::set_var(first, "/usagio-first-home");
+            std::env::set_var(second, "/usagio-second-home");
+        }
+        let _m1 = crate::env_lock::mark_scoped(first);
+        let _m2 = crate::env_lock::mark_scoped(second);
+        assert_eq!(user_home(), Some(PathBuf::from("/usagio-first-home")));
     }
 
     // --- config_base (XDG-first resolution) ---
