@@ -433,3 +433,86 @@ fn a_sign_in_nobody_completes_times_out() {
         .expect("wait_for_code never re-checked its deadline: accept() blocked");
     assert!(format!("{}", r.unwrap_err()).contains("timed out"));
 }
+
+/// A provider with a loopback login and nothing else, to drive [`start`].
+struct LoginOnly;
+
+impl Provider for LoginOnly {
+    fn provider_id(&self) -> &'static str {
+        "t-login-only"
+    }
+    fn display_name(&self) -> &'static str {
+        "LoginOnly"
+    }
+    fn capabilities(&self) -> crate::providers::trait_def::Capabilities {
+        use crate::providers::trait_def::{Capabilities, CaptureMode, SecretBackend};
+        Capabilities {
+            supports_usage: false,
+            supports_switching: false,
+            supports_launch: false,
+            supports_remove: false,
+            supports_email_capture: false,
+            secret_backend: SecretBackend::File,
+            capture_mode: CaptureMode::CredsOnDisk,
+        }
+    }
+    fn capture_current_login(
+        &self,
+    ) -> crate::providers::trait_def::PResult<Option<crate::providers::trait_def::CapturedAccount>>
+    {
+        Ok(None)
+    }
+    fn parse_stored_blob(
+        &self,
+        _blob: &str,
+    ) -> crate::providers::trait_def::PResult<crate::providers::trait_def::TokenGrant> {
+        Err(crate::providers::trait_def::ProviderError::Unsupported)
+    }
+    fn patch_stored_blob(
+        &self,
+        _blob: &str,
+        _grant: &crate::providers::trait_def::TokenGrant,
+    ) -> crate::providers::trait_def::PResult<String> {
+        Err(crate::providers::trait_def::ProviderError::Unsupported)
+    }
+    fn login_spec(&self) -> Option<LoginSpec> {
+        Some(spec("http://unused", TokenRequestStyle::Form))
+    }
+}
+
+static LOGIN_ONLY: LoginOnly = LoginOnly;
+
+#[test]
+fn start_releases_the_redirect_port_before_on_done_runs() {
+    use std::sync::atomic::AtomicU16;
+    let _home = crate::store::ScopedConfigDir::new();
+    let port = Arc::new(AtomicU16::new(0));
+    let seen = Arc::clone(&port);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let started = start(
+        &LOGIN_ONLY,
+        Target::Renew("dev@example.com".into()),
+        move |result: Result<Renewed>| {
+            // A successor started from here binds the same port: it must be
+            // free already, not only once the worker thread exits.
+            let port = seen.load(Ordering::SeqCst);
+            let free = TcpListener::bind(("127.0.0.1", port)).is_ok();
+            let _ = tx.send((result.is_err(), free));
+        },
+    )
+    .unwrap();
+    let url = url::Url::parse(&started.url).unwrap();
+    let redirect = url
+        .query_pairs()
+        .find(|(k, _)| k == "redirect_uri")
+        .map(|(_, v)| url::Url::parse(&v).unwrap())
+        .unwrap();
+    port.store(redirect.port().unwrap(), Ordering::SeqCst);
+    started.progress.cancel();
+    let (failed, free) = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("on_done never ran: the worker could not finish");
+    assert!(failed, "a cancelled flow reports an error");
+    assert!(free, "the redirect port was still bound when on_done ran");
+    assert!(started.progress.is_finished());
+}
