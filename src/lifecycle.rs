@@ -334,6 +334,41 @@ pub(crate) fn active_refresh_cas(
         }
     };
 
+    // A renewal whose live write failed (`persist_claude_login`) left a marker
+    // naming the refresh token it could not publish. Only while that marker
+    // matches the stored token do we rewrite the slot; otherwise the slot is
+    // the truth and is adopted below (expiry is never compared: clocks and
+    // server-chosen lifetimes are not provenance).
+    if acct.live_write_pending.as_deref()
+        == Some(logging::token_fingerprint(&acct.refresh_token).as_str())
+        && acct.refresh_token != cc_acct.refresh_token
+    {
+        let identity = providers::IdentitySnapshot {
+            email: acct.email.clone(),
+            uuid: acct.identity_uuid(),
+            display_name: None,
+            native_blob: serde_json::json!({
+                "oauthAccount": acct.oauth_account.clone().unwrap_or(serde_json::Value::Null),
+                "userID": acct.user_id,
+            }),
+        };
+        return match provider.write_active_account(&acct.keychain_blob, &identity) {
+            Ok(()) => {
+                acct.live_write_pending = None;
+                logging::log(&format!(
+                    "event=active_refresh_rewrote_slot account={email} reason=pending_live_write"
+                ));
+                ActiveRefreshOutcome::Adopted
+            }
+            Err(e) => {
+                logging::log(&format!(
+                    "event=active_refresh_adopt_failed account={email} reason=slot_rewrite:{e}"
+                ));
+                ActiveRefreshOutcome::RefreshFailed
+            }
+        };
+    }
+    acct.live_write_pending = None;
     let drifted = cc_acct.access_token != acct.access_token;
     let cc_prefix = logging::token_fingerprint(&cc_acct.access_token);
     acct.set_tokens(
@@ -540,6 +575,10 @@ pub(crate) fn prepare_handoff(
         .provider_accounts(slug)
         .and_then(|accounts| accounts.pending_switch.as_ref())
         .and_then(|pending| pending.renewed_account.clone());
+    let was_renewal = state
+        .provider_accounts(slug)
+        .and_then(|accounts| accounts.pending_switch.as_ref())
+        .is_some_and(|pending| pending.renewal && pending.key == key);
     if let Some(renewed) = &renewed_account {
         anyhow::ensure!(
             renewed.key == key,
@@ -569,6 +608,7 @@ pub(crate) fn prepare_handoff(
                     drain_token: None,
                     credentials_written: true,
                     renewed_account: None,
+                    renewal: false,
                     leave_latch: None,
                 });
                 state.save()?;
@@ -625,7 +665,7 @@ pub(crate) fn prepare_handoff(
                     .and_then(|pending| pending.leave_latch.clone())
             })
     };
-    accounts.pending_switch = Some(crate::store::PendingSwitch {
+    let queued = crate::store::PendingSwitch {
         key: key.to_owned(),
         manual,
         from: accounts.active.clone(),
@@ -633,8 +673,17 @@ pub(crate) fn prepare_handoff(
         credentials_written: false,
         leave_latch,
         renewed_account,
-    });
-    state.save()?;
+        // A renewal stays a renewal across drain retries, unless the user now
+        // explicitly picks the account (manual).
+        renewal: !manual && was_renewal,
+    };
+    // A retry that changes nothing must not rewrite state.json (each save
+    // rotates a rolling backup).
+    let changed = accounts.pending_switch.as_ref() != Some(&queued);
+    accounts.pending_switch = Some(queued);
+    if changed {
+        state.save()?;
+    }
     if !already_requested || provider.handoff_request_is_idempotent() {
         provider.begin_handoff(token)?;
         logging::log(&format!(

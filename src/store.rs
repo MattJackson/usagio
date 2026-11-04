@@ -119,6 +119,12 @@ pub struct Account {
     /// Cleared on any successful refresh or fresh capture.
     #[serde(default)]
     pub needs_relogin: bool,
+    /// Fingerprint of the refresh token whose renewal could not be written to
+    /// the live slot (`persist_claude_login`). While it matches the stored
+    /// refresh token the active-account CAS rewrites the slot instead of
+    /// adopting it; anything else is adopted as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_write_pending: Option<String>,
     /// True while the account's Claude subscription has lapsed (the usage
     /// endpoint answers 403/429 and the profile shows a free/canceled org).
     /// When set: the poller stops calling the usage endpoint for it (those
@@ -175,6 +181,7 @@ impl Account {
             cached_usage: None,
             notif_state: crate::notifications::NotifState::default(),
             needs_relogin: false,
+            live_write_pending: None,
             no_subscription: false,
             plan: None,
             profile_refresh_after: None,
@@ -220,6 +227,7 @@ impl Account {
     /// Code put in the blob.
     pub fn adopt_login(&mut self, fresh: &Account) {
         self.profile_refresh_after = None;
+        self.live_write_pending = None;
         self.set_tokens(
             fresh.access_token.clone(),
             fresh.refresh_token.clone(),
@@ -368,6 +376,24 @@ impl ProviderAccount {
     }
 }
 
+/// `State::resolve` found several accounts for a prefix (typed, so callers
+/// never match on message text).
+#[derive(Debug)]
+pub struct AmbiguousSelector(pub String);
+
+impl std::fmt::Display for AmbiguousSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AmbiguousSelector {}
+
+/// Whether `e` is an [`AmbiguousSelector`] error.
+pub fn is_ambiguous_selector(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<AmbiguousSelector>().is_some()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingSwitch {
     pub key: String,
@@ -382,6 +408,10 @@ pub struct PendingSwitch {
     /// A renewed active login waits here until the old client has drained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub renewed_account: Option<ProviderAccount>,
+    /// This queued "switch" is a login renewal of the already-active account:
+    /// its commit must leave the user's pick/hold alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub renewal: bool,
     #[serde(default)]
     pub leave_latch: Option<(
         crate::autoswap::memory::LatchKind,
@@ -857,6 +887,7 @@ impl State {
                         .get("needs_relogin")
                         .and_then(|x| x.as_bool())
                         .unwrap_or(false),
+                    live_write_pending: None,
                     no_subscription: obj
                         .get("no_subscription")
                         .and_then(|x| x.as_bool())
@@ -1142,10 +1173,10 @@ impl State {
         match matches.as_slice() {
             [one] => Ok((*one).to_string()),
             [] => Err(anyhow!("no account matches '{sel}'")),
-            many => Err(anyhow!(
+            many => Err(anyhow::Error::new(AmbiguousSelector(format!(
                 "'{sel}' is ambiguous — matches: {}",
                 many.join(", ")
-            )),
+            )))),
         }
     }
 
