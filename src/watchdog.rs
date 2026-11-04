@@ -690,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn real_effects_respawn_reports_fd_counts_and_resets_keychain_counter() {
+    fn real_effects_respawn_reports_fd_counts_and_keeps_keychain_counter_without_a_watcher() {
         let _cfg = crate::store::ScopedConfigDir::new();
         let _kc = KC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         record_keychain_result(false);
@@ -709,9 +709,10 @@ mod tests {
 
         assert_eq!(
             keychain_consecutive_failures(),
-            0,
-            "respawn must reset the stale failure count"
+            2,
+            "nothing was remediated, so the failure count must survive to escalate"
         );
+        record_keychain_result(true);
         // No watcher is installed under test, so the miss is logged.
         let path = crate::store::config_dir().unwrap().join("usagio.log");
         let contents = std::fs::read_to_string(path).unwrap();
@@ -728,17 +729,5 @@ mod tests {
         crate::env_lock::scoped_env_var("XPC_SERVICE_NAME", None, || {
             assert!(!RealEffects.self_restart());
         });
-    }
-
-    /// With no watcher installed nothing was remediated, so the keychain
-    /// failure count must survive for the next check to escalate.
-    #[test]
-    fn respawn_with_no_watcher_keeps_the_keychain_failure_count() {
-        let _cfg = crate::store::ScopedConfigDir::new();
-        KEYCHAIN_CONSEC_FAILURES.store(3, Ordering::Relaxed);
-        let _ = RealEffects.respawn_watcher();
-        let kept = keychain_consecutive_failures();
-        KEYCHAIN_CONSEC_FAILURES.store(0, Ordering::Relaxed);
-        assert_eq!(kept, 3);
     }
 }

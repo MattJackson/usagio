@@ -3307,9 +3307,14 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
             // path (edge-triggered purely through state, so it runs even on the
             // first poll). Persisted once at the end if anything changed.
             let mut ns = acct.notif_state.clone();
-            for trig in &notifications::reset_grant_triggers(&mut ns, &cu.reported.reset_grants) {
-                if let Err(e) = notifications::fire(trig, &account_key) {
-                    logging::log(&format!("notify: {email}: {e:#}"));
+            for g in &cu.reported.reset_grants {
+                for trig in &notifications::reset_grant_triggers(&mut ns, std::slice::from_ref(g)) {
+                    if let Err(e) = notifications::fire(trig, &account_key) {
+                        logging::log(&format!("notify: {email}: {e:#}"));
+                        // Not delivered: leave the grant un-announced so the
+                        // next poll retries instead of losing it for good.
+                        notifications::release_dedup(&mut ns, trig, Some(&g.id));
+                    }
                 }
             }
             if let Some(prev) = prev_snap {
@@ -3334,6 +3339,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
                 for trig in &kept {
                     if let Err(e) = notifications::fire(trig, &account_key) {
                         logging::log(&format!("notify: {email}: {e:#}"));
+                        notifications::release_dedup(&mut ns, trig, None);
                     }
                 }
             }

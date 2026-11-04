@@ -286,6 +286,24 @@ pub fn evaluate_pace(
     Some(Trigger::WeeklyPace { hit_time: hit })
 }
 
+/// Undo the dedup bit a state-driven trigger set, after its delivery failed,
+/// so the next tick retries it. `grant_id` is the grant a reset-grant trigger
+/// was raised for. Threshold/reset crossings are edge-triggered on the
+/// (prev, curr) pair, which advances regardless, so they are not retried
+/// (fire is documented best-effort).
+pub fn release_dedup(state: &mut NotifState, trigger: &Trigger, grant_id: Option<&str>) {
+    match (trigger, grant_id) {
+        (Trigger::WeeklyPace { .. }, _) => state.pace_fired_this_window = false,
+        (Trigger::ResetGrantAvailable { .. }, Some(id)) => {
+            state.reset_grants_seen.remove(id);
+        }
+        (Trigger::ResetUsableNow { .. }, Some(id)) => {
+            state.reset_grants_usable_fired.remove(id);
+        }
+        _ => {}
+    }
+}
+
 /// Reset-grant notifications for this tick, deduped in place against `state`.
 /// Two moments, each fired once per grant id:
 ///   * arrival — a grant with a reset left that we've never announced
@@ -995,5 +1013,32 @@ mod tests {
             }),
             "{trig:?}"
         );
+    }
+
+    #[test]
+    fn a_failed_delivery_releases_the_dedup_bit_for_retry() {
+        let mut st = NotifState::default();
+        let g = ResetGrant {
+            id: "g1".into(),
+            label: "L".into(),
+            resets_left: 1,
+            usable_now: true,
+            ..Default::default()
+        };
+        let trigs = reset_grant_triggers(&mut st, std::slice::from_ref(&g));
+        assert_eq!(trigs.len(), 2);
+        for t in &trigs {
+            release_dedup(&mut st, t, Some("g1"));
+        }
+        assert_eq!(reset_grant_triggers(&mut st, &[g]).len(), 2, "retried");
+        st.pace_fired_this_window = true;
+        release_dedup(
+            &mut st,
+            &Trigger::WeeklyPace {
+                hit_time: Utc::now(),
+            },
+            None,
+        );
+        assert!(!st.pace_fired_this_window);
     }
 }
