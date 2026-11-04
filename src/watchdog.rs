@@ -647,6 +647,29 @@ mod tests {
         );
     }
 
+    /// maybe_run keeps an unproven keychain episode until a write succeeds
+    /// after the respawn, and only then lets a quiet check reset the ladder.
+    #[test]
+    fn maybe_run_clears_keychain_unproven_only_after_a_later_success() {
+        let _kc = KC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        record_keychain_result(true); // zero the failure counter
+        let mut wd = Watchdog {
+            keychain_unproven: true,
+            already_respawned: true,
+            ok_total_at_respawn: KEYCHAIN_OK_TOTAL.load(Ordering::Relaxed),
+            ..Watchdog::default()
+        };
+        let mut fx = MockEffects::default();
+        wd.maybe_run(&mut fx);
+        assert!(wd.keychain_unproven, "no write succeeded since the respawn");
+        assert!(wd.already_respawned, "a quiet check reset the ladder");
+        record_keychain_result(true);
+        wd.last_check = None; // the next call is due
+        wd.maybe_run(&mut fx);
+        assert!(!wd.keychain_unproven, "the later success proves recovery");
+        assert!(!wd.already_respawned, "healthy again: the ladder resets");
+    }
+
     /// A self_restart that fails to issue (bare foreground watch: returns
     /// `false`) must NOT loop back into repeated watcher respawns — the
     /// escalation flag stays set so we don't churn the watcher every cycle.
