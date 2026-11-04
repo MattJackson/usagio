@@ -158,48 +158,66 @@ fn parse_callback(target: &str, path: &str, state: &str) -> Callback {
 const BIND_ATTEMPTS: u32 = 10;
 const BIND_RETRY_DELAY: Duration = Duration::from_millis(200);
 
+/// Bind the IPv4 loopback listener on `port`, retrying while it is in use.
+/// `Ok(None)` = still in use after `attempts`; any other bind error fails at
+/// once.
+fn bind_v4_retrying(port: u16, attempts: u32, delay: Duration) -> Result<Option<TcpListener>> {
+    for attempt in 1..=attempts.max(1) {
+        match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => return Ok(Some(listener)),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                if attempt < attempts {
+                    std::thread::sleep(delay);
+                }
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("listening on localhost:{port} for the sign-in redirect")
+                })
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The ports a login with a fixed redirect port may listen on, in order: the
+/// preferred one, then the provider's registered fallback.
+fn redirect_port_candidates(port: u16, fallback: Option<u16>) -> Vec<u16> {
+    let mut ports = vec![port];
+    ports.extend(fallback.filter(|f| port != 0 && *f != port));
+    ports
+}
+
 /// Bind the loopback redirect listener the way the Codex client does: retry
 /// `port` while it is in use, then move to the registered `fallback` port
 /// (retried the same way). Any other bind error fails at once. Unlike the
 /// Codex client, no `/cancel` is sent to the port's holder: that may be the
 /// user's own `codex login`, which usagio must not end.
+#[cfg(test)]
 fn bind_redirect_listener(
     port: u16,
     fallback: Option<u16>,
     attempts: u32,
     delay: Duration,
 ) -> Result<TcpListener> {
-    let try_port = |port: u16| -> Result<Option<TcpListener>> {
-        for attempt in 1..=attempts.max(1) {
-            match TcpListener::bind(("127.0.0.1", port)) {
-                Ok(listener) => return Ok(Some(listener)),
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                    if attempt < attempts {
-                        std::thread::sleep(delay);
-                    }
-                }
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("listening on localhost:{port} for the sign-in redirect")
-                    })
-                }
-            }
-        }
-        Ok(None)
-    };
-    if let Some(listener) = try_port(port)? {
-        return Ok(listener);
-    }
-    if let Some(fallback) = fallback.filter(|f| port != 0 && *f != port) {
-        crate::logging::log(&format!(
-            "login: redirect port {port} is in use; using registered fallback port {fallback}"
-        ));
-        if let Some(listener) = try_port(fallback)? {
+    let ports = redirect_port_candidates(port, fallback);
+    for &candidate in &ports {
+        if let Some(listener) = bind_v4_retrying(candidate, attempts, delay)? {
             return Ok(listener);
         }
-        bail!("sign-in redirect ports {port} and {fallback} are both in use");
     }
-    bail!("sign-in redirect port {port} is already in use")
+    Err(ports_in_use(&ports))
+}
+
+/// The error for a fixed-port login whose every candidate port is taken.
+fn ports_in_use(ports: &[u16]) -> anyhow::Error {
+    match ports {
+        [port, fallback] => {
+            anyhow!("sign-in redirect ports {port} and {fallback} are both in use")
+        }
+        [port, ..] => anyhow!("sign-in redirect port {port} is already in use"),
+        [] => anyhow!("no sign-in redirect port"),
+    }
 }
 
 struct Loopback {
@@ -217,24 +235,55 @@ const DUAL_BIND_ATTEMPTS: usize = 8;
 
 impl Loopback {
     pub(crate) fn bind(spec: &LoginSpec) -> Result<Self> {
-        let fixed = spec.redirect_port;
         let both = spec.redirect_host.eq_ignore_ascii_case("localhost");
-        let attempts = if fixed.is_some() || !both {
-            1
-        } else {
-            DUAL_BIND_ATTEMPTS
-        };
+        match spec.redirect_port {
+            Some(port) => Self::bind_fixed(spec, port, both),
+            None => Self::bind_ephemeral(spec, both),
+        }
+    }
+
+    /// A fixed redirect port: the preferred port, else the provider's
+    /// registered fallback, whichever is free on every stack the redirect
+    /// host resolves to. A port taken on either IPv4 or `[::1]` is skipped
+    /// (listening beside a squatter would hand it the redirect); IPv4 is
+    /// retried while busy first, as the vendor client does.
+    fn bind_fixed(spec: &LoginSpec, port: u16, both: bool) -> Result<Self> {
+        let ports = redirect_port_candidates(port, spec.fallback_redirect_port);
+        let mut v6_err = None;
+        for (i, &candidate) in ports.iter().enumerate() {
+            if i > 0 {
+                crate::logging::log(&format!(
+                    "login: redirect port {port} is in use; using registered fallback port {candidate}"
+                ));
+            }
+            let Some(v4) = bind_v4_retrying(candidate, BIND_ATTEMPTS, BIND_RETRY_DELAY)? else {
+                continue;
+            };
+            let mut listeners = vec![v4];
+            if both {
+                match bind_v6_loopback(candidate) {
+                    Ok(Some(v6)) => listeners.push(v6),
+                    Ok(None) => {}
+                    Err(e) => {
+                        v6_err = Some(anyhow::Error::new(e).context(format!(
+                            "listening on [::1]:{candidate} for the sign-in redirect"
+                        )));
+                        continue;
+                    }
+                }
+            }
+            return Self::serve(spec, candidate, listeners);
+        }
+        Err(v6_err.unwrap_or_else(|| ports_in_use(&ports)))
+    }
+
+    /// An ephemeral redirect port: any port free on every stack.
+    fn bind_ephemeral(spec: &LoginSpec, both: bool) -> Result<Self> {
+        let attempts = if both { DUAL_BIND_ATTEMPTS } else { 1 };
         let mut last_err = None;
         for _ in 0..attempts {
-            // A fixed port is retried while busy, then the provider's
-            // registered fallback port; the redirect_uri names whichever
-            // was bound.
-            let v4 = bind_redirect_listener(
-                fixed.unwrap_or(0),
-                spec.fallback_redirect_port,
-                BIND_ATTEMPTS,
-                BIND_RETRY_DELAY,
-            )?;
+            let v4 = TcpListener::bind(("127.0.0.1", 0))
+                .context("listening on localhost:0 for the sign-in redirect")?;
             let port = v4.local_addr()?.port();
             let mut listeners = vec![v4];
             if both {
@@ -242,8 +291,8 @@ impl Loopback {
                     Ok(Some(v6)) => listeners.push(v6),
                     Ok(None) => {}
                     Err(e) => {
-                        // Someone holds [::1]:port. An ephemeral port can be
-                        // picked again; a fixed one cannot.
+                        // Someone holds [::1]:port; an ephemeral port can be
+                        // picked again.
                         last_err = Some(anyhow::Error::new(e).context(format!(
                             "listening on [::1]:{port} for the sign-in redirect"
                         )));
@@ -251,16 +300,20 @@ impl Loopback {
                     }
                 }
             }
-            for l in &listeners {
-                l.set_nonblocking(true)?;
-            }
-            return Ok(Loopback {
-                listeners,
-                redirect_uri: format!("http://{}:{port}{}", spec.redirect_host, spec.redirect_path),
-                path: spec.redirect_path,
-            });
+            return Self::serve(spec, port, listeners);
         }
         Err(last_err.unwrap_or_else(|| anyhow!("no free loopback port for the sign-in redirect")))
+    }
+
+    fn serve(spec: &LoginSpec, port: u16, listeners: Vec<TcpListener>) -> Result<Self> {
+        for l in &listeners {
+            l.set_nonblocking(true)?;
+        }
+        Ok(Loopback {
+            listeners,
+            redirect_uri: format!("http://{}:{port}{}", spec.redirect_host, spec.redirect_path),
+            path: spec.redirect_path,
+        })
     }
 
     /// The port the redirect comes back to.

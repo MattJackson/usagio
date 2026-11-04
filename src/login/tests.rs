@@ -568,6 +568,43 @@ fn a_squatted_ipv6_port_is_never_used() {
 }
 
 #[test]
+fn a_squatted_ipv6_preferred_port_falls_back_to_the_registered_one() {
+    // [::1] is taken on the preferred fixed port (IPv4 is free): the login
+    // must move to the registered fallback port, not fail and not listen on
+    // the preferred port beside the squatter.
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let Ok(squat) = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)) else {
+        return; // no IPv6 loopback on this machine: nothing to squat
+    };
+    let preferred = squat.local_addr().unwrap().port();
+    let fallback = loop {
+        let (a, b) = two_free_ports();
+        let candidate = if a == preferred { b } else { a };
+        if candidate != preferred {
+            break candidate;
+        }
+    };
+    let mut s = spec("http://unused", TokenRequestStyle::Form);
+    s.redirect_port = Some(preferred);
+    s.fallback_redirect_port = Some(fallback);
+    let lb = Loopback::bind(&s).unwrap();
+    assert_eq!(lb.port(), fallback);
+    assert_eq!(
+        lb.redirect_uri,
+        format!("http://localhost:{fallback}/callback"),
+        "the redirect_uri must name the port actually bound"
+    );
+    assert!(
+        lb.listeners
+            .iter()
+            .all(|l| l.local_addr().unwrap().port() == fallback),
+        "nothing may listen on the squatted preferred port"
+    );
+    // The preferred port's IPv4 side was released again.
+    assert!(TcpListener::bind(("127.0.0.1", preferred)).is_ok());
+}
+
+#[test]
 fn a_literal_ipv4_redirect_binds_only_ipv4() {
     let mut s = spec("http://unused", TokenRequestStyle::Form);
     s.redirect_host = "127.0.0.1";

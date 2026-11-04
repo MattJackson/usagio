@@ -5,6 +5,14 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Sign-in: when the preferred fixed redirect port is taken on either IPv4 or `[::1]`, the login now falls back to the provider's registered fallback port (1457 for Codex) instead of failing.
+- Switching to the already-active Claude account now adopts the vendor slot's token under the state lock, as every other active-account adoption does.
+- An unchanged `state.json` is no longer rewritten (with its rolling backup rotated) just because another process serialized the same state in a different key order.
+
 ## [1.1.0] - 2026-11-03
 
 ### Fixed
