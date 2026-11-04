@@ -88,10 +88,6 @@ where
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let prev = std::env::var_os(key);
-    SCOPED_KEYS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(key.to_string());
     // SAFETY: guarded by ENV_LOCK — no other thread inside this test binary
     // reads or writes `key` concurrently while this scope is live.
     #[allow(clippy::disallowed_methods)]
@@ -99,6 +95,12 @@ where
         Some(v) => std::env::set_var(key, v),
         None => std::env::remove_var(key),
     }
+    // Mark scoped only after the value is set, so no other thread can see the
+    // key as scoped while it still holds the developer's real value.
+    SCOPED_KEYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(key.to_string());
 
     struct Restore<'a> {
         key: &'a str,

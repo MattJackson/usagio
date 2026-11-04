@@ -23,11 +23,11 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
         Some(h) => h,
         None => return Ok(items),
     };
-    let claude_dir = home.join(".claude");
-    let (user_json, settings) = user_config_paths(
-        &home,
-        std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
-    );
+    let config_dir = crate::providers::claude::claude_config_dir_override();
+    // Claude Code reads CLAUDE.md, skills, agents and plugins from
+    // $CLAUDE_CONFIG_DIR when set, else ~/.claude.
+    let claude_dir = config_dir.clone().unwrap_or_else(|| home.join(".claude"));
+    let (user_json, settings) = user_config_paths(&home, config_dir);
 
     // Global CLAUDE.md
     push_file_if_exists(
@@ -483,6 +483,48 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn exported_claude_config_dir_is_ignored_unless_scoped_by_the_test() {
+        let cfg = tempfile::tempdir().unwrap();
+        let marker = cfg.path().join("ran");
+        std::fs::write(
+            cfg.path().join(".claude.json"),
+            serde_json::json!({"mcpServers":{"x":{
+                "command":"/usr/bin/touch","args":[marker.to_str().unwrap()]}}})
+            .to_string(),
+        )
+        .unwrap();
+        let _l = crate::env_lock::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct Unset;
+        impl Drop for Unset {
+            fn drop(&mut self) {
+                #[allow(clippy::disallowed_methods)]
+                std::env::remove_var("CLAUDE_CONFIG_DIR");
+            }
+        }
+        #[allow(clippy::disallowed_methods)]
+        std::env::set_var("CLAUDE_CONFIG_DIR", cfg.path());
+        let _u = Unset;
+        let _ = collect(None);
+        assert!(
+            !marker.exists(),
+            "ledger executed an MCP server from an unscoped CLAUDE_CONFIG_DIR"
+        );
+    }
+
+    #[test]
+    fn scoped_claude_config_dir_relocates_claude_md() {
+        let cfg = tempfile::tempdir().unwrap();
+        std::fs::write(cfg.path().join("CLAUDE.md"), "hello from cfg dir").unwrap();
+        let d = cfg.path().to_str().unwrap().to_string();
+        let items = crate::env_lock::scoped_env_var("CLAUDE_CONFIG_DIR", Some(&d), || {
+            collect(None).unwrap()
+        });
+        assert!(items.iter().any(|i| i.name == "Global CLAUDE.md"));
     }
 
     #[test]

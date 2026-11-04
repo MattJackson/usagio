@@ -822,7 +822,7 @@ pub(crate) fn active_slot_write(blob: &str) -> PResult<()> {
 // ---- ~/.claude.json identity read/write (mirrors main.rs helpers) --------
 
 /// Claude Code's relocatable config root: a non-empty `CLAUDE_CONFIG_DIR`.
-fn claude_config_dir_override() -> Option<std::path::PathBuf> {
+pub(crate) fn claude_config_dir_override() -> Option<std::path::PathBuf> {
     crate::paths::path_env_var("CLAUDE_CONFIG_DIR")
         .filter(|d| !d.is_empty())
         .map(std::path::PathBuf::from)
@@ -1764,27 +1764,27 @@ mod tests {
         let _l = crate::env_lock::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        #[allow(clippy::disallowed_methods)]
-        std::env::set_var("CLAUDE_CONFIG_DIR", sentinel.path());
-        struct Unset;
-        impl Drop for Unset {
+        struct Restore(&'static str, Option<std::ffi::OsString>);
+        impl Drop for Restore {
             fn drop(&mut self) {
                 #[allow(clippy::disallowed_methods)]
-                std::env::remove_var("CLAUDE_CONFIG_DIR");
+                match self.1.take() {
+                    Some(v) => std::env::set_var(self.0, v),
+                    None => std::env::remove_var(self.0),
+                }
             }
         }
-        let _u = Unset;
-        let _hold = crate::env_lock::mark_scoped("HOME");
+        // Declared before the sets so they restore on panic too.
         #[allow(clippy::disallowed_methods)]
-        let prev = std::env::var_os("HOME");
+        let _u = Restore("CLAUDE_CONFIG_DIR", std::env::var_os("CLAUDE_CONFIG_DIR"));
+        #[allow(clippy::disallowed_methods)]
+        let _h = Restore("HOME", std::env::var_os("HOME"));
+        #[allow(clippy::disallowed_methods)]
+        std::env::set_var("CLAUDE_CONFIG_DIR", sentinel.path());
         #[allow(clippy::disallowed_methods)]
         std::env::set_var("HOME", home.path());
+        let _hold = crate::env_lock::mark_scoped("HOME");
         write_claude_identity(&serde_json::json!({"emailAddress":"new@e.com"}), None).unwrap();
-        #[allow(clippy::disallowed_methods)]
-        match prev {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
         assert_eq!(
             std::fs::read_to_string(&sfile).unwrap(),
             r#"{"oauthAccount":{"emailAddress":"real@me.com"}}"#
