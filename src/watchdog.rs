@@ -81,6 +81,10 @@ pub const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 use std::sync::atomic::{AtomicU32, Ordering};
 
 static KEYCHAIN_CONSEC_FAILURES: AtomicU32 = AtomicU32::new(0);
+/// Total successful keychain writes this process; lets the watchdog tell that
+/// a write succeeded after a respawn (the respawn zeroes the failure counter,
+/// so "0 failures" alone does not prove the keychain is healthy again).
+static KEYCHAIN_OK_TOTAL: AtomicU32 = AtomicU32::new(0);
 
 /// Record the outcome of a keychain/secret write. A success resets the
 /// consecutive-failure counter to zero; a failure increments it. Called from
@@ -90,6 +94,7 @@ static KEYCHAIN_CONSEC_FAILURES: AtomicU32 = AtomicU32::new(0);
 pub fn record_keychain_result(ok: bool) {
     if ok {
         KEYCHAIN_CONSEC_FAILURES.store(0, Ordering::Relaxed);
+        KEYCHAIN_OK_TOTAL.fetch_add(1, Ordering::Relaxed);
     } else {
         KEYCHAIN_CONSEC_FAILURES.fetch_add(1, Ordering::Relaxed);
     }
@@ -218,6 +223,11 @@ pub trait WatchdogEffects {
 pub struct Watchdog {
     last_check: Option<Instant>,
     already_respawned: bool,
+    /// A keychain-driven respawn happened and no keychain write has succeeded
+    /// since: a quiet check is "no information", not "healthy", so the
+    /// escalation flag is kept.
+    keychain_unproven: bool,
+    ok_total_at_respawn: u32,
 }
 
 impl Watchdog {
@@ -232,6 +242,11 @@ impl Watchdog {
             }
         }
         self.last_check = Some(now);
+        if self.keychain_unproven
+            && KEYCHAIN_OK_TOTAL.load(Ordering::Relaxed) != self.ok_total_at_respawn
+        {
+            self.keychain_unproven = false;
+        }
         let fd_count = count_open_fds();
         let keychain_failures = keychain_consecutive_failures();
         self.run_check(fd_count, keychain_failures, effects);
@@ -256,8 +271,11 @@ impl Watchdog {
         match action {
             WatchdogAction::None => {
                 // Back to healthy — clear the escalation flag so the next
-                // unhealthy episode starts fresh at the watcher-respawn rung.
-                self.already_respawned = false;
+                // unhealthy episode starts fresh at the watcher-respawn rung
+                // (unless a keychain failure episode is still unproven).
+                if !self.keychain_unproven {
+                    self.already_respawned = false;
+                }
             }
             WatchdogAction::Warn => {
                 self.already_respawned = false;
@@ -285,6 +303,10 @@ impl Watchdog {
                 // Remember we tried the cheap fix; if the next check is still
                 // unhealthy, `decide` escalates to SelfRestart.
                 self.already_respawned = true;
+                if keychain_failures >= KEYCHAIN_FAILURE_THRESHOLD {
+                    self.keychain_unproven = true;
+                    self.ok_total_at_respawn = KEYCHAIN_OK_TOTAL.load(Ordering::Relaxed);
+                }
             }
             WatchdogAction::SelfRestart => {
                 let n = fd_count.unwrap_or(0);
@@ -558,6 +580,20 @@ mod tests {
         assert_eq!(keychain_consecutive_failures(), 2);
         record_keychain_result(true); // success resets
         assert_eq!(keychain_consecutive_failures(), 0);
+    }
+
+    /// The respawn zeroes the keychain failure counter; a quiet check right
+    /// after must not reset the ladder, or keychain failures never escalate.
+    #[test]
+    fn run_check_keychain_failures_escalate_after_a_quiet_check() {
+        let mut wd = Watchdog::default();
+        let mut fx = MockEffects::default();
+        wd.run_check(Some(40), KEYCHAIN_FAILURE_THRESHOLD, &mut fx);
+        assert_eq!(fx.respawns, 1);
+        wd.run_check(Some(40), 0, &mut fx); // few writes happened: quiet
+        wd.run_check(Some(40), KEYCHAIN_FAILURE_THRESHOLD, &mut fx);
+        assert_eq!(fx.respawns, 1, "must not respawn a second time");
+        assert_eq!(fx.self_restarts, 1, "persisting failures self-restart");
     }
 
     /// A self_restart that fails to issue (bare foreground watch: returns

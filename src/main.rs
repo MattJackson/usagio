@@ -1574,6 +1574,7 @@ fn switch_provider_if_still_active(
         if !current
             .as_deref()
             .is_some_and(|c| c.eq_ignore_ascii_case(expect_active))
+            || autoswap::shell::pick_diverged_from_armed(slug, &state)
         {
             return Ok(false);
         }
@@ -1888,7 +1889,9 @@ fn switch_to_guarded(
     let switched = with_state_lock(|| {
         let mut st = State::load()?;
         if let Some(exp) = expect_active {
-            if st.active.as_deref() != Some(exp) {
+            if st.active.as_deref() != Some(exp)
+                || autoswap::shell::pick_diverged_from_armed(CLAUDE_SLUG, &st)
+            {
                 logging::log(&format!(
                     "swap to {label} skipped: active changed to {:?} since the decision",
                     st.active

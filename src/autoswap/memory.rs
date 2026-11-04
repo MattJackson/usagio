@@ -80,6 +80,9 @@ pub struct SwapMemory {
     pub real_tier: Option<String>,
 }
 
+/// How far past `now` a stored timestamp may sit before it is treated as bogus.
+const FUTURE_SLACK_SECS: i64 = 60;
+
 fn lc(s: &str) -> String {
     s.to_ascii_lowercase()
 }
@@ -150,6 +153,22 @@ impl SwapMemory {
     pub fn prune(&mut self, now: DateTime<Utc>) {
         let now_ts = now.timestamp();
         let max_age = LATCH_MAX_AGE_DAYS * 86_400;
+        // A timestamp from the future (clock was ahead when it was written)
+        // is treated as "now" rather than pinning post-leave checks forever.
+        let slack = FUTURE_SLACK_SECS;
+        let clamp = |t: &mut i64| {
+            if *t > now_ts + slack {
+                *t = now_ts;
+            }
+        };
+        self.trigger_left
+            .values_mut()
+            .for_each(|l| clamp(&mut l.at));
+        self.drained.values_mut().for_each(|l| clamp(&mut l.at));
+        self.left_at.values_mut().for_each(clamp);
+        if let Some(t) = self.last_switch_at.as_mut() {
+            clamp(t);
+        }
         let keep = |l: &Latch| l.resets_at.is_none_or(|r| r > now_ts) && now_ts - l.at < max_age;
         self.trigger_left.retain(|_, l| keep(l));
         self.drained.retain(|_, l| keep(l));
