@@ -2123,11 +2123,18 @@ fn mirror_inactive_rotation(
         if !matches {
             return Ok(None);
         }
-        Ok(Some(
-            provider
-                .mirror_rotated_token(&acct.keychain_blob)
-                .map_err(|e| e.to_string()),
-        ))
+        let result = provider
+            .mirror_rotated_token(&acct.keychain_blob)
+            .map_err(|e| e.to_string());
+        crate::logging::log(&format!(
+            "event=mirror account={} result={}",
+            acct.key(),
+            match &result {
+                Ok(()) => "ok".to_string(),
+                Err(e) => format!("err:{e}"),
+            }
+        ));
+        Ok(Some(result))
     });
     // On the Ok path, the inner Option is the mirror outcome; if we couldn't
     // even acquire the lock / run the closure this cycle, skip (None) — the
@@ -2852,8 +2859,8 @@ fn cmd_secrets_selftest(args: &[String]) -> Result<()> {
 }
 
 fn claude_json_path() -> Result<std::path::PathBuf> {
-    let home = crate::paths::user_home().context("HOME/USERPROFILE is not set")?;
-    Ok(home.join(".claude.json"))
+    // Same resolution as the Claude provider (honours CLAUDE_CONFIG_DIR).
+    crate::providers::claude::claude_json_path().context("HOME/USERPROFILE is not set")
 }
 
 /// Read the current `oauthAccount` + `userID` from `~/.claude.json`.

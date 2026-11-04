@@ -2825,6 +2825,23 @@ fn apply_account_writes_the_slot_claude_code_reads() {
 }
 
 #[test]
+fn claude_config_dir_redirects_the_main_switch_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("cfg");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(cfg.join(".claude.json"), "{}").unwrap();
+    crate::env_lock::scoped_env_var("CLAUDE_CONFIG_DIR", Some(cfg.to_str().unwrap()), || {
+        assert_eq!(claude_json_path().unwrap(), cfg.join(".claude.json"));
+        write_claude_identity(&serde_json::json!({"emailAddress": "c@e.com"}), None).unwrap();
+        let (oauth, _) = read_claude_identity();
+        assert_eq!(
+            oauth.unwrap().get("emailAddress").and_then(|v| v.as_str()),
+            Some("c@e.com")
+        );
+    });
+}
+
+#[test]
 fn claude_json_helpers_read_write_and_report_the_file() {
     with_claude_home("who@e.com", |home| {
         assert_eq!(claude_json_path().unwrap(), home.join(".claude.json"));

@@ -458,10 +458,10 @@ impl Provider for ClaudeProvider {
             "file:~/.claude/.credentials.json"
         };
         let result = active_slot_write(blob);
-        let account = extract_claude_email(&serde_json::from_str(blob).unwrap_or(Value::Null))
-            .unwrap_or_else(|| "<unknown>".to_string());
+        // The blob is claudeAiOauth-only (no identity); the caller logs the
+        // account (see `mirror_inactive_rotation`).
         crate::logging::log(&format!(
-            "event=mirror provider={} account={account} to={to} result={}",
+            "event=mirror provider={} to={to} result={}",
             self.provider_id(),
             match &result {
                 Ok(()) => "ok".to_string(),
@@ -830,7 +830,7 @@ fn claude_config_dir_override() -> Option<std::path::PathBuf> {
 
 /// `$CLAUDE_CONFIG_DIR/.claude.json` when that variable is set and
 /// non-empty (Claude Code's documented relocation), else `~/.claude.json`.
-fn claude_json_path() -> Option<std::path::PathBuf> {
+pub(crate) fn claude_json_path() -> Option<std::path::PathBuf> {
     if let Some(dir) = claude_config_dir_override() {
         return Some(dir.join(".claude.json"));
     }
