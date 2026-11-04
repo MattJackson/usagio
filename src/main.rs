@@ -3387,19 +3387,16 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
             ));
             continue;
         }
-        // The ACTIVE account gets the compare-and-swap treatment (see the
-        // `active_refresh_cas` doc above): usagio DOES rotate its token, but
-        // the read-refresh-read sequence is run entirely under the state
-        // lock so it can never race a concurrent switch/capture in this
-        // process, and it backs off cleanly the instant it observes Claude
-        // Code touched the same slot. Every other account uses the plain
+        // The ACTIVE account is adopt-only (`lifecycle::active_refresh_cas`):
+        // usagio never POSTs a refresh grant for it, it adopts whatever the
+        // vendor client left in the slot (or republishes a renewal whose live
+        // write failed), all under the state lock so it cannot race a
+        // concurrent switch/capture. Every other account uses the plain
         // network-outside-the-lock refresh below.
-        // H3/gap-4 (v0.5.0 codeaudit + codex-switch-e2e): `supports_active_refresh`
-        // used to be read nowhere outside its own doc comment — this is the
-        // gate that makes it load-bearing. A provider that can't do a
-        // programmatic refresh grant (or, before this change, hasn't
-        // explicitly opted in) falls through to the plain `ensure_fresh`
-        // path below even for its active account, same as an inactive one.
+        // `supports_active_refresh` gates that path. Claude returns true; a
+        // provider returning false would fall through to `ensure_fresh` for
+        // its active account too, which POSTs — so a provider driven through
+        // this loop must opt in.
         let is_active =
             state.active.as_deref() == Some(email.as_str()) && provider.supports_active_refresh();
         if is_active {
