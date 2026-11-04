@@ -24,7 +24,10 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
         None => return Ok(items),
     };
     let claude_dir = home.join(".claude");
-    let settings = claude_dir.join("settings.json");
+    let (user_json, settings) = user_config_paths(
+        &home,
+        std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
+    );
 
     // Global CLAUDE.md
     push_file_if_exists(
@@ -122,7 +125,6 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
     // `mcpServers` is only a legacy fallback. First definition of a name wins
     // (local > project > user > legacy).
     let mut sources: Vec<(PathBuf, Vec<(String, serde_json::Value)>)> = Vec::new();
-    let user_json = home.join(".claude.json");
     let user_val = read_json_logged(&user_json);
     // Claude Code keys projects by absolute path.
     let proj_abs: Option<PathBuf> =
@@ -167,8 +169,13 @@ pub fn collect(project: Option<&Path>) -> Result<Vec<LedgerItem>, LedgerError> {
             if let Some(m) = val.get("mcpServers").and_then(|m| m.as_object()) {
                 let mut approved = Vec::new();
                 for (name, cfg) in m {
-                    if approval.project_server_approved(name) {
+                    if trusted && approval.project_server_approved(name) {
                         approved.push((name.clone(), cfg.clone()));
+                    } else if !trusted {
+                        eprintln!(
+                            "mcp {}: not started (folder not trusted in Claude Code)",
+                            printable(name)
+                        );
                     } else {
                         // Never execute repo-controlled commands Claude Code
                         // itself would not start.
@@ -292,6 +299,18 @@ fn printable(name: &str) -> String {
             }
         })
         .collect()
+}
+
+/// `.claude.json` and `settings.json` locations. Claude Code relocates both
+/// under `$CLAUDE_CONFIG_DIR` when it is set (non-empty).
+fn user_config_paths(home: &Path, config_dir: Option<PathBuf>) -> (PathBuf, PathBuf) {
+    match config_dir.filter(|d| !d.as_os_str().is_empty()) {
+        Some(d) => (d.join(".claude.json"), d.join("settings.json")),
+        None => (
+            home.join(".claude.json"),
+            home.join(".claude").join("settings.json"),
+        ),
+    }
 }
 
 /// An absolute spelling of `p` without touching the filesystem.
@@ -444,6 +463,27 @@ use super::file_mtime;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_config_dir_relocates_user_json_and_settings() {
+        let home = Path::new("/h");
+        assert_eq!(
+            user_config_paths(home, Some(PathBuf::from("/c"))),
+            (
+                PathBuf::from("/c/.claude.json"),
+                PathBuf::from("/c/settings.json")
+            )
+        );
+        for unset in [None, Some(PathBuf::new())] {
+            assert_eq!(
+                user_config_paths(home, unset),
+                (
+                    PathBuf::from("/h/.claude.json"),
+                    PathBuf::from("/h/.claude/settings.json")
+                )
+            );
+        }
+    }
 
     #[test]
     fn printable_escapes_terminal_control_sequences() {
