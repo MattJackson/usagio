@@ -2171,6 +2171,8 @@ fn cycle(slug: &str, active: &str, max_pct: f64, rate_limited: bool) -> Provider
         active: Some(active.to_string()),
         swapped: None,
         rate_limited,
+        fetched: 0,
+        failed: 0,
         max_pct: Some(max_pct),
         actionable: true,
         urgency: None,

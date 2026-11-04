@@ -3438,19 +3438,32 @@ fn handle_refresh_now() {
                 // Surface accounts that can't refresh at all — a dead login is
                 // the reason the numbers won't move, so a bare "Usage refreshed"
                 // would be a quiet lie for those rows.
-                let stuck = accounts_needing_relogin();
-                match stuck.as_slice() {
-                    [] => notify("Usage refreshed"),
-                    [one] => notify(&format!("Usage refreshed — {one} needs re-login")),
-                    many => notify(&format!(
-                        "Usage refreshed — {} accounts need re-login: {}",
-                        many.len(),
-                        many.join(", ")
-                    )),
-                }
+                let fetched = outcome.providers.iter().map(|p| p.fetched).sum();
+                let failed = outcome.providers.iter().map(|p| p.failed).sum();
+                notify(&refresh_summary(fetched, failed, &accounts_needing_relogin()));
             }
         });
     })
+}
+
+/// The "Refresh usage now" result toast. Per-account failures are logged and
+/// skipped by the cycle, so they must be counted here, not read off `Ok`.
+fn refresh_summary(fetched: usize, failed: usize, stuck: &[String]) -> String {
+    let head = match (fetched, failed) {
+        (0, f) if f > 0 => "Refresh failed — no account could be refreshed".to_string(),
+        (_, 0) => "Usage refreshed".to_string(),
+        (_, 1) => "Usage refreshed — 1 account could not be refreshed".to_string(),
+        (_, f) => format!("Usage refreshed — {f} accounts could not be refreshed"),
+    };
+    match stuck {
+        [] => head,
+        [one] => format!("{head} — {one} needs re-login"),
+        many => format!(
+            "{head} — {} accounts need re-login: {}",
+            many.len(),
+            many.join(", ")
+        ),
+    }
 }
 
 /// CAS `REFRESH_IN_FLIGHT` from `false` to `true`; if it was already `true`
@@ -8676,6 +8689,29 @@ mod tests {
             confirm_answer(R::Cancel, "Remove"),
             None,
             "a non-button result means the dialog could not be shown"
+        );
+    }
+
+    #[test]
+    fn refresh_now_reports_failed_fetches_instead_of_success() {
+        assert_eq!(
+            refresh_summary(0, 3, &[]),
+            "Refresh failed — no account could be refreshed"
+        );
+        assert_eq!(
+            refresh_summary(2, 1, &[]),
+            "Usage refreshed — 1 account could not be refreshed"
+        );
+        assert_eq!(
+            refresh_summary(2, 2, &[]),
+            "Usage refreshed — 2 accounts could not be refreshed"
+        );
+        assert_eq!(refresh_summary(2, 0, &[]), "Usage refreshed");
+        // Nothing was due (all skipped as fresh): not a failure.
+        assert_eq!(refresh_summary(0, 0, &[]), "Usage refreshed");
+        assert_eq!(
+            refresh_summary(1, 0, &["a@x.io".to_string()]),
+            "Usage refreshed — a@x.io needs re-login"
         );
     }
 

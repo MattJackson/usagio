@@ -3255,6 +3255,7 @@ fn write_claude_identity_with(
 // ---------------------------------------------------------------------------
 
 /// Outcome of a usage refresh.
+#[derive(Default)]
 struct RefreshOutcome {
     /// True if the ACTIVE account got HTTP 429 (caller should back off).
     rate_limited: bool,
@@ -3262,6 +3263,10 @@ struct RefreshOutcome {
     active_fetched: bool,
     /// Any account's usage request 429'd this cycle (v2 storm guard).
     saw_429: bool,
+    /// Accounts whose usage was fetched this cycle.
+    fetched: usize,
+    /// Accounts whose token refresh or usage fetch failed this cycle.
+    failed: usize,
 }
 
 /// The ONE place that calls the usage API. Does all network work (token refresh
@@ -3286,11 +3291,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
         Ok(s) => s,
         Err(e) => {
             logging::log(&format!("poll: state load failed: {e}"));
-            return RefreshOutcome {
-                rate_limited: false,
-                active_fetched: false,
-                saw_429: false,
-            };
+            return RefreshOutcome::default();
         }
     };
     // v1 state is Claude-only; resolve the provider once at the top of the
@@ -3301,11 +3302,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
         Ok(p) => p,
         Err(e) => {
             logging::log(&format!("poll: provider unavailable: {e:#}"));
-            return RefreshOutcome {
-                rate_limited: false,
-                active_fetched: false,
-                saw_429: false,
-            };
+            return RefreshOutcome::default();
         }
     };
     sync_active_from_keychain(provider, &mut state);
@@ -3318,6 +3315,8 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
     // Per-account outcome for the replay rows (§6); "skip" unless fetched.
     let mut outcomes: std::collections::HashMap<String, &'static str> =
         std::collections::HashMap::new();
+    // Token refreshes that failed before any fetch (no replay outcome).
+    let mut refresh_failed = 0usize;
     let mut active_fetched = false;
     let mut saw_429 = false;
 
@@ -3435,6 +3434,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
                 Ok((Some(ActiveRefreshOutcome::RefreshFailed), _)) => {
                     // Keep the existing cache this cycle; retry next tick.
                     note_refresh_error(email, Some("token refresh failed".to_string()));
+                    refresh_failed += 1;
                     continue;
                 }
                 Ok((Some(_), Some(fresh))) => {
@@ -3450,6 +3450,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
                     logging::log(&format!(
                         "poll: active CAS state operation failed for {email}: {e:#}"
                     ));
+                    refresh_failed += 1;
                     continue;
                 }
             }
@@ -3510,6 +3511,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
                         "token refresh failed for {email}: {e} (keeping cache)"
                     ));
                     note_refresh_error(email, Some(format!("token refresh failed: {e}")));
+                    refresh_failed += 1;
                     continue;
                 }
             }
@@ -3795,10 +3797,13 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
         logging::log(&format!("poll: saving refreshed cache failed: {e:#}"));
     }
     logging::log("poll: done");
+    let fetched = outcomes.values().filter(|o| **o == "ok").count();
     RefreshOutcome {
         rate_limited,
         active_fetched,
         saw_429,
+        fetched,
+        failed: outcomes.len() - fetched + refresh_failed,
     }
 }
 
@@ -4040,6 +4045,10 @@ struct ProviderRefresh {
     active_fetched: std::collections::HashSet<String>,
     /// Any account's request 429'd (v2 storm guard).
     saw_429: std::collections::HashSet<String>,
+    /// Accounts whose usage was fetched, per slug.
+    fetched: std::collections::HashMap<String, usize>,
+    /// Accounts whose token refresh or usage fetch failed, per slug.
+    failed: std::collections::HashMap<String, usize>,
 }
 
 #[cfg(test)]
@@ -4184,6 +4193,7 @@ fn refresh_provider_usage_caches_with(
                             &tracker_key,
                             Some(format!("token refresh failed: {e}")),
                         );
+                        *out.failed.entry(slug.to_string()).or_default() += 1;
                         continue;
                     }
                 }
@@ -4209,6 +4219,7 @@ fn refresh_provider_usage_caches_with(
             let cu = match provider.fetch_usage(&access) {
                 Ok(snap) => {
                     record_usage_fetch_success(&tracker_key);
+                    *out.fetched.entry(slug.to_string()).or_default() += 1;
                     if snap.plan.is_some() {
                         plan = snap.plan.clone();
                     }
@@ -4225,6 +4236,7 @@ fn refresh_provider_usage_caches_with(
                 }
                 Err(e) => {
                     record_fetch_attempt_failed(&tracker_key, now_ts);
+                    *out.failed.entry(slug.to_string()).or_default() += 1;
                     if matches!(e, ProviderError::RateLimited { .. }) {
                         outcomes.insert(key.clone(), "429");
                         out.saw_429.insert(slug.to_string());
@@ -4742,9 +4754,8 @@ fn with_fetch_trackers<T>(
 /// The last token-refresh / usage-fetch failure per fetch-tracker key, shown
 /// on the account's menu row until a fetch succeeds. In-memory like the
 /// trackers: the polling process is the one whose menu renders it.
-static LAST_REFRESH_ERRORS: std::sync::Mutex<
-    Option<std::collections::HashMap<String, String>>,
-> = std::sync::Mutex::new(None);
+static LAST_REFRESH_ERRORS: std::sync::Mutex<Option<std::collections::HashMap<String, String>>> =
+    std::sync::Mutex::new(None);
 
 fn note_refresh_error(key: &str, err: Option<String>) {
     let mut g = LAST_REFRESH_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
@@ -5082,6 +5093,10 @@ pub(crate) struct ProviderCycle {
     pub swapped: Option<(String, String)>,
     /// The active account's usage fetch was rate-limited (HTTP 429).
     pub rate_limited: bool,
+    /// Accounts whose usage was fetched this cycle.
+    pub fetched: usize,
+    /// Accounts whose token refresh or usage fetch failed this cycle.
+    pub failed: usize,
     /// The ACTIVE account's `Row::max_pct()` (session OR weekly, whichever is
     /// tighter), feeding `next_interval`'s cadence ramp. v0.5.13: scoped to the
     /// active account (see `cadence_max_pct`) so an inactive, already-maxed
@@ -5321,6 +5336,14 @@ fn watch_cycle(
                 provider_refresh.saw_429.contains(slug),
             )
         };
+        let (fetched, failed) = if slug == CLAUDE_SLUG {
+            (claude_refresh.fetched, claude_refresh.failed)
+        } else {
+            (
+                provider_refresh.fetched.get(slug).copied().unwrap_or(0),
+                provider_refresh.failed.get(slug).copied().unwrap_or(0),
+            )
+        };
         let max_pct = cadence_max_pct(&rows, active.as_deref());
         let guard = guards.for_provider(slug);
         guard.manual_locked_choice = state
@@ -5368,6 +5391,8 @@ fn watch_cycle(
             active,
             swapped,
             rate_limited,
+            fetched,
+            failed,
             max_pct,
             actionable,
             urgency,
