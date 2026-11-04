@@ -551,6 +551,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stale_session_and_session_priority_over_weekly() {
+        let now = t(10_000);
+        // Session alone stale.
+        let u = usage_with_fetched_at(Some(100.0), Some(9_970), None, None, 9_700);
+        assert_eq!(
+            compute_display(&u, now),
+            DisplayState::StaleAfterReset {
+                window: BlockingWindow::Session,
+                reset: t(9_970),
+            }
+        );
+        // Both stale: the session window wins even though weekly reset later.
+        let u = usage_with_fetched_at(Some(100.0), Some(9_900), Some(100.0), Some(9_970), 9_700);
+        assert_eq!(
+            compute_display(&u, now),
+            DisplayState::StaleAfterReset {
+                window: BlockingWindow::Session,
+                reset: t(9_900),
+            }
+        );
+    }
+
+    #[test]
+    fn missing_fetched_at_is_never_stale() {
+        let now = t(10_000);
+        let mut u = usage_with_fetched_at(None, None, Some(100.0), Some(9_970), 9_700);
+        u.fetched_at = None;
+        assert_eq!(
+            compute_display(&u, now),
+            DisplayState::Usage {
+                session_pct: None,
+                weekly_pct: Some(100.0),
+            }
+        );
+    }
+
+    #[test]
+    fn reset_exactly_now_is_stale_not_locked_and_one_second_later_is_locked() {
+        let now = t(10_000);
+        let u = usage_with_fetched_at(None, None, Some(100.0), Some(10_000), 9_700);
+        assert_eq!(
+            compute_display(&u, now),
+            DisplayState::StaleAfterReset {
+                window: BlockingWindow::Weekly,
+                reset: t(10_000),
+            }
+        );
+        let u = usage_with_fetched_at(None, None, Some(100.0), Some(10_001), 9_700);
+        assert_eq!(
+            compute_display(&u, now),
+            DisplayState::Locked {
+                until: t(10_001),
+                window: BlockingWindow::Weekly,
+            }
+        );
+    }
+
     // ---- is_stale_after_reset: every condition must hold ----
 
     #[test]
