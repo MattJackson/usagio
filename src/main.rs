@@ -4884,6 +4884,7 @@ fn persist_plan(
     let lapsed = !plan.active;
     let res = with_state_lock(|| {
         let mut st = State::load()?;
+        let loaded = serde_json::to_vec(&st).unwrap_or_default();
         let mut changed = false;
         let apply = |no_sub: &mut bool, label: &mut Option<String>| {
             let was = *no_sub;
@@ -4904,7 +4905,7 @@ fn persist_plan(
                 lifecycle::set_provider_tokens(provider, a, at, rt, *exp)?;
             }
         }
-        st.save()?;
+        save_if_changed(&st, &loaded)?;
         Ok(changed)
     });
     match res {

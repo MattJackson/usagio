@@ -7761,3 +7761,20 @@ fn an_in_sync_active_cas_does_not_rewrite_state() {
     assert!(matches!(outcome, Some(ActiveRefreshOutcome::Adopted)));
     assert_eq!(backups(), before, "an idle CAS rewrote state.json");
 }
+
+#[test]
+fn an_unchanged_plan_does_not_rewrite_state() {
+    let _g = crate::store::ScopedConfigDir::new();
+    let mut st = State::default();
+    st.upsert_provider_account("codex", codex_account("c@e.com", None));
+    st.save().unwrap();
+    persist_plan("codex", "c@e.com", &plan("Plus", true), None);
+    let backups = || {
+        std::fs::read_dir(crate::store::config_dir().unwrap().join("backups"))
+            .map(|d| d.count())
+            .unwrap_or(0)
+    };
+    let before = backups();
+    persist_plan("codex", "c@e.com", &plan("Plus", true), None);
+    assert_eq!(backups(), before, "an unchanged plan rotated a backup");
+}
