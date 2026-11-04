@@ -1644,10 +1644,13 @@ fn release_reset_hold(state: &mut State, slug: &str, rows: &[Row], trigger: f64)
 }
 
 /// `settle_manual_pick` for every provider with a pick still waiting on a
-/// post-switch reading, and `release_reset_hold` for every held one.
-fn settle_manual_picks(trigger: f64) {
+/// post-switch reading, and `release_reset_hold` for every held one. Judged
+/// against the saved trigger, the threshold `pick_tier` decided the hold by
+/// (not the cycle's effective one: auto-swap off runs at a 101% sentinel).
+fn settle_manual_picks() {
     let settled = with_state_lock(|| {
         let mut st = State::load()?;
+        let trigger = st.trigger_pct.unwrap_or(TRIGGER_PCT);
         let mut slugs: Vec<String> = st.manual_pick_at.keys().cloned().collect();
         slugs.extend(st.manual_holds.keys().cloned());
         slugs.sort();
@@ -5190,7 +5193,7 @@ fn watch_cycle(
         }
     }
     let provider_refresh = refresh_provider_usage_caches_with(force, trigger, &spent);
-    settle_manual_picks(trigger);
+    settle_manual_picks();
 
     let state = State::load()?;
     let now_ts = Utc::now().timestamp();

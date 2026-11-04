@@ -7661,3 +7661,28 @@ fn switch_away_keeps_a_renewal_whose_live_write_failed() {
         );
     });
 }
+
+#[test]
+fn a_hold_survives_a_cycle_run_with_auto_swap_off() {
+    // Auto-swap off runs the cycle at the 101% sentinel; the hold was decided
+    // against the saved 95% trigger and must be judged against it.
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let mut state = State {
+        trigger_pct: Some(95.0),
+        ..State::default()
+    };
+    let mut a = acct_with_cache(Some(usage_at(97.0)));
+    a.email = Some("pick@e.com".to_string());
+    state.upsert(a);
+    state.active = Some("pick@e.com".to_string());
+    state.set_manual_pick(CLAUDE_SLUG, Some("pick@e.com"));
+    state.set_manual_hold(CLAUDE_SLUG, Some("pick@e.com"));
+    state.manual_pick_at.clear(); // the first reading already settled it
+    state.save().unwrap();
+    // The cycle ran at the auto-swap-off sentinel (101%).
+    settle_manual_picks();
+    assert_eq!(
+        State::load().unwrap().manual_hold(CLAUDE_SLUG),
+        Some("pick@e.com")
+    );
+}
