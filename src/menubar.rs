@@ -2067,7 +2067,7 @@ fn cached_state() -> State {
 /// with no known reset — nothing useful to say.
 fn window_status_row(w: &WindowView) -> Option<(String, bool)> {
     let label = stat_display_label(w);
-    let locked = w.pct.is_some_and(|p| p >= 100.0);
+    let locked = w.pct.is_some_and(|p| p >= countdown::LOCKED_THRESHOLD_PCT);
     match (locked, w.reset.is_empty()) {
         (true, false) => Some((format!("{label} locked · unlocks in {}", w.reset), true)),
         (true, true) => Some((format!("{label} locked"), true)),
@@ -2235,17 +2235,18 @@ fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)
             // can't convey); otherwise keep window order (session before weekly).
             // Stable sort preserves that order among the non-locked windows.
             let mut ordered: Vec<&WindowView> = a.windows.iter().collect();
-            ordered.sort_by_key(|w| u8::from(!w.pct.is_some_and(|p| p >= 100.0)));
+            ordered.sort_by_key(|w| {
+                u8::from(!w.pct.is_some_and(|p| p >= countdown::LOCKED_THRESHOLD_PCT))
+            });
             // When the WEEKLY window is locked, the account is fully blocked
             // regardless of the session window — so drop the "Session renews in X"
             // line (its countdown is meaningless while the weekly limit blocks all
             // use). The "Weekly locked · unlocks in X" row says everything.
-            let weekly_locked = a
-                .windows
-                .iter()
-                .any(|w| w.id == "weekly" && w.pct.is_some_and(|p| p >= 100.0));
+            let weekly_locked = a.windows.iter().any(|w| {
+                w.id == "weekly" && w.pct.is_some_and(|p| p >= countdown::LOCKED_THRESHOLD_PCT)
+            });
             for w in ordered {
-                if weekly_locked && !w.pct.is_some_and(|p| p >= 100.0) {
+                if weekly_locked && !w.pct.is_some_and(|p| p >= countdown::LOCKED_THRESHOLD_PCT) {
                     continue;
                 }
                 if let Some((mut text, locked)) = window_status_row(w) {
@@ -2285,10 +2286,9 @@ fn account_extra_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
         // N% · ~X"). Once the weekly window is already locked (100%),
         // that reads as a redundant "· 100% · ~0m" — skip it; the
         // "Weekly limit reached" status row already conveys the lock.
-        let weekly_locked = a
-            .windows
-            .iter()
-            .any(|w| w.id == "weekly" && w.pct.is_some_and(|p| p >= 100.0));
+        let weekly_locked = a.windows.iter().any(|w| {
+            w.id == "weekly" && w.pct.is_some_and(|p| p >= countdown::LOCKED_THRESHOLD_PCT)
+        });
         if !weekly_locked {
             if let Some(row) = empty_in_row(&account_key, a, Utc::now()) {
                 rows.push(row);
@@ -5397,6 +5397,19 @@ mod tests {
     }
 
     #[test]
+    fn window_status_row_locks_at_the_countdown_threshold() {
+        let w = WindowView {
+            id: "weekly".into(),
+            label: "7d".into(),
+            pct: Some(99.7),
+            reset: "3d".into(),
+        };
+        let (text, locked) = window_status_row(&w).unwrap();
+        assert!(locked, "99.7% is locked per countdown threshold: {text}");
+        assert!(text.contains("unlocks in"), "{text}");
+    }
+
+    #[test]
     fn menu_signature_folds_provider_id() {
         // Same account, same numbers, different provider slug → different
         // signature. Guards against a cross-provider menu change being
@@ -6419,7 +6432,9 @@ mod tests {
         live.accounts.push(restore_test_acct("a@e.com"));
         live.save().unwrap();
         let redacted = crate::store::redact_state_for_dump(&crate::store::State::load().unwrap());
-        let path = crate::store::config_dir().unwrap().join("redacted-dump.json");
+        let path = crate::store::config_dir()
+            .unwrap()
+            .join("redacted-dump.json");
         std::fs::write(&path, serde_json::to_vec(&redacted).unwrap()).unwrap();
 
         let dialog = crate::platform::MockFileDialog::default();

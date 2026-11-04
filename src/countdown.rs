@@ -11,7 +11,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 
-const LOCKED_THRESHOLD_PCT: f64 = 99.5;
+pub(crate) const LOCKED_THRESHOLD_PCT: f64 = 99.5;
 
 #[derive(Clone, Debug)]
 pub struct AccountUsage {
