@@ -126,25 +126,14 @@ fn inspect<S: Read + Write>(socket: &mut WebSocket<S>) -> Result<ClientState> {
             .get("data")
             .and_then(Value::as_array)
             .context("Codex returned no loaded-thread list")?;
-        for thread in threads {
-            let thread_id = thread
-                .as_str()
-                .context("invalid loaded-thread identifier")?;
-            let details = call(
-                socket,
-                id,
-                "thread/read",
-                json!({"threadId":thread_id,"includeTurns":false}),
-            )?;
-            id += 1;
-            match details
-                .pointer("/thread/status/type")
-                .and_then(Value::as_str)
-            {
-                Some("idle" | "notLoaded" | "systemError") => {}
-                Some("active") => busy = true,
-                _ => bail!("Codex returned an unknown thread activity state"),
-            }
+        let ids = threads
+            .iter()
+            .map(|thread| thread.as_str().context("invalid loaded-thread identifier"))
+            .collect::<Result<Vec<_>>>()?;
+        if any_thread_active(socket, &mut id, &ids)? {
+            // One active thread settles it: no need to read the rest.
+            busy = true;
+            break;
         }
         cursor = page.get("nextCursor").cloned().unwrap_or(Value::Null);
         if cursor.is_null() {
@@ -157,6 +146,53 @@ fn inspect<S: Read + Write>(socket: &mut WebSocket<S>) -> Result<ClientState> {
         account_id,
         instance_token: None,
     })
+}
+
+/// Read the status of every thread in `ids` with one pipelined batch (all
+/// requests first, then the replies in any order) instead of one round trip
+/// each. Returns as soon as one reply reports an active thread.
+fn any_thread_active<S: Read + Write>(
+    socket: &mut WebSocket<S>,
+    next_id: &mut u64,
+    ids: &[&str],
+) -> Result<bool> {
+    let mut pending = std::collections::HashSet::new();
+    for thread_id in ids {
+        let id = *next_id;
+        *next_id += 1;
+        socket.send(Message::Text(
+            json!({"id": id, "method": "thread/read",
+                   "params": {"threadId": thread_id, "includeTurns": false}})
+            .to_string()
+            .into(),
+        ))?;
+        pending.insert(id);
+    }
+    while !pending.is_empty() {
+        let Message::Text(body) = socket.read()? else {
+            continue;
+        };
+        let response: Value = serde_json::from_str(&body)?;
+        let Some(id) = response.get("id").and_then(Value::as_u64) else {
+            continue;
+        };
+        if !pending.remove(&id) {
+            continue;
+        }
+        if response.get("error").is_some() {
+            // Never include response bodies: protocol errors can echo input.
+            bail!("Codex rejected thread/read");
+        }
+        match response
+            .pointer("/result/thread/status/type")
+            .and_then(Value::as_str)
+        {
+            Some("idle" | "notLoaded" | "systemError") => {}
+            Some("active") => return Ok(true),
+            _ => bail!("Codex returned an unknown thread activity state"),
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn probe() -> Result<Option<ClientState>> {
@@ -380,18 +416,27 @@ mod tests {
     /// `status` maps a thread id to its `thread/read` status type; loaded
     /// threads come in two pages, `t1` then `t2`.
     fn inspect_scripted(status: fn(&str) -> &'static str) -> Result<ClientState> {
+        inspect_scripted_logged(status).0
+    }
+
+    /// As `inspect_scripted`, also returning every request method received.
+    fn inspect_scripted_logged(
+        status: fn(&str) -> &'static str,
+    ) -> (Result<ClientState>, Vec<String>) {
         use tungstenite::protocol::Role;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (tcp, _) = listener.accept().unwrap();
             let mut ws = WebSocket::from_raw_socket(tcp, Role::Server, None);
+            let mut methods = Vec::new();
             while let Ok(msg) = ws.read() {
                 let Message::Text(body) = msg else { continue };
                 let req: Value = serde_json::from_str(&body).unwrap();
                 let Some(id) = req.get("id").cloned() else {
                     continue; // the `initialized` notification
                 };
+                methods.push(req["method"].as_str().unwrap().to_string());
                 let result = match req["method"].as_str().unwrap() {
                     "accountSession/list" => json!({"sessions": [
                         {"isActive": false, "email": "other@example.com"},
@@ -399,7 +444,7 @@ mod tests {
                          "selectedWorkspaceAccountId": "acct-1"},
                     ]}),
                     "thread/loaded/list" if req["params"]["cursor"].is_null() => {
-                        json!({"data": ["t1"], "nextCursor": "page-2"})
+                        json!({"data": ["t1", "t3"], "nextCursor": "page-2"})
                     }
                     "thread/loaded/list" => json!({"data": ["t2"], "nextCursor": null}),
                     "thread/read" => {
@@ -413,13 +458,34 @@ mod tests {
                     break;
                 }
             }
+            methods
         });
         let tcp = std::net::TcpStream::connect(addr).unwrap();
         let mut ws = WebSocket::from_raw_socket(tcp, Role::Client, None);
         let state = inspect(&mut ws);
         drop(ws);
-        server.join().unwrap();
-        state
+        let methods = server.join().unwrap();
+        (state, methods)
+    }
+
+    #[test]
+    fn inspect_stops_at_the_first_active_thread() {
+        let (state, methods) =
+            inspect_scripted_logged(|t| if t == "t1" { "active" } else { "idle" });
+        assert!(state.unwrap().busy);
+        let lists = methods
+            .iter()
+            .filter(|m| *m == "thread/loaded/list")
+            .count();
+        assert_eq!(
+            lists, 1,
+            "page 2 was fetched after a busy answer: {methods:?}"
+        );
+        // All threads idle: every loaded thread is read, page by page.
+        let (state, methods) = inspect_scripted_logged(|_| "idle");
+        assert!(!state.unwrap().busy);
+        let reads = methods.iter().filter(|m| *m == "thread/read").count();
+        assert_eq!(reads, 3, "{methods:?}");
     }
 
     #[test]
