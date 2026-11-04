@@ -1043,6 +1043,7 @@ struct MockActiveSlotProvider {
     retry_drain: bool,
     process_alive: std::sync::atomic::AtomicBool,
     drains: std::sync::Mutex<Vec<String>>,
+    lock_held_at_handoff: std::sync::atomic::AtomicBool,
     email: String,
     slot: std::sync::Mutex<Option<String>>,
 }
@@ -1057,6 +1058,7 @@ impl MockActiveSlotProvider {
             retry_drain: false,
             process_alive: std::sync::atomic::AtomicBool::new(false),
             drains: std::sync::Mutex::new(Vec::new()),
+            lock_held_at_handoff: std::sync::atomic::AtomicBool::new(false),
             email: "active@example.com".into(),
             slot: std::sync::Mutex::new(Some(initial.to_string())),
         }
@@ -1142,6 +1144,10 @@ impl crate::providers::Provider for MockActiveSlotProvider {
         _identity: &providers::IdentitySnapshot,
         _token: Option<&str>,
     ) -> providers::PResult<()> {
+        self.lock_held_at_handoff.store(
+            crate::credentials::state_lock_held(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         if self
             .fail_handoff
             .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -6320,4 +6326,292 @@ fn menu_order_active_locked_account_uses_unlock_time() {
     for selected in [Some("dev8"), Some("dev4"), None] {
         assert!(menu_order(&earlier, &active, selected, now).is_lt());
     }
+}
+
+#[test]
+fn auto_switch_hands_off_client_without_holding_state_lock() {
+    use std::sync::atomic::Ordering;
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let provider = MockActiveSlotProvider::new("outgoing");
+    let slug = provider.provider_id();
+    let mut account = codex_account("target@example.com", None);
+    account.identity_email = Some("target@example.com".into());
+    account.secret_blob = "target".into();
+    let mut state = State::default();
+    state.provider_accounts_mut(slug).accounts.push(account);
+    state.provider_accounts_mut(slug).active = Some("old@example.com".into());
+    state.save().unwrap();
+    let status = provider.client_status().unwrap();
+    let out = switch_provider_if_still_active(
+        &provider,
+        &status,
+        "target@example.com",
+        "old@example.com",
+    )
+    .unwrap();
+    assert!(out.is_some());
+    assert!(
+        !provider.lock_held_at_handoff.load(Ordering::SeqCst),
+        "state lock was held across client handoff"
+    );
+}
+
+#[test]
+fn rm_removes_a_captured_codex_account_by_qualified_or_bare_selector() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    for sel in ["codex:dev@example.com", "dev", "codex:dev"] {
+        let mut state = State::default();
+        state
+            .provider_accounts_mut("codex")
+            .accounts
+            .push(codex_account("dev@example.com", None));
+        state.save().unwrap();
+        cmd_rm(Some(sel)).unwrap_or_else(|e| panic!("rm {sel}: {e:#}"));
+        assert!(State::load()
+            .unwrap()
+            .provider_accounts("codex")
+            .is_none_or(|p| p.accounts.is_empty()));
+    }
+}
+
+#[test]
+fn renew_selector_qualifier_picks_the_provider() {
+    let mut slug = "claude".to_string();
+    let sel = strip_renew_qualifier(&mut slug, Some("codex:dev@example.com".into()));
+    assert_eq!(
+        (slug.as_str(), sel.as_deref()),
+        ("codex", Some("dev@example.com"))
+    );
+    let mut slug = "claude".to_string();
+    let sel = strip_renew_qualifier(&mut slug, Some("dev@example.com".into()));
+    assert_eq!(
+        (slug.as_str(), sel.as_deref()),
+        ("claude", Some("dev@example.com"))
+    );
+}
+
+#[test]
+fn renewing_active_account_keeps_a_queued_switch_to_another_account() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let provider = MockActiveSlotProvider::new("outgoing");
+    let slug = provider.provider_id();
+    let k = "active@example.com";
+    let mut state = State::default();
+    state
+        .provider_accounts_mut(slug)
+        .accounts
+        .push(codex_account(k, None));
+    state
+        .provider_accounts_mut(slug)
+        .accounts
+        .push(codex_account("other@example.com", None));
+    state.provider_accounts_mut(slug).active = Some(k.into());
+    state.provider_accounts_mut(slug).pending_switch = Some(store::PendingSwitch {
+        key: "other@example.com".into(),
+        manual: true,
+        from: Some(k.into()),
+        drain_token: Some("drain".into()),
+        credentials_written: false,
+        renewed_account: None,
+        leave_latch: None,
+    });
+    state.save().unwrap();
+    let captured = providers::trait_def::CapturedAccount {
+        identity: providers::IdentitySnapshot {
+            email: Some(k.into()),
+            uuid: None,
+            display_name: None,
+            native_blob: serde_json::Value::Null,
+        },
+        secret_blob: "renewed".into(),
+        tokens: providers::trait_def::TokenGrant {
+            access: "renewed-at".into(),
+            refresh: Some("renewed-rt".into()),
+            expires_in_secs: 3600,
+        },
+    };
+    let r = persist_login(&provider, captured, None).unwrap();
+    assert!(!r.made_live);
+    let state = State::load().unwrap();
+    let pa = state.provider_accounts(slug).unwrap();
+    let pending = pa.pending_switch.as_ref().expect("queued switch dropped");
+    assert_eq!(pending.key, "other@example.com");
+    assert_eq!(
+        state.find_provider_account(slug, k).unwrap().access_token,
+        "renewed-at"
+    );
+}
+
+#[test]
+fn poll_merge_does_not_reflag_a_renewed_login() {
+    let mut stored = claude_account("m@e.com", 3_600_000);
+    stored.refresh_token = "renewed-rt".into();
+    let mut snap = claude_account("m@e.com", 3_600_000);
+    snap.refresh_token = "superseded-rt".into();
+    snap.needs_relogin = true;
+    merge_poll_update(&mut stored, &snap, None, None);
+    assert!(!stored.needs_relogin);
+    snap.refresh_token = "renewed-rt".into();
+    merge_poll_update(&mut stored, &snap, None, None);
+    assert!(stored.needs_relogin);
+}
+
+#[test]
+fn poll_merge_keeps_newer_usage_and_expiry_warning() {
+    let mut stored = claude_account("m@e.com", 3_600_000);
+    let mut newer = cu(10.0, 10.0, 2000);
+    newer.fetched_at = 2000;
+    stored.cached_usage = Some(newer);
+    stored.notif_state.login_expiry_warned = Some(42);
+    let snap = claude_account("m@e.com", 3_600_000);
+    let mut older = cu(50.0, 50.0, 2000);
+    older.fetched_at = 1000;
+    let ns = notifications::NotifState {
+        pace_fired_this_window: true,
+        ..Default::default()
+    };
+    merge_poll_update(&mut stored, &snap, Some(&older), Some(&ns));
+    assert_eq!(stored.cached_usage.as_ref().unwrap().fetched_at, 2000);
+    assert_eq!(stored.notif_state.login_expiry_warned, Some(42));
+    assert!(stored.notif_state.pace_fired_this_window);
+}
+
+#[test]
+fn failed_fetch_keeps_a_plan_restored_earlier_in_the_cycle() {
+    let restored = plan("Pro", true);
+    let kept = plan_after_failed_fetch(Some(restored.clone()), None);
+    assert_eq!(kept.map(|p| p.active), Some(true));
+    let lapsed = plan_after_failed_fetch(Some(restored), Some(plan("Free", false)));
+    assert_eq!(lapsed.map(|p| p.active), Some(false));
+    assert!(plan_after_failed_fetch(None, None).is_none());
+}
+
+#[test]
+fn watch_flags_reject_bad_or_missing_values() {
+    let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert!(parse_watch_opts(&args(&["--trigger", "8O"])).is_err());
+    assert!(parse_watch_opts(&args(&["--ceiling"])).is_err());
+    assert!(parse_watch_opts(&args(&["--interval", "x"])).is_err());
+    let ok = parse_watch_opts(&args(&["--trigger", "80", "--interval", "30"])).unwrap();
+    assert_eq!(ok.trigger, Some(80.0));
+    assert_eq!(ok.base, 30);
+}
+
+#[cfg(unix)]
+#[test]
+fn run_with_deadline_kills_an_overrunning_child_without_timeout_binary() {
+    let started = std::time::Instant::now();
+    let mut cmd = std::process::Command::new("/bin/sleep");
+    cmd.arg("30");
+    let ok = run_with_deadline(cmd, std::time::Duration::from_millis(150)).unwrap();
+    assert!(!ok);
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    let cmd = std::process::Command::new("/usr/bin/true");
+    assert!(run_with_deadline(cmd, std::time::Duration::from_secs(5)).unwrap());
+}
+
+#[test]
+fn pending_switch_check_reports_a_state_read_failure() {
+    let cfg = crate::store::ScopedConfigDir::new();
+    let mut state = State::default();
+    state.provider_accounts_mut("codex").pending_switch = Some(store::PendingSwitch {
+        key: "a@example.com".into(),
+        manual: true,
+        from: None,
+        drain_token: None,
+        credentials_written: false,
+        renewed_account: None,
+        leave_latch: None,
+    });
+    state.save().unwrap();
+    assert!(try_provider_switch_pending("codex", "a@example.com").unwrap());
+    std::fs::write(store::config_dir().unwrap().join("state.json"), "{not json").unwrap();
+    assert!(try_provider_switch_pending("codex", "a@example.com").is_err());
+    drop(cfg);
+}
+
+#[test]
+fn pace_report_covers_non_claude_accounts() {
+    let mut state = State::default();
+    state
+        .provider_accounts_mut("codex")
+        .accounts
+        .push(codex_account("dev@example.com", None));
+    let targets = pace_targets(&state);
+    assert_eq!(
+        targets,
+        vec![("codex".to_string(), "dev@example.com".to_string())]
+    );
+}
+
+#[test]
+fn auto_commit_aborts_when_a_renewal_was_staged_after_the_cas() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let provider = MockActiveSlotProvider::new("outgoing");
+    let slug = provider.provider_id();
+    let (k, j) = ("active@example.com", "target@example.com");
+    let mut state = State::default();
+    for key in [k, j] {
+        let mut a = codex_account(key, None);
+        a.identity_email = Some(key.into());
+        state.provider_accounts_mut(slug).accounts.push(a);
+    }
+    state.provider_accounts_mut(slug).active = Some(k.into());
+    // The renewal staged by persist_login between the CAS and the commit.
+    state.provider_accounts_mut(slug).pending_switch = Some(store::PendingSwitch {
+        key: k.into(),
+        manual: true,
+        from: Some(k.into()),
+        drain_token: None,
+        credentials_written: false,
+        renewed_account: Some(codex_account(k, None)),
+        leave_latch: None,
+    });
+    state.save().unwrap();
+    let out = commit_provider_switch_guarded(&provider, slug, j, false, false, Some(k)).unwrap();
+    assert!(out.is_none());
+    assert_eq!(provider.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let state = State::load().unwrap();
+    let pa = state.provider_accounts(slug).unwrap();
+    assert_eq!(pa.pending_switch.as_ref().unwrap().key, k);
+    assert!(pa
+        .pending_switch
+        .as_ref()
+        .unwrap()
+        .renewed_account
+        .is_some());
+    assert_eq!(pa.active.as_deref(), Some(k));
+}
+
+#[test]
+fn rm_with_ambiguous_claude_selector_never_deletes_a_provider_account() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let mut state = State::default();
+    state.accounts.push(claude_account("dev1@a.com", 3_600_000));
+    state.accounts.push(claude_account("dev2@a.com", 3_600_000));
+    state
+        .provider_accounts_mut("codex")
+        .accounts
+        .push(codex_account("dev@x.com", None));
+    state.save().unwrap();
+    let err = cmd_rm(Some("dev")).unwrap_err().to_string();
+    assert!(err.contains("ambiguous"), "{err}");
+    let state = State::load().unwrap();
+    assert_eq!(state.accounts.len(), 2);
+    assert_eq!(state.provider_accounts("codex").unwrap().accounts.len(), 1);
+}
+
+#[test]
+fn rm_refuses_a_selector_matching_two_providers() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let mut state = State::default();
+    state.accounts.push(claude_account("dev@a.com", 3_600_000));
+    state
+        .provider_accounts_mut("codex")
+        .accounts
+        .push(codex_account("dev@a.com", None));
+    state.save().unwrap();
+    assert!(cmd_rm(Some("dev@a.com")).is_err());
+    assert_eq!(State::load().unwrap().accounts.len(), 1);
+    cmd_rm(Some("codex:dev@a.com")).unwrap();
 }

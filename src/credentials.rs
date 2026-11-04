@@ -69,6 +69,12 @@ impl Drop for DepthGuard {
     }
 }
 
+/// Whether this thread currently holds the state lock (test hook).
+#[cfg(test)]
+pub(crate) fn state_lock_held() -> bool {
+    STATE_LOCK_DEPTH.with(|d| d.get()) > 0
+}
+
 /// Run `f` holding the shared exclusive advisory lock on the state file.
 /// Serialises state read-modify-write across processes; reentrant within a
 /// single thread so callers can nest without self-deadlocking.
