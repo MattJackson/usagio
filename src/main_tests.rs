@@ -6359,12 +6359,50 @@ fn auto_switch_hands_off_client_without_holding_state_lock() {
     state.provider_accounts_mut(slug).active = Some("old@example.com".into());
     state.save().unwrap();
     let status = provider.client_status().unwrap();
-    let out =
-        switch_provider_if_still_active(&provider, &status, "target@example.com", "old@example.com")
-            .unwrap();
+    let out = switch_provider_if_still_active(
+        &provider,
+        &status,
+        "target@example.com",
+        "old@example.com",
+    )
+    .unwrap();
     assert!(out.is_some());
     assert!(
         !provider.lock_held_at_handoff.load(Ordering::SeqCst),
         "state lock was held across client handoff"
+    );
+}
+
+#[test]
+fn rm_removes_a_captured_codex_account_by_qualified_or_bare_selector() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    for sel in ["codex:dev@example.com", "dev", "codex:dev"] {
+        let mut state = State::default();
+        state
+            .provider_accounts_mut("codex")
+            .accounts
+            .push(codex_account("dev@example.com", None));
+        state.save().unwrap();
+        cmd_rm(Some(sel)).unwrap_or_else(|e| panic!("rm {sel}: {e:#}"));
+        assert!(State::load()
+            .unwrap()
+            .provider_accounts("codex")
+            .is_none_or(|p| p.accounts.is_empty()));
+    }
+}
+
+#[test]
+fn renew_selector_qualifier_picks_the_provider() {
+    let mut slug = "claude".to_string();
+    let sel = strip_renew_qualifier(&mut slug, Some("codex:dev@example.com".into()));
+    assert_eq!(
+        (slug.as_str(), sel.as_deref()),
+        ("codex", Some("dev@example.com"))
+    );
+    let mut slug = "claude".to_string();
+    let sel = strip_renew_qualifier(&mut slug, Some("dev@example.com".into()));
+    assert_eq!(
+        (slug.as_str(), sel.as_deref()),
+        ("claude", Some("dev@example.com"))
     );
 }

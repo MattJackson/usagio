@@ -691,6 +691,19 @@ fn warn_expiring_logins() {
     }
 }
 
+/// A `claude:`/`codex:` qualifier on a renew selector picks the provider (as it
+/// does for switch/start/rm); returns the bare account selector.
+fn strip_renew_qualifier(slug: &mut String, selector: Option<String>) -> Option<String> {
+    let sel = selector?;
+    match sel.split_once(':') {
+        Some((q, account)) => {
+            *slug = q.to_ascii_lowercase();
+            Some(account.to_string())
+        }
+        None => Some(sel),
+    }
+}
+
 /// `usagio login|renew [<email>] [--provider <slug>]`: run the provider's own
 /// login in the default browser — renewing `<email>`, or adding whichever
 /// account signs in when none is given (the CLI side of the menu's "Renew
@@ -698,7 +711,7 @@ fn warn_expiring_logins() {
 fn cmd_renew(args: &[String]) -> Result<()> {
     const USAGE: &str = "usage: usagio login|renew [<email>] [--provider <slug>]";
     let mut slug = CLAUDE_SLUG.to_string();
-    let mut selector = None;
+    let mut selector: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -706,6 +719,7 @@ fn cmd_renew(args: &[String]) -> Result<()> {
             other => selector = Some(other.to_string()),
         }
     }
+    let selector = strip_renew_qualifier(&mut slug, selector);
     let provider = provider_by_slug(&slug)?;
     let state = State::load()?;
     let target = match selector {
@@ -2285,12 +2299,42 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
 // rm
 // ---------------------------------------------------------------------------
 
+/// Resolve an account selector across providers: `claude:x` / `codex:x`
+/// qualify the provider; an unqualified selector tries Claude first, then the
+/// other providers' accounts. Returns `(slug, key)`.
+fn resolve_account_selector(state: &State, sel: &str) -> Result<(String, String)> {
+    if let Some((slug, account)) = sel.split_once(':') {
+        let slug = slug.to_ascii_lowercase();
+        provider_by_slug(&slug)?;
+        if slug == CLAUDE_SLUG {
+            return Ok((slug, state.resolve(account)?));
+        }
+        return resolve_provider_selector(state, sel)
+            .ok_or_else(|| anyhow!("no unique {slug} account matches '{account}'"));
+    }
+    let claude = (!state.accounts.is_empty()).then(|| state.resolve(sel));
+    if let Some(Ok(email)) = claude {
+        return Ok((CLAUDE_SLUG.to_string(), email));
+    }
+    if let Some(found) = resolve_provider_selector(state, sel) {
+        return Ok(found);
+    }
+    match claude {
+        Some(Err(e)) => Err(e),
+        _ => bail!("no account matches '{sel}'"),
+    }
+}
+
 fn cmd_rm(selector: Option<&str>) -> Result<()> {
     let selector = selector.context("usage: usagio rm <email>")?;
     let state = State::load()?;
-    let email = state.resolve(selector)?;
-    remove_account(&email)?;
-    println!("Removed {email}.");
+    let (slug, key) = resolve_account_selector(&state, selector)?;
+    if slug == CLAUDE_SLUG {
+        remove_account(&key)?;
+    } else {
+        remove_provider_account_generic(&slug, &key)?;
+    }
+    println!("Removed {key}.");
     Ok(())
 }
 
