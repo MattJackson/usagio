@@ -17,7 +17,7 @@ pub enum FetchError {
     Auth,
     /// HTTP 403 — the token is valid but the account may not use the endpoint.
     /// Seen when the account's Claude subscription has lapsed; the caller
-    /// confirms via the profile (`Provider::check_plan`) before treating it as that.
+    /// confirms via the profile (`PlanCheck::check_plan`) before treating it as that.
     Forbidden,
     /// Network / transport failure (no HTTP status).
     Transient(String),

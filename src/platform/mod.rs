@@ -637,7 +637,7 @@ mod tests {
         let start = String::from_utf8(output.stdout).unwrap();
         let token = serde_json::json!({"pid": pid, "start": start.trim()}).to_string();
         let alive = super::daemon_instance_alive(pid, start.trim());
-        let pending = crate::providers::Provider::verify_handoff_stopped(
+        let pending = crate::providers::ClientHandoff::verify_handoff_stopped(
             &crate::providers::codex::CodexProvider,
             &token,
         );
@@ -651,7 +651,7 @@ mod tests {
         // An unparseable record is "can't tell", never "stopped".
         assert!(unknown_generation.is_err());
         assert!(!super::daemon_instance_alive(pid, start.trim()).unwrap());
-        crate::providers::Provider::verify_handoff_stopped(
+        crate::providers::ClientHandoff::verify_handoff_stopped(
             &crate::providers::codex::CodexProvider,
             &token,
         )

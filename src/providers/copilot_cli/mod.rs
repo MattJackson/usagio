@@ -13,10 +13,7 @@
 
 #![allow(dead_code)]
 
-use crate::providers::trait_def::{
-    Capabilities, CaptureMode, CapturedAccount, PResult, Provider, ProviderError, SecretBackend,
-    TokenGrant,
-};
+use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
 pub fn new() -> Box<dyn Provider> {
     Box::new(CopilotCliProvider)
@@ -24,6 +21,11 @@ pub fn new() -> Box<dyn Provider> {
 
 pub struct CopilotCliProvider;
 
+// Not wired yet (no capability exposed):
+// TODO: read the `copilot-cli` macOS Keychain entry (or the plaintext
+// fallback in `~/.copilot/config.json`, or the env-var override
+// ladder), then GET `https://api.github.com/user` + `/user/emails`
+// with the resulting token to label the account.
 impl Provider for CopilotCliProvider {
     fn provider_id(&self) -> &'static str {
         "copilot-cli"
@@ -43,22 +45,6 @@ impl Provider for CopilotCliProvider {
             secret_backend: SecretBackend::Keychain,
             capture_mode: CaptureMode::CredsOnDisk,
         }
-    }
-
-    fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
-        // TODO: read the `copilot-cli` macOS Keychain entry (or the plaintext
-        // fallback in `~/.copilot/config.json`, or the env-var override
-        // ladder), then GET `https://api.github.com/user` + `/user/emails`
-        // with the resulting token to label the account.
-        Err(ProviderError::Unsupported)
-    }
-
-    fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
-        Err(ProviderError::Unsupported)
-    }
-
-    fn patch_stored_blob(&self, _blob: &str, _grant: &TokenGrant) -> PResult<String> {
-        Err(ProviderError::Unsupported)
     }
 }
 
@@ -81,9 +67,6 @@ mod tests {
 
     #[test]
     fn capture_returns_none_placeholder() {
-        assert!(matches!(
-            CopilotCliProvider.capture_current_login(),
-            Err(ProviderError::Unsupported)
-        ));
+        assert!(CopilotCliProvider.login_capture().is_none());
     }
 }

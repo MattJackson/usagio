@@ -16,10 +16,7 @@
 
 #![allow(dead_code)]
 
-use crate::providers::trait_def::{
-    Capabilities, CaptureMode, CapturedAccount, PResult, Provider, ProviderError, SecretBackend,
-    TokenGrant,
-};
+use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
 pub fn new() -> Box<dyn Provider> {
     Box::new(KimiProvider)
@@ -27,6 +24,10 @@ pub fn new() -> Box<dyn Provider> {
 
 pub struct KimiProvider;
 
+// Not wired yet (no capability exposed):
+// TODO: read `~/.kimi/` TOML plus the macOS Keychain entry under
+// service `kimi-code`, decode the OAuth refresh material, and emit a
+// single CapturedAccount for the currently-active slot.
 impl Provider for KimiProvider {
     fn provider_id(&self) -> &'static str {
         "kimi"
@@ -46,21 +47,6 @@ impl Provider for KimiProvider {
             secret_backend: SecretBackend::File,
             capture_mode: CaptureMode::CredsOnDisk,
         }
-    }
-
-    fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
-        // TODO: read `~/.kimi/` TOML plus the macOS Keychain entry under
-        // service `kimi-code`, decode the OAuth refresh material, and emit a
-        // single CapturedAccount for the currently-active slot.
-        Err(ProviderError::Unsupported)
-    }
-
-    fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
-        Err(ProviderError::Unsupported)
-    }
-
-    fn patch_stored_blob(&self, _blob: &str, _grant: &TokenGrant) -> PResult<String> {
-        Err(ProviderError::Unsupported)
     }
 }
 
@@ -87,9 +73,6 @@ mod tests {
 
     #[test]
     fn capture_returns_none_placeholder() {
-        assert!(matches!(
-            KimiProvider.capture_current_login(),
-            Err(ProviderError::Unsupported)
-        ));
+        assert!(KimiProvider.login_capture().is_none());
     }
 }

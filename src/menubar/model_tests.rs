@@ -6,6 +6,11 @@ use crate::menubar::test_support::{
 };
 use crate::menubar::tray::tray_target;
 use crate::providers;
+use crate::providers::LoginCapture;
+use crate::providers::PResult;
+use crate::providers::ProviderError;
+use crate::providers::TokenGrant;
+use crate::providers::TokenLifecycle;
 use crate::providers::{CaptureMode, Provider, SeverityBands, CLAUDE_SLUG};
 use crate::store::State;
 use chrono::{TimeZone, Utc};
@@ -255,9 +260,23 @@ impl Provider for FakeProvider {
             capture_mode: self.capture_mode,
         }
     }
+
+    fn login_capture(&self) -> Option<&dyn LoginCapture> {
+        Some(self)
+    }
+
+    fn token_lifecycle(&self) -> Option<&dyn TokenLifecycle> {
+        Some(self)
+    }
+}
+
+impl LoginCapture for FakeProvider {
     fn capture_current_login(&self) -> providers::PResult<Option<providers::CapturedAccount>> {
         Ok(None)
     }
+}
+
+impl TokenLifecycle for FakeProvider {
     fn parse_stored_blob(&self, _blob: &str) -> providers::PResult<providers::TokenGrant> {
         Err(providers::ProviderError::Unsupported)
     }
@@ -267,6 +286,15 @@ impl Provider for FakeProvider {
         _grant: &providers::TokenGrant,
     ) -> providers::PResult<String> {
         Err(providers::ProviderError::Unsupported)
+    }
+
+    fn refresh_token(&self, refresh: &str) -> PResult<TokenGrant> {
+        let _ = refresh;
+        Err(ProviderError::Unsupported)
+    }
+
+    fn supports_active_refresh(&self) -> bool {
+        false
     }
 }
 

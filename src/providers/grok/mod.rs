@@ -16,10 +16,7 @@
 
 #![allow(dead_code)]
 
-use crate::providers::trait_def::{
-    Capabilities, CaptureMode, CapturedAccount, PResult, Provider, ProviderError, SecretBackend,
-    TokenGrant,
-};
+use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
 pub fn new() -> Box<dyn Provider> {
     Box::new(GrokProvider)
@@ -27,6 +24,10 @@ pub fn new() -> Box<dyn Provider> {
 
 pub struct GrokProvider;
 
+// Not wired yet (no capability exposed):
+// TODO: read `~/.grok/auth.json` and `~/.grok/mcp_credentials.json`,
+// decode the OIDC ID token payload to pull the account email, and
+// emit a single CapturedAccount for the currently-active slot.
 impl Provider for GrokProvider {
     fn provider_id(&self) -> &'static str {
         "grok"
@@ -46,21 +47,6 @@ impl Provider for GrokProvider {
             secret_backend: SecretBackend::File,
             capture_mode: CaptureMode::CredsOnDisk,
         }
-    }
-
-    fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
-        // TODO: read `~/.grok/auth.json` and `~/.grok/mcp_credentials.json`,
-        // decode the OIDC ID token payload to pull the account email, and
-        // emit a single CapturedAccount for the currently-active slot.
-        Err(ProviderError::Unsupported)
-    }
-
-    fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
-        Err(ProviderError::Unsupported)
-    }
-
-    fn patch_stored_blob(&self, _blob: &str, _grant: &TokenGrant) -> PResult<String> {
-        Err(ProviderError::Unsupported)
     }
 }
 
@@ -87,9 +73,6 @@ mod tests {
 
     #[test]
     fn capture_returns_none_placeholder() {
-        assert!(matches!(
-            GrokProvider.capture_current_login(),
-            Err(ProviderError::Unsupported)
-        ));
+        assert!(GrokProvider.login_capture().is_none());
     }
 }

@@ -414,6 +414,8 @@ fn identity_matches(actual: &ClientState, email: &str, uuid: Option<&String>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::trait_def::ActiveSlot;
+    use crate::providers::trait_def::LoginFlow;
 
     /// Run `inspect` against a scripted daemon over a loopback socket pair.
     /// `status` maps a thread id to its `thread/read` status type; loaded
@@ -636,7 +638,6 @@ mod tests {
     #[test]
     #[ignore = "requires installed Codex; starts only an isolated test daemon"]
     fn isolated_daemon_restarts_and_loads_the_selected_account() {
-        use crate::providers::Provider;
         let _cfg = crate::store::ScopedConfigDir::new();
         let dir = tempfile::Builder::new()
             .prefix("usagio-codex-")

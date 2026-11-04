@@ -9,6 +9,7 @@ use crate::cli::capture::{capture_current, capture_current_generic};
 use crate::notifications::notify;
 use crate::picking::optimize_now;
 use crate::providers;
+use crate::providers::require;
 use crate::providers::CLAUDE_SLUG;
 use crate::state_ops::{remove_account, remove_provider_account_generic, with_state_lock};
 use crate::store::State;
@@ -477,10 +478,12 @@ pub(super) fn handle_apikey_capture(slug: &str) {
         ));
         return;
     };
-    // Deliberately call the trait method so the error message reflects the
-    // real provider state — a future wire-up (returning Ok) will just skip
-    // the notify branch below without touching this handler.
-    match provider.capture_api_key(String::new(), String::new()) {
+    // Ask the provider for the capability so the outcome reflects the real
+    // provider state — a future wire-up (exposing `ApiKeyCapture`) will just
+    // skip the notify branch below without touching this handler.
+    match require(provider.api_key_capture())
+        .and_then(|c| c.capture_api_key(String::new(), String::new()))
+    {
         Ok(acct) => notify(&format!(
             "Captured {} API-key account (persistence lands in a later phase): {}",
             provider.display_name(),

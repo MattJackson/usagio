@@ -4,6 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 
 use crate::notifications::notify;
+use crate::providers::require;
 use crate::providers::CLAUDE_SLUG;
 use crate::state_ops::with_state_lock;
 use crate::store::{Account, CachedUsage, ProviderAccount, State};
@@ -52,7 +53,7 @@ pub(crate) fn cmd_capture(args: &[String]) -> Result<()> {
 /// (email, existed_already). Shared by the CLI and the menu bar.
 ///
 /// Delegates identity resolution (email lookup + `~/.claude.json` snapshot)
-/// to `providers::claude`'s `Provider::capture_current_login` — the same
+/// to `providers::claude`'s `LoginCapture::capture_current_login` — the same
 /// logic every other provider's capture path (`capture_current_generic`)
 /// already dispatches through — instead of re-deriving it inline (v0.5.2
 /// simplification-02). Persistence still targets `state.accounts` (the
@@ -65,8 +66,8 @@ pub(crate) fn cmd_capture(args: &[String]) -> Result<()> {
 /// across two incompatible buckets.
 pub(crate) fn capture_current() -> Result<(String, bool)> {
     let provider = provider_by_slug(CLAUDE_SLUG)?;
-    let captured = provider
-        .capture_current_login()
+    let captured = require(provider.login_capture())
+        .and_then(|c| c.capture_current_login())
         .map_err(|e| anyhow!("{e}"))?
         .ok_or_else(|| {
             anyhow!(
@@ -138,8 +139,8 @@ pub(crate) fn merged_cached_usage(existing: Option<&Account>) -> Option<CachedUs
 /// "Refreshed").
 pub(crate) fn capture_current_generic(slug: &str) -> Result<(String, bool)> {
     let provider = provider_by_slug(slug)?;
-    let captured = provider
-        .capture_current_login()
+    let captured = require(provider.login_capture())
+        .and_then(|c| c.capture_current_login())
         .map_err(|e| anyhow!("{e}"))?
         .ok_or_else(|| anyhow!("nothing to capture — is {slug} logged in on this host?"))?;
     let key = provider.account_identifier(&captured.identity);
@@ -287,7 +288,7 @@ pub(crate) fn persist_login(
     if active {
         let _refresh = lifecycle::refresh_lock()?;
         let attempt = (|| -> Result<bool> {
-            let status = provider.client_status()?;
+            let status = lifecycle::client_status(provider)?;
             let ready = with_state_lock(|| {
                 let mut state = State::load()?;
                 lifecycle::prepare_handoff(provider, &status, &mut state, &key, false)
@@ -356,7 +357,9 @@ pub(crate) fn persist_claude_login(
         // Inside the lock, so a concurrent switch can't land between the
         // "is it active" check and this write.
         if active {
-            if let Err(e) = provider.write_active_account(&a.keychain_blob, &identity) {
+            if let Err(e) = require(provider.active_slot())
+                .and_then(|slot| slot.write_active_account(&a.keychain_blob, &identity))
+            {
                 // Durable marker so the next poll's CAS republishes this exact
                 // grant instead of adopting the old slot over it.
                 let fp = logging::token_fingerprint(&a.refresh_token);
@@ -383,7 +386,7 @@ pub(crate) fn persist_claude_login(
 /// point). Lapsed-plan accounts are skipped — they render as their plan.
 pub(crate) fn warn_expiring_logins() {
     if providers::get(CLAUDE_SLUG)
-        .and_then(|p| p.login_spec())
+        .and_then(|p| p.login_flow())
         .is_none()
     {
         return;

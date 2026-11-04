@@ -1,6 +1,7 @@
 use super::*;
 use crate::cli::capture::capture_current_generic;
 use crate::providers::claude::oauth;
+use crate::providers::trait_def::ClientHandoff;
 use crate::providers::Provider;
 use crate::store::{Account, State};
 use crate::test_support::{

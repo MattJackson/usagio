@@ -14,10 +14,7 @@
 
 #![allow(dead_code)]
 
-use crate::providers::trait_def::{
-    Capabilities, CaptureMode, CapturedAccount, PResult, Provider, ProviderError, SecretBackend,
-    TokenGrant,
-};
+use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
 pub fn new() -> Box<dyn Provider> {
     Box::new(ZaiProvider)
@@ -25,6 +22,9 @@ pub fn new() -> Box<dyn Provider> {
 
 pub struct ZaiProvider;
 
+// Not wired yet (no capability exposed):
+// TODO: derive account_id = `<nickname>-<last-4-of-key>`, persist
+// the key to the keychain under `zai/<account_id>`.
 impl Provider for ZaiProvider {
     fn provider_id(&self) -> &'static str {
         "zai"
@@ -46,24 +46,6 @@ impl Provider for ZaiProvider {
             secret_backend: SecretBackend::Keychain,
             capture_mode: CaptureMode::ApiKey,
         }
-    }
-
-    fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
-        Err(ProviderError::Unsupported)
-    }
-
-    fn capture_api_key(&self, _nickname: String, _key: String) -> PResult<CapturedAccount> {
-        // TODO: derive account_id = `<nickname>-<last-4-of-key>`, persist
-        // the key to the keychain under `zai/<account_id>`.
-        Err(ProviderError::Unsupported)
-    }
-
-    fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
-        Err(ProviderError::Unsupported)
-    }
-
-    fn patch_stored_blob(&self, _blob: &str, _grant: &TokenGrant) -> PResult<String> {
-        Err(ProviderError::Unsupported)
     }
 }
 
@@ -91,13 +73,7 @@ mod tests {
     #[test]
     fn capture_paths_return_unsupported() {
         let p = ZaiProvider;
-        assert!(matches!(
-            p.capture_current_login(),
-            Err(ProviderError::Unsupported)
-        ));
-        assert!(matches!(
-            p.capture_api_key("prod".into(), "sk-zai-x".into()),
-            Err(ProviderError::Unsupported)
-        ));
+        assert!(p.login_capture().is_none());
+        assert!(p.api_key_capture().is_none());
     }
 }

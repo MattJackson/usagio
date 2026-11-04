@@ -749,7 +749,7 @@ impl Paths for WindowsPaths {
 // ---- Terminal launcher ------------------------------------------------------
 //
 // Not (yet) part of the `Platform` trait — no caller launches an interactive
-// REPL in a new terminal window on any OS today (`Provider::launch_client`
+// REPL in a new terminal window on any OS today (`Launcher::launch_client`
 // runs the vendor CLI in-place via `Command::status()`; see
 // `src/providers/claude/mod.rs`). This is the Windows-side primitive for
 // when that lands; kept `pub(crate)` so it's ready to wire up without

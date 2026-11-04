@@ -119,7 +119,7 @@ pub struct UsageSnapshot {
     pub fetched_at: DateTime<Utc>,
     /// The account's plan, when the usage response reports it (Codex's
     /// `plan_type`). `None` when the provider only exposes it elsewhere —
-    /// see [`Provider::check_plan`].
+    /// see [`PlanCheck::check_plan`].
     #[serde(default)]
     pub plan: Option<PlanStatus>,
     /// Extra figures the provider itself reported alongside the windows
@@ -466,7 +466,7 @@ pub struct CapturedAccount {
 /// with a loopback redirect — the flow every vendor CLI's own `login` runs.
 /// One engine (`crate::login`) drives it for every provider; a provider only
 /// describes its endpoints here and turns the token response into its own
-/// credential blob in [`Provider::complete_login`].
+/// credential blob in [`LoginFlow::complete_login`].
 #[derive(Clone, Debug)]
 pub struct LoginSpec {
     pub authorize_url: &'static str,
@@ -547,9 +547,9 @@ pub enum CaptureMode {
 /// to construct a "Switch to this account" / "Launch client" / "Remove…" row
 /// at all — they must stay truthful. Before this fix, `supports_switching`
 /// alone gated BOTH the Switch row and the Launch row (a provider whose
-/// `write_active_account` was wired but whose `launch_client` was still the
-/// `Unsupported` trait default would still get a Launch row that always
-/// errored), and the Remove row wasn't gated on anything.
+/// `write_active_account` was wired but which had no launcher would still
+/// get a Launch row that always errored), and the Remove row wasn't gated on
+/// anything.
 #[derive(Copy, Clone, Debug)]
 pub struct Capabilities {
     pub supports_usage: bool,
@@ -594,7 +594,7 @@ impl AccountKey {
 }
 
 /// How fresh a stored credential blob is relative to `now`. Returned by
-/// `Provider::credential_freshness` so a provider-agnostic sync layer can
+/// `CredentialSync::credential_freshness` so a provider-agnostic sync layer can
 /// compare rotations across paths without knowing per-provider timestamps.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CredentialFreshness {
@@ -638,6 +638,13 @@ impl CredentialFreshness {
 
 /// One provider (Claude, Codex, opencode, ...). Registered once at startup
 /// via `providers::init()`; every method is called through `&dyn Provider`.
+///
+/// The core trait covers only what every provider has: its identity, its
+/// UI flags, and how its accounts are keyed and labelled. Everything a
+/// provider may or may not support is a separate capability trait, reached
+/// through an accessor that returns `None` when the provider lacks it — a
+/// caller asks for the capability and handles its absence, instead of
+/// calling a method that answers `Unsupported`.
 pub trait Provider: Send + Sync + 'static {
     // --- Identity of the provider itself ---
 
@@ -668,248 +675,6 @@ pub trait Provider: Send + Sync + 'static {
         &[]
     }
 
-    // --- Capture / listing ---
-
-    /// Read whatever the vendor CLI persisted on this host. `Ok(None)` means
-    /// "nothing captured / not logged in"; `Err(Unsupported)` means the
-    /// provider is a pure stub with no capture path wired yet.
-    fn capture_current_login(&self) -> PResult<Option<CapturedAccount>>;
-
-    /// Register an account onboarded via a pasted API key. `nickname` is the
-    /// user-supplied label (used for menu display and, for providers that
-    /// can't derive an email from the key alone, for `account_identifier`);
-    /// `key` is the raw API key. Default is `Unsupported` for providers whose
-    /// `capture_mode` is `CredsOnDisk`.
-    fn capture_api_key(&self, nickname: String, key: String) -> PResult<CapturedAccount> {
-        let _ = (nickname, key);
-        Err(ProviderError::Unsupported)
-    }
-
-    /// This provider's browser login, if usagio can run it itself (the "Renew
-    /// login…" action). `None` = the user must log in through the vendor CLI.
-    fn login_spec(&self) -> Option<LoginSpec> {
-        None
-    }
-
-    /// Turn a successful authorization-code exchange (the token endpoint's
-    /// JSON response) into a captured account: identity resolved from the
-    /// provider (never trusted from the window) plus the credential blob the
-    /// vendor CLI would have written.
-    fn complete_login(&self, token_response: &Value) -> PResult<CapturedAccount> {
-        let _ = token_response;
-        Err(ProviderError::Unsupported)
-    }
-
-    // --- Token lifecycle ---
-
-    /// Decode the vendor's on-disk credential bytes to a `TokenGrant`.
-    fn parse_stored_blob(&self, blob: &str) -> PResult<TokenGrant>;
-
-    /// Merge a fresh `TokenGrant` back into the vendor blob (typically after
-    /// a refresh); returns the bytes to persist.
-    fn patch_stored_blob(&self, blob: &str, grant: &TokenGrant) -> PResult<String>;
-
-    /// Refresh an access token using the stored refresh token. Default is
-    /// `Unsupported` for providers that don't do refresh math themselves.
-    fn refresh_token(&self, refresh: &str) -> PResult<TokenGrant> {
-        let _ = refresh;
-        Err(ProviderError::Unsupported)
-    }
-
-    /// Refresh a saved credential, preserving vendor metadata alongside tokens.
-    /// Ownership, serialization and persistence belong to the lifecycle engine.
-    fn refresh_credential(&self, blob: &str, refresh: &str) -> PResult<(TokenGrant, String)> {
-        let grant = self.refresh_token(refresh)?;
-        let updated = self.patch_stored_blob(blob, &grant)?;
-        Ok((grant, updated))
-    }
-
-    /// Whether this provider's refresh grant is fully programmatic (a plain
-    /// HTTPS POST `usagio` can issue itself, with no vendor CLI / browser
-    /// step required) and therefore safe to drive proactively — including,
-    /// for providers whose active-login store is a single file (no separate
-    /// keychain/identity-file layer), refreshing the ACTIVE account under a
-    /// compare-and-swap on that file (see `codex::oauth::active_refresh_cas`
-    /// for the reference implementation and its doc comment for why Codex's
-    /// CAS is simpler than a keychain-backed provider's).
-    ///
-    /// Deliberately a trait method with a `false` default rather than a
-    /// `Capabilities` field: `Capabilities` is a plain struct literal
-    /// constructed by every provider, so adding a required field there would
-    /// force an unrelated edit onto every other provider module. A method
-    /// with a default impl lets Codex opt in without touching anyone else.
-    fn supports_active_refresh(&self) -> bool {
-        false
-    }
-
-    // --- Usage ---
-
-    /// Call the provider's usage endpoint with the given access token.
-    /// Default is `Unsupported` for reporting-only providers without one.
-    fn fetch_usage(&self, access_token: &str) -> PResult<UsageSnapshot> {
-        let _ = access_token;
-        Err(ProviderError::Unsupported)
-    }
-
-    /// [`Self::fetch_usage`] for a stored account, whose `secret_blob` may
-    /// carry request context the token alone lacks (Codex's ChatGPT
-    /// workspace id). Defaults to `fetch_usage`.
-    fn fetch_account_usage(&self, access_token: &str, secret_blob: &str) -> PResult<UsageSnapshot> {
-        let _ = secret_blob;
-        self.fetch_usage(access_token)
-    }
-
-    /// Ask the provider which plan the account is on, WITHOUT touching the
-    /// usage endpoint (so it's safe to call while that endpoint 403s/429s a
-    /// lapsed account). Used to confirm a suspected lapse and to notice a
-    /// renewal. `None` = unknown or unsupported; callers then fall back to
-    /// the plan reported in [`UsageSnapshot::plan`], if any.
-    fn check_plan(&self, access_token: &str) -> Option<PlanStatus> {
-        let _ = access_token;
-        None
-    }
-
-    // --- Switching ---
-
-    /// Persist `blob` as the active login for this provider and update any
-    /// identity-adjacent files the vendor CLI expects to read.
-    fn write_active_account(&self, blob: &str, identity: &IdentitySnapshot) -> PResult<()> {
-        let _ = (blob, identity);
-        Err(ProviderError::Unsupported)
-    }
-
-    /// Read whatever the vendor CLI currently considers the active identity.
-    fn read_active_identity(&self) -> PResult<Option<IdentitySnapshot>> {
-        Err(ProviderError::Unsupported)
-    }
-
-    /// Inspect a client that caches credentials. Stateless clients need no handoff.
-    fn client_status(&self) -> PResult<ClientStatus> {
-        Ok(ClientStatus::default())
-    }
-
-    /// Load the newly written credentials and verify the running identity.
-    /// Called only after the shared engine permits the handoff.
-    fn begin_handoff(&self, token: &str) -> PResult<()> {
-        let _ = token;
-        Ok(())
-    }
-
-    /// Whether begin_handoff waits for process exit within a bounded deadline.
-    fn handoff_stops_synchronously(&self) -> bool {
-        false
-    }
-
-    /// Whether retrying the same stop request is supported.
-    fn handoff_request_is_idempotent(&self) -> bool {
-        false
-    }
-
-    /// Confirm that the drained instance has fully exited before credentials change.
-    fn verify_handoff_stopped(&self, token: &str) -> PResult<()> {
-        let _ = token;
-        Ok(())
-    }
-
-    fn handoff_client(&self, identity: &IdentitySnapshot, token: Option<&str>) -> PResult<()> {
-        let _ = (identity, token);
-        Ok(())
-    }
-
-    /// Launch the vendor CLI in the given mode (fresh session vs continue).
-    fn launch_client(&self, mode: LaunchMode) -> PResult<ExitStatus> {
-        let _ = mode;
-        Err(ProviderError::Unsupported)
-    }
-
-    /// Persist `blob` to the vendor CLI's OS-native credential storage for
-    /// wherever `read_active_identity` would report as the current login.
-    ///
-    /// Called ONLY after usagio refreshes an INACTIVE account's token
-    /// server-side (see `credentials::refresh_inactive_if_stale`) — never for
-    /// the active account, which the vendor CLI itself owns rotation for.
-    /// Without this mirror step, state.json would race ahead of whatever
-    /// on-disk / keychain blob the vendor CLI reads on its next invocation,
-    /// silently reintroducing the "never re-login" regression this exists to
-    /// close.
-    ///
-    /// The default impl delegates to `write_active_account` using the
-    /// current identity — providers with no switching support (whose
-    /// `read_active_identity` is still the `Unsupported` trait default)
-    /// inherit `Unsupported` transitively, which is the correct behavior:
-    /// there's nowhere vendor-native to mirror to yet.
-    fn mirror_rotated_token(&self, blob: &str) -> PResult<()> {
-        match self.read_active_identity()? {
-            Some(id) => self.write_active_account(blob, &id),
-            None => Err(ProviderError::NotLoggedIn),
-        }
-    }
-
-    /// Read the vendor CLI's current OS-native credential blob for whichever
-    /// account it currently considers active — the same slot
-    /// `mirror_rotated_token` writes to (macOS keychain, or the on-disk
-    /// credentials file on Linux/Windows).
-    ///
-    /// This is the read half of the compare-and-swap the ACTIVE account's
-    /// refresh cycle uses (`main.rs::active_refresh_cas`): usagio reads this
-    /// slot before AND after its own `/token` POST to detect whether the
-    /// vendor CLI rotated the same slot concurrently, without introducing any
-    /// new OS-specific code outside `platform/*` — providers implement this
-    /// purely in terms of `Platform::secrets()` / `credential_paths()`, the
-    /// same primitives `mirror_rotated_token` already uses.
-    ///
-    /// `Ok(None)` means the slot is empty (nothing captured yet). Default is
-    /// `Unsupported` — only providers with `mirror_rotated_token` wired
-    /// (Claude, Codex) implement this.
-    fn read_active_slot(&self) -> PResult<Option<String>> {
-        Err(ProviderError::Unsupported)
-    }
-
-    // --- Credential sync (fsnotify + proactive refresh + last-chance fallback) ---
-
-    /// On-disk paths where the vendor CLI may write this provider's
-    /// credential blob. The credential-sync watcher subscribes to these with
-    /// notify(); the last-chance fallback re-reads them on invalid_grant to
-    /// adopt whichever rotation the vendor did behind our back. Default is
-    /// empty — providers that don't persist to disk don't participate.
-    fn credential_paths(&self) -> Vec<PathBuf> {
-        Vec::new()
-    }
-
-    /// Which account does this raw credential blob belong to? Returns
-    /// `Some(AccountKey)` if the blob is recognisable and carries an
-    /// identifier this provider tracks. Default is `None` (unknown).
-    fn identify_credential(&self, blob: &str) -> Option<AccountKey> {
-        let _ = blob;
-        None
-    }
-
-    /// Last-resort identification for a blob `identify_credential` could not
-    /// place (e.g. tokens but no embedded identity). May perform ONE network
-    /// request, so it is only called from the invalid_grant last-chance
-    /// fallback, never from polling or watcher paths. Default is `None`.
-    fn identify_credential_online(&self, blob: &str) -> Option<AccountKey> {
-        let _ = blob;
-        None
-    }
-
-    /// Report how fresh the blob's access token is right now. Used to pick
-    /// the freshest of several observed rotations, and to decide when to
-    /// pre-emptively refresh an inactive account.
-    fn credential_freshness(&self, blob: &str) -> CredentialFreshness {
-        let _ = blob;
-        CredentialFreshness::Unknown
-    }
-
-    /// Absorb a rotated blob into `account`'s stored credentials. Providers
-    /// that own a slot in state.json overwrite it in place; providers with
-    /// no first-class account storage yet may no-op. Default is a no-op so
-    /// non-tracked providers don't need to opt in.
-    fn absorb_credential(&self, account: &AccountKey, blob: &str) -> PResult<()> {
-        let _ = (account, blob);
-        Ok(())
-    }
-
     // --- Account identity helpers ---
 
     /// The key a stored account should have under this build's keying, when
@@ -938,6 +703,253 @@ pub trait Provider: Send + Sync + 'static {
             .or_else(|| id.display_name.clone())
             .unwrap_or_else(|| format!("{} account", self.display_name()))
     }
+
+    // --- Capabilities (None = the provider doesn't have it) ---
+
+    /// Reading the login the vendor CLI persisted on this host.
+    fn login_capture(&self) -> Option<&dyn LoginCapture> {
+        None
+    }
+
+    /// Onboarding an account from a pasted API key.
+    fn api_key_capture(&self) -> Option<&dyn ApiKeyCapture> {
+        None
+    }
+
+    /// usagio's own browser sign-in for this provider.
+    fn login_flow(&self) -> Option<&dyn LoginFlow> {
+        None
+    }
+
+    /// Decoding, patching and refreshing the stored credential blob.
+    fn token_lifecycle(&self) -> Option<&dyn TokenLifecycle> {
+        None
+    }
+
+    /// Fetching usage from the provider's usage endpoint.
+    fn usage_source(&self) -> Option<&dyn UsageSource> {
+        None
+    }
+
+    /// Asking which plan an account is on, separately from usage.
+    fn plan_check(&self) -> Option<&dyn PlanCheck> {
+        None
+    }
+
+    /// Reading and writing the vendor CLI's active login (switching).
+    fn active_slot(&self) -> Option<&dyn ActiveSlot> {
+        None
+    }
+
+    /// Draining a running client that caches credentials before a switch.
+    /// Absent = the client is stateless and needs no handoff.
+    fn client_handoff(&self) -> Option<&dyn ClientHandoff> {
+        None
+    }
+
+    /// Launching the vendor CLI.
+    fn launcher(&self) -> Option<&dyn Launcher> {
+        None
+    }
+
+    /// Following rotations the vendor CLI writes to disk (fsnotify sync,
+    /// proactive refresh, and the invalid_grant last-chance fallback).
+    fn credential_sync(&self) -> Option<&dyn CredentialSync> {
+        None
+    }
+}
+
+/// A capability a caller cannot do without: `Unsupported` when absent.
+pub fn require<C: ?Sized>(capability: Option<&C>) -> PResult<&C> {
+    capability.ok_or(ProviderError::Unsupported)
+}
+
+/// Reads whatever the vendor CLI persisted on this host.
+pub trait LoginCapture: Send + Sync {
+    /// `Ok(None)` means "nothing captured / not logged in".
+    fn capture_current_login(&self) -> PResult<Option<CapturedAccount>>;
+}
+
+/// Registers an account onboarded via a pasted API key.
+pub trait ApiKeyCapture: Send + Sync {
+    /// `nickname` is the user-supplied label (used for menu display and, for
+    /// providers that can't derive an email from the key alone, for
+    /// `account_identifier`); `key` is the raw API key.
+    fn capture_api_key(&self, nickname: String, key: String) -> PResult<CapturedAccount>;
+}
+
+/// usagio's own browser login (the "Renew login…" action). A provider
+/// without it is signed in through the vendor CLI.
+pub trait LoginFlow: Send + Sync {
+    /// The authorization endpoints and client parameters of the login.
+    fn login_spec(&self) -> LoginSpec;
+
+    /// Turn a successful authorization-code exchange (the token endpoint's
+    /// JSON response) into a captured account: identity resolved from the
+    /// provider (never trusted from the window) plus the credential blob the
+    /// vendor CLI would have written.
+    fn complete_login(&self, token_response: &Value) -> PResult<CapturedAccount>;
+}
+
+/// The stored credential blob's token lifecycle.
+pub trait TokenLifecycle: Send + Sync {
+    /// Decode the vendor's on-disk credential bytes to a `TokenGrant`.
+    fn parse_stored_blob(&self, blob: &str) -> PResult<TokenGrant>;
+
+    /// Merge a fresh `TokenGrant` back into the vendor blob (typically after
+    /// a refresh); returns the bytes to persist.
+    fn patch_stored_blob(&self, blob: &str, grant: &TokenGrant) -> PResult<String>;
+
+    /// Refresh an access token using the stored refresh token.
+    fn refresh_token(&self, refresh: &str) -> PResult<TokenGrant>;
+
+    /// Refresh a saved credential, preserving vendor metadata alongside tokens.
+    /// Ownership, serialization and persistence belong to the lifecycle engine.
+    fn refresh_credential(&self, blob: &str, refresh: &str) -> PResult<(TokenGrant, String)> {
+        let grant = self.refresh_token(refresh)?;
+        let updated = self.patch_stored_blob(blob, &grant)?;
+        Ok((grant, updated))
+    }
+
+    /// Whether this provider's refresh grant is fully programmatic (a plain
+    /// HTTPS POST `usagio` can issue itself, with no vendor CLI / browser
+    /// step required) and therefore safe to drive proactively — including,
+    /// for providers whose active-login store is a single file (no separate
+    /// keychain/identity-file layer), refreshing the ACTIVE account under a
+    /// compare-and-swap on that file (see `codex::oauth::active_refresh_cas`
+    /// for the reference implementation and its doc comment for why Codex's
+    /// CAS is simpler than a keychain-backed provider's).
+    fn supports_active_refresh(&self) -> bool;
+}
+
+/// The provider's usage endpoint.
+pub trait UsageSource: Send + Sync {
+    /// Call the provider's usage endpoint with the given access token.
+    fn fetch_usage(&self, access_token: &str) -> PResult<UsageSnapshot>;
+
+    /// [`Self::fetch_usage`] for a stored account, whose `secret_blob` may
+    /// carry request context the token alone lacks (Codex's ChatGPT
+    /// workspace id). Defaults to `fetch_usage`.
+    fn fetch_account_usage(&self, access_token: &str, secret_blob: &str) -> PResult<UsageSnapshot> {
+        let _ = secret_blob;
+        self.fetch_usage(access_token)
+    }
+}
+
+/// Asks the provider which plan the account is on, WITHOUT touching the
+/// usage endpoint (so it's safe to call while that endpoint 403s/429s a
+/// lapsed account). Used to confirm a suspected lapse and to notice a
+/// renewal.
+pub trait PlanCheck: Send + Sync {
+    /// `None` = unknown; callers then fall back to the plan reported in
+    /// [`UsageSnapshot::plan`], if any.
+    fn check_plan(&self, access_token: &str) -> Option<PlanStatus>;
+}
+
+/// The vendor CLI's active login: what account switching writes.
+pub trait ActiveSlot: Send + Sync {
+    /// Persist `blob` as the active login for this provider and update any
+    /// identity-adjacent files the vendor CLI expects to read.
+    fn write_active_account(&self, blob: &str, identity: &IdentitySnapshot) -> PResult<()>;
+
+    /// Read whatever the vendor CLI currently considers the active identity.
+    fn read_active_identity(&self) -> PResult<Option<IdentitySnapshot>>;
+
+    /// Persist `blob` to the vendor CLI's OS-native credential storage for
+    /// wherever `read_active_identity` would report as the current login.
+    ///
+    /// Called ONLY after usagio refreshes an INACTIVE account's token
+    /// server-side (see `credentials::refresh_inactive_if_stale`) — never for
+    /// the active account, which the vendor CLI itself owns rotation for.
+    /// Without this mirror step, state.json would race ahead of whatever
+    /// on-disk / keychain blob the vendor CLI reads on its next invocation,
+    /// silently reintroducing the "never re-login" regression this exists to
+    /// close.
+    ///
+    /// The default impl delegates to `write_active_account` using the
+    /// current identity.
+    fn mirror_rotated_token(&self, blob: &str) -> PResult<()> {
+        match self.read_active_identity()? {
+            Some(id) => self.write_active_account(blob, &id),
+            None => Err(ProviderError::NotLoggedIn),
+        }
+    }
+
+    /// Read the vendor CLI's current OS-native credential blob for whichever
+    /// account it currently considers active — the same slot
+    /// `mirror_rotated_token` writes to (macOS keychain, or the on-disk
+    /// credentials file on Linux/Windows).
+    ///
+    /// This is the read half of the compare-and-swap the ACTIVE account's
+    /// refresh cycle uses (`lifecycle::active_refresh_cas`): usagio reads this
+    /// slot before AND after its own `/token` POST to detect whether the
+    /// vendor CLI rotated the same slot concurrently, without introducing any
+    /// new OS-specific code outside `platform/*` — providers implement this
+    /// purely in terms of `Platform::secrets()` / `credential_paths()`, the
+    /// same primitives `mirror_rotated_token` already uses.
+    ///
+    /// `Ok(None)` means the slot is empty (nothing captured yet).
+    fn read_active_slot(&self) -> PResult<Option<String>>;
+}
+
+/// A client that caches credentials in a running process, so a switch must
+/// drain it first.
+pub trait ClientHandoff: Send + Sync {
+    /// Inspect the running client.
+    fn client_status(&self) -> PResult<ClientStatus>;
+
+    /// Load the newly written credentials and verify the running identity.
+    /// Called only after the shared engine permits the handoff.
+    fn begin_handoff(&self, token: &str) -> PResult<()>;
+
+    /// Whether begin_handoff waits for process exit within a bounded deadline.
+    fn handoff_stops_synchronously(&self) -> bool;
+
+    /// Whether retrying the same stop request is supported.
+    fn handoff_request_is_idempotent(&self) -> bool;
+
+    /// Confirm that the drained instance has fully exited before credentials change.
+    fn verify_handoff_stopped(&self, token: &str) -> PResult<()>;
+
+    fn handoff_client(&self, identity: &IdentitySnapshot, token: Option<&str>) -> PResult<()>;
+}
+
+/// Launches the vendor CLI.
+pub trait Launcher: Send + Sync {
+    /// Launch the vendor CLI in the given mode (fresh session vs continue).
+    fn launch_client(&self, mode: LaunchMode) -> PResult<ExitStatus>;
+}
+
+/// Credential sync: following rotations the vendor CLI writes behind our
+/// back (fsnotify + proactive refresh + last-chance fallback).
+pub trait CredentialSync: Send + Sync {
+    /// On-disk paths where the vendor CLI may write this provider's
+    /// credential blob. The credential-sync watcher subscribes to these with
+    /// notify(); the last-chance fallback re-reads them on invalid_grant to
+    /// adopt whichever rotation the vendor did behind our back.
+    fn credential_paths(&self) -> Vec<PathBuf>;
+
+    /// Which account does this raw credential blob belong to? Returns
+    /// `Some(AccountKey)` if the blob is recognisable and carries an
+    /// identifier this provider tracks.
+    fn identify_credential(&self, blob: &str) -> Option<AccountKey>;
+
+    /// Last-resort identification for a blob `identify_credential` could not
+    /// place (e.g. tokens but no embedded identity). May perform ONE network
+    /// request, so it is only called from the invalid_grant last-chance
+    /// fallback, never from polling or watcher paths. Default is `None`.
+    fn identify_credential_online(&self, blob: &str) -> Option<AccountKey> {
+        let _ = blob;
+        None
+    }
+
+    /// Report how fresh the blob's access token is right now. Used to pick
+    /// the freshest of several observed rotations, and to decide when to
+    /// pre-emptively refresh an inactive account.
+    fn credential_freshness(&self, blob: &str) -> CredentialFreshness;
+
+    /// Absorb a rotated blob into `account`'s stored credentials.
+    fn absorb_credential(&self, account: &AccountKey, blob: &str) -> PResult<()>;
 }
 
 /// Separates an account key's email from the workspace it belongs to, for
@@ -1165,34 +1177,32 @@ mod tests {
                 capture_mode: CaptureMode::CredsOnDisk,
             }
         }
+
+        fn login_capture(&self) -> Option<&dyn LoginCapture> {
+            Some(self)
+        }
+    }
+
+    impl LoginCapture for Dummy {
         fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
             Ok(None)
-        }
-        fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
-            Err(ProviderError::Unsupported)
-        }
-        fn patch_stored_blob(&self, _blob: &str, _grant: &TokenGrant) -> PResult<String> {
-            Err(ProviderError::Unsupported)
         }
     }
 
     #[test]
-    fn defaults_return_unsupported() {
+    fn defaults_expose_no_capabilities() {
         let p = Dummy;
+        assert!(p.api_key_capture().is_none());
+        assert!(p.login_flow().is_none());
+        assert!(p.token_lifecycle().is_none());
+        assert!(p.usage_source().is_none());
+        assert!(p.plan_check().is_none());
+        assert!(p.active_slot().is_none());
+        assert!(p.client_handoff().is_none());
+        assert!(p.launcher().is_none());
+        assert!(p.credential_sync().is_none());
         assert!(matches!(
-            p.refresh_token("r"),
-            Err(ProviderError::Unsupported)
-        ));
-        assert!(matches!(
-            p.fetch_usage("a"),
-            Err(ProviderError::Unsupported)
-        ));
-        assert!(matches!(
-            p.launch_client(LaunchMode::Fresh),
-            Err(ProviderError::Unsupported)
-        ));
-        assert!(matches!(
-            p.capture_api_key("n".into(), "k".into()),
+            require(p.launcher()).map(|_| ()),
             Err(ProviderError::Unsupported)
         ));
     }
@@ -1217,15 +1227,13 @@ mod tests {
 
     #[test]
     fn credential_defaults_report_nothing() {
-        // A provider that opts out of credential sync must return empty
-        // paths, unknown identity, and unknown freshness — the sync layer
-        // treats these as "nothing to do".
+        // A provider that opts out of credential sync exposes no capability,
+        // and the sync layer treats that as "nothing to do".
         let p = Dummy;
-        assert!(p.credential_paths().is_empty());
-        assert!(p.identify_credential("{}").is_none());
-        assert_eq!(p.credential_freshness("{}"), CredentialFreshness::Unknown);
+        assert!(p.credential_sync().is_none());
+        assert!(crate::credentials::absorb_all_lagging(&p).is_empty());
         let k = AccountKey::new("dummy", "x");
-        assert!(p.absorb_credential(&k, "{}").is_ok());
+        assert!(!crate::credentials::last_chance_fallback(&p, &k));
     }
 
     #[test]

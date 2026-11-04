@@ -1,6 +1,8 @@
 use super::*;
 use crate::cli::capture::{capture_current_generic, persist_login};
 use crate::lifecycle::refresh_provider_active_account;
+use crate::providers::trait_def::ClientHandoff;
+use crate::providers::trait_def::LoginFlow;
 use crate::providers::{Provider, CLAUDE_SLUG};
 use crate::selectors::resolve_provider_selector;
 use crate::store::State;

@@ -95,7 +95,7 @@ fn signin_is_one_provider_submenu_and_classic_is_absent() {
     let snap = one_section_snap(acct("a@x", Some(10.0), Some(10.0), true));
     let tree = cross_platform::menu_tree_from_snapshot(&snap);
     let signin = find_submenu(&tree.items, "Sign in to a new account");
-    for provider in providers::all().iter().filter(|p| p.login_spec().is_some()) {
+    for provider in providers::all().iter().filter(|p| p.login_flow().is_some()) {
         assert!(signin.iter().any(|item| matches!(item, crate::platform::MenuItem::Action { id, label, .. } if id == &format!("signin:{}", provider.provider_id()) && label == provider.display_name())));
     }
     let auto = find_submenu(find_submenu(&tree.items, "Settings"), "Auto-swap");

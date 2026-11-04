@@ -61,7 +61,12 @@ fn inactive_rotation_is_mirrored_only_while_the_vendor_cli_is_that_account() {
         prime_active_slot(&claude_account("a@e.com", 1_000).keychain_blob);
         let got = mirror_inactive_rotation(provider, &acct);
         assert!(matches!(got, Some(Ok(()))), "{got:?}");
-        let slot = provider.read_active_slot().unwrap().unwrap();
+        let slot = provider
+            .active_slot()
+            .unwrap()
+            .read_active_slot()
+            .unwrap()
+            .unwrap();
         assert_eq!(
             Account::from_keychain_blob(&slot).unwrap().access_token,
             "at-mirror"
@@ -71,7 +76,15 @@ fn inactive_rotation_is_mirrored_only_while_the_vendor_cli_is_that_account() {
         let before = claude_account("stranger@e.com", 1_000).keychain_blob;
         prime_active_slot(&before);
         assert!(mirror_inactive_rotation(provider, &acct).is_none());
-        assert_eq!(provider.read_active_slot().unwrap().unwrap(), before);
+        assert_eq!(
+            provider
+                .active_slot()
+                .unwrap()
+                .read_active_slot()
+                .unwrap()
+                .unwrap(),
+            before
+        );
     });
 }
 

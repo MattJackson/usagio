@@ -15,6 +15,7 @@ use crate::poll::trackers::{
     record_inactive_fetch_failure, record_usage_fetch_429, record_usage_fetch_non_429,
     record_usage_fetch_success, INACTIVE_FETCH_FLOOR_SECS,
 };
+use crate::providers::require;
 use crate::providers::trait_def::{PlanStatus, ProviderError};
 use crate::providers::CLAUDE_SLUG;
 use crate::rows::{cached_from_usage_snapshot, cached_to_account_usage};
@@ -26,7 +27,7 @@ use crate::{countdown, lifecycle, logging, providers, usage_log};
 /// Fetch usage for every captured non-Claude provider account and persist it
 /// into `state.providers[slug]`. The counterpart to the Claude loop in
 /// `refresh_usage_cache` — without it, a captured Codex/etc. account renders
-/// "no data yet" forever because `Provider::fetch_usage` is otherwise never
+/// "no data yet" forever because `UsageSource::fetch_usage` is otherwise never
 /// called. Best-effort throughout: a token-refresh or usage error keeps the
 /// existing cache and moves on (never panics the poll loop). Applies the same
 /// locked-until-reset skip so a maxed provider account doesn't burn requests.
@@ -217,7 +218,9 @@ pub(crate) fn refresh_provider_usage_caches_with(
             if is_active {
                 out.active_fetched.insert(slug.to_string());
             }
-            let cu = match provider.fetch_account_usage(&access, &request_account.secret_blob) {
+            let cu = match require(provider.usage_source())
+                .and_then(|usage| usage.fetch_account_usage(&access, &request_account.secret_blob))
+            {
                 Ok(snap) => {
                     record_usage_fetch_success(&tracker_key);
                     *out.fetched.entry(slug.to_string()).or_default() += 1;

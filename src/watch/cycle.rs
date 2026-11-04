@@ -13,6 +13,7 @@ use crate::poll::trackers::{
     record_usage_fetch_non_429, record_usage_fetch_success,
 };
 use crate::providers::claude::usage;
+use crate::providers::require;
 use crate::providers::trait_def::ProviderError;
 use crate::providers::CLAUDE_SLUG;
 use crate::rows::{
@@ -137,9 +138,8 @@ pub(crate) fn verify_swap_target_detailed(slug: &str, key: &str) -> std::result:
         if acct.needs_relogin || (acct.expires_at != 0 && acct.expires_at <= now_ts) {
             return Err(false);
         }
-        match provider_by_slug(slug)
-            .map_err(|_| false)?
-            .fetch_account_usage(&acct.access_token, &acct.secret_blob)
+        match require(provider_by_slug(slug).map_err(|_| false)?.usage_source())
+            .and_then(|usage| usage.fetch_account_usage(&acct.access_token, &acct.secret_blob))
         {
             Ok(snap) => Ok(cached_from_usage_snapshot(&snap)),
             Err(e) => {

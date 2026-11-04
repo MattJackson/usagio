@@ -325,7 +325,7 @@ impl Account {
 /// `CredsOnDisk` provider can reuse without a parallel struct: `secret_blob`
 /// is the provider's *entire* on-disk credential blob verbatim (Codex's full
 /// `auth.json` contents), so writing it back via
-/// `Provider::write_active_account` always reproduces exactly what a real
+/// `ActiveSlot::write_active_account` always reproduces exactly what a real
 /// login would have produced. `access_token`/`refresh_token`/`expires_at`
 /// mirror the blob's tokens for refresh math, exactly like `Account` does for
 /// Claude.
@@ -370,7 +370,7 @@ pub struct ProviderAccount {
 
 impl ProviderAccount {
     /// Rebuild the `IdentitySnapshot` this account was captured with, for
-    /// callers that need to hand it back to `Provider::write_active_account`.
+    /// callers that need to hand it back to `ActiveSlot::write_active_account`.
     pub fn identity_snapshot(&self) -> crate::providers::trait_def::IdentitySnapshot {
         crate::providers::trait_def::IdentitySnapshot {
             email: self.identity_email.clone(),

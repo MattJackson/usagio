@@ -1,6 +1,6 @@
 //! Shared account identity and credential persistence rules.
 use crate::credentials::with_state_lock;
-use crate::providers::{IdentitySnapshot, Provider, TokenGrant};
+use crate::providers::{require, IdentitySnapshot, Provider, TokenGrant};
 use crate::store::{Account, ProviderAccount, State};
 use crate::{logging, providers};
 use anyhow::{bail, Result};
@@ -68,8 +68,8 @@ pub fn ensure_provider_fresh(provider: &dyn Provider, key: &str) -> Result<Provi
             if snapshot.refresh_token.is_empty() {
                 return Err(crate::providers::ProviderError::Auth.into());
             }
-            let (grant, blob) =
-                provider.refresh_credential(&snapshot.secret_blob, &snapshot.refresh_token)?;
+            let (grant, blob) = require(provider.token_lifecycle())?
+                .refresh_credential(&snapshot.secret_blob, &snapshot.refresh_token)?;
             let mut candidate = snapshot.clone();
             candidate.secret_blob = blob;
             candidate.access_token = grant.access;
@@ -123,7 +123,7 @@ fn prepare_provider_refresh(
         }
     };
     if let Some(blob) = matched {
-        let grant = provider.parse_stored_blob(&blob)?;
+        let grant = require(provider.token_lifecycle())?.parse_stored_blob(&blob)?;
         let adopted = crate::credentials::with_state_lock(|| {
             let mut state = crate::store::State::load()?;
             let account = state
@@ -226,7 +226,10 @@ pub fn identity_matches(expected: &IdentitySnapshot, actual: &IdentitySnapshot) 
 }
 
 pub fn validate_stored_identity(provider: &dyn Provider, account: &ProviderAccount) -> Result<()> {
-    if let Some(key) = provider.identify_credential(&account.secret_blob) {
+    if let Some(key) = provider
+        .credential_sync()
+        .and_then(|sync| sync.identify_credential(&account.secret_blob))
+    {
         if key.provider != provider.provider_id() || !key.key.eq_ignore_ascii_case(&account.key) {
             bail!(
                 "stored credentials belong to another account; renew login for {}",
@@ -250,7 +253,8 @@ pub fn set_provider_tokens(
         refresh: Some(refresh.to_owned()),
         expires_in_secs: expires_at.saturating_sub(chrono::Utc::now().timestamp()),
     };
-    let blob = provider.patch_stored_blob(&account.secret_blob, &grant)?;
+    let blob =
+        require(provider.token_lifecycle())?.patch_stored_blob(&account.secret_blob, &grant)?;
     account.secret_blob = blob;
     account.access_token = grant.access;
     account.refresh_token = refresh.to_owned();
@@ -266,14 +270,15 @@ pub fn matching_active_blob(
     provider: &dyn Provider,
     expected: &IdentitySnapshot,
 ) -> Result<Option<String>> {
-    let Some(before) = provider.read_active_identity()? else {
+    let slot = require(provider.active_slot())?;
+    let Some(before) = slot.read_active_identity()? else {
         return Ok(None);
     };
     if !identity_matches(expected, &before) {
         return Ok(None);
     }
-    let blob = provider.read_active_slot()?;
-    let Some(after) = provider.read_active_identity()? else {
+    let blob = slot.read_active_slot()?;
+    let Some(after) = slot.read_active_identity()? else {
         return Ok(None);
     };
     if !identity_matches(&before, &after) || !identity_matches(expected, &after) {
@@ -352,7 +357,9 @@ pub(crate) fn active_refresh_cas(
                 "userID": acct.user_id,
             }),
         };
-        return match provider.write_active_account(&acct.keychain_blob, &identity) {
+        let written = require(provider.active_slot())
+            .and_then(|slot| slot.write_active_account(&acct.keychain_blob, &identity));
+        return match written {
             Ok(()) => {
                 acct.live_write_pending = None;
                 logging::log(&format!(
@@ -398,7 +405,10 @@ pub(crate) fn refresh_provider_active_account(slug: &str) {
     let Some(provider) = providers::get(slug) else {
         return;
     };
-    if !provider.supports_active_refresh() {
+    if !provider
+        .token_lifecycle()
+        .is_some_and(|t| t.supports_active_refresh())
+    {
         return;
     }
     let result = with_state_lock(|| {
@@ -458,7 +468,7 @@ fn provider_active_refresh(slug: &str, acct: &ProviderAccount) -> ProviderRefres
     };
     match matching_active_blob(provider, &acct.identity_snapshot()) {
         Ok(Some(blob)) if blob != acct.secret_blob || acct.needs_relogin => {
-            match provider.parse_stored_blob(&blob) {
+            match require(provider.token_lifecycle()).and_then(|t| t.parse_stored_blob(&blob)) {
                 Ok(grant) => ProviderRefreshOutcome::Refreshed(blob, grant),
                 Err(e) => {
                     logging::log(&format!(
@@ -577,6 +587,17 @@ fn save_rotation(acct: &Account, sent: &str) -> anyhow::Result<()> {
     })
 }
 
+/// The running client's status; a stateless client (no handoff capability)
+/// reports the default, not-running status.
+pub(crate) fn client_status(
+    provider: &dyn Provider,
+) -> providers::PResult<providers::ClientStatus> {
+    match provider.client_handoff() {
+        Some(handoff) => handoff.client_status(),
+        None => Ok(providers::ClientStatus::default()),
+    }
+}
+
 /// Drain before changing credentials. Caller holds state and refresh locks.
 /// The durable receipt prevents retries from sending a second shutdown request,
 /// which some vendors interpret as force termination.
@@ -588,6 +609,8 @@ pub(crate) fn prepare_handoff(
     manual: bool,
 ) -> Result<bool> {
     let slug = provider.provider_id();
+    // A stateless client (no handoff capability) needs no drain.
+    let handoff = provider.client_handoff();
     let renewed_account = state
         .provider_accounts(slug)
         .and_then(|accounts| accounts.pending_switch.as_ref())
@@ -659,7 +682,9 @@ pub(crate) fn prepare_handoff(
             .and_then(|accounts| accounts.pending_switch.as_ref())
             .and_then(|pending| pending.drain_token.as_deref())
         {
-            provider.verify_handoff_stopped(token)?;
+            if let Some(handoff) = handoff {
+                handoff.verify_handoff_stopped(token)?;
+            }
         }
         return Ok(true);
     }
@@ -707,17 +732,21 @@ pub(crate) fn prepare_handoff(
     if changed {
         state.save()?;
     }
-    if !already_requested || provider.handoff_request_is_idempotent() {
-        provider.begin_handoff(token)?;
+    if !already_requested || handoff.is_some_and(|h| h.handoff_request_is_idempotent()) {
+        if let Some(handoff) = handoff {
+            handoff.begin_handoff(token)?;
+        }
         logging::log(&format!(
             "event=client_drain_requested provider={slug} account={key}"
         ));
     }
     // A bounded provider stop can finish synchronously. Publish/restart in
     // this transaction instead of leaving clients disconnected until polling.
-    if provider.handoff_stops_synchronously() && !provider.client_status()?.running {
-        provider.verify_handoff_stopped(token)?;
-        return Ok(true);
+    if let Some(handoff) = handoff.filter(|h| h.handoff_stops_synchronously()) {
+        if !handoff.client_status()?.running {
+            handoff.verify_handoff_stopped(token)?;
+            return Ok(true);
+        }
     }
     Ok(false)
 }

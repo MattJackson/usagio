@@ -5,8 +5,10 @@
 use super::*;
 use crate::providers::trait_def::{
     AccountKey, Capabilities, CaptureMode, CapturedAccount, CredentialFreshness, IdentitySnapshot,
-    LaunchMode, PResult, Provider, ProviderError, SecretBackend, TokenGrant, UsageSnapshot,
+    LaunchMode, PResult, Provider, SecretBackend, UsageSnapshot,
 };
+use crate::providers::CredentialSync;
+use crate::providers::LoginCapture;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -75,15 +77,23 @@ impl Provider for FakeProvider {
             capture_mode: CaptureMode::CredsOnDisk,
         }
     }
+
+    fn login_capture(&self) -> Option<&dyn LoginCapture> {
+        Some(self)
+    }
+
+    fn credential_sync(&self) -> Option<&dyn CredentialSync> {
+        Some(self)
+    }
+}
+
+impl LoginCapture for FakeProvider {
     fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
         Ok(None)
     }
-    fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
-        Err(ProviderError::Unsupported)
-    }
-    fn patch_stored_blob(&self, _blob: &str, _grant: &TokenGrant) -> PResult<String> {
-        Err(ProviderError::Unsupported)
-    }
+}
+
+impl CredentialSync for FakeProvider {
     fn credential_paths(&self) -> Vec<PathBuf> {
         self.paths.clone()
     }
@@ -368,7 +378,7 @@ fn refresh_skew_is_fifteen_minutes() {
 
 // -----------------------------------------------------------------------------
 // with_state_lock reentrancy — regression test for the switch-time deadlock
-// where absorb_before_switch -> Provider::absorb_credential ->
+// where absorb_before_switch -> CredentialSync::absorb_credential ->
 // with_state_lock_absorb -> with_state_lock reopens the same lock file and
 // flock(LOCK_EX) blocks forever on the same process's outer frame.
 // -----------------------------------------------------------------------------
@@ -397,7 +407,7 @@ fn with_isolated_home<F: FnOnce()>(f: F) {
 #[test]
 fn nested_with_state_lock_does_not_deadlock() {
     // The switch path takes with_state_lock, then calls absorb_before_switch
-    // which recurses into with_state_lock_absorb (a Provider::absorb_credential
+    // which recurses into with_state_lock_absorb (a CredentialSync::absorb_credential
     // implementation) which in turn takes with_state_lock again. Before the
     // reentrancy fix this second flock(LOCK_EX) blocked forever on the same
     // process's outer frame. Run the nested call on a worker thread and fail
@@ -644,15 +654,23 @@ impl Provider for PanicOnceProvider {
             capture_mode: CaptureMode::CredsOnDisk,
         }
     }
+
+    fn login_capture(&self) -> Option<&dyn LoginCapture> {
+        Some(self)
+    }
+
+    fn credential_sync(&self) -> Option<&dyn CredentialSync> {
+        Some(self)
+    }
+}
+
+impl LoginCapture for PanicOnceProvider {
     fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
         Ok(None)
     }
-    fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
-        Err(ProviderError::Unsupported)
-    }
-    fn patch_stored_blob(&self, _blob: &str, _grant: &TokenGrant) -> PResult<String> {
-        Err(ProviderError::Unsupported)
-    }
+}
+
+impl CredentialSync for PanicOnceProvider {
     fn credential_paths(&self) -> Vec<PathBuf> {
         let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if n == 0 {

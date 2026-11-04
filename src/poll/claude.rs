@@ -137,8 +137,10 @@ pub(crate) fn refresh_usage_cache_with(force: bool, defer_active: bool) -> Refre
         // active-refresh CAS below is the only path that adopts it and clears
         // the flag — skipping it froze the active account's reading (no
         // auto-swap, wrong cadence) after a manual switch to a flagged account.
-        let active_with_refresh =
-            state.active.as_deref() == Some(email.as_str()) && provider.supports_active_refresh();
+        let active_with_refresh = state.active.as_deref() == Some(email.as_str())
+            && provider
+                .token_lifecycle()
+                .is_some_and(|t| t.supports_active_refresh());
         if acct.needs_relogin && !active_with_refresh {
             continue;
         }
@@ -207,8 +209,10 @@ pub(crate) fn refresh_usage_cache_with(force: bool, defer_active: bool) -> Refre
         // provider returning false would fall through to `ensure_fresh` for
         // its active account too, which POSTs — so a provider driven through
         // this loop must opt in.
-        let is_active =
-            state.active.as_deref() == Some(email.as_str()) && provider.supports_active_refresh();
+        let is_active = state.active.as_deref() == Some(email.as_str())
+            && provider
+                .token_lifecycle()
+                .is_some_and(|t| t.supports_active_refresh());
         if is_active {
             let cas = poll_active_cas(provider, email);
             match cas {

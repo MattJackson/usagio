@@ -15,10 +15,7 @@
 
 #![allow(dead_code)]
 
-use crate::providers::trait_def::{
-    Capabilities, CaptureMode, CapturedAccount, PResult, Provider, ProviderError, SecretBackend,
-    TokenGrant,
-};
+use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
 pub fn new() -> Box<dyn Provider> {
     Box::new(CursorAgentProvider)
@@ -26,6 +23,11 @@ pub fn new() -> Box<dyn Provider> {
 
 pub struct CursorAgentProvider;
 
+// Not wired yet (no capability exposed):
+// TODO: with `AGENT_CLI_CREDENTIAL_STORE=file`, read
+// `~/.cursor/auth.json`; otherwise probe the macOS keychain (service
+// label undocumented) or accept a `CURSOR_API_KEY` env var. Then
+// call `https://api.cursor.com/v1/me` to attach the email.
 impl Provider for CursorAgentProvider {
     fn provider_id(&self) -> &'static str {
         "cursor-agent"
@@ -45,22 +47,6 @@ impl Provider for CursorAgentProvider {
             secret_backend: SecretBackend::Keychain,
             capture_mode: CaptureMode::CredsOnDisk,
         }
-    }
-
-    fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
-        // TODO: with `AGENT_CLI_CREDENTIAL_STORE=file`, read
-        // `~/.cursor/auth.json`; otherwise probe the macOS keychain (service
-        // label undocumented) or accept a `CURSOR_API_KEY` env var. Then
-        // call `https://api.cursor.com/v1/me` to attach the email.
-        Err(ProviderError::Unsupported)
-    }
-
-    fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
-        Err(ProviderError::Unsupported)
-    }
-
-    fn patch_stored_blob(&self, _blob: &str, _grant: &TokenGrant) -> PResult<String> {
-        Err(ProviderError::Unsupported)
     }
 }
 
@@ -83,9 +69,6 @@ mod tests {
 
     #[test]
     fn capture_returns_none_placeholder() {
-        assert!(matches!(
-            CursorAgentProvider.capture_current_login(),
-            Err(ProviderError::Unsupported)
-        ));
+        assert!(CursorAgentProvider.login_capture().is_none());
     }
 }

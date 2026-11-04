@@ -247,7 +247,7 @@ pub(super) fn menu_tree_from_snapshot(snap: &Snapshot) -> MenuTree {
     }
     // Sign in to a new account — every provider usagio can log in itself.
     let mut signin_items = Vec::new();
-    for p in providers::all().iter().filter(|p| p.login_spec().is_some()) {
+    for p in providers::all().iter().filter(|p| p.login_flow().is_some()) {
         signin_items.push(action(
             format!("signin:{}", p.provider_id()),
             p.display_name(),

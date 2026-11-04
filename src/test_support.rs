@@ -4,6 +4,7 @@
 use crate::claude_local::write_claude_identity;
 use crate::poll::claude::{refresh_usage_cache, RefreshOutcome};
 use crate::poll::trackers::{claim_subscription_check, note_polled_active};
+use crate::providers::trait_def::Provider;
 use crate::providers::CLAUDE_SLUG;
 use crate::rows::{Cell, Row};
 use crate::store::{Account, CachedUsage, State};
@@ -172,25 +173,60 @@ impl crate::providers::Provider for MockActiveSlotProvider {
             capture_mode: crate::providers::trait_def::CaptureMode::CredsOnDisk,
         }
     }
+
+    fn login_capture(&self) -> Option<&dyn crate::providers::LoginCapture> {
+        Some(self)
+    }
+
+    fn active_slot(&self) -> Option<&dyn crate::providers::ActiveSlot> {
+        Some(self)
+    }
+
+    fn client_handoff(&self) -> Option<&dyn crate::providers::ClientHandoff> {
+        Some(self)
+    }
+}
+
+impl crate::providers::LoginCapture for MockActiveSlotProvider {
     fn capture_current_login(
         &self,
     ) -> crate::providers::trait_def::PResult<Option<crate::providers::trait_def::CapturedAccount>>
     {
         Ok(None)
     }
-    fn parse_stored_blob(
+}
+
+impl crate::providers::ActiveSlot for MockActiveSlotProvider {
+    fn write_active_account(
         &self,
-        _blob: &str,
-    ) -> crate::providers::trait_def::PResult<crate::providers::trait_def::TokenGrant> {
-        Err(crate::providers::trait_def::ProviderError::Unsupported)
+        blob: &str,
+        _identity: &providers::IdentitySnapshot,
+    ) -> providers::PResult<()> {
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.slot.lock().unwrap() = Some(blob.into());
+        Ok(())
     }
-    fn patch_stored_blob(
+    fn read_active_identity(
         &self,
-        _blob: &str,
-        _grant: &crate::providers::trait_def::TokenGrant,
-    ) -> crate::providers::trait_def::PResult<String> {
-        Err(crate::providers::trait_def::ProviderError::Unsupported)
+    ) -> crate::providers::trait_def::PResult<Option<providers::IdentitySnapshot>> {
+        Ok(Some(providers::IdentitySnapshot {
+            email: Some(self.email.clone()),
+            uuid: None,
+            display_name: None,
+            native_blob: serde_json::Value::Null,
+        }))
     }
+    fn read_active_slot(&self) -> crate::providers::trait_def::PResult<Option<String>> {
+        Ok(self.slot.lock().unwrap().clone())
+    }
+    fn mirror_rotated_token(&self, blob: &str) -> crate::providers::trait_def::PResult<()> {
+        *self.slot.lock().unwrap() = Some(blob.to_string());
+        Ok(())
+    }
+}
+
+impl crate::providers::ClientHandoff for MockActiveSlotProvider {
     fn verify_handoff_stopped(&self, _token: &str) -> providers::PResult<()> {
         if self.process_alive.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(providers::ProviderError::Other(
@@ -210,16 +246,6 @@ impl crate::providers::Provider for MockActiveSlotProvider {
             account_id: None,
             handoff_token: self.client_running.then(|| "renewal-instance".into()),
         })
-    }
-    fn write_active_account(
-        &self,
-        blob: &str,
-        _identity: &providers::IdentitySnapshot,
-    ) -> providers::PResult<()> {
-        self.writes
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        *self.slot.lock().unwrap() = Some(blob.into());
-        Ok(())
     }
     fn handoff_client(
         &self,
@@ -265,22 +291,9 @@ impl crate::providers::Provider for MockActiveSlotProvider {
         }
         Ok(())
     }
-    fn read_active_identity(
-        &self,
-    ) -> crate::providers::trait_def::PResult<Option<providers::IdentitySnapshot>> {
-        Ok(Some(providers::IdentitySnapshot {
-            email: Some(self.email.clone()),
-            uuid: None,
-            display_name: None,
-            native_blob: serde_json::Value::Null,
-        }))
-    }
-    fn read_active_slot(&self) -> crate::providers::trait_def::PResult<Option<String>> {
-        Ok(self.slot.lock().unwrap().clone())
-    }
-    fn mirror_rotated_token(&self, blob: &str) -> crate::providers::trait_def::PResult<()> {
-        *self.slot.lock().unwrap() = Some(blob.to_string());
-        Ok(())
+
+    fn handoff_stops_synchronously(&self) -> bool {
+        false
     }
 }
 
@@ -582,6 +595,8 @@ pub(crate) fn with_claude_home<R>(json_email: &str, f: impl FnOnce(&std::path::P
 /// Put `blob` where the vendor CLI's active login lives on this OS.
 pub(crate) fn prime_active_slot(blob: &str) {
     providers::get(CLAUDE_SLUG)
+        .unwrap()
+        .active_slot()
         .unwrap()
         .mirror_rotated_token(blob)
         .unwrap();

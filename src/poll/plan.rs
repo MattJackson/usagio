@@ -33,7 +33,7 @@ pub(crate) fn recheck_lapsed_plan(
     tracker_key: &str,
     access: &str,
 ) -> Recheck {
-    match provider.check_plan(access) {
+    match provider.plan_check().and_then(|p| p.check_plan(access)) {
         Some(p) if p.active => {
             clear_inactive_fetch_backoff(tracker_key);
             Recheck::Restored(p)
@@ -70,7 +70,10 @@ pub(crate) fn detect_lapsed_plan(
     if !claim_subscription_check(tracker_key, now_ts, false) {
         return None;
     }
-    provider.check_plan(access).filter(|p| !p.active)
+    provider
+        .plan_check()
+        .and_then(|p| p.check_plan(access))
+        .filter(|p| !p.active)
 }
 
 /// Persist an account's plan (label + lapsed flag) for any provider, and

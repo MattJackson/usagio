@@ -1,4 +1,9 @@
 use super::*;
+use crate::providers::CapturedAccount;
+use crate::providers::LoginCapture;
+use crate::providers::LoginFlow;
+use crate::providers::PResult;
+use crate::providers::ProviderError;
 use std::io::{BufRead, BufReader, Read};
 use std::sync::atomic::AtomicBool;
 
@@ -457,27 +462,33 @@ impl Provider for LoginOnly {
             capture_mode: CaptureMode::CredsOnDisk,
         }
     }
+
+    fn login_capture(&self) -> Option<&dyn LoginCapture> {
+        Some(self)
+    }
+
+    fn login_flow(&self) -> Option<&dyn LoginFlow> {
+        Some(self)
+    }
+}
+
+impl LoginCapture for LoginOnly {
     fn capture_current_login(
         &self,
     ) -> crate::providers::trait_def::PResult<Option<crate::providers::trait_def::CapturedAccount>>
     {
         Ok(None)
     }
-    fn parse_stored_blob(
-        &self,
-        _blob: &str,
-    ) -> crate::providers::trait_def::PResult<crate::providers::trait_def::TokenGrant> {
-        Err(crate::providers::trait_def::ProviderError::Unsupported)
+}
+
+impl LoginFlow for LoginOnly {
+    fn login_spec(&self) -> LoginSpec {
+        spec("http://unused", TokenRequestStyle::Form)
     }
-    fn patch_stored_blob(
-        &self,
-        _blob: &str,
-        _grant: &crate::providers::trait_def::TokenGrant,
-    ) -> crate::providers::trait_def::PResult<String> {
-        Err(crate::providers::trait_def::ProviderError::Unsupported)
-    }
-    fn login_spec(&self) -> Option<LoginSpec> {
-        Some(spec("http://unused", TokenRequestStyle::Form))
+
+    fn complete_login(&self, token_response: &serde_json::Value) -> PResult<CapturedAccount> {
+        let _ = token_response;
+        Err(ProviderError::Unsupported)
     }
 }
 
@@ -626,7 +637,10 @@ fn a_busy_redirect_port_falls_back_to_the_registered_one() {
 #[cfg(feature = "codex")]
 #[test]
 fn codex_registers_1457_as_its_fallback_redirect_port() {
-    let spec = crate::providers::codex::new().login_spec().unwrap();
+    let spec = crate::providers::codex::new()
+        .login_flow()
+        .unwrap()
+        .login_spec();
     assert_eq!(spec.redirect_port, Some(1455));
     assert_eq!(spec.fallback_redirect_port, Some(1457));
 }

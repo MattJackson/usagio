@@ -4,6 +4,7 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use crate::poll::claude::log_manual_switch;
 use crate::poll::trackers::{fetch_tracker_key, reset_usage_fetch_tracker};
+use crate::providers::require;
 use crate::providers::{Provider, CLAUDE_SLUG};
 use crate::state_ops::{provider_active, with_state_lock};
 use crate::store::State;
@@ -14,7 +15,7 @@ use crate::{autoswap, credentials, lifecycle, logging, providers, store};
 /// Make `key` the active login for the non-Claude provider `slug` (state
 /// v2's `State::providers[slug]`). Mirrors `switch_to`'s contract for Claude:
 /// rewrites the vendor's on-disk credential file via
-/// `Provider::write_active_account`, then commits the new `active` selection
+/// `ActiveSlot::write_active_account`, then commits the new `active` selection
 /// to state.json under the state lock. Returns the account key as the
 /// display label (non-Claude providers have no separate display-name
 /// resolution step the way Claude's identity backfill does). `hold` marks a
@@ -79,7 +80,7 @@ pub(crate) fn switch_provider_expecting(
         lifecycle::ensure_provider_fresh(provider, key)?;
     }
     let _refresh = lifecycle::refresh_lock()?;
-    let status = provider.client_status()?;
+    let status = lifecycle::client_status(provider)?;
     let ready = with_state_lock(|| {
         let mut state = State::load()?;
         // Authoritative compare-and-set: same state lock as the queue write.
@@ -191,11 +192,16 @@ pub(crate) fn recover_obsolete_pending_switch(
     })?;
     if let Some(token) = restart {
         let _refresh = lifecycle::refresh_lock()?;
-        provider.verify_handoff_stopped(&token)?;
-        let identity = provider
+        let handoff = provider.client_handoff();
+        if let Some(handoff) = handoff {
+            handoff.verify_handoff_stopped(&token)?;
+        }
+        let identity = require(provider.active_slot())?
             .read_active_identity()?
             .context("cannot restore the drained client's live login")?;
-        provider.handoff_client(&identity, Some(&token))?;
+        if let Some(handoff) = handoff {
+            handoff.handoff_client(&identity, Some(&token))?;
+        }
         with_state_lock(|| {
             let mut state = State::load()?;
             let accounts = state.provider_accounts_mut(slug);
@@ -296,8 +302,8 @@ pub(crate) fn commit_provider_switch_guarded(
         });
         state.save()?;
         if !credentials_written {
-            provider
-                .write_active_account(&acct.secret_blob, &identity)
+            require(provider.active_slot())
+                .and_then(|slot| slot.write_active_account(&acct.secret_blob, &identity))
                 .map_err(|e| anyhow!("switching {slug} account: {e}"))?;
             state.upsert_provider_account(slug, acct.clone());
             state
@@ -321,9 +327,11 @@ pub(crate) fn commit_provider_switch_guarded(
     };
     // Starting a daemon can take seconds. Keep state reads, usage persistence,
     // and account management responsive while the refresh lock owns this switch.
-    provider
-        .handoff_client(&identity, drain_token.as_deref())
-        .map_err(|error| anyhow!("credentials saved; client handoff will retry: {error}"))?;
+    if let Some(handoff) = provider.client_handoff() {
+        handoff
+            .handoff_client(&identity, drain_token.as_deref())
+            .map_err(|error| anyhow!("credentials saved; client handoff will retry: {error}"))?;
+    }
     with_state_lock(|| {
         let mut state = State::load()?;
         let accounts = state.provider_accounts_mut(slug);
@@ -419,7 +427,7 @@ pub(crate) fn switch_if_still_active(
     let provider = provider_by_slug(slug)?;
     lifecycle::ensure_provider_fresh(provider, target)?;
     let _refresh = lifecycle::refresh_lock()?;
-    let status = provider.client_status()?;
+    let status = lifecycle::client_status(provider)?;
     switch_provider_if_still_active(provider, &status, target, expect_active)
 }
 

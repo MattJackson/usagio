@@ -12,10 +12,7 @@
 
 #![allow(dead_code)]
 
-use crate::providers::trait_def::{
-    Capabilities, CaptureMode, CapturedAccount, PResult, Provider, ProviderError, SecretBackend,
-    TokenGrant,
-};
+use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
 pub fn new() -> Box<dyn Provider> {
     Box::new(QwenCodeProvider)
@@ -23,6 +20,10 @@ pub fn new() -> Box<dyn Provider> {
 
 pub struct QwenCodeProvider;
 
+// Not wired yet (no capability exposed):
+// TODO: read `~/.qwen/oauth_creds.json` and populate `TokenGrant` from
+// its `access_token` / `refresh_token` / `expiry_date` fields. Email
+// is not available at capture — the CLI never asks for it.
 impl Provider for QwenCodeProvider {
     fn provider_id(&self) -> &'static str {
         "qwen-code"
@@ -42,21 +43,6 @@ impl Provider for QwenCodeProvider {
             secret_backend: SecretBackend::File,
             capture_mode: CaptureMode::CredsOnDisk,
         }
-    }
-
-    fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
-        // TODO: read `~/.qwen/oauth_creds.json` and populate `TokenGrant` from
-        // its `access_token` / `refresh_token` / `expiry_date` fields. Email
-        // is not available at capture — the CLI never asks for it.
-        Err(ProviderError::Unsupported)
-    }
-
-    fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
-        Err(ProviderError::Unsupported)
-    }
-
-    fn patch_stored_blob(&self, _blob: &str, _grant: &TokenGrant) -> PResult<String> {
-        Err(ProviderError::Unsupported)
     }
 }
 
@@ -79,9 +65,6 @@ mod tests {
 
     #[test]
     fn capture_returns_none_placeholder() {
-        assert!(matches!(
-            QwenCodeProvider.capture_current_login(),
-            Err(ProviderError::Unsupported)
-        ));
+        assert!(QwenCodeProvider.login_capture().is_none());
     }
 }

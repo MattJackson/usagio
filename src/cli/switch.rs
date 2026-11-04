@@ -3,6 +3,7 @@
 use anyhow::{anyhow, bail, Result};
 
 use crate::picking::auto_pick_for;
+use crate::providers::require;
 use crate::providers::{Provider, CLAUDE_SLUG};
 use crate::rows::provider_rows;
 use crate::selectors::{
@@ -174,7 +175,7 @@ pub(crate) fn launch_selected_client(
         Launch::Fresh => providers::trait_def::LaunchMode::Fresh,
         Launch::Continue => providers::trait_def::LaunchMode::Continue,
     };
-    let status = provider.launch_client(mode)?;
+    let status = require(provider.launcher())?.launch_client(mode)?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }

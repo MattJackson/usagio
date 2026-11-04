@@ -48,6 +48,14 @@ use crate::providers::trait_def::{
     IdentitySnapshot, Money, PResult, Provider, ProviderError, ReportedUsage, ResetGrant,
     SecretBackend, TokenGrant, UsageSnapshot, UsageWindow,
 };
+use crate::providers::ActiveSlot;
+use crate::providers::ClientHandoff;
+use crate::providers::CredentialSync;
+use crate::providers::Launcher;
+use crate::providers::LoginCapture;
+use crate::providers::LoginFlow;
+use crate::providers::TokenLifecycle;
+use crate::providers::UsageSource;
 
 fn launch_command(mode: crate::providers::trait_def::LaunchMode) -> std::process::Command {
     let mut command = std::process::Command::new("codex");
@@ -464,16 +472,40 @@ impl Provider for CodexProvider {
         ))
     }
 
-    /// Codex's refresh grant is a plain, programmatic HTTPS POST (no vendor
-    /// CLI / browser step) — see `oauth.rs`'s module doc for the endpoint
-    /// research. `oauth::active_refresh_cas` is the CAS-safe entry point a
-    /// future proactive-refresh caller should use for the single active
-    /// login; nothing in the credential-sync loop wires it up yet (that loop
-    /// lives in `credentials.rs`, out of this provider's scope).
-    fn supports_active_refresh(&self) -> bool {
-        true
+    fn login_capture(&self) -> Option<&dyn LoginCapture> {
+        Some(self)
     }
 
+    fn login_flow(&self) -> Option<&dyn LoginFlow> {
+        Some(self)
+    }
+
+    fn token_lifecycle(&self) -> Option<&dyn TokenLifecycle> {
+        Some(self)
+    }
+
+    fn usage_source(&self) -> Option<&dyn UsageSource> {
+        Some(self)
+    }
+
+    fn active_slot(&self) -> Option<&dyn ActiveSlot> {
+        Some(self)
+    }
+
+    fn client_handoff(&self) -> Option<&dyn ClientHandoff> {
+        Some(self)
+    }
+
+    fn launcher(&self) -> Option<&dyn Launcher> {
+        Some(self)
+    }
+
+    fn credential_sync(&self) -> Option<&dyn CredentialSync> {
+        Some(self)
+    }
+}
+
+impl LoginCapture for CodexProvider {
     // --- Capture -----------------------------------------------------------
 
     fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
@@ -490,10 +522,12 @@ impl Provider for CodexProvider {
             .map_err(|e| ProviderError::Other(format!("auth.json is not UTF-8: {e}")))?;
         Ok(Some(capture_blob(blob)?))
     }
+}
 
-    fn login_spec(&self) -> Option<crate::providers::trait_def::LoginSpec> {
+impl LoginFlow for CodexProvider {
+    fn login_spec(&self) -> crate::providers::trait_def::LoginSpec {
         use crate::providers::trait_def::{LoginSpec, TokenRequestStyle};
-        Some(LoginSpec {
+        LoginSpec {
             authorize_url: "https://auth.openai.com/oauth/authorize",
             token_url: oauth::TOKEN_URL,
             client_id: oauth::CLIENT_ID,
@@ -517,7 +551,7 @@ impl Provider for CodexProvider {
             ],
             login_hint_param: Some("login_hint"),
             token_request: TokenRequestStyle::Form,
-        })
+        }
     }
 
     fn complete_login(&self, response: &Value) -> PResult<CapturedAccount> {
@@ -557,6 +591,18 @@ impl Provider for CodexProvider {
             ));
         }
         Ok(captured)
+    }
+}
+
+impl TokenLifecycle for CodexProvider {
+    /// Codex's refresh grant is a plain, programmatic HTTPS POST (no vendor
+    /// CLI / browser step) — see `oauth.rs`'s module doc for the endpoint
+    /// research. `oauth::active_refresh_cas` is the CAS-safe entry point a
+    /// future proactive-refresh caller should use for the single active
+    /// login; nothing in the credential-sync loop wires it up yet (that loop
+    /// lives in `credentials.rs`, out of this provider's scope).
+    fn supports_active_refresh(&self) -> bool {
+        true
     }
 
     fn parse_stored_blob(&self, blob: &str) -> PResult<TokenGrant> {
@@ -629,55 +675,27 @@ impl Provider for CodexProvider {
         }
         Ok((grant, updated.to_string()))
     }
+}
 
-    fn client_status(&self) -> PResult<crate::providers::ClientStatus> {
-        if let Some(path) = auth_json_path() {
-            ensure_file_backend(&path)?;
-        }
-        client::probe()
-            .map(|state| match state {
-                Some(state) => crate::providers::ClientStatus {
-                    running: true,
-                    busy: state.busy,
-                    account_key: state.email,
-                    account_id: state.account_id,
-                    handoff_token: state.instance_token,
-                },
-                None => crate::providers::ClientStatus::default(),
-            })
-            .map_err(|error| ProviderError::Other(error.to_string()))
+impl UsageSource for CodexProvider {
+    // --- Usage -------------------------------------------------------------
+
+    fn fetch_usage(&self, access_token: &str) -> PResult<UsageSnapshot> {
+        fetch_usage_as(access_token, None)
     }
 
-    fn begin_handoff(&self, token: &str) -> PResult<()> {
-        client::begin_drain(token).map_err(|error| ProviderError::Other(error.to_string()))
+    /// Like the Codex client, name the ChatGPT workspace the token is for
+    /// (`ChatGPT-Account-Id`, from `tokens.account_id`): one login can belong
+    /// to several workspaces, each with its own limits.
+    fn fetch_account_usage(&self, access_token: &str, secret_blob: &str) -> PResult<UsageSnapshot> {
+        let account_id = parse_codex_blob(secret_blob)
+            .ok()
+            .and_then(|parsed| blob_account_id(&parsed));
+        fetch_usage_as(access_token, account_id.as_deref())
     }
+}
 
-    fn launch_client(
-        &self,
-        mode: crate::providers::trait_def::LaunchMode,
-    ) -> PResult<std::process::ExitStatus> {
-        launch_command(mode).status().map_err(ProviderError::Io)
-    }
-
-    fn handoff_stops_synchronously(&self) -> bool {
-        cfg!(unix)
-    }
-
-    fn handoff_request_is_idempotent(&self) -> bool {
-        crate::platform::graceful_drain_is_idempotent()
-    }
-
-    fn verify_handoff_stopped(&self, token: &str) -> PResult<()> {
-        client::verify_stopped(token).map_err(|error| ProviderError::Other(error.to_string()))
-    }
-
-    fn handoff_client(&self, identity: &IdentitySnapshot, token: Option<&str>) -> PResult<()> {
-        if token.is_none() {
-            return Ok(());
-        }
-        client::start_and_verify(identity).map_err(|error| ProviderError::Other(error.to_string()))
-    }
-
+impl ActiveSlot for CodexProvider {
     fn read_active_identity(&self) -> PResult<Option<IdentitySnapshot>> {
         Ok(self
             .capture_current_login()?
@@ -696,22 +714,6 @@ impl Provider for CodexProvider {
                 "reading Codex credentials: {error}"
             ))),
         }
-    }
-
-    // --- Usage -------------------------------------------------------------
-
-    fn fetch_usage(&self, access_token: &str) -> PResult<UsageSnapshot> {
-        fetch_usage_as(access_token, None)
-    }
-
-    /// Like the Codex client, name the ChatGPT workspace the token is for
-    /// (`ChatGPT-Account-Id`, from `tokens.account_id`): one login can belong
-    /// to several workspaces, each with its own limits.
-    fn fetch_account_usage(&self, access_token: &str, secret_blob: &str) -> PResult<UsageSnapshot> {
-        let account_id = parse_codex_blob(secret_blob)
-            .ok()
-            .and_then(|parsed| blob_account_id(&parsed));
-        fetch_usage_as(access_token, account_id.as_deref())
     }
 
     // --- Switching -----------------------------------------------------------
@@ -767,7 +769,61 @@ impl Provider for CodexProvider {
         }
         self.write_active_account(blob, &current.identity)
     }
+}
 
+impl ClientHandoff for CodexProvider {
+    fn client_status(&self) -> PResult<crate::providers::ClientStatus> {
+        if let Some(path) = auth_json_path() {
+            ensure_file_backend(&path)?;
+        }
+        client::probe()
+            .map(|state| match state {
+                Some(state) => crate::providers::ClientStatus {
+                    running: true,
+                    busy: state.busy,
+                    account_key: state.email,
+                    account_id: state.account_id,
+                    handoff_token: state.instance_token,
+                },
+                None => crate::providers::ClientStatus::default(),
+            })
+            .map_err(|error| ProviderError::Other(error.to_string()))
+    }
+
+    fn begin_handoff(&self, token: &str) -> PResult<()> {
+        client::begin_drain(token).map_err(|error| ProviderError::Other(error.to_string()))
+    }
+
+    fn handoff_stops_synchronously(&self) -> bool {
+        cfg!(unix)
+    }
+
+    fn handoff_request_is_idempotent(&self) -> bool {
+        crate::platform::graceful_drain_is_idempotent()
+    }
+
+    fn verify_handoff_stopped(&self, token: &str) -> PResult<()> {
+        client::verify_stopped(token).map_err(|error| ProviderError::Other(error.to_string()))
+    }
+
+    fn handoff_client(&self, identity: &IdentitySnapshot, token: Option<&str>) -> PResult<()> {
+        if token.is_none() {
+            return Ok(());
+        }
+        client::start_and_verify(identity).map_err(|error| ProviderError::Other(error.to_string()))
+    }
+}
+
+impl Launcher for CodexProvider {
+    fn launch_client(
+        &self,
+        mode: crate::providers::trait_def::LaunchMode,
+    ) -> PResult<std::process::ExitStatus> {
+        launch_command(mode).status().map_err(ProviderError::Io)
+    }
+}
+
+impl CredentialSync for CodexProvider {
     // --- Credential sync ---------------------------------------------------
 
     fn credential_paths(&self) -> Vec<PathBuf> {
@@ -2321,7 +2377,7 @@ mod tests {
     #[test]
     fn codex_browser_login_uses_vendor_contract_and_rejects_missing_identity() {
         let provider = providers::codex::CodexProvider;
-        let spec = provider.login_spec().unwrap();
+        let spec = provider.login_spec();
         assert_eq!(spec.redirect_port, Some(1455));
         assert_eq!(spec.redirect_host, "127.0.0.1");
         assert_eq!(spec.redirect_path, "/auth/callback");

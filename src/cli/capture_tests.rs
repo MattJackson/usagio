@@ -1,5 +1,6 @@
 use super::*;
 use crate::lifecycle::{active_refresh_cas, refresh_provider_active_account, ActiveRefreshOutcome};
+use crate::providers::trait_def::LoginFlow;
 use crate::providers::trait_def::TokenGrant;
 use crate::providers::{Provider, CLAUDE_SLUG};
 use crate::rows::claude_plan_label;
@@ -660,25 +661,26 @@ impl crate::providers::Provider for FailingClaudeSlot {
             capture_mode: crate::providers::trait_def::CaptureMode::CredsOnDisk,
         }
     }
+
+    fn login_capture(&self) -> Option<&dyn crate::providers::LoginCapture> {
+        Some(self)
+    }
+
+    fn active_slot(&self) -> Option<&dyn crate::providers::ActiveSlot> {
+        Some(self)
+    }
+}
+
+impl crate::providers::LoginCapture for FailingClaudeSlot {
     fn capture_current_login(
         &self,
     ) -> crate::providers::trait_def::PResult<Option<crate::providers::trait_def::CapturedAccount>>
     {
         Ok(None)
     }
-    fn parse_stored_blob(
-        &self,
-        _blob: &str,
-    ) -> crate::providers::trait_def::PResult<crate::providers::trait_def::TokenGrant> {
-        Err(crate::providers::trait_def::ProviderError::Unsupported)
-    }
-    fn patch_stored_blob(
-        &self,
-        _blob: &str,
-        _grant: &crate::providers::trait_def::TokenGrant,
-    ) -> crate::providers::trait_def::PResult<String> {
-        Err(crate::providers::trait_def::ProviderError::Unsupported)
-    }
+}
+
+impl crate::providers::ActiveSlot for FailingClaudeSlot {
     fn write_active_account(
         &self,
         _blob: &str,
@@ -687,6 +689,16 @@ impl crate::providers::Provider for FailingClaudeSlot {
         Err(providers::ProviderError::Other(
             "keychain write refused".into(),
         ))
+    }
+
+    fn read_active_identity(
+        &self,
+    ) -> crate::providers::PResult<Option<crate::providers::IdentitySnapshot>> {
+        Err(crate::providers::ProviderError::Unsupported)
+    }
+
+    fn read_active_slot(&self) -> crate::providers::PResult<Option<String>> {
+        Err(crate::providers::ProviderError::Unsupported)
     }
 }
 

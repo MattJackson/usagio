@@ -461,7 +461,7 @@ pub(super) fn build_snapshot() -> Snapshot {
         // the exact comparator `flat_account_order` uses, so this section vec
         // and the rendered `account_order` are always identical.
         accounts.sort_by(|a, b| account_priority_cmp(a, b, now));
-        let renewable = provider.login_spec().is_some();
+        let renewable = provider.login_flow().is_some();
         for a in &mut accounts {
             if a.active && a.has_data {
                 a.rate = cached_rates(slug, &a.key, now);

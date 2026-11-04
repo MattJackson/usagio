@@ -36,6 +36,14 @@ use crate::providers::trait_def::{
     LaunchMode, LoginSpec, PResult, Provider, ProviderError, SecretBackend, TokenGrant,
     TokenRequestStyle, UsageSnapshot, UsageWindow,
 };
+use crate::providers::ActiveSlot;
+use crate::providers::CredentialSync;
+use crate::providers::Launcher;
+use crate::providers::LoginCapture;
+use crate::providers::LoginFlow;
+use crate::providers::PlanCheck;
+use crate::providers::TokenLifecycle;
+use crate::providers::UsageSource;
 
 /// Read/write timeout applied to every outbound HTTP call this provider
 /// makes. The default `ureq::Agent` only bounds the TCP *connect* (30s); a
@@ -119,18 +127,40 @@ impl Provider for ClaudeProvider {
         &["session", "weekly", "opus"]
     }
 
-    /// Claude's refresh grant is also a plain, programmatic HTTPS POST (see
-    /// `oauth::refresh`) — `main.rs::active_refresh_cas` has driven a
-    /// compare-and-swap on the ACTIVE account's keychain slot since v0.4.0,
-    /// it just didn't previously go through this trait method to decide
-    /// whether to run. `main.rs`'s poll cycle now checks
-    /// `supports_active_refresh()` before invoking that CAS for ANY
-    /// provider (Claude included), so this must stay `true` to keep today's
-    /// behavior — see the call site's doc comment.
-    fn supports_active_refresh(&self) -> bool {
-        true
+    fn login_capture(&self) -> Option<&dyn LoginCapture> {
+        Some(self)
     }
 
+    fn login_flow(&self) -> Option<&dyn LoginFlow> {
+        Some(self)
+    }
+
+    fn token_lifecycle(&self) -> Option<&dyn TokenLifecycle> {
+        Some(self)
+    }
+
+    fn usage_source(&self) -> Option<&dyn UsageSource> {
+        Some(self)
+    }
+
+    fn plan_check(&self) -> Option<&dyn PlanCheck> {
+        Some(self)
+    }
+
+    fn active_slot(&self) -> Option<&dyn ActiveSlot> {
+        Some(self)
+    }
+
+    fn launcher(&self) -> Option<&dyn Launcher> {
+        Some(self)
+    }
+
+    fn credential_sync(&self) -> Option<&dyn CredentialSync> {
+        Some(self)
+    }
+}
+
+impl LoginCapture for ClaudeProvider {
     // --- Capture / listing --------------------------------------------------
 
     fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
@@ -197,10 +227,12 @@ impl Provider for ClaudeProvider {
             tokens,
         }))
     }
+}
 
+impl LoginFlow for ClaudeProvider {
     /// Claude Code's own `/login` (claude.ai account), run by usagio.
-    fn login_spec(&self) -> Option<LoginSpec> {
-        Some(LoginSpec {
+    fn login_spec(&self) -> LoginSpec {
+        LoginSpec {
             authorize_url: config::AUTHORIZE_URL,
             token_url: config::TOKEN_URL,
             client_id: config::CLIENT_ID,
@@ -214,7 +246,7 @@ impl Provider for ClaudeProvider {
             token_request: TokenRequestStyle::Json {
                 include_state: true,
             },
-        })
+        }
     }
 
     fn complete_login(&self, token_response: &Value) -> PResult<CapturedAccount> {
@@ -230,6 +262,20 @@ impl Provider for ClaudeProvider {
             &profile,
             chrono::Utc::now().timestamp_millis(),
         )
+    }
+}
+
+impl TokenLifecycle for ClaudeProvider {
+    /// Claude's refresh grant is also a plain, programmatic HTTPS POST (see
+    /// `oauth::refresh`) — `main.rs::active_refresh_cas` has driven a
+    /// compare-and-swap on the ACTIVE account's keychain slot since v0.4.0,
+    /// it just didn't previously go through this trait method to decide
+    /// whether to run. `main.rs`'s poll cycle now checks
+    /// `supports_active_refresh()` before invoking that CAS for ANY
+    /// provider (Claude included), so this must stay `true` to keep today's
+    /// behavior — see the call site's doc comment.
+    fn supports_active_refresh(&self) -> bool {
+        true
     }
 
     // --- Token lifecycle ----------------------------------------------------
@@ -322,7 +368,9 @@ impl Provider for ClaudeProvider {
             expires_in_secs: tok.expires_in,
         })
     }
+}
 
+impl UsageSource for ClaudeProvider {
     // --- Usage --------------------------------------------------------------
 
     fn fetch_usage(&self, access_token: &str) -> PResult<UsageSnapshot> {
@@ -345,11 +393,15 @@ impl Provider for ClaudeProvider {
             reported: usage::reported_usage(&u),
         })
     }
+}
 
+impl PlanCheck for ClaudeProvider {
     fn check_plan(&self, access_token: &str) -> Option<crate::providers::trait_def::PlanStatus> {
         usage::plan_status_from_profile(&usage::fetch_profile(access_token)?)
     }
+}
 
+impl ActiveSlot for ClaudeProvider {
     // --- Switching ----------------------------------------------------------
 
     fn write_active_account(&self, blob: &str, identity: &IdentitySnapshot) -> PResult<()> {
@@ -429,14 +481,6 @@ impl Provider for ClaudeProvider {
         }))
     }
 
-    fn launch_client(&self, mode: LaunchMode) -> PResult<ExitStatus> {
-        let mut cmd = std::process::Command::new("claude");
-        if matches!(mode, LaunchMode::Continue) {
-            cmd.arg("--continue");
-        }
-        cmd.status().map_err(ProviderError::Io)
-    }
-
     /// Mirror a rotated blob (from an INACTIVE-account refresh) to wherever
     /// Claude Code actually reads its credentials from on this OS. Claude
     /// Code only uses the OS keychain on macOS (via the `security` CLI,
@@ -449,8 +493,8 @@ impl Provider for ClaudeProvider {
     /// strict-cfg rule that OS forks outside `src/platform/` must route
     /// through `Platform`.
     ///
-    /// Overridden (rather than inheriting the trait default) because the
-    /// default routes through `write_active_account`, which requires a full
+    /// Overridden (rather than inheriting the `ActiveSlot` default) because
+    /// the default routes through `write_active_account`, which requires a full
     /// `IdentitySnapshot` to rebuild `~/.claude.json` too — but mirroring a
     /// rotated token must NOT touch identity at all, only the token bytes.
     fn mirror_rotated_token(&self, blob: &str) -> PResult<()> {
@@ -483,7 +527,19 @@ impl Provider for ClaudeProvider {
     fn read_active_slot(&self) -> PResult<Option<String>> {
         active_slot_read()
     }
+}
 
+impl Launcher for ClaudeProvider {
+    fn launch_client(&self, mode: LaunchMode) -> PResult<ExitStatus> {
+        let mut cmd = std::process::Command::new("claude");
+        if matches!(mode, LaunchMode::Continue) {
+            cmd.arg("--continue");
+        }
+        cmd.status().map_err(ProviderError::Io)
+    }
+}
+
+impl CredentialSync for ClaudeProvider {
     // --- Credential sync ---------------------------------------------------
 
     fn credential_paths(&self) -> Vec<PathBuf> {
@@ -1165,7 +1221,10 @@ mod tests {
 
     #[test]
     fn claude_publishes_its_login_spec() {
-        let spec = ClaudeProvider.login_spec().expect("claude can renew");
+        let spec = ClaudeProvider
+            .login_flow()
+            .expect("claude can renew")
+            .login_spec();
         assert_eq!(spec.client_id, config::CLIENT_ID);
         assert_eq!(spec.token_url, config::TOKEN_URL);
         assert_eq!(spec.redirect_path, "/callback");

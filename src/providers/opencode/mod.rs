@@ -38,8 +38,8 @@
 //!
 //! **(b) is what's implemented here**, for three reasons:
 //!   1. Scope: v0.5.0's contract is "never re-login" for accounts usagio
-//!      actively manages. opencode's `capture_current_login` is still a
-//!      stub (`Err(Unsupported)` below) — there's no captured opencode account for a
+//!      actively manages. opencode exposes no `LoginCapture` yet (see the
+//!      provider impl below) — there's no captured opencode account for a
 //!      refresh/mirror-back to apply to yet, so building CAS/mirror-back
 //!      plumbing now would have no caller.
 //!   2. Identity gap: per-`providerID` blobs carry no email/user_id (see
@@ -58,15 +58,12 @@
 //!
 //! `Capabilities` below are therefore all `false` except `supports_remove`
 //! (dropping a captured account from state.json is safe regardless), and
-//! `Provider::supports_active_refresh` is left at its `false` trait default.
+//! no `TokenLifecycle` is exposed, so no active refresh runs.
 //! Revisit this file when v0.6 designs the multi-provider account model.
 
 #![allow(dead_code)]
 
-use crate::providers::trait_def::{
-    Capabilities, CaptureMode, CapturedAccount, PResult, Provider, ProviderError, SecretBackend,
-    TokenGrant,
-};
+use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
 pub fn new() -> Box<dyn Provider> {
     Box::new(OpencodeProvider)
@@ -74,6 +71,10 @@ pub fn new() -> Box<dyn Provider> {
 
 pub struct OpencodeProvider;
 
+// Not wired yet (no capability exposed):
+// TODO: read `~/.local/share/opencode/auth.json` (or the
+// `OPENCODE_AUTH_CONTENT` env override) and iterate its providerID
+// keys to produce one CapturedAccount per configured provider.
 impl Provider for OpencodeProvider {
     fn provider_id(&self) -> &'static str {
         "opencode"
@@ -93,21 +94,6 @@ impl Provider for OpencodeProvider {
             secret_backend: SecretBackend::File,
             capture_mode: CaptureMode::CredsOnDisk,
         }
-    }
-
-    fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
-        // TODO: read `~/.local/share/opencode/auth.json` (or the
-        // `OPENCODE_AUTH_CONTENT` env override) and iterate its providerID
-        // keys to produce one CapturedAccount per configured provider.
-        Err(ProviderError::Unsupported)
-    }
-
-    fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
-        Err(ProviderError::Unsupported)
-    }
-
-    fn patch_stored_blob(&self, _blob: &str, _grant: &TokenGrant) -> PResult<String> {
-        Err(ProviderError::Unsupported)
     }
 }
 
@@ -130,9 +116,6 @@ mod tests {
 
     #[test]
     fn capture_returns_none_placeholder() {
-        assert!(matches!(
-            OpencodeProvider.capture_current_login(),
-            Err(ProviderError::Unsupported)
-        ));
+        assert!(OpencodeProvider.login_capture().is_none());
     }
 }

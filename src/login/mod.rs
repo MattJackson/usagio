@@ -3,7 +3,7 @@
 //! Every vendor CLI logs in the same way — OAuth 2.0 authorization code with
 //! PKCE (RFC 7636) and a loopback redirect. A provider describes its endpoints
 //! in a [`LoginSpec`] and turns the token response into its own credential
-//! blob ([`Provider::complete_login`]); this module does the rest:
+//! blob ([`LoginFlow::complete_login`]); this module does the rest:
 //!
 //! 1. mint a PKCE verifier/challenge and a `state`,
 //! 2. listen on `localhost` for the redirect,
@@ -565,9 +565,10 @@ pub fn start(
     target: Target,
     on_done: impl FnOnce(Result<Renewed>) + Send + 'static,
 ) -> Result<Started> {
-    let spec = provider
-        .login_spec()
+    let flow = provider
+        .login_flow()
         .ok_or_else(|| anyhow!("{} can't be signed in from usagio", provider.display_name()))?;
+    let spec = flow.login_spec();
     let pkce = pkce();
     let state = random_token(32);
     let loopback = Loopback::bind(&spec)?;
@@ -593,9 +594,7 @@ pub fn start(
         let result = (|| {
             let code = wait_and_release(loopback, &state, LOGIN_TIMEOUT, &worker.cancelled)?;
             let tokens = exchange(&spec, &code, &pkce.verifier, &state, &redirect_uri)?;
-            let captured = provider
-                .complete_login(&tokens)
-                .map_err(|e| anyhow!("{e}"))?;
+            let captured = flow.complete_login(&tokens).map_err(|e| anyhow!("{e}"))?;
             check_signed_in_as(
                 &provider.account_identifier(&captured.identity),
                 target.expected(),

@@ -2,6 +2,7 @@
 
 use crate::claude_local::{keychain_read, read_claude_identity};
 use crate::providers::claude::usage;
+use crate::providers::require;
 use crate::providers::Provider;
 use crate::state_ops::with_state_lock;
 use crate::store::{Account, State};
@@ -51,7 +52,8 @@ pub(crate) fn mirror_inactive_rotation(
     // only runs when a rotation was actually detected (rare), and the switch
     // path already holds the state lock across its own keychain write.
     let outcome = with_state_lock(|| {
-        let vendor_identity = match provider.read_active_identity() {
+        let slot = require(provider.active_slot());
+        let vendor_identity = match slot.and_then(|slot| slot.read_active_identity()) {
             Ok(Some(id)) => id,
             Ok(None) => return Ok(None),
             // Surface the failure (logged as mirror_back=err) instead of
@@ -71,8 +73,8 @@ pub(crate) fn mirror_inactive_rotation(
         if !matches {
             return Ok(None);
         }
-        let result = provider
-            .mirror_rotated_token(&acct.keychain_blob)
+        let result = require(provider.active_slot())
+            .and_then(|slot| slot.mirror_rotated_token(&acct.keychain_blob))
             .map_err(|e| e.to_string());
         crate::logging::log(&format!(
             "event=mirror account={} result={}",

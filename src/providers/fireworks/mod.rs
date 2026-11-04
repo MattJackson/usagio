@@ -17,10 +17,7 @@
 
 #![allow(dead_code)]
 
-use crate::providers::trait_def::{
-    Capabilities, CaptureMode, CapturedAccount, PResult, Provider, ProviderError, SecretBackend,
-    TokenGrant,
-};
+use crate::providers::trait_def::{Capabilities, CaptureMode, Provider, SecretBackend};
 
 pub fn new() -> Box<dyn Provider> {
     Box::new(FireworksProvider)
@@ -28,6 +25,10 @@ pub fn new() -> Box<dyn Provider> {
 
 pub struct FireworksProvider;
 
+// Not wired yet (no capability exposed):
+// TODO: call GET /v1/accounts with the pasted key, use the returned
+// account owner email as the identifier, persist the key to the
+// keychain under `fireworks/<email>`.
 impl Provider for FireworksProvider {
     fn provider_id(&self) -> &'static str {
         "fireworks"
@@ -49,25 +50,6 @@ impl Provider for FireworksProvider {
             secret_backend: SecretBackend::Keychain,
             capture_mode: CaptureMode::ApiKey,
         }
-    }
-
-    fn capture_current_login(&self) -> PResult<Option<CapturedAccount>> {
-        Err(ProviderError::Unsupported)
-    }
-
-    fn capture_api_key(&self, _nickname: String, _key: String) -> PResult<CapturedAccount> {
-        // TODO: call GET /v1/accounts with the pasted key, use the returned
-        // account owner email as the identifier, persist the key to the
-        // keychain under `fireworks/<email>`.
-        Err(ProviderError::Unsupported)
-    }
-
-    fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
-        Err(ProviderError::Unsupported)
-    }
-
-    fn patch_stored_blob(&self, _blob: &str, _grant: &TokenGrant) -> PResult<String> {
-        Err(ProviderError::Unsupported)
     }
 }
 
@@ -98,13 +80,7 @@ mod tests {
     #[test]
     fn capture_paths_return_unsupported() {
         let p = FireworksProvider;
-        assert!(matches!(
-            p.capture_current_login(),
-            Err(ProviderError::Unsupported)
-        ));
-        assert!(matches!(
-            p.capture_api_key("prod".into(), "fw-x".into()),
-            Err(ProviderError::Unsupported)
-        ));
+        assert!(p.login_capture().is_none());
+        assert!(p.api_key_capture().is_none());
     }
 }

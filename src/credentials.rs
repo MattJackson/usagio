@@ -7,7 +7,7 @@
 //! freshest match, and only flag `needs_relogin` if all paths agree the
 //! token is dead.
 //!
-//! Everything here is provider-agnostic — it drives `Provider::credential_paths`,
+//! Everything here is provider-agnostic — it drives `CredentialSync::credential_paths`,
 //! `identify_credential`, `credential_freshness`, and `absorb_credential`, so
 //! adding a new provider just means implementing those four methods on its
 //! trait impl.
@@ -22,6 +22,7 @@ use anyhow::{Context, Result};
 use crate::providers::trait_def::{
     AccountKey, CredentialFreshness, PResult, Provider, ProviderError,
 };
+use crate::providers::CredentialSync;
 use crate::store::{self, State};
 
 /// Refresh a token if it expires within this many seconds. Bumped from the
@@ -58,7 +59,7 @@ thread_local! {
     /// outermost frame owns the actual fs2 advisory lock; nested frames
     /// short-circuit and just run the closure. Without this a call chain like
     /// `switch_to_guarded` -> `absorb_before_switch` ->
-    /// `Provider::absorb_credential` -> `with_state_lock_absorb` -> `with_state_lock`
+    /// `CredentialSync::absorb_credential` -> `with_state_lock_absorb` -> `with_state_lock`
     /// would `open()` the lock file a second time in the same process and
     /// `flock(LOCK_EX)` on that fresh open file description, which blocks
     /// forever on both macOS and Linux (per-open-fd semantics).
@@ -135,7 +136,7 @@ pub fn read_blob(path: &Path) -> Option<String> {
 /// `last_chance_fallback` does) should check `read_blob` itself rather than
 /// use this helper for that path. Both current callers only need the
 /// "recognised or not" split, which `identified` already gives them.
-fn for_each_credential_path<F>(provider: &dyn Provider, online_identify: bool, mut f: F)
+fn for_each_credential_path<F>(provider: &dyn CredentialSync, online_identify: bool, mut f: F)
 where
     F: FnMut(&Path, &str, Option<(AccountKey, CredentialFreshness)>),
 {
@@ -161,6 +162,14 @@ where
     }
 }
 
+/// The paths a provider's credential sync watches; none without that capability.
+fn credential_paths_of(provider: &dyn Provider) -> Vec<std::path::PathBuf> {
+    provider
+        .credential_sync()
+        .map(|s| s.credential_paths())
+        .unwrap_or_default()
+}
+
 /// Scan a provider's credential paths and let it absorb any lagging
 /// rotations. Returns the set of AccountKeys observed on disk (whether we
 /// absorbed them or not — the caller can use this to detect additions).
@@ -171,6 +180,9 @@ where
 /// polling for another). Absorb those too.
 pub fn absorb_all_lagging(provider: &dyn Provider) -> Vec<AccountKey> {
     let mut seen = Vec::new();
+    let Some(provider) = provider.credential_sync() else {
+        return seen;
+    };
     for_each_credential_path(provider, false, |path, blob, identified| {
         let Some((key, freshness)) = identified else {
             return;
@@ -376,6 +388,9 @@ pub fn absorb_before_switch(provider: &dyn Provider) {
 /// tracked account. This is the "free-sync" behaviour: we already have
 /// the data in hand, no reason not to update it.
 pub fn last_chance_fallback(provider: &dyn Provider, target: &AccountKey) -> bool {
+    let Some(provider) = provider.credential_sync() else {
+        return false;
+    };
     let mut best_for_target: Option<(String, CredentialFreshness)> = None;
     for_each_credential_path(provider, true, |path, blob, identified| {
         let Some((key, freshness)) = identified else {
@@ -452,7 +467,7 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
     // directories, whose other files must not keep it busy.
     let cred_names: Vec<std::ffi::OsString> = providers
         .iter()
-        .flat_map(|p| p.credential_paths())
+        .flat_map(|p| credential_paths_of(*p))
         .filter_map(|p| p.file_name().map(std::ffi::OsStr::to_os_string))
         .collect();
     let watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
@@ -497,7 +512,7 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
     let mut watched_parents: std::collections::HashSet<std::path::PathBuf> =
         std::collections::HashSet::new();
     for p in &providers {
-        for path in p.credential_paths() {
+        for path in credential_paths_of(*p) {
             // Watch the parent directory (notify's file-level watching is
             // unreliable across atomic-rename rotations, which is exactly
             // how the vendor CLIs write these files).
