@@ -5,6 +5,12 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] - 2026-11-04
+
+### Fixed
+
+- The menu-bar app no longer crashes about a second after launch on macOS 27. The 1.1.1 startup clean-up of old sign-in sessions called WebKit before WebKit was initialised; it now initialises WebKit first. A macOS startup smoke test in CI launches the real app and fails if it exits.
+
 ## [1.1.1] - 2026-11-04
 
 ### Fixed
