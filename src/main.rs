@@ -308,10 +308,11 @@ fn print_help() {
          usagio start [email]     Switch, then launch the selected provider CLI\n  \
          usagio continue [email]  Switch, then resume the selected provider session\n  \
          usagio token [email]     Print a fresh access token\n  \
-         usagio watch             Auto-swap at 95%, keep working (foreground)\n  \
-         usagio menubar           Run the macOS menu-bar app (usage + auto-swap)\n  \
+         usagio watch [OPTS]      Auto-swap at your trigger (default 95%), keep working (foreground)\n  \
+                                        --trigger <pct>  --ceiling <pct>  --interval <secs>\n  \
+         usagio menubar           Run the menu-bar/tray app (usage + auto-swap)\n  \
          usagio menubar --theme <os>  Force an OEM look for a UI audit: windows|macos|gnome|system\n  \
-         usagio install           Run the menu-bar app at every login (via launchd)\n  \
+         usagio install           Run the menu-bar/tray app at every login\n  \
          usagio uninstall         Stop running the menu-bar app at login\n  \
          usagio report            Usage patterns by weekday / hour / account\n  \
          usagio report --pace     Per-account burn-rate forecast (empty-in ETA)\n  \
@@ -320,6 +321,7 @@ fn print_help() {
                                         --project  <path>  scope in-tree instructions to this project\n  \
          usagio login             Sign in to a new account in your browser (adds it)\n  \
          usagio renew <email>     Sign that account in again in your browser (fresh login)\n  \
+                                        --provider <slug>  or use `codex:email`\n  \
          usagio rm <email>        Forget an account\n\n\
          With no [email], switch/start/continue auto-pick the account that has room\n  \
          and whose weekly limit resets soonest (use it before the quota resets).\n  \
@@ -4009,18 +4011,38 @@ fn cached_to_account_usage(cu: &CachedUsage) -> countdown::AccountUsage {
     }
 }
 
-fn cmd_watch(args: &[String]) -> Result<()> {
+const WATCH_USAGE: &str =
+    "usage: usagio watch [--interval <secs>] [--trigger <pct>] [--ceiling <pct>]";
+
+/// Parse `watch` flags; a missing or unparsable value is an error, never a
+/// silent fallback to the saved/default setting.
+fn parse_watch_opts(args: &[String]) -> Result<menubar::LoopOpts> {
+    fn value<T: std::str::FromStr>(flag: &str, it: &mut std::slice::Iter<'_, String>) -> Result<T> {
+        let raw = it
+            .next()
+            .with_context(|| format!("{flag} needs a value\n{WATCH_USAGE}"))?;
+        raw.parse()
+            .map_err(|_| anyhow!("invalid value '{raw}' for {flag}\n{WATCH_USAGE}"))
+    }
     let mut opts = menubar::LoopOpts::default();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--interval" => opts.base = it.next().and_then(|s| s.parse().ok()).unwrap_or(opts.base),
-            "--trigger" => opts.trigger = it.next().and_then(|s| s.parse().ok()).or(opts.trigger),
-            "--ceiling" => opts.ceiling = it.next().and_then(|s| s.parse().ok()).or(opts.ceiling),
-            other => bail!("unknown watch option: {other}"),
+            "--interval" => opts.base = value("--interval", &mut it)?,
+            "--trigger" => opts.trigger = Some(value("--trigger", &mut it)?),
+            "--ceiling" => opts.ceiling = Some(value("--ceiling", &mut it)?),
+            other => bail!("unknown watch option: {other}\n{WATCH_USAGE}"),
         }
     }
-    let state = State::load().unwrap_or_default();
+    Ok(opts)
+}
+
+fn cmd_watch(args: &[String]) -> Result<()> {
+    let opts = parse_watch_opts(args)?;
+    let state = State::load().unwrap_or_else(|e| {
+        eprintln!("usagio watch: could not read state.json ({e:#}); the banner below shows defaults, not your saved settings");
+        State::default()
+    });
     let trigger = opts
         .trigger
         .unwrap_or_else(|| state.trigger_pct.unwrap_or(TRIGGER_PCT));
@@ -5499,16 +5521,35 @@ fn migrate_launchd_if_needed() {
 /// exiting non-zero in that case is the expected, swallowed outcome.
 fn purge_legacy_login_items() {
     for name in ["usagio", "claude-usage"] {
-        let _ = std::process::Command::new("timeout")
-            .args([
-                "3",
-                "osascript",
-                "-e",
-                &format!("tell application \"System Events\" to delete login item \"{name}\""),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        let mut cmd = std::process::Command::new("/usr/bin/osascript");
+        cmd.args([
+            "-e",
+            &format!("tell application \"System Events\" to delete login item \"{name}\""),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+        let _ = run_with_deadline(cmd, std::time::Duration::from_secs(3));
+    }
+}
+
+/// Run `cmd`, killing it if it outlives `deadline` (no dependency on
+/// `timeout(1)`, which stock macOS does not ship). `Ok(true)` on exit 0.
+fn run_with_deadline(
+    mut cmd: std::process::Command,
+    deadline: std::time::Duration,
+) -> std::io::Result<bool> {
+    let mut child = cmd.spawn()?;
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status.success());
+        }
+        if start.elapsed() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 

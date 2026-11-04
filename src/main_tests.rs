@@ -6502,3 +6502,27 @@ fn failed_fetch_keeps_a_plan_restored_earlier_in_the_cycle() {
     assert_eq!(lapsed.map(|p| p.active), Some(false));
     assert!(plan_after_failed_fetch(None, None).is_none());
 }
+
+#[test]
+fn watch_flags_reject_bad_or_missing_values() {
+    let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert!(parse_watch_opts(&args(&["--trigger", "8O"])).is_err());
+    assert!(parse_watch_opts(&args(&["--ceiling"])).is_err());
+    assert!(parse_watch_opts(&args(&["--interval", "x"])).is_err());
+    let ok = parse_watch_opts(&args(&["--trigger", "80", "--interval", "30"])).unwrap();
+    assert_eq!(ok.trigger, Some(80.0));
+    assert_eq!(ok.base, 30);
+}
+
+#[cfg(unix)]
+#[test]
+fn run_with_deadline_kills_an_overrunning_child_without_timeout_binary() {
+    let started = std::time::Instant::now();
+    let mut cmd = std::process::Command::new("/bin/sleep");
+    cmd.arg("30");
+    let ok = run_with_deadline(cmd, std::time::Duration::from_millis(150)).unwrap();
+    assert!(!ok);
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    let cmd = std::process::Command::new("/usr/bin/true");
+    assert!(run_with_deadline(cmd, std::time::Duration::from_secs(5)).unwrap());
+}
