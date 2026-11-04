@@ -119,6 +119,16 @@ pub fn compute_display(usage: &AccountUsage, now: DateTime<Utc>) -> DisplayState
     }
 }
 
+/// A window at/above the lock threshold whose reset time is unknown stays
+/// blocked indefinitely: no other window's unlock time says when the account
+/// is usable again, so callers must not present one as a countdown.
+pub(crate) fn has_indefinite_block(u: &AccountUsage) -> bool {
+    let unknown = |pct: Option<f64>, reset: Option<DateTime<Utc>>| {
+        pct.is_some_and(|p| p >= LOCKED_THRESHOLD_PCT) && reset.is_none()
+    };
+    unknown(u.session_pct, u.session_reset) || unknown(u.weekly_pct, u.weekly_reset)
+}
+
 fn is_blocking(
     pct: Option<f64>,
     reset: Option<DateTime<Utc>>,
