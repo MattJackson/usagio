@@ -1642,6 +1642,7 @@ fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     static LAST_CHECK: Mutex<Option<Instant>> = Mutex::new(None);
+    static FAILED_TARGET: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
     {
         let mut g = LAST_CHECK.lock().unwrap();
         let should_check = !matches!(*g, Some(t) if t.elapsed() < Duration::from_secs(10));
@@ -1655,7 +1656,8 @@ fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
     let Ok(now) = std::fs::canonicalize(&stable) else {
         return;
     };
-    if now == start {
+    let mut failed = FAILED_TARGET.lock().unwrap_or_else(|e| e.into_inner());
+    if !relaunch_due(start, &now, failed.as_deref()) {
         return;
     }
     crate::logging::log("binary changed on disk (brew upgrade); relaunching");
@@ -1669,7 +1671,10 @@ fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
             // Under launchd but the kickstart didn't take. Staying on the current
             // (old) binary — alive — is far better than exiting into a dead,
             // never-restarted state (KeepAlive=false won't bring us back).
-            crate::logging::log("launchctl kickstart failed; staying on current version");
+            crate::logging::log(
+                "launchctl kickstart failed; staying on current version until the binary changes again",
+            );
+            *failed = Some(now);
         }
         LaunchdRestart::NotManaged => {
             // Bare run (no launchd job): an orphaned child re-parents to
@@ -1677,12 +1682,26 @@ fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
             // actually succeeded, else we'd vanish with no replacement.
             match std::process::Command::new(&stable).arg("menubar").spawn() {
                 Ok(_) => std::process::exit(0),
-                Err(e) => crate::logging::log(&format!(
-                    "relaunch spawn failed: {e}; staying on current version"
-                )),
+                Err(e) => {
+                    crate::logging::log(&format!(
+                        "relaunch spawn failed: {e}; staying on current version until the binary changes again"
+                    ));
+                    *failed = Some(now);
+                }
             }
         }
     }
+}
+
+/// Whether the binary at `now` should be relaunched into: it differs from the
+/// one this process started from, and a relaunch into it hasn't already failed
+/// (a failure isn't retried every 10s; a newer binary is tried again).
+fn relaunch_due(
+    start: &std::path::Path,
+    now: &std::path::Path,
+    failed: Option<&std::path::Path>,
+) -> bool {
+    now != start && failed != Some(now)
 }
 
 /// Outcome of attempting a launchd-driven restart.
@@ -8572,6 +8591,23 @@ mod tests {
         assert!(!new.is_cancelled());
         let prev = supersede_previous_login("t-login-replace").expect("tracked");
         assert!(std::sync::Arc::ptr_eq(&prev, &new));
+    }
+
+    #[test]
+    fn a_failed_relaunch_is_not_retried_until_the_binary_changes_again() {
+        use std::path::Path;
+        let (a, b, c) = (
+            Path::new("/v1/usagio"),
+            Path::new("/v2/usagio"),
+            Path::new("/v3/usagio"),
+        );
+        assert!(!relaunch_due(a, a, None), "unchanged binary");
+        assert!(relaunch_due(a, b, None), "first sight of a new binary");
+        assert!(
+            !relaunch_due(a, b, Some(b)),
+            "a relaunch into this binary already failed"
+        );
+        assert!(relaunch_due(a, c, Some(b)), "a newer binary retries");
     }
 
     #[test]
