@@ -160,7 +160,8 @@ For window `w` of account `a`:
 - **[v3.1] window epoch**: the window identified by its reported `resets_at`. A new epoch starts when a reading
   reports a different `resets_at` or a lower pct than the previous reading. That covers an early reset, a limit
   boost, or a claimed banked reset (0.11.0). Latches (§3.5) store the epoch's `resets_at` and are void in any
-  other epoch.
+  other epoch. Two `resets_at` values within `EPOCH_MATCH_TOLERANCE_S` (300 s) are the same epoch: Codex reports a
+  relative reset (`now + reset_after_seconds`), which drifts by seconds between reads.
 - **[v3.1] lower bound `lb_w`** = the pct of the **latest successful reading**, not a running maximum (usage
   only rises within an epoch, so the latest reading is the maximum). It is valid at any age until the window
   turns reset-pending or a newer reading arrives.
