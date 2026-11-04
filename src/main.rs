@@ -4216,7 +4216,7 @@ fn refresh_provider_usage_caches_with(
             if is_active {
                 out.active_fetched.insert(slug.to_string());
             }
-            let cu = match provider.fetch_usage(&access) {
+            let cu = match provider.fetch_account_usage(&access, &request_account.secret_blob) {
                 Ok(snap) => {
                     record_usage_fetch_success(&tracker_key);
                     *out.fetched.entry(slug.to_string()).or_default() += 1;
@@ -5164,7 +5164,7 @@ fn verify_swap_target_detailed(slug: &str, key: &str) -> std::result::Result<Row
         }
         match provider_by_slug(slug)
             .map_err(|_| false)?
-            .fetch_usage(&acct.access_token)
+            .fetch_account_usage(&acct.access_token, &acct.secret_blob)
         {
             Ok(snap) => Ok(cached_from_usage_snapshot(&snap)),
             Err(e) => {

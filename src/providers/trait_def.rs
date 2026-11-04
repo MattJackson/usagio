@@ -744,6 +744,14 @@ pub trait Provider: Send + Sync + 'static {
         Err(ProviderError::Unsupported)
     }
 
+    /// [`Self::fetch_usage`] for a stored account, whose `secret_blob` may
+    /// carry request context the token alone lacks (Codex's ChatGPT
+    /// workspace id). Defaults to `fetch_usage`.
+    fn fetch_account_usage(&self, access_token: &str, secret_blob: &str) -> PResult<UsageSnapshot> {
+        let _ = secret_blob;
+        self.fetch_usage(access_token)
+    }
+
     /// Ask the provider which plan the account is on, WITHOUT touching the
     /// usage endpoint (so it's safe to call while that endpoint 403s/429s a
     /// lapsed account). Used to confirm a suspected lapse and to notice a

@@ -655,41 +655,17 @@ impl Provider for CodexProvider {
     // --- Usage -------------------------------------------------------------
 
     fn fetch_usage(&self, access_token: &str) -> PResult<UsageSnapshot> {
-        let url = usage_url();
-        let resp = http_agent()
-            .get(&url)
-            .set("Authorization", &format!("Bearer {access_token}"))
-            .set("Content-Type", "application/json")
-            .call();
-        let body: Value = match resp {
-            Ok(r) => r
-                .into_json()
-                .map_err(|e| ProviderError::Other(format!("parsing codex usage: {e}")))?,
-            Err(ureq::Error::Status(401, _)) => return Err(ProviderError::Auth),
-            Err(ureq::Error::Status(429, _)) => {
-                return Err(ProviderError::RateLimited {
-                    retry_after_secs: None,
-                })
-            }
-            Err(ureq::Error::Status(code, _)) => {
-                return Err(ProviderError::Other(format!(
-                    "codex usage endpoint returned HTTP {code}"
-                )))
-            }
-            Err(e) => return Err(ProviderError::Transient(e.to_string())),
-        };
+        fetch_usage_as(access_token, None)
+    }
 
-        crate::providers::log_watched_fields("codex", &body, WATCHED_FIELDS);
-        Ok(UsageSnapshot {
-            windows: parse_usage_windows(&body),
-            fetched_at: Utc::now(),
-            plan: parse_plan(&body),
-            reported: ReportedUsage {
-                credits: parse_credits(&body),
-                reset_grants: parse_reset_credits(&body),
-                ..ReportedUsage::default()
-            },
-        })
+    /// Like the Codex client, name the ChatGPT workspace the token is for
+    /// (`ChatGPT-Account-Id`, from `tokens.account_id`): one login can belong
+    /// to several workspaces, each with its own limits.
+    fn fetch_account_usage(&self, access_token: &str, secret_blob: &str) -> PResult<UsageSnapshot> {
+        let account_id = parse_codex_blob(secret_blob)
+            .ok()
+            .and_then(|parsed| blob_account_id(&parsed));
+        fetch_usage_as(access_token, account_id.as_deref())
     }
 
     // --- Switching -----------------------------------------------------------
@@ -868,6 +844,48 @@ impl Provider for CodexProvider {
             Ok(())
         })
     }
+}
+
+/// GET the usage endpoint, as `account_id`'s workspace when known.
+fn fetch_usage_as(access_token: &str, account_id: Option<&str>) -> PResult<UsageSnapshot> {
+    let url = usage_url();
+    let mut request = http_agent()
+        .get(&url)
+        .set("Authorization", &format!("Bearer {access_token}"))
+        .set("Content-Type", "application/json");
+    if let Some(account_id) = account_id.filter(|id| !id.is_empty()) {
+        request = request.set("ChatGPT-Account-Id", account_id);
+    }
+    let resp = request.call();
+    let body: Value = match resp {
+        Ok(r) => r
+            .into_json()
+            .map_err(|e| ProviderError::Other(format!("parsing codex usage: {e}")))?,
+        Err(ureq::Error::Status(401, _)) => return Err(ProviderError::Auth),
+        Err(ureq::Error::Status(429, _)) => {
+            return Err(ProviderError::RateLimited {
+                retry_after_secs: None,
+            })
+        }
+        Err(ureq::Error::Status(code, _)) => {
+            return Err(ProviderError::Other(format!(
+                "codex usage endpoint returned HTTP {code}"
+            )))
+        }
+        Err(e) => return Err(ProviderError::Transient(e.to_string())),
+    };
+
+    crate::providers::log_watched_fields("codex", &body, WATCHED_FIELDS);
+    Ok(UsageSnapshot {
+        windows: parse_usage_windows(&body),
+        fetched_at: Utc::now(),
+        plan: parse_plan(&body),
+        reported: ReportedUsage {
+            credits: parse_credits(&body),
+            reset_grants: parse_reset_credits(&body),
+            ..ReportedUsage::default()
+        },
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1866,6 +1884,49 @@ mod tests {
         assert_eq!(
             CodexProvider.credential_freshness(&blob),
             CredentialFreshness::Expired
+        );
+    }
+
+    #[test]
+    fn usage_request_names_the_chatgpt_workspace() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/wham/usage", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut headers = Vec::new();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                    break;
+                }
+                headers.push(line.trim().to_ascii_lowercase());
+            }
+            let body = "{}";
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            headers
+        });
+        let blob = serde_json::json!({
+            "tokens": {
+                "id_token": make_id_token("u@e.com", 4_000_000_000),
+                "access_token": "at",
+                "account_id": "ws-1",
+            }
+        })
+        .to_string();
+        set_usage_url_override(Some(url));
+        let result = CodexProvider.fetch_account_usage("at", &blob);
+        set_usage_url_override(None);
+        result.unwrap();
+        let headers = server.join().unwrap();
+        assert!(
+            headers.iter().any(|h| h == "chatgpt-account-id: ws-1"),
+            "{headers:?}"
         );
     }
 
