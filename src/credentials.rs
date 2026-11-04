@@ -291,6 +291,14 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
                             "{email}: re-login required — run `usagio capture`"
                         ))
                     };
+                    // When the save keeps failing the flag never persists and
+                    // the dead grant is retried every interval; alert once per
+                    // process per (account, refresh token) on that path.
+                    let alert_once = || {
+                        if first_relogin_alert(&email, &acct.refresh_token) {
+                            alert()
+                        }
+                    };
                     match flag_needs_relogin_if_unchanged(&email, &acct.refresh_token) {
                         Ok(FlagOutcome::Flagged) => alert(),
                         Ok(FlagOutcome::Rotated) => crate::logging::log(&format!(
@@ -305,7 +313,7 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
                             crate::logging::log(&format!(
                                 "credentials: flag_needs_relogin({email}): save failed: {e:#}"
                             ));
-                            alert();
+                            alert_once();
                         }
                     }
                 }
@@ -317,6 +325,19 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
             }
         }
     }
+}
+
+/// True the first time this process sees `(email, refresh token)`; only a hash
+/// of the token is kept in memory.
+pub(crate) fn first_relogin_alert(email: &str, refresh_token: &str) -> bool {
+    use std::hash::{Hash, Hasher};
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(String, u64)>>> =
+        std::sync::Mutex::new(None);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    refresh_token.hash(&mut h);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(Default::default)
+        .insert((email.to_string(), h.finish()))
 }
 
 /// Absorb any lagging rotations for the outgoing account BEFORE the caller

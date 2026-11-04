@@ -1342,3 +1342,20 @@ fn active_key_comparison_is_case_insensitive() {
     assert!(!is_active_key("b@e.com", Some("alice@e.com")));
     assert!(!is_active_key("b@e.com", None));
 }
+
+#[test]
+fn relogin_alert_fires_once_per_account_and_refresh_token() {
+    assert!(first_relogin_alert("once@e.com", "rt-1"));
+    assert!(
+        !first_relogin_alert("once@e.com", "rt-1"),
+        "repeat is suppressed"
+    );
+    assert!(
+        first_relogin_alert("once@e.com", "rt-2"),
+        "new grant alerts"
+    );
+    assert!(
+        first_relogin_alert("other@e.com", "rt-1"),
+        "other account alerts"
+    );
+}
