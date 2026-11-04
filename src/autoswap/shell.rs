@@ -698,6 +698,14 @@ pub(crate) fn soonest_unlock(assessed: &[Assessed], now: DateTime<Utc>) -> Optio
         .filter_map(|a| a.blocked_until)
         .filter(|u| *u > now)
         .min()
+        // Nothing blocked (e.g. a Draining stay): the earliest upcoming reset.
+        .or_else(|| {
+            assessed
+                .iter()
+                .flat_map(|a| a.windows.iter().filter_map(|w| w.resets_at))
+                .filter(|r| *r > now)
+                .min()
+        })
 }
 
 /// Keep `manual_holds[slug]` ⇔ (pick settled tier ≥ Draining), so a rollback
