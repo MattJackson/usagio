@@ -50,7 +50,7 @@ impl Provider for CopilotCliProvider {
         // fallback in `~/.copilot/config.json`, or the env-var override
         // ladder), then GET `https://api.github.com/user` + `/user/emails`
         // with the resulting token to label the account.
-        Ok(None)
+        Err(ProviderError::Unsupported)
     }
 
     fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
@@ -83,7 +83,7 @@ mod tests {
     fn capture_returns_none_placeholder() {
         assert!(matches!(
             CopilotCliProvider.capture_current_login(),
-            Ok(None)
+            Err(ProviderError::Unsupported)
         ));
     }
 }

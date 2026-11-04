@@ -52,7 +52,7 @@ impl Provider for CursorAgentProvider {
         // `~/.cursor/auth.json`; otherwise probe the macOS keychain (service
         // label undocumented) or accept a `CURSOR_API_KEY` env var. Then
         // call `https://api.cursor.com/v1/me` to attach the email.
-        Ok(None)
+        Err(ProviderError::Unsupported)
     }
 
     fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
@@ -85,7 +85,7 @@ mod tests {
     fn capture_returns_none_placeholder() {
         assert!(matches!(
             CursorAgentProvider.capture_current_login(),
-            Ok(None)
+            Err(ProviderError::Unsupported)
         ));
     }
 }

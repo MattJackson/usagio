@@ -48,7 +48,7 @@ impl Provider for ClineProvider {
         // entry per configured vendor). Real usage requires calling each
         // vendor's own quota endpoint — the Cline binary itself has no
         // aggregate usage API (Cline hub subscription excepted).
-        Ok(None)
+        Err(ProviderError::Unsupported)
     }
 
     fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
@@ -79,6 +79,9 @@ mod tests {
 
     #[test]
     fn capture_returns_none_placeholder() {
-        assert!(matches!(ClineProvider.capture_current_login(), Ok(None)));
+        assert!(matches!(
+            ClineProvider.capture_current_login(),
+            Err(ProviderError::Unsupported)
+        ));
     }
 }

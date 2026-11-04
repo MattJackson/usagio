@@ -51,7 +51,7 @@ impl Provider for GrokProvider {
         // TODO: read `~/.grok/auth.json` and `~/.grok/mcp_credentials.json`,
         // decode the OIDC ID token payload to pull the account email, and
         // emit a single CapturedAccount for the currently-active slot.
-        Ok(None)
+        Err(ProviderError::Unsupported)
     }
 
     fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
@@ -86,6 +86,9 @@ mod tests {
 
     #[test]
     fn capture_returns_none_placeholder() {
-        assert!(matches!(GrokProvider.capture_current_login(), Ok(None)));
+        assert!(matches!(
+            GrokProvider.capture_current_login(),
+            Err(ProviderError::Unsupported)
+        ));
     }
 }
