@@ -336,11 +336,15 @@ impl WatchdogEffects for RealEffects {
                 "event=fd_watchdog action=watcher_respawn result=no_watcher_installed",
             );
         }
-        // A respawn also resets the keychain-failure counter: if the respawn
+        // A real respawn also resets the keychain-failure counter: if it
         // released the descriptors, the next keychain write should succeed, and
         // we don't want a stale pre-respawn failure count to escalate us to a
-        // restart before that next write gets a chance.
-        KEYCHAIN_CONSEC_FAILURES.store(0, Ordering::Relaxed);
+        // restart before that next write gets a chance. With no watcher there
+        // was nothing to remediate, so keep the count and let a persisting
+        // failure escalate.
+        if respawned {
+            KEYCHAIN_CONSEC_FAILURES.store(0, Ordering::Relaxed);
+        }
         let after = count_open_fds();
         (before, after)
     }
@@ -724,5 +728,17 @@ mod tests {
         crate::env_lock::scoped_env_var("XPC_SERVICE_NAME", None, || {
             assert!(!RealEffects.self_restart());
         });
+    }
+
+    /// With no watcher installed nothing was remediated, so the keychain
+    /// failure count must survive for the next check to escalate.
+    #[test]
+    fn respawn_with_no_watcher_keeps_the_keychain_failure_count() {
+        let _cfg = crate::store::ScopedConfigDir::new();
+        KEYCHAIN_CONSEC_FAILURES.store(3, Ordering::Relaxed);
+        let _ = RealEffects.respawn_watcher();
+        let kept = keychain_consecutive_failures();
+        KEYCHAIN_CONSEC_FAILURES.store(0, Ordering::Relaxed);
+        assert_eq!(kept, 3);
     }
 }
