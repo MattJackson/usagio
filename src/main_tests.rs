@@ -806,87 +806,10 @@ fn row_from_account_propagates_needs_relogin_flag() {
     assert!(row_from_account(&a).needs_relogin);
 }
 
-// -----------------------------------------------------------------------------
-// switch_to_guarded lock-closure invariant (H1 round-1 + H_R2_1 round-2)
-//
-// switch_to_guarded's contract is: any in-memory mutation to the state
-// snapshot that happens BEFORE `st = State::load()?;` (the reload that
-// absorbs `absorb_before_switch`'s disk writes) is DISCARDED and must not be
-// relied on. Mutations AFTER the reload survive `st.save()`.
-//
-// This pins that contract at the state-lock/save layer without dragging in
-// the keychain + apply_account plumbing. Red-before-green: swap the order
-// (mutate after reload → mutate before reload) and this test fails.
-// -----------------------------------------------------------------------------
-#[test]
-fn switch_lock_closure_invariant_mutations_after_reload_survive() {
-    use crate::credentials::with_state_lock;
-    use crate::store::{Account, ScopedConfigDir, State};
-
-    let _g = ScopedConfigDir::new();
-
-    // Seed: two accounts, A active with a "stale" access token.
-    let mut a = Account::from_keychain_blob(
-        r#"{"claudeAiOauth":{"accessToken":"stale","refreshToken":"r","expiresAt":0}}"#,
-    )
-    .unwrap();
-    a.email = Some("a@e.com".into());
-    let mut b = Account::from_keychain_blob(
-        r#"{"claudeAiOauth":{"accessToken":"bt","refreshToken":"br","expiresAt":0}}"#,
-    )
-    .unwrap();
-    b.email = Some("b@e.com".into());
-    let mut seed = State::default();
-    seed.accounts.push(a);
-    seed.accounts.push(b);
-    seed.active = Some("a@e.com".into());
-    seed.save().unwrap();
-
-    // Model switch_to_guarded's ordering: (1) load, (2) simulate
-    // absorb_before_switch by writing a fresher token for A on disk via a
-    // NESTED with_state_lock (matches the real reentrant absorb path), (3)
-    // reload, (4) mutate AFTER reload, (5) save.
-    with_state_lock(|| {
-        let _st = State::load()?;
-
-        // Nested lock frame simulates absorb_before_switch's on-disk write
-        // for the outgoing account A.
-        with_state_lock(|| {
-            let mut st_nested = State::load()?;
-            if let Some(x) = st_nested.find_mut("a@e.com") {
-                x.access_token = "absorbed_fresh".into();
-                x.expires_at = 999_999;
-            }
-            st_nested.save()
-        })?;
-
-        // Reload — pre-reload mutations would be discarded here.
-        let mut st = State::load()?;
-        // Post-reload mutation: bump B's expiry as a stand-in for what
-        // sync_active_from_keychain / apply_account bookkeeping do.
-        if let Some(x) = st.find_mut("b@e.com") {
-            x.expires_at = 111_111;
-        }
-        st.active = Some("b@e.com".into());
-        st.save()
-    })
-    .unwrap();
-
-    // A's absorbed rotation survived (fresher token persisted, not clobbered).
-    let disk = State::load().unwrap();
-    let a_on_disk = disk.find("a@e.com").expect("A still present");
-    assert_eq!(
-        a_on_disk.access_token, "absorbed_fresh",
-        "reload+save must preserve the fresher token absorbed for the outgoing account (H1)"
-    );
-    // And B's post-reload mutation persisted.
-    let b_on_disk = disk.find("b@e.com").expect("B still present");
-    assert_eq!(
-        b_on_disk.expires_at, 111_111,
-        "post-reload mutations must survive the final save (H_R2_1 sibling)"
-    );
-    assert_eq!(disk.active.as_deref(), Some("b@e.com"));
-}
+// The switch_to_guarded reload/sync ordering (H1, H_R2_1) is pinned by
+// `guarded_switch_keeps_a_rotation_absorbed_from_disk_for_the_outgoing_account`
+// and `guarded_switch_saves_the_keychain_rotation_of_the_outgoing_account`,
+// which drive the real function.
 
 // --- launch_agent_exe_path / sibling_app_bundle_exe ---
 
@@ -2988,6 +2911,89 @@ fn guarded_switch_commits_only_while_the_expected_account_is_active() {
         assert_eq!(State::load().unwrap().active.as_deref(), Some("b@e.com"));
         assert_eq!(keychain_access_token().as_deref(), Some("at-b@e.com"));
     });
+}
+
+/// Seed A (active) and B, then run a real guarded switch A -> B and return
+/// A's stored account afterwards. `before` runs after seeding, to plant a
+/// rotation for the outgoing account A somewhere other than state.json.
+fn switch_a_to_b_after(before: impl FnOnce(&std::path::Path)) -> Account {
+    let mut result = None;
+    with_claude_home("a@e.com", |home| {
+        seed_claude_state(
+            vec![
+                claude_account_with_identity("a@e.com", 3_600_000),
+                claude_account_with_identity("b@e.com", 3_600_000),
+            ],
+            Some("a@e.com"),
+        );
+        before(home);
+        let provider = providers::get(CLAUDE_SLUG).unwrap();
+        let acct = State::load().unwrap().find("b@e.com").cloned().unwrap();
+        let identity = acct.oauth_account.clone().unwrap();
+        let done =
+            switch_to_guarded(provider, "b@e.com", &acct, &identity, false, None, false).unwrap();
+        assert_eq!(done.as_deref(), Some("b@e.com"));
+        let st = State::load().unwrap();
+        assert_eq!(st.active.as_deref(), Some("b@e.com"));
+        result = st.find("a@e.com").cloned();
+    });
+    result.unwrap()
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "reads or writes the OS secret store, which is only hermetic (in-memory) on macOS"
+)]
+fn guarded_switch_keeps_a_rotation_absorbed_from_disk_for_the_outgoing_account() {
+    // H1: absorb_before_switch rewrites state.json under the lock; the
+    // switch must reload afterwards or its save clobbers the rotation.
+    let a = switch_a_to_b_after(plant_disk_rotation);
+    assert_eq!(a.access_token, "at-disk-rotated");
+    assert_eq!(a.refresh_token, "rt-disk-rotated");
+}
+
+fn plant_disk_rotation(home: &std::path::Path) {
+    {
+        // Only the on-disk rotation may be in play: empty the (process-wide
+        // in-memory) keychain slot other tests leave behind.
+        let account = std::env::var("USER").unwrap_or_else(|_| "claude".to_string());
+        crate::platform()
+            .secrets()
+            .delete("Claude Code-credentials", &account)
+            .unwrap();
+        let exp = Utc::now().timestamp_millis() + 7_200_000;
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(
+            home.join(".claude").join(".credentials.json"),
+            serde_json::json!({"claudeAiOauth": {
+                "accessToken": "at-disk-rotated",
+                "refreshToken": "rt-disk-rotated",
+                "expiresAt": exp,
+                "oauthAccount": {"emailAddress": "a@e.com"},
+            }})
+            .to_string(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "reads or writes the OS secret store, which is only hermetic (in-memory) on macOS"
+)]
+fn guarded_switch_saves_the_keychain_rotation_of_the_outgoing_account() {
+    // H_R2_1: sync_active_from_keychain must run after the reload so its
+    // in-memory adoption is what gets saved.
+    let a = switch_a_to_b_after(|_| {
+        let exp = Utc::now().timestamp_millis() + 7_200_000;
+        prime_active_slot(&format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"at-kc-rotated","refreshToken":"rt-kc-rotated","expiresAt":{exp}}}}}"#
+        ));
+    });
+    assert_eq!(a.access_token, "at-kc-rotated");
+    assert_eq!(a.refresh_token, "rt-kc-rotated");
 }
 
 #[test]
