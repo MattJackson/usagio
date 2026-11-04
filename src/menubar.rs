@@ -2978,6 +2978,17 @@ fn handle_backup_restore_dialog() {
     handle_backup_restore_dialog_with(crate::platform().file_dialog());
 }
 
+/// True if any string anywhere in `v` is the `"<redacted>"` placeholder that
+/// `store::redact_state_for_dump` writes (such a file holds no usable logins).
+fn json_contains_redacted(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::String(s) => s == "<redacted>",
+        serde_json::Value::Array(a) => a.iter().any(json_contains_redacted),
+        serde_json::Value::Object(o) => o.values().any(json_contains_redacted),
+        _ => false,
+    }
+}
+
 /// Testable core of the Restore… click: takes the `FileDialog` as a
 /// parameter so `#[cfg(test)]` can pass a `platform::MockFileDialog` instead
 /// of popping a real native panel. See `platform::Platform::file_dialog`.
@@ -3012,12 +3023,34 @@ fn handle_backup_restore_dialog_with(dialog: &dyn crate::platform::FileDialog) {
         notify("Restore failed: not a usagio state file (missing 'accounts')");
         return;
     }
+    if json_contains_redacted(&value) {
+        notify(
+            "Restore failed: this is a redacted diagnostic dump (tokens are \"<redacted>\"), \
+             not a working backup",
+        );
+        return;
+    }
     let new_state = State::from_value(&value);
 
+    // Ask OUTSIDE the cross-process state lock: the modal can stay open
+    // indefinitely and would otherwise block every poller/CLI state write.
+    let asked_about = match crate::store::accounts_dropped_by(&new_state) {
+        Ok(d) => d,
+        Err(e) => {
+            notify(&format!("Restore failed: {e}"));
+            return;
+        }
+    };
+    if !asked_about.is_empty() && !confirm(&restore_drop_confirmation(&asked_about)) {
+        return; // user declined; not an error
+    }
+
     let outcome = with_state_lock(|| -> Result<bool> {
+        // Recompute under the lock: if the set of dropped accounts changed
+        // while the dialog was open, the confirmation no longer applies.
         let dropped = crate::store::accounts_dropped_by(&new_state)?;
-        if !dropped.is_empty() && !confirm(&restore_drop_confirmation(&dropped)) {
-            return Ok(false); // user declined; not an error
+        if dropped != asked_about {
+            anyhow::bail!("accounts changed while the confirmation was open; try Restore again");
         }
         let dir = crate::store::config_dir()?;
         let stash = crate::store::stash_pre_restore(&dir)?;
@@ -6316,6 +6349,27 @@ mod tests {
             "unexpected default file name: {default_name}"
         );
         assert_eq!(default_dir.as_deref(), dirs::download_dir().as_deref());
+    }
+
+    #[test]
+    fn restore_rejects_redacted_dump_and_keeps_live_tokens() {
+        let _g = crate::store::ScopedConfigDir::new();
+        let mut live = crate::store::State::default();
+        live.accounts.push(restore_test_acct("a@e.com"));
+        live.save().unwrap();
+        let redacted = crate::store::redact_state_for_dump(&crate::store::State::load().unwrap());
+        let path = crate::store::config_dir().unwrap().join("redacted-dump.json");
+        std::fs::write(&path, serde_json::to_vec(&redacted).unwrap()).unwrap();
+
+        let dialog = crate::platform::MockFileDialog::default();
+        *dialog.pick_file_returns.borrow_mut() = Some(path);
+        handle_backup_restore_dialog_with(&dialog);
+
+        let after = crate::store::State::load().unwrap();
+        assert_eq!(
+            after.accounts[0].access_token, "at",
+            "restoring a redacted dump must not overwrite live tokens"
+        );
     }
 
     #[test]
