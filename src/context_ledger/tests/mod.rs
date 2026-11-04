@@ -428,3 +428,115 @@ fn not_stale_when_tracked_file_missing_or_ledger_empty() {
     empty.items.clear();
     assert!(!is_stale(&empty));
 }
+
+// ---- MCP driver: failure modes -----------------------------------------
+
+#[test]
+fn mcp_silent_server_hits_wall_clock_timeout() {
+    // Reads the handshake and never answers: a blocking read would hang
+    // forever; the 3s RPC budget must turn it into an Err.
+    let started = std::time::Instant::now();
+    let e = mcp::fetch_tools(&sh_server("read a; sleep 20")).unwrap_err();
+    assert!(e.contains("timeout"), "got: {e}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "timeout must be wall-clock bounded, took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn mcp_malformed_or_unexpected_replies_are_errors() {
+    let bad_json = format!("read a; echo '{INIT_OK}'; read b; read c; echo 'not json'; sleep 5");
+    let e = mcp::fetch_tools(&sh_server(&bad_json)).unwrap_err();
+    assert!(e.contains("parse tools/list"), "got: {e}");
+
+    let rpc_err = format!(
+        r#"read a; echo '{INIT_OK}'; read b; read c; echo '{{"jsonrpc":"2.0","id":2,"error":{{"code":-1}}}}'; sleep 5"#
+    );
+    let e = mcp::fetch_tools(&sh_server(&rpc_err)).unwrap_err();
+    assert!(e.contains("missing result.tools"), "got: {e}");
+
+    let not_array = format!(
+        r#"read a; echo '{INIT_OK}'; read b; read c; echo '{{"jsonrpc":"2.0","id":2,"result":{{"tools":{{}}}}}}'; sleep 5"#
+    );
+    let e = mcp::fetch_tools(&sh_server(&not_array)).unwrap_err();
+    assert!(e.contains("missing result.tools"), "got: {e}");
+
+    let eof = "read a; exit 0";
+    let e = mcp::fetch_tools(&sh_server(eof)).unwrap_err();
+    assert!(e.contains("eof"), "got: {e}");
+}
+
+#[test]
+fn mcp_http_transport_and_bad_config_are_skipped_with_errors() {
+    let e = mcp::fetch_tools(&serde_json::json!({"url": "http://localhost:1/mcp"})).unwrap_err();
+    assert!(e.contains("http transport"), "got: {e}");
+    let e = mcp::fetch_tools(&serde_json::json!({"args": []})).unwrap_err();
+    assert!(e.contains("bad stdio config"), "got: {e}");
+}
+
+// ---- collect(): MCP / skills / plugins actually discovered ---------------
+
+fn working_mcp_server() -> serde_json::Value {
+    sh_server(&format!(
+        "read a; echo '{INIT_OK}'; read b; read c; echo '{TOOLS_OK}'; sleep 5"
+    ))
+}
+
+#[test]
+fn claude_collect_reports_working_mcp_server_skills_and_plugins() {
+    with_home(|home| {
+        let dir = home.join(".claude");
+        fs::create_dir_all(dir.join("skills/my-skill")).unwrap();
+        fs::write(dir.join("skills/my-skill/SKILL.md"), "skill body").unwrap();
+        fs::create_dir_all(dir.join("plugins/my-plugin")).unwrap();
+        fs::write(dir.join("plugins/my-plugin/plugin.json"), r#"{"name":"p"}"#).unwrap();
+        let settings = serde_json::json!({ "mcpServers": { "good": working_mcp_server() } });
+        fs::write(
+            dir.join("settings.json"),
+            serde_json::to_string(&settings).unwrap(),
+        )
+        .unwrap();
+        let l = build_ledger("claude", None).unwrap();
+        let mcp_item = l
+            .items
+            .iter()
+            .find(|i| i.kind == ItemKind::McpTools)
+            .unwrap_or_else(|| panic!("no McpTools item in {:?}", l.items));
+        assert_eq!(mcp_item.name, "mcp: good");
+        assert_eq!(mcp_item.tool_count, Some(2));
+        assert!(mcp_item.token_count > 0);
+        assert!(l
+            .items
+            .iter()
+            .any(|i| i.kind == ItemKind::Skill && i.name == "skill: my-skill"));
+        assert!(l
+            .items
+            .iter()
+            .any(|i| i.kind == ItemKind::PluginManifest && i.name == "plugin: my-plugin"));
+    });
+}
+
+#[test]
+fn opencode_collect_reads_mcp_from_opencode_json_fallback() {
+    with_home(|home| {
+        let dir = home.join(".config/opencode");
+        fs::create_dir_all(&dir).unwrap();
+        // Only opencode.json (no .jsonc) exists: the fallback name is read.
+        let cfg = serde_json::json!({ "mcp": { "good": working_mcp_server() } });
+        fs::write(
+            dir.join("opencode.json"),
+            serde_json::to_string(&cfg).unwrap(),
+        )
+        .unwrap();
+        let l = build_ledger("opencode", None).unwrap();
+        let item = l
+            .items
+            .iter()
+            .find(|i| i.kind == ItemKind::McpTools)
+            .unwrap_or_else(|| panic!("no McpTools item in {:?}", l.items));
+        assert_eq!(item.name, "mcp: good");
+        assert_eq!(item.tool_count, Some(2));
+    });
+}
