@@ -129,7 +129,37 @@ pub fn migrate_between(old: &Path, new: &Path) -> Result<MigrationResult, Migrat
 /// cwd-relative paths). Env-only so tests that scope `$HOME` stay hermetic.
 pub(crate) fn user_home() -> Option<PathBuf> {
     let [first, second] = crate::platform().paths().home_env_order();
+    #[cfg(test)]
+    {
+        // Test isolation: only env vars a test explicitly scoped count. With
+        // none scoped, use the thread's HOME_OVERRIDE, else fail loudly like
+        // `store::config_dir` rather than resolve the developer's real home.
+        let any_scoped = crate::env_lock::is_scoped(first) || crate::env_lock::is_scoped(second);
+        if !any_scoped {
+            return Some(crate::store::home_override().expect(
+                "paths::user_home() called from a unit test with neither HOME \
+                 scoped (env_lock::scoped_env_var) nor a ScopedConfigDir installed",
+            ));
+        }
+        home_from(
+            crate::env_lock::guarded_var(first),
+            crate::env_lock::guarded_var(second),
+        )
+    }
+    #[cfg(not(test))]
     home_from(std::env::var_os(first), std::env::var_os(second))
+}
+
+/// Read an env var that feeds Claude/Codex path resolution
+/// (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`). Under `cfg(test)` only a value a test
+/// explicitly scoped is visible.
+pub(crate) fn path_env_var(key: &str) -> Option<std::ffi::OsString> {
+    #[cfg(test)]
+    {
+        crate::env_lock::guarded_var(key)
+    }
+    #[cfg(not(test))]
+    std::env::var_os(key)
 }
 
 /// First non-empty of the two values, in priority order.

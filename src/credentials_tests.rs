@@ -438,6 +438,7 @@ fn nested_with_state_lock_does_not_deadlock() {
 // -----------------------------------------------------------------------------
 #[test]
 fn spawn_watchers_creates_missing_parent_dir() {
+    let _cfg = crate::store::ScopedConfigDir::new();
     let td = tempfile::tempdir().unwrap();
     // Parent dir does NOT exist yet — this is the fresh-install condition.
     let missing_parent = td.path().join("dot-claude");
@@ -1296,6 +1297,7 @@ fn spawn_watchers_refuses_to_watch_the_filesystem_root() {
 
 #[test]
 fn install_then_respawn_watchers_rebuilds_the_registered_watcher() {
+    let _cfg = crate::store::ScopedConfigDir::new();
     let td = tempfile::tempdir().unwrap();
     let cred = td.path().join("creds").join("c.json");
     let prov = FakeProvider::new("fake-reg").with_path(cred);

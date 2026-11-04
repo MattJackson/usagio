@@ -980,7 +980,7 @@ fn ensure_file_backend(auth_path: &std::path::Path) -> PResult<()> {
 pub(super) fn auth_json_path() -> Option<PathBuf> {
     // An empty `CODEX_HOME` counts as unset (as in Codex itself and
     // `context_ledger::codex`); otherwise the path would be cwd-relative.
-    if let Some(h) = std::env::var_os("CODEX_HOME").filter(|h| !h.is_empty()) {
+    if let Some(h) = crate::paths::path_env_var("CODEX_HOME").filter(|h| !h.is_empty()) {
         return Some(PathBuf::from(h).join("auth.json"));
     }
     Some(crate::paths::user_home()?.join(".codex").join("auth.json"))
@@ -1970,6 +1970,7 @@ mod tests {
 
     #[test]
     fn empty_codex_home_is_treated_as_unset() {
+        let _cfg = crate::store::ScopedConfigDir::new();
         crate::env_lock::scoped_env_var("CODEX_HOME", Some(""), || {
             let p = auth_json_path();
             assert_ne!(p, Some(PathBuf::from("auth.json")));
