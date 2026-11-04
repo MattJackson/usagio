@@ -492,6 +492,17 @@ fn real_get(service: &str, account: &str) -> Result<Option<String>> {
 }
 
 fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
+    real_set_with(&run_security, service, account, secret)
+}
+
+/// `real_set` over an injectable `security(1)` runner (a test seam for the
+/// delete -> add -> restore sequence).
+fn real_set_with(
+    run: &dyn Fn(&[&str]) -> Result<SecurityRun>,
+    service: &str,
+    account: &str,
+    secret: &str,
+) -> Result<()> {
     // L5 (round-1 codeaudit): passing the secret via argv (`-w <secret>`)
     // briefly exposes it in `ps(1)` output. Acknowledged limitation of
     // `security(1)` — its stdin variant does not exist for
@@ -511,7 +522,7 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
     let result = (|| -> Result<()> {
         // Remember the current value so a failed add (after the delete has
         // already succeeded) can put it back instead of leaving no credential.
-        let prior = run_security(&["find-generic-password", "-s", service, "-a", account, "-w"])
+        let prior = run(&["find-generic-password", "-s", service, "-a", account, "-w"])
             .ok()
             .filter(|r| r.success())
             .map(|r| {
@@ -519,7 +530,7 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
                     .trim_end_matches('\n')
                     .to_string()
             });
-        let del = run_security(&["delete-generic-password", "-s", service, "-a", account])
+        let del = run(&["delete-generic-password", "-s", service, "-a", account])
             .context("running `security delete-generic-password` (pre-set)")?;
         if del.timed_out {
             timed_out = true;
@@ -538,7 +549,7 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
                 stderr.trim(),
             );
         }
-        let out = match run_security(&[
+        let out = match run(&[
             "add-generic-password",
             "-s",
             service,
@@ -550,12 +561,12 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
             Ok(out) => out,
             Err(e) => {
                 // Spawn / wait failure after the delete already succeeded.
-                restore_prior_secret(service, account, prior.as_deref());
+                restore_prior_secret(run, service, account, prior.as_deref());
                 return Err(e.context("running `security add-generic-password`"));
             }
         };
         if out.timed_out || !out.success() {
-            restore_prior_secret(service, account, prior.as_deref());
+            restore_prior_secret(run, service, account, prior.as_deref());
         }
         if out.timed_out {
             timed_out = true;
@@ -593,9 +604,14 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
 
 /// Best-effort: re-add the secret that `real_set` deleted when the following
 /// add failed, so the keychain isn't left with no credential at all.
-fn restore_prior_secret(service: &str, account: &str, prior: Option<&str>) {
+fn restore_prior_secret(
+    run: &dyn Fn(&[&str]) -> Result<SecurityRun>,
+    service: &str,
+    account: &str,
+    prior: Option<&str>,
+) {
     let Some(prior) = prior else { return };
-    let ok = run_security(&[
+    let ok = run(&[
         "add-generic-password",
         "-s",
         service,
@@ -1186,6 +1202,58 @@ mod tests {
         }
     }
 
+    /// Drive `real_set_with` against a scripted `security(1)`: the find/delete
+    /// succeed, the add of `new` fails as `add_new`, and every call is recorded.
+    fn real_set_scripted(add_new: SecurityRun) -> (Result<()>, Vec<Vec<String>>) {
+        let _cfg = crate::store::ScopedConfigDir::new();
+        let calls = std::cell::RefCell::new(Vec::<Vec<String>>::new());
+        let add_new = std::cell::RefCell::new(Some(add_new));
+        let runner = |args: &[&str]| -> Result<SecurityRun> {
+            calls
+                .borrow_mut()
+                .push(args.iter().map(|a| a.to_string()).collect());
+            Ok(match args[0] {
+                "find-generic-password" => run(Some(0), false, "prior-secret\n"),
+                "delete-generic-password" => run(Some(0), false, ""),
+                _ if args.contains(&"new-secret") => add_new.borrow_mut().take().unwrap(),
+                _ => run(Some(0), false, ""),
+            })
+        };
+        let res = real_set_with(&runner, "svc", "acct", "new-secret");
+        (res, calls.into_inner())
+    }
+
+    fn adds(calls: &[Vec<String>]) -> Vec<&str> {
+        calls
+            .iter()
+            .filter(|c| c[0] == "add-generic-password")
+            .map(|c| c.last().unwrap().as_str())
+            .collect()
+    }
+
+    #[test]
+    fn real_set_restores_the_prior_secret_when_the_add_fails() {
+        let (res, calls) = real_set_scripted(run(Some(1), false, ""));
+        assert!(res.is_err());
+        assert_eq!(adds(&calls), ["new-secret", "prior-secret"]);
+    }
+
+    #[test]
+    fn real_set_restores_the_prior_secret_when_the_add_times_out() {
+        let (res, calls) = real_set_scripted(run(None, true, ""));
+        assert!(format!("{:#}", res.unwrap_err()).contains("timed out"));
+        assert_eq!(adds(&calls), ["new-secret", "prior-secret"]);
+    }
+
+    #[test]
+    fn real_set_reads_the_prior_secret_before_deleting_and_skips_restore_on_success() {
+        let (res, calls) = real_set_scripted(run(Some(0), false, ""));
+        res.unwrap();
+        assert_eq!(adds(&calls), ["new-secret"], "no restore after a good add");
+        assert_eq!(calls[0][0], "find-generic-password");
+        assert_eq!(calls[1][0], "delete-generic-password");
+    }
+
     #[test]
     fn interpret_get_only_exit_44_is_not_found() {
         assert_eq!(
@@ -1497,6 +1565,7 @@ mod tests {
     #[test]
     #[ignore = "touches the real login keychain; run with --ignored"]
     fn macos_secrets_set_after_existing_item_created_by_another_process() {
+        let _g = crate::store::ScopedConfigDir::new();
         let service = format!("usagio-platform-test-foreign-{}", std::process::id());
         let account = "foreign-owner";
         let _ = Command::new("security")
