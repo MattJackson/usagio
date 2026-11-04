@@ -1456,3 +1456,55 @@ fn absorb_that_changes_nothing_does_not_save() {
         assert!(crate::store::State::load().unwrap().autoswap_disabled);
     });
 }
+
+#[test]
+fn refresh_inactive_if_stale_refreshes_every_expired_inactive_account() {
+    use crate::store::State;
+    with_isolated_home(|| {
+        seed_state(
+            vec![
+                expired_account("one@e.com"),
+                expired_account("active@e.com"),
+                expired_account("two@e.com"),
+            ],
+            Some("active@e.com"),
+        );
+        let (url, hits) = spawn_token_server(200, || {});
+        let _u = TokenUrlGuard::set(&url);
+
+        refresh_inactive_if_stale(None);
+
+        let st = State::load().unwrap();
+        for email in ["one@e.com", "two@e.com"] {
+            assert_eq!(
+                st.find(email).unwrap().access_token,
+                "mock-refreshed-access-token",
+                "{email} was not refreshed"
+            );
+        }
+        assert_eq!(st.find("active@e.com").unwrap().access_token, "stale-at");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    });
+}
+
+#[test]
+fn a_dead_grant_does_not_stop_the_loop_before_the_next_inactive_account() {
+    use crate::store::State;
+    with_isolated_home(|| {
+        seed_state(
+            vec![expired_account("one@e.com"), expired_account("two@e.com")],
+            None,
+        );
+        let (url, hits) = spawn_token_server(400, || {});
+        let _u = TokenUrlGuard::set(&url);
+
+        refresh_inactive_if_stale(None);
+
+        // Each account spent its own POST and was flagged on its own.
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let st = State::load().unwrap();
+        for email in ["one@e.com", "two@e.com"] {
+            assert!(st.find(email).unwrap().needs_relogin, "{email} not flagged");
+        }
+    });
+}
