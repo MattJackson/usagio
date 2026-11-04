@@ -179,6 +179,33 @@ fn collect_from_config(
     }
 }
 
+fn v_or_null(o: &serde_json::Map<String, serde_json::Value>, k: &str) -> serde_json::Value {
+    o.get(k).cloned().unwrap_or(serde_json::Value::Null)
+}
+
+/// Expand opencode's `{env:VAR}` substitution (unset -> empty string, as
+/// opencode does).
+pub(crate) fn expand_opencode_env(input: &str) -> String {
+    let mut out = String::new();
+    let mut rest = input;
+    while let Some(i) = rest.find("{env:") {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 5..];
+        match after.find('}') {
+            Some(end) => {
+                out.push_str(&std::env::var(&after[..end]).unwrap_or_default());
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str(&rest[i..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Convert an opencode `mcp` entry to the Claude-style `{command, args, env}`
 /// (or `{url}`) shape `mcp::fetch_tools` understands. opencode local servers
 /// use `command` as an argv ARRAY and `environment` for env vars; entries with
@@ -191,10 +218,23 @@ fn translate_mcp_entry(cfg: &serde_json::Value) -> Option<serde_json::Value> {
     if let Some(argv) = cfg.get("command").and_then(|c| c.as_array()) {
         let argv: Vec<&str> = argv.iter().filter_map(|a| a.as_str()).collect();
         let (cmd, args) = argv.split_first()?;
+        let args: Vec<String> = args.iter().map(|a| expand_opencode_env(a)).collect();
+        let env: serde_json::Map<String, serde_json::Value> = cfg
+            .get("environment")
+            .and_then(|e| e.as_object())
+            .map(|o| {
+                o.iter()
+                    .map(|(k, v)| {
+                        let v = v.as_str().map(expand_opencode_env).map(Into::into);
+                        (k.clone(), v.unwrap_or_else(|| v_or_null(o, k)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         return Some(serde_json::json!({
-            "command": cmd,
+            "command": expand_opencode_env(cmd),
             "args": args,
-            "env": cfg.get("environment").cloned().unwrap_or_else(|| serde_json::json!({})),
+            "env": env,
         }));
     }
     if cfg.get("type").and_then(|t| t.as_str()) == Some("remote") && cfg.get("url").is_some() {

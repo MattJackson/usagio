@@ -175,24 +175,35 @@ fn is_active_key(key: &str, active: Option<&str>) -> bool {
     active.is_some_and(|a| a.eq_ignore_ascii_case(key))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FlagOutcome {
+    Flagged,
+    Rotated,
+    AlreadyFlagged,
+    Missing,
+}
+
 /// Set `needs_relogin` on `email` under the state lock, but only if the
 /// account still holds `failed_refresh_token` (the grant that just got
 /// `invalid_grant`). Returns whether the flag was newly set.
 pub(crate) fn flag_needs_relogin_if_unchanged(
     email: &str,
     failed_refresh_token: &str,
-) -> Result<bool> {
+) -> Result<FlagOutcome> {
     with_state_lock(|| {
         let mut st = State::load()?;
         let Some(a) = st.find_mut(email) else {
-            return Ok(false);
+            return Ok(FlagOutcome::Missing);
         };
-        if a.refresh_token != failed_refresh_token || a.needs_relogin {
-            return Ok(false);
+        if a.refresh_token != failed_refresh_token {
+            return Ok(FlagOutcome::Rotated);
+        }
+        if a.needs_relogin {
+            return Ok(FlagOutcome::AlreadyFlagged);
         }
         a.needs_relogin = true;
         st.save()?;
-        Ok(true)
+        Ok(FlagOutcome::Flagged)
     })
 }
 
@@ -266,19 +277,30 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
                     // failure instead of discarding it. The flag is only set
                     // if the account still holds the refresh token that just
                     // failed (a concurrent rotation/re-login must not be
-                    // clobbered), and the alert fires only after a successful
-                    // flag, on the clear->flagged transition.
-                    match flag_needs_relogin_if_unchanged(&email, &acct.refresh_token) {
-                        Ok(true) => crate::notify(&format!(
+                    // clobbered). The grant really is dead, so the alert also
+                    // fires when the save fails; it is skipped only when the
+                    // token rotated or the account was already flagged.
+                    let alert = || {
+                        crate::notify(&format!(
                             "{email}: re-login required — run `usagio capture`"
-                        )),
-                        Ok(false) => crate::logging::log(&format!(
+                        ))
+                    };
+                    match flag_needs_relogin_if_unchanged(&email, &acct.refresh_token) {
+                        Ok(FlagOutcome::Flagged) => alert(),
+                        Ok(FlagOutcome::Rotated) => crate::logging::log(&format!(
                             "credentials: {email}: refresh token changed since the \
                              invalid_grant; not flagging needs_relogin"
                         )),
-                        Err(e) => crate::logging::log(&format!(
-                            "credentials: flag_needs_relogin({email}): save failed: {e:#}"
+                        Ok(FlagOutcome::AlreadyFlagged) => crate::logging::log(&format!(
+                            "credentials: {email}: already flagged needs_relogin"
                         )),
+                        Ok(FlagOutcome::Missing) => {}
+                        Err(e) => {
+                            crate::logging::log(&format!(
+                                "credentials: flag_needs_relogin({email}): save failed: {e:#}"
+                            ));
+                            alert();
+                        }
                     }
                 }
             }

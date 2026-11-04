@@ -31,14 +31,16 @@ pub fn terminal(ledger: &Ledger) -> String {
         ItemKind::Other,
     ];
 
-    // Column width for the name so token counts align.
+    // Column width for group/total labels. Item rows indent 2 further, so
+    // items need `name + 2`; the floor fits the widest fixed label ("Total
+    // baseline per turn") so every count lands in one column.
     let name_col = ledger
         .items
         .iter()
-        .map(|i| i.name.chars().count())
+        .map(|i| i.name.chars().count() + 2)
         .max()
-        .unwrap_or(20)
-        .max(20);
+        .unwrap_or(0)
+        .max("Total baseline per turn".chars().count());
 
     for kind in ordered {
         let group: Vec<_> = ledger.items.iter().filter(|i| i.kind == kind).collect();
@@ -219,16 +221,16 @@ mod tests {
         let out = terminal(&l);
         let expected = [
             "Context Ledger — Claude Code",
-            "  Global instructions           250 tok",
-            "    Global CLAUDE.md            250 tok",
-            "  Skills                      2,000 tok",
-            "    skill: a                  1,500 tok",
-            "    skill: b                    500 tok",
-            "  MCP servers                12,345 tok",
-            "    mcp: srv                 12,345 tok (4 tools)",
-            "  ----------------------------------------",
+            "  Global instructions              250 tok",
+            "    Global CLAUDE.md               250 tok",
+            "  Skills                         2,000 tok",
+            "    skill: a                     1,500 tok",
+            "    skill: b                       500 tok",
+            "  MCP servers                   12,345 tok",
+            "    mcp: srv                    12,345 tok (4 tools)",
+            "  -------------------------------------------",
             "  Total baseline per turn       14,595 tok",
-            "  Est. cost per turn     $   0.0123",
+            "  Est. cost per turn        $   0.0123",
             "",
         ]
         .join("\n");
@@ -243,10 +245,18 @@ mod tests {
             vec![item(ItemKind::Other, &name, 5, None)],
             None,
         ));
+        let lines: Vec<_> = out.lines().collect();
+        // The longest item name sets the width: its count must end in the
+        // same column as the Total row's.
+        assert_eq!(
+            lines[lines.len() - 3].len(),
+            lines[lines.len() - 1].len(),
+            "{out}"
+        );
         let total = out.lines().last().unwrap();
         assert_eq!(
             total,
-            format!("  {:30}   {:>10} tok", "Total baseline per turn", "5")
+            format!("  {:32}   {:>10} tok", "Total baseline per turn", "5")
         );
     }
 }

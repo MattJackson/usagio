@@ -1284,10 +1284,21 @@ fn flag_needs_relogin_skips_account_whose_refresh_token_rotated() {
         // The invalid_grant verdict was for the OLD token; another process
         // has since rotated it. Must not flag.
         let flagged = flag_needs_relogin_if_unchanged("a@e.com", "old-rt").unwrap();
-        assert!(!flagged, "stale verdict must not flag a rotated account");
+        assert_eq!(
+            flagged,
+            FlagOutcome::Rotated,
+            "stale verdict must not flag a rotated account"
+        );
         assert!(!State::load().unwrap().accounts[0].needs_relogin);
         // Same token that failed -> flag.
-        assert!(flag_needs_relogin_if_unchanged("a@e.com", "new-rt").unwrap());
+        assert_eq!(
+            flag_needs_relogin_if_unchanged("a@e.com", "new-rt").unwrap(),
+            FlagOutcome::Flagged
+        );
+        assert_eq!(
+            flag_needs_relogin_if_unchanged("a@e.com", "new-rt").unwrap(),
+            FlagOutcome::AlreadyFlagged
+        );
         assert!(State::load().unwrap().accounts[0].needs_relogin);
     });
 }

@@ -722,3 +722,21 @@ fn claude_skill_when_to_use_is_counted() {
         );
     });
 }
+
+#[test]
+fn opencode_env_substitution_expands() {
+    crate::env_lock::scoped_env_var("USAGIO_TEST_OC_VAR", Some("val"), || {
+        assert_eq!(
+            opencode::expand_opencode_env("a-{env:USAGIO_TEST_OC_VAR}-b"),
+            "a-val-b"
+        );
+        assert_eq!(
+            opencode::expand_opencode_env("{env:USAGIO_NOPE_UNSET}x"),
+            "x"
+        );
+        assert_eq!(
+            opencode::expand_opencode_env("plain {env:oops"),
+            "plain {env:oops"
+        );
+    });
+}
