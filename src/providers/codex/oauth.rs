@@ -159,9 +159,16 @@ impl From<CodexRefreshGrant> for TokenGrant {
     }
 }
 
-/// Whether a 403 body from the token endpoint names a dead grant
-/// (`invalid_grant` / `refresh_token_{reused,expired,invalidated}`).
+/// Whether a 403 body is a structured OAuth error (a JSON object with an
+/// `error` field, or one of the known dead-grant codes) rather than an
+/// HTML/empty WAF or CDN block page.
 fn forbidden_body_is_terminal(body: &str) -> bool {
+    if serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .is_some_and(|v| v.get("error").is_some())
+    {
+        return true;
+    }
     [
         "invalid_grant",
         "refresh_token_reused",

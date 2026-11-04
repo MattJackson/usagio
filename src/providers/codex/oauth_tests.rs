@@ -191,6 +191,22 @@ fn refresh_token_grant_403_with_invalid_grant_body_is_terminal() {
 }
 
 #[test]
+fn refresh_token_grant_403_empty_body_is_transient_and_json_error_is_terminal() {
+    let (url, handle) = spawn_mock_token_server(403, String::new(), || {});
+    crate::env_lock::scoped_env_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE", Some(&url), || {
+        let err = refresh_token_grant("rt").unwrap_err();
+        assert!(matches!(err, RefreshError::Transient(_)), "got {err:?}");
+    });
+    let _ = handle.join();
+    let (url, handle) = spawn_mock_token_server(403, r#"{"error":"access_denied"}"#.into(), || {});
+    crate::env_lock::scoped_env_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE", Some(&url), || {
+        let err = refresh_token_grant("rt").unwrap_err();
+        assert!(matches!(err, RefreshError::InvalidGrant), "got {err:?}");
+    });
+    let _ = handle.join();
+}
+
+#[test]
 fn refresh_token_grant_maps_429_to_rate_limited() {
     let (url, handle) = spawn_mock_token_server(429, "{}".into(), || {});
     crate::env_lock::scoped_env_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE", Some(&url), || {

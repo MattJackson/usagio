@@ -2692,7 +2692,7 @@ fn prime_active_account(account: &Account) {
 /// it is `$HOME/.claude/.credentials.json`, read DIRECTLY from disk (not via
 /// `active_slot_read`, which would be tautological with the writer).
 fn keychain_access_token() -> Option<String> {
-    let blob = if cfg!(target_os = "macos") {
+    let blob = if crate::platform::current().os_display_name() == "macOS" {
         keychain_read()
     } else {
         let home = std::env::var_os("HOME").expect("HOME is scoped by with_claude_home");
@@ -2704,6 +2704,23 @@ fn keychain_access_token() -> Option<String> {
         .ok()
     };
     blob.map(|b| Account::from_keychain_blob(&b).unwrap().access_token)
+}
+
+#[test]
+fn main_write_claude_identity_redoes_patch_when_file_changes_before_commit() {
+    with_claude_home("a@e.com", |home| {
+        let file = home.join(".claude.json");
+        let mut first = true;
+        write_claude_identity_with(&serde_json::json!({"emailAddress":"b@e.com"}), None, || {
+            if std::mem::take(&mut first) {
+                std::fs::write(&file, r#"{"cli_new_key":1}"#).unwrap();
+            }
+        })
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(v["cli_new_key"], 1, "concurrent CLI write was dropped");
+        assert_eq!(v["oauthAccount"]["emailAddress"], "b@e.com");
+    });
 }
 
 #[test]

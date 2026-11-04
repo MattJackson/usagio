@@ -191,9 +191,15 @@ fn read_instance_token(home: &Path) -> Option<String> {
         })
 }
 
+const UNSTABLE_DAEMON_MSG: &str = "Codex daemon changed while being inspected; retry next cycle";
+
+fn is_unstable_daemon(e: &anyhow::Error) -> bool {
+    e.to_string() == UNSTABLE_DAEMON_MSG
+}
+
 fn stable_instance_token(before: Option<String>, after: Option<String>) -> Result<Option<String>> {
     if before != after {
-        bail!("Codex daemon changed while being inspected; retry next cycle");
+        bail!("{UNSTABLE_DAEMON_MSG}");
     }
     Ok(after)
 }
@@ -316,7 +322,18 @@ pub(crate) fn start_and_verify(expected: &crate::providers::IdentitySnapshot) ->
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    let actual = probe()?.context("Codex daemon did not return after restart")?;
+    // The pid file can land mid-probe; retry the token-mismatch error within
+    // the handoff deadline instead of failing a verification that never uses
+    // the token.
+    let actual = loop {
+        match probe() {
+            Ok(state) => break state.context("Codex daemon did not return after restart")?,
+            Err(e) if is_unstable_daemon(&e) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(e) => return Err(e),
+        }
+    };
     if !actual
         .email
         .as_deref()
@@ -341,6 +358,8 @@ mod tests {
         assert_eq!(stable_instance_token(a.clone(), a.clone()).unwrap(), a);
         assert!(stable_instance_token(a, Some("b".into())).is_err());
         assert_eq!(stable_instance_token(None, None).unwrap(), None);
+        let e = stable_instance_token(None, Some("b".into())).unwrap_err();
+        assert!(is_unstable_daemon(&e));
     }
 
     /// Hold a synthetic Responses stream open until the test releases it.

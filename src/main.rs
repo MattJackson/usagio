@@ -2820,29 +2820,49 @@ fn write_bytes_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> R
 /// `cachedUsageUtilization`. Atomic, preserves the file mode, cleans the tmp on
 /// failure.
 fn write_claude_identity(oauth_account: &serde_json::Value, user_id: Option<&str>) -> Result<()> {
+    write_claude_identity_with(oauth_account, user_id, || {})
+}
+
+/// Read-modify-write `~/.claude.json`. The Claude CLI rewrites this file
+/// continually, so re-read just before committing and redo the patch if the
+/// bytes moved (bounded). `before_commit` is a test seam.
+fn write_claude_identity_with(
+    oauth_account: &serde_json::Value,
+    user_id: Option<&str>,
+    mut before_commit: impl FnMut(),
+) -> Result<()> {
     let path = claude_json_path()?;
-    let bytes = std::fs::read(&path).context("reading ~/.claude.json")?;
-    let mut v: serde_json::Value =
-        serde_json::from_slice(&bytes).context("parsing ~/.claude.json")?;
-    let obj = v
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("~/.claude.json is not a JSON object"))?;
-    obj.insert("oauthAccount".into(), oauth_account.clone());
-    match user_id {
-        Some(uid) => {
-            obj.insert("userID".into(), serde_json::Value::String(uid.to_string()));
+    for attempt in 0..3 {
+        let bytes = std::fs::read(&path).context("reading ~/.claude.json")?;
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&bytes).context("parsing ~/.claude.json")?;
+        let obj = v
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("~/.claude.json is not a JSON object"))?;
+        obj.insert("oauthAccount".into(), oauth_account.clone());
+        match user_id {
+            Some(uid) => {
+                obj.insert("userID".into(), serde_json::Value::String(uid.to_string()));
+            }
+            // Don't leave the previous account's userID paired with a new identity.
+            None => {
+                obj.remove("userID");
+            }
         }
-        // Don't leave the previous account's userID paired with a new identity.
-        None => {
-            obj.remove("userID");
+        obj.remove("cachedUsageUtilization");
+        let json = serde_json::to_vec_pretty(&v)?;
+        // Preserve the file's existing mode; the shared writer creates the temp
+        // owner-only first, so tokens are never briefly world-readable.
+        let mode = claude_json_mode(&path);
+        before_commit();
+        let unchanged = std::fs::read(&path)
+            .map(|now| now == bytes)
+            .unwrap_or(false);
+        if unchanged || attempt == 2 {
+            return write_bytes_atomic_mode(&path, &json, mode).context("replacing ~/.claude.json");
         }
     }
-    obj.remove("cachedUsageUtilization");
-    let json = serde_json::to_vec_pretty(&v)?;
-    // Preserve the file's existing mode; the shared writer creates the temp
-    // owner-only first, so tokens are never briefly world-readable.
-    let mode = claude_json_mode(&path);
-    write_bytes_atomic_mode(&path, &json, mode).context("replacing ~/.claude.json")
+    unreachable!("loop returns on the last attempt")
 }
 
 // ---------------------------------------------------------------------------
