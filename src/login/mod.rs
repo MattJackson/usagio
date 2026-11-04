@@ -344,6 +344,11 @@ impl Progress {
     pub fn is_finished(&self) -> bool {
         self.finished.load(Ordering::SeqCst)
     }
+    /// Mark the flow ended, as its worker does on exit.
+    #[cfg(test)]
+    pub fn mark_finished(&self) {
+        self.finished.store(true, Ordering::SeqCst);
+    }
     /// The sign-in page was closed, or a newer login superseded this flow.
     #[cfg(test)]
     pub fn is_cancelled(&self) -> bool {

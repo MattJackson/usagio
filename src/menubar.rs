@@ -3738,11 +3738,15 @@ static BROWSER_LOGINS: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 fn track_browser_login(slug: &str, progress: std::sync::Arc<crate::login::Progress>) {
-    BROWSER_LOGINS
+    let replaced = BROWSER_LOGINS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(Default::default)
-        .insert(slug.to_string(), progress);
+        .insert(slug.to_string(), std::sync::Arc::clone(&progress));
+    // A flow replaced here would otherwise keep its listener, untracked.
+    if let Some(old) = replaced.filter(|old| !std::sync::Arc::ptr_eq(old, &progress)) {
+        old.supersede();
+    }
 }
 
 /// Supersede the previous browser login for `slug`, if any. Never blocks; the
@@ -3754,6 +3758,11 @@ fn supersede_previous_login(slug: &str) -> Option<std::sync::Arc<crate::login::P
         .unwrap_or_else(|e| e.into_inner())
         .as_mut()
         .and_then(|m| m.remove(slug))?;
+    // A finished flow holds no listener: nothing to wait for, so the new
+    // sign-in runs inline and may use the sign-in window.
+    if prev.is_finished() {
+        return None;
+    }
     prev.supersede();
     Some(prev)
 }
@@ -8538,6 +8547,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_finished_browser_login_is_not_superseded_and_leaves_the_registry() {
+        let done = std::sync::Arc::new(crate::login::Progress::default());
+        track_browser_login("t-login-done", done.clone());
+        done.mark_finished();
+        assert!(
+            supersede_previous_login("t-login-done").is_none(),
+            "a finished flow holds no listener: the next sign-in may use the window"
+        );
+        assert!(supersede_previous_login("t-login-done").is_none());
+    }
+
+    #[test]
+    fn tracking_a_new_browser_login_supersedes_the_one_it_replaces() {
+        let old = std::sync::Arc::new(crate::login::Progress::default());
+        let new = std::sync::Arc::new(crate::login::Progress::default());
+        track_browser_login("t-login-replace", old.clone());
+        track_browser_login("t-login-replace", new.clone());
+        assert!(
+            old.is_superseded(),
+            "a replaced flow must not keep its listener untracked"
+        );
+        assert!(!new.is_cancelled());
+        let prev = supersede_previous_login("t-login-replace").expect("tracked");
+        assert!(std::sync::Arc::ptr_eq(&prev, &new));
+    }
+
+    #[test]
     #[test]
     fn a_new_browser_login_cancels_the_previous_one_for_that_provider() {
         let old = std::sync::Arc::new(crate::login::Progress::default());
