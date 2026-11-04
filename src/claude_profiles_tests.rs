@@ -252,7 +252,10 @@ fn a_canceled_profile_marks_the_lapse_once_and_an_active_one_restores_it() {
 
     assert!(commit(&snapshot(), &canceled).unwrap());
     let saved = snapshot();
-    assert!(saved.no_subscription, "a canceled plan was not marked lapsed");
+    assert!(
+        saved.no_subscription,
+        "a canceled plan was not marked lapsed"
+    );
     assert_eq!(saved.plan.as_deref(), Some("Free"));
     assert_eq!(count("event=subscription_lapsed"), 1);
 
@@ -270,5 +273,9 @@ fn a_canceled_profile_marks_the_lapse_once_and_an_active_one_restores_it() {
     assert_eq!(count("event=subscription_restored"), 1);
     assert!(commit(&snapshot(), &profile(email)).unwrap());
     assert!(!snapshot().no_subscription);
-    assert_eq!(count("event=subscription_restored"), 1, "restore re-announced");
+    assert_eq!(
+        count("event=subscription_restored"),
+        1,
+        "restore re-announced"
+    );
 }
