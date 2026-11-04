@@ -14,24 +14,33 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Patterns that indicate a direct OS check. Covers the attribute form
-/// (`#[cfg(target_os = "...")]`), nested forms (`#[cfg(all(target_os = ...`,
-/// `#[cfg(any(target_os = ...`, `#[cfg(not(target_os = ...`), and the
-/// expression-macro form (`cfg!(target_os = "...")`). Each nested wrapper
-/// needs its own needle — "cfg(not(target_os" does NOT contain "cfg(target_os"
-/// as a contiguous substring (there's a `not(` in between), so a single
-/// "cfg(target_os" needle would silently miss it. (Plain `cfg(unix)` /
-/// `cfg(windows)` — no `target_os` — are NOT covered here and don't need to
-/// be: those are the *sanctioned* per-OS-family escape hatch for code that
-/// merely varies by a std-lib-recognized family, not a `Platform`-trait-sized
-/// OS branch — see `menubar::relaunch_via_launchd_kickstart`.)
-const NEEDLES: &[&str] = &[
-    "cfg(target_os",
-    "cfg!(target_os",
-    "cfg(not(target_os",
-    "cfg(all(target_os",
-    "cfg(any(target_os",
-];
+/// Whether `line` is a direct OS check: it mentions the `target_os` token
+/// inside any `cfg(...)`, `cfg!(...)` or `cfg_attr(...)` form. Token-based on
+/// purpose: enumerating wrappers (`cfg(not(target_os`, `cfg(all(test, not(
+/// target_os`, `cfg_attr(target_os`, ...) as literal substrings silently
+/// misses combinations. (Plain `cfg(unix)` / `cfg(windows)` — no `target_os` —
+/// are NOT covered and don't need to be: those are the *sanctioned* per-OS-
+/// family escape hatch for code that merely varies by a std-lib-recognized
+/// family, not a `Platform`-trait-sized OS branch — see
+/// `menubar::relaunch_via_launchd_kickstart`.)
+fn is_os_cfg_line(line: &str) -> bool {
+    line.contains("target_os")
+        && ["cfg(", "cfg!(", "cfg_attr("]
+            .iter()
+            .any(|n| line.contains(n))
+}
+
+/// Test-only source files may gate individual tests per host OS (e.g. macOS-
+/// only `#[ignore]` conditions); that is test infrastructure, not product
+/// behaviour that should route through the `Platform` trait.
+fn is_test_only_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "tests.rs" || n.ends_with("_tests.rs"))
+        || path
+            .strip_prefix(src_root())
+            .is_ok_and(|rel| rel.components().any(|c| c.as_os_str() == "tests"))
+}
 
 /// Documented exceptions. Every entry is `(relative path, line number,
 /// rationale)`. Additions require a comment explaining WHY the site can't
@@ -107,6 +116,21 @@ const ALLOWLIST: &[(&str, &str)] = &[
     // event loop. Never compiled alongside the macOS `NSApplication` run. (The
     // menu *content* builders in this module are NOT gated — they feed macOS too.)
     ("src/menubar.rs", "pub(super) fn run() -> Result<()> {"),
+    // `cfg_attr(..., allow(dead_code))` sites: lint-level only, no behaviour
+    // branch. The helper is used solely by the non-macOS (or macOS) path.
+    (
+        "src/icons.rs",
+        "pub fn usagio_tray_icon() -> &'static [u8] {",
+    ),
+    (
+        "src/menubar.rs",
+        "fn tray_icon_bytes(snap: &Snapshot) -> &'static [u8] {",
+    ),
+    (
+        "src/menubar.rs",
+        "fn tooltip_for(snap: &Snapshot) -> String {",
+    ),
+    ("src/menubar.rs", "mod tests {"),
 ];
 
 fn src_root() -> PathBuf {
@@ -158,7 +182,7 @@ fn no_scattered_target_os_cfg_outside_platform_module() {
 
     let mut violations = Vec::new();
     for path in &files {
-        if path.starts_with(&platform_dir) {
+        if path.starts_with(&platform_dir) || is_test_only_file(path) {
             continue;
         }
         let contents = fs::read_to_string(path)
@@ -170,7 +194,7 @@ fn no_scattered_target_os_cfg_outside_platform_module() {
             if line.trim_start().starts_with("//") {
                 continue;
             }
-            if NEEDLES.iter().any(|needle| line.contains(needle)) {
+            if is_os_cfg_line(line) {
                 let guarded = guarded_line(&lines, lineno + 1).unwrap_or_default();
                 if allowlist.contains(&(path.clone(), guarded.as_str())) {
                     continue;
