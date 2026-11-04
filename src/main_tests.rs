@@ -6492,3 +6492,13 @@ fn poll_merge_keeps_newer_usage_and_expiry_warning() {
     assert_eq!(stored.notif_state.login_expiry_warned, Some(42));
     assert!(stored.notif_state.pace_fired_this_window);
 }
+
+#[test]
+fn failed_fetch_keeps_a_plan_restored_earlier_in_the_cycle() {
+    let restored = plan("Pro", true);
+    let kept = plan_after_failed_fetch(Some(restored.clone()), None);
+    assert_eq!(kept.map(|p| p.active), Some(true));
+    let lapsed = plan_after_failed_fetch(Some(restored), Some(plan("Free", false)));
+    assert_eq!(lapsed.map(|p| p.active), Some(false));
+    assert!(plan_after_failed_fetch(None, None).is_none());
+}

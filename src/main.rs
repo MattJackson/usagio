@@ -3894,7 +3894,10 @@ fn refresh_provider_usage_caches_with(
                         e,
                         ProviderError::RateLimited { .. } | ProviderError::Other(_)
                     ) {
-                        plan = detect_lapsed_plan(provider.as_ref(), &tracker_key, &access, now_ts);
+                        plan = plan_after_failed_fetch(
+                            plan,
+                            detect_lapsed_plan(provider.as_ref(), &tracker_key, &access, now_ts),
+                        );
                     }
                     None
                 }
@@ -4484,6 +4487,16 @@ fn recheck_lapsed_plan(provider: &dyn Provider, tracker_key: &str, access: &str)
         }
         None => Recheck::Unknown,
     }
+}
+
+/// The plan to persist after a failed usage fetch: a lapse detected now wins,
+/// but a `Restored` plan confirmed earlier this cycle is kept (the throttled
+/// detector returns `None` for an account already checked this cycle).
+fn plan_after_failed_fetch(
+    current: Option<PlanStatus>,
+    detected: Option<PlanStatus>,
+) -> Option<PlanStatus> {
+    detected.or(current)
 }
 
 /// After a 403/429 from the usage endpoint, ask the provider (throttled per
