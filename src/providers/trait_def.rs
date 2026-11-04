@@ -211,6 +211,9 @@ impl Money {
     pub const CREDITS: &'static str = "credits";
     /// Largest exponent we'll format; anything bigger is a garbled response.
     const MAX_EXPONENT: u32 = 12;
+    /// `amount_minor` standing for "unlimited" (see `Credits::spendable`):
+    /// ranks above any real amount and renders as "unlimited".
+    const UNLIMITED_MINOR: i64 = i64::MAX;
 
     pub fn new(amount_minor: i64, exponent: u32, unit: impl Into<String>) -> Option<Self> {
         (exponent <= Self::MAX_EXPONENT).then(|| Money {
@@ -264,6 +267,9 @@ impl Money {
     }
 
     fn render(&self, whole_only: bool) -> String {
+        if self.amount_minor == Self::UNLIMITED_MINOR {
+            return "unlimited".to_string();
+        }
         // `Deserialize` bypasses `new`'s exponent check; a corrupt cached value
         // must not overflow `pow` (panic) or wrap it to 0 (divide by zero).
         if self.exponent > Self::MAX_EXPONENT {
@@ -353,9 +359,23 @@ impl Credits {
     /// balance and what's left under the spend cap, whichever are reported.
     /// `None` when credits are off, the cap is reached, nothing is reported,
     /// or nothing is left — i.e. "can this account keep working on credits".
+    /// Unlimited credits are always spendable (until the cap is reported
+    /// reached), whatever balance is reported.
     pub fn spendable(&self) -> Option<Money> {
         if !(self.enabled || self.unlimited) || self.limit_reached {
             return None;
+        }
+        if self.unlimited {
+            let unit = [&self.balance, &self.limit, &self.used]
+                .into_iter()
+                .flatten()
+                .next()
+                .map_or(Money::CREDITS, |m| m.unit.as_str());
+            return Some(Money {
+                amount_minor: Money::UNLIMITED_MINOR,
+                exponent: 0,
+                unit: unit.to_string(),
+            });
         }
         let under_cap = match (&self.limit, &self.used) {
             (Some(limit), Some(used))
@@ -983,6 +1003,27 @@ mod tests {
             ..on(None, None, usd(500))
         };
         assert_eq!(amt(capped), None);
+    }
+
+    #[test]
+    fn unlimited_credits_are_spendable_without_a_balance() {
+        let unlimited = |balance| Credits {
+            enabled: true,
+            unlimited: true,
+            balance,
+            ..Credits::default()
+        };
+        // Codex reports {has_credits, unlimited, balance: "0"}: still spendable.
+        let zero = unlimited(Money::from_decimal_str("0", Money::CREDITS));
+        let left = zero.spendable().expect("unlimited is spendable");
+        assert_eq!(left.display(), "unlimited");
+        assert!(unlimited(None).spendable().is_some());
+        // ...unless the provider says the cap is reached.
+        let capped = Credits {
+            limit_reached: true,
+            ..unlimited(None)
+        };
+        assert_eq!(capped.spendable(), None);
     }
 
     #[test]

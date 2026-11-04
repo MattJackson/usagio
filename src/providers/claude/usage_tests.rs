@@ -236,6 +236,20 @@ fn metadata_profile_request_handles_http_and_parse_failures() {
 }
 
 #[test]
+fn fetch_profile_uses_only_the_test_mock() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    // No mock: no request at all (tests must never contact Anthropic).
+    set_profile_url_override(None);
+    assert!(fetch_profile("test-access").is_none());
+    let expected = sample_profile();
+    let (url, _) = crate::tests::spawn_mock_usage_server(200, expected.to_string());
+    set_profile_url_override(Some(&format!("{url}/api/oauth/profile")));
+    let actual = fetch_profile("test-access");
+    set_profile_url_override(None);
+    assert_eq!(actual, Some(expected));
+}
+
+#[test]
 fn fetch_error_display_texts() {
     assert_eq!(
         FetchError::RateLimited.to_string(),
