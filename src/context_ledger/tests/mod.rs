@@ -965,3 +965,41 @@ fn claude_project_instructions_found_in_all_documented_locations() {
         );
     });
 }
+
+#[test]
+fn codex_override_walk_cap_and_disabled_mcp() {
+    with_home(|home| {
+        let dir = home.join(".codex");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("AGENTS.md"), "x".repeat(30_000)).unwrap();
+        fs::write(dir.join("AGENTS.override.md"), "short").unwrap();
+        let marker = home.join("ran");
+        let script = format!("echo ran > '{}'; exit 1", marker.display());
+        fs::write(
+            dir.join("config.toml"),
+            format!(
+                "[mcp_servers.off]\ncommand = \"/bin/sh\"\nargs = [\"-c\", {script:?}]\nenabled = false\n"
+            ),
+        )
+        .unwrap();
+        // repo root (has .git) with a big AGENTS.md; project is a subdir.
+        let repo = tempdir().unwrap();
+        fs::create_dir_all(repo.path().join(".git")).unwrap();
+        fs::write(repo.path().join("AGENTS.md"), "r".repeat(40_000)).unwrap();
+        let sub = repo.path().join("pkg");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("AGENTS.md"), "sub").unwrap();
+        let l = build_ledger("codex", Some(&sub)).unwrap();
+        let by = |n: &str| l.items.iter().find(|i| i.name.starts_with(n));
+        assert_eq!(by("Global AGENTS.override.md").unwrap().content_bytes, 5);
+        assert!(by("Global AGENTS.md").is_none());
+        let root_doc = l
+            .items
+            .iter()
+            .find(|i| i.name.starts_with("AGENTS.md ("))
+            .expect("git-root AGENTS.md");
+        assert_eq!(root_doc.content_bytes, 32 * 1024);
+        assert!(by("Project AGENTS.md").is_none(), "cap reached");
+        assert!(!marker.exists(), "enabled=false server was started");
+    });
+}
