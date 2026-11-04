@@ -122,25 +122,24 @@ pub fn migrate_between(old: &Path, new: &Path) -> Result<MigrationResult, Migrat
     }
 }
 
-/// The user's home directory: `$HOME`, else `%USERPROFILE%`. An empty value
-/// counts as unset (an empty `HOME` would otherwise yield cwd-relative paths
-/// and block the `USERPROFILE` fallback). Deliberately env-only and cfg-free
-/// so tests that scope `$HOME` stay hermetic on every OS.
-///
-/// Known residual on Windows: Claude Code (libuv `os.homedir()`) and Codex
-/// (`dirs`) ignore `HOME`; if `HOME` is set and differs from `USERPROFILE`
-/// (e.g. an MSYS2 shell), these paths diverge from the vendors'. This matches
-/// the pre-existing `.credentials.json` rule.
+/// The user's home directory. The variables are read in the order given by
+/// `Paths::home_env_order` (Windows: `USERPROFILE` then `HOME`, matching
+/// Claude Code's libuv and Codex's `dirs`; Unix: `HOME` then `USERPROFILE`).
+/// An empty value counts as unset (an empty `HOME` would otherwise yield
+/// cwd-relative paths). Env-only so tests that scope `$HOME` stay hermetic.
 pub(crate) fn user_home() -> Option<PathBuf> {
-    home_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+    let [first, second] = crate::platform().paths().home_env_order();
+    home_from(std::env::var_os(first), std::env::var_os(second))
 }
 
+/// First non-empty of the two values, in priority order.
 fn home_from(
-    home: Option<std::ffi::OsString>,
-    userprofile: Option<std::ffi::OsString>,
+    first: Option<std::ffi::OsString>,
+    second: Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {
-    home.filter(|h| !h.is_empty())
-        .or_else(|| userprofile.filter(|h| !h.is_empty()))
+    first
+        .filter(|h| !h.is_empty())
+        .or_else(|| second.filter(|h| !h.is_empty()))
         .map(PathBuf::from)
 }
 
@@ -478,6 +477,16 @@ mod tests {
     fn user_home_with_empty_home_is_not_cwd_relative() {
         crate::env_lock::scoped_env_var("HOME", Some(""), || {
             assert_ne!(user_home(), Some(PathBuf::from("")));
+        });
+    }
+
+    #[test]
+    fn user_home_reads_the_platform_env_order_first() {
+        // Whatever variable the platform ranks first wins over the second,
+        // even when the second is set to something else.
+        let [first, _second] = crate::platform().paths().home_env_order();
+        crate::env_lock::scoped_env_var(first, Some("/usagio-first-home"), || {
+            assert_eq!(user_home(), Some(PathBuf::from("/usagio-first-home")));
         });
     }
 
