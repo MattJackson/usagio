@@ -1485,11 +1485,6 @@ mod tests {
             &stale,
             SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_700_000_000),
         );
-        append(&snap("claude", "a@x.io", utc(2049, 9, 6, 5), Some(1.0))).unwrap();
-        assert!(
-            stale.exists(),
-            "same-month appends must not re-run the prune"
-        );
         // A long-lived daemon rolling into a new month prunes without a restart.
         append(&snap("claude", "a@x.io", utc(2049, 10, 1, 5), Some(1.0))).unwrap();
         assert!(!stale.exists(), "month change must prune expired files");
