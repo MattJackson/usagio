@@ -823,7 +823,7 @@ pub(crate) fn active_slot_write(blob: &str) -> PResult<()> {
 
 /// Claude Code's relocatable config root: a non-empty `CLAUDE_CONFIG_DIR`.
 fn claude_config_dir_override() -> Option<std::path::PathBuf> {
-    std::env::var_os("CLAUDE_CONFIG_DIR")
+    crate::paths::path_env_var("CLAUDE_CONFIG_DIR")
         .filter(|d| !d.is_empty())
         .map(std::path::PathBuf::from)
 }
@@ -893,7 +893,7 @@ fn claude_json_mode(_path: &std::path::Path) -> u32 {
 /// since the snapshot: re-patch the CURRENT file with the prior
 /// `oauthAccount`/`userID`. Falls back to restoring the raw snapshot when the
 /// prior file had no identity to patch back (or was unparseable).
-fn rollback_claude_identity(prior_bytes: &[u8], mode: u32) -> PResult<()> {
+pub(crate) fn rollback_claude_identity(prior_bytes: &[u8], mode: u32) -> PResult<()> {
     let prior: Option<Value> = serde_json::from_slice(prior_bytes).ok();
     let oauth = prior
         .as_ref()
@@ -914,7 +914,11 @@ fn restore_claude_json_raw(bytes: &[u8], mode: u32) -> PResult<()> {
     write_bytes_atomic_mode(&path, bytes, mode)
 }
 
-fn write_bytes_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> PResult<()> {
+pub(crate) fn write_bytes_atomic_mode(
+    path: &std::path::Path,
+    bytes: &[u8],
+    mode: u32,
+) -> PResult<()> {
     let tmp = path.with_extension("json.usagio.tmp");
     if let Err(e) = crate::store::write_private(&tmp, bytes) {
         let _ = std::fs::remove_file(&tmp);
@@ -981,8 +985,9 @@ fn ensure_unverified_capture_is_safe(
                 "event=capture provider=claude account={email} result=refused reason=unverified-identity"
             ));
             Err(ProviderError::Other(format!(
-                "could not verify which account this token belongs to (profile lookup failed) \
-                 and it differs from the saved login for {email}; connect and try capture again"
+                "could not verify which account this token belongs to: the profile lookup failed \
+                 (offline, or the live token is expired) and the token differs from the saved \
+                 login for {email}; run `claude` once to refresh it, then capture again"
             )))
         }
         _ => Ok(()),
@@ -1014,7 +1019,7 @@ fn write_claude_identity(oauth_account: &Value, user_id: Option<&str>) -> PResul
 /// Read-modify-write `~/.claude.json`. The Claude CLI rewrites this file
 /// continually, so re-read just before committing and redo the patch if the
 /// bytes moved (bounded). `before_commit` is a test seam.
-fn write_claude_identity_with(
+pub(crate) fn write_claude_identity_with(
     oauth_account: &Value,
     user_id: Option<&str>,
     mut before_commit: impl FnMut(),
@@ -1722,6 +1727,7 @@ mod tests {
 
     #[test]
     fn claude_config_dir_relocates_json_and_credentials_paths() {
+        let _cfg = crate::store::ScopedConfigDir::new();
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().to_str().unwrap();
         crate::env_lock::scoped_env_var("CLAUDE_CONFIG_DIR", Some(d), || {
@@ -1745,7 +1751,51 @@ mod tests {
     }
 
     #[test]
+    fn exported_claude_config_dir_never_redirects_a_home_scoped_test() {
+        // A developer's real CLAUDE_CONFIG_DIR is in the process env but NOT
+        // scoped by the test: it must be ignored (sentinel stays untouched).
+        let sentinel = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let sfile = sentinel.path().join(".claude.json");
+        std::fs::write(&sfile, r#"{"oauthAccount":{"emailAddress":"real@me.com"}}"#).unwrap();
+        std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
+        // Emulate an exported variable the test did not scope: set it
+        // directly, bypassing scoped_env_var, under the env lock.
+        let _l = crate::env_lock::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        #[allow(clippy::disallowed_methods)]
+        std::env::set_var("CLAUDE_CONFIG_DIR", sentinel.path());
+        struct Unset;
+        impl Drop for Unset {
+            fn drop(&mut self) {
+                #[allow(clippy::disallowed_methods)]
+                std::env::remove_var("CLAUDE_CONFIG_DIR");
+            }
+        }
+        let _u = Unset;
+        let _hold = crate::env_lock::mark_scoped("HOME");
+        #[allow(clippy::disallowed_methods)]
+        let prev = std::env::var_os("HOME");
+        #[allow(clippy::disallowed_methods)]
+        std::env::set_var("HOME", home.path());
+        write_claude_identity(&serde_json::json!({"emailAddress":"new@e.com"}), None).unwrap();
+        #[allow(clippy::disallowed_methods)]
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&sfile).unwrap(),
+            r#"{"oauthAccount":{"emailAddress":"real@me.com"}}"#
+        );
+        let written = std::fs::read_to_string(home.path().join(".claude.json")).unwrap();
+        assert!(written.contains("new@e.com"));
+    }
+
+    #[test]
     fn credential_paths_do_not_scan_claude_json() {
+        let _cfg = crate::store::ScopedConfigDir::new();
         for p in ClaudeProvider.credential_paths() {
             assert!(!p.ends_with(".claude.json"), "{p:?}");
         }
