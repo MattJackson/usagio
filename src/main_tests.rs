@@ -5878,7 +5878,14 @@ fn codex_inactive_refresh_persists_complete_credential_without_touching_active_f
         assert_eq!(saved["tokens"], fresh_value["tokens"]);
         assert_eq!(account.access_token, "new-at-b");
         assert_eq!(account.refresh_token, "new-rt-b");
-        assert_eq!(account.expires_at, 4_000_000_001);
+        // Opaque access token: due 8 days after this refresh (the Codex
+        // client's cadence), not at the id_token's exp.
+        let due = chrono::Utc::now().timestamp() + 8 * 86_400;
+        assert!(
+            (due - 120..=due).contains(&account.expires_at),
+            "{}",
+            account.expires_at
+        );
         assert_eq!(hit_count(&hits), 1);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("auth.json")).unwrap(),
@@ -6024,8 +6031,13 @@ fn codex_renew_repairs_only_the_target_account_and_preserves_active_login() {
         let result = persist_login(&provider, captured, None).unwrap();
         assert!(!result.made_live);
         let state = State::load().unwrap();
-        let repaired = state
+        // The email-only entry (no workspace on record) is upgraded by the
+        // renewal to its workspace key.
+        assert!(state
             .find_provider_account("codex", "b@example.com")
+            .is_none());
+        let repaired = state
+            .find_provider_account("codex", "b@example.com#account-b")
             .unwrap();
         assert!(!repaired.needs_relogin);
         lifecycle::validate_stored_identity(&provider, repaired).unwrap();
@@ -8231,4 +8243,155 @@ fn a_provider_account_added_by_sign_in_keeps_its_store_through_a_sweep() {
         .is_empty());
     assert!(!crate::menubar::sign_in_stores_to_keep(&state)
         .contains(&login::store_id(slug, "new:fresh")));
+}
+
+/// A Codex `auth.json` for `email` in ChatGPT workspace `account_id`.
+fn codex_workspace_auth_json(email: &str, account_id: &str, access: &str) -> String {
+    serde_json::json!({
+        "tokens": {
+            "id_token": codex_id_token(email, 4_000_000_000),
+            "access_token": access,
+            "refresh_token": format!("rt-{account_id}"),
+            "account_id": account_id,
+        }
+    })
+    .to_string()
+}
+
+#[test]
+fn codex_workspaces_of_one_email_are_separate_accounts() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+        let personal = codex_workspace_auth_json("a@example.com", "ws-personal", "at-p");
+        let team = codex_workspace_auth_json("a@example.com", "ws-team", "at-t");
+        std::fs::write(dir.path().join("auth.json"), &personal).unwrap();
+        let (k1, _) = capture_current_generic("codex").unwrap();
+        std::fs::write(dir.path().join("auth.json"), &team).unwrap();
+        let (k2, existed) = capture_current_generic("codex").unwrap();
+        assert!(!existed, "the team workspace must not overwrite personal");
+        assert_eq!(k1, "a@example.com#ws-personal");
+        assert_eq!(k2, "a@example.com#ws-team");
+        let state = State::load().unwrap();
+        assert_eq!(state.provider_accounts("codex").unwrap().accounts.len(), 2);
+        assert_eq!(
+            state
+                .find_provider_account("codex", &k1)
+                .unwrap()
+                .access_token,
+            "at-p"
+        );
+        // The email alone is ambiguous; the full key selects one.
+        assert!(resolve_provider_selector(&state, "a@example.com").is_none());
+        assert_eq!(
+            resolve_provider_selector(&state, "a@example.com#ws-team"),
+            Some(("codex".to_string(), k2.clone()))
+        );
+        // Labels show the workspace only because the email is shared.
+        assert_eq!(
+            provider_account_label("codex", &k2),
+            "a@example.com (workspace ws-team)"
+        );
+        // The renewal hint is the email, not the workspace key.
+        assert_eq!(providers::trait_def::key_email(&k2), "a@example.com");
+    });
+}
+
+#[test]
+fn email_keyed_codex_state_upgrades_on_load_and_keeps_its_history() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let blob = codex_workspace_auth_json("a@example.com", "ws-1", "at-1");
+    let raw = serde_json::json!({
+        "schema_version": 2,
+        "accounts": [],
+        "providers": {"codex": {
+            "active": "a@example.com",
+            "accounts": [{
+                "key": "a@example.com",
+                "secret_blob": blob,
+                "access_token": "at-1",
+                "identity_email": "a@example.com",
+            }],
+        }},
+        "manual_picks": {"codex": "a@example.com"},
+        "swap_memory": {"codex": {"left_at": {"a@example.com": 100}}},
+    });
+    let path = crate::store::config_dir().unwrap().join("state.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, raw.to_string()).unwrap();
+    let old_row = usage_log::Snapshot {
+        ts: Utc::now() - chrono::Duration::hours(1),
+        provider: "codex".into(),
+        account: "a@example.com".into(),
+        weekly_pct: Some(42.0),
+        ..Default::default()
+    };
+    usage_log::append(&old_row).unwrap();
+
+    let state = State::load().unwrap();
+    let key = "a@example.com#ws-1";
+    let pa = state.provider_accounts("codex").unwrap();
+    assert_eq!(pa.accounts[0].key, key, "workspace derived from the blob");
+    assert_eq!(pa.active.as_deref(), Some(key));
+    assert_eq!(
+        state.manual_picks.get("codex").map(String::as_str),
+        Some(key)
+    );
+    assert!(state.swap_memory["codex"].left_at.contains_key(key));
+    // The save guard accepts the rename, and it sticks.
+    state.save().unwrap();
+    let again = State::load().unwrap();
+    assert!(again.find_provider_account("codex", key).is_some());
+    // Rows written under the old key are still this account's history.
+    let last = usage_log::last_snapshot(&usage_log::AccountKey::new("codex", key)).unwrap();
+    assert_eq!(last.weekly_pct, Some(42.0));
+}
+
+#[test]
+fn an_upgraded_codex_key_keeps_the_sign_in_store_it_was_added_with() {
+    // "Sign in to a new Codex account…" remembered its store under the
+    // email-only key; the workspace re-key must carry it, or renewals open a
+    // fresh session and the sweep deletes the working one.
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let blob = codex_workspace_auth_json("a@example.com", "ws-1", "at-1");
+    let raw = serde_json::json!({
+        "schema_version": 2,
+        "accounts": [],
+        "providers": {"codex": {
+            "accounts": [{
+                "key": "a@example.com",
+                "secret_blob": blob,
+                "access_token": "at-1",
+                "identity_email": "a@example.com",
+            }],
+            "login_stores": {"a@example.com": "new:fresh"},
+        }},
+    });
+    let path = crate::store::config_dir().unwrap().join("state.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, raw.to_string()).unwrap();
+
+    let state = State::load().unwrap();
+    let key = "a@example.com#ws-1";
+    assert_eq!(
+        state.provider_accounts("codex").unwrap().accounts[0].key,
+        key
+    );
+    assert_eq!(
+        state.provider_accounts("codex").unwrap().login_store(key),
+        Some("new:fresh")
+    );
+    assert_eq!(
+        crate::menubar::renew_login_store(&state, "codex", key),
+        "new:fresh",
+        "a renew must reopen the store the account signed in with"
+    );
+    assert!(crate::menubar::sign_in_stores_to_keep(&state)
+        .contains(&login::store_id("codex", "new:fresh")));
+    // Saved under the new key, it survives the next load too.
+    state.save().unwrap();
+    let again = State::load().unwrap();
+    let stores = &again.provider_accounts("codex").unwrap().login_stores;
+    assert_eq!(stores.len(), 1);
+    assert_eq!(stores.get(key).map(String::as_str), Some("new:fresh"));
 }

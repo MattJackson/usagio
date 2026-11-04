@@ -26,8 +26,8 @@
 //!   RFC 6749 `invalid_grant` on HTTP 400/401, into `RefreshError::InvalidGrant`
 //!   — callers need "dead, don't retry" vs. "retry later", not the subtype.
 //! - **No `expires_in` in the response.** Like `parse_stored_blob`, expiry is
-//!   read from the `exp` claim of the returned `id_token` (falling back to
-//!   the `access_token` JWT if no `id_token` came back).
+//!   the `access_token` JWT's own `exp` (what the Codex client checks), else
+//!   the 8-day cadence from this refresh; see `access_expires_at`.
 //! - **Server-side session TTL independent of the access token's own expiry**:
 //!   the vendor CLI's `should_refresh_proactively` refreshes whenever EITHER
 //!   (a) the access token expires within 5 minutes, OR (b) `last_refresh` is
@@ -47,7 +47,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{auth_json_path, jwt_payload_claims};
+use super::auth_json_path;
 use crate::providers::trait_def::TokenGrant;
 
 /// Codex's OAuth token endpoint. Override via `CODEX_REFRESH_TOKEN_URL_OVERRIDE`
@@ -235,14 +235,14 @@ pub fn refresh_token_grant(refresh_token: &str) -> Result<CodexRefreshGrant, Ref
     let refresh_token_out = parsed
         .refresh_token
         .unwrap_or_else(|| refresh_token.to_string());
-    let expires_in_secs = parsed
-        .id_token
-        .as_deref()
-        .or(Some(access_token.as_str()))
-        .and_then(jwt_payload_claims)
-        .and_then(|c| c.get("exp").and_then(|x| x.as_i64()))
-        .map(|exp| exp.saturating_sub(chrono::Utc::now().timestamp()))
-        .unwrap_or(0);
+    // The refreshed blob's `last_refresh` is now, so this matches what
+    // `parse_stored_blob` reads back from it.
+    let now = chrono::Utc::now().to_rfc3339();
+    let expires_in_secs = super::expires_in_secs(super::access_expires_at(
+        &access_token,
+        Some(&now),
+        parsed.id_token.as_deref(),
+    ));
     Ok(CodexRefreshGrant {
         id_token: parsed.id_token,
         access_token,

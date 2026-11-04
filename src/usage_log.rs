@@ -199,6 +199,40 @@ pub fn last_n_days(account: &AccountKey, days: u32) -> Vec<Snapshot> {
 }
 
 // ---------------------------------------------------------------------------
+// History aliases
+// ---------------------------------------------------------------------------
+
+/// Account → the older key its earlier rows were written under (an account
+/// renamed by a keying upgrade; see `State::rename_provider_account`).
+fn history_aliases() -> &'static Mutex<HashMap<AccountKey, AccountKey>> {
+    static ALIASES: OnceLock<Mutex<HashMap<AccountKey, AccountKey>>> = OnceLock::new();
+    ALIASES.get_or_init(Default::default)
+}
+
+/// Make `provider`/`legacy` rows read as `provider`/`key`'s history.
+pub fn register_history_alias(provider: &str, key: &str, legacy: &str) {
+    if let Ok(mut aliases) = history_aliases().lock() {
+        aliases.insert(
+            AccountKey::new(provider, key.to_ascii_lowercase()),
+            AccountKey::new(provider, legacy),
+        );
+    }
+}
+
+/// `account` itself, then the key its older rows were written under.
+fn history_keys(account: &AccountKey) -> Vec<AccountKey> {
+    let lookup = AccountKey::new(
+        account.provider.clone(),
+        account.account.to_ascii_lowercase(),
+    );
+    let alias = history_aliases()
+        .lock()
+        .ok()
+        .and_then(|aliases| aliases.get(&lookup).cloned());
+    std::iter::once(account.clone()).chain(alias).collect()
+}
+
+// ---------------------------------------------------------------------------
 // mtime-keyed cache (H9)
 // ---------------------------------------------------------------------------
 
@@ -318,6 +352,7 @@ fn read_range_cached(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Vec<Snapshot> {
+    let keys = history_keys(account);
     let mut out = Vec::new();
     let mut y = from.year();
     let mut m = from.month();
@@ -326,8 +361,8 @@ fn read_range_cached(
         let path = month_path_ym(dir, y, m);
         let index = load_month_cached(&path, y, m);
         // Only this account's rows are scanned, not the whole month's.
-        if let Some(rows) = index.by_account.get(account) {
-            for snap in rows {
+        for key in &keys {
+            for snap in index.by_account.get(key).into_iter().flatten() {
                 if snap.ts >= from && snap.ts <= to {
                     out.push(snap.clone());
                 }
@@ -505,11 +540,12 @@ pub fn last_snapshot(account: &AccountKey) -> Option<Snapshot> {
     // of NDJSON per tick is wasteful.
     let (from, to) = (now - Duration::days(35), now);
     // Scan the cached per-account rows for the newest reading; clone only it.
+    let keys = history_keys(account);
     let (mut y, mut m) = (from.year(), from.month());
     let mut best: Option<Snapshot> = None;
     loop {
         let index = load_month_cached(&month_path_ym(&dir, y, m), y, m);
-        if let Some(rows) = index.by_account.get(account) {
+        for rows in keys.iter().filter_map(|k| index.by_account.get(k)) {
             let newest = rows
                 .iter()
                 .filter(|s| s.ts >= from && s.ts <= to && s.is_reading())
@@ -764,6 +800,7 @@ fn read_range(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Vec<Snapshot> {
+    let keys = history_keys(account);
     let mut out = Vec::new();
     let mut y = from.year();
     let mut m = from.month();
@@ -785,8 +822,9 @@ fn read_range(
                     continue;
                 }
                 if let Ok(snap) = serde_json::from_str::<Snapshot>(&line) {
-                    let account_matches =
-                        snap.provider == account.provider && snap.account == account.account;
+                    let account_matches = keys
+                        .iter()
+                        .any(|k| snap.provider == k.provider && snap.account == k.account);
                     if snap.ts >= from && snap.ts <= to && account_matches {
                         out.push(snap);
                     }

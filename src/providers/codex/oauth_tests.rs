@@ -259,10 +259,14 @@ fn refresh_token_grant_maps_statuses_and_missing_access_token() {
 }
 
 #[test]
-fn refresh_token_grant_expiry_falls_back_to_access_token_jwt() {
-    // No id_token: exp is read from the access token when it is a JWT.
+fn refresh_token_grant_expiry_comes_from_the_access_token() {
+    // The access token's own exp wins over a shorter-lived id_token.
     let at = make_id_token("u@e.com", chrono::Utc::now().timestamp() + 3600);
-    let body = serde_json::json!({ "access_token": at }).to_string();
+    let body = serde_json::json!({
+        "access_token": at,
+        "id_token": make_id_token("u@e.com", chrono::Utc::now().timestamp() + 60),
+    })
+    .to_string();
     let (url, handle) = spawn_mock_token_server(200, body, || {});
     crate::env_lock::scoped_env_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE", Some(&url), || {
         let grant = refresh_token_grant("rt").unwrap();
@@ -273,11 +277,17 @@ fn refresh_token_grant_expiry_falls_back_to_access_token_jwt() {
         );
     });
     let _ = handle.join();
-    // Opaque access token and no id_token: unknown expiry is 0, not an error.
-    let body = serde_json::json!({ "access_token": "opaque" }).to_string();
+    // Opaque access token: due on the Codex client's 8-day cadence from
+    // this refresh, even when the id_token claims a shorter life.
+    let body = serde_json::json!({
+        "access_token": "opaque",
+        "id_token": make_id_token("u@e.com", chrono::Utc::now().timestamp() + 60),
+    })
+    .to_string();
     let (url, handle) = spawn_mock_token_server(200, body, || {});
     crate::env_lock::scoped_env_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE", Some(&url), || {
-        assert_eq!(refresh_token_grant("rt").unwrap().expires_in_secs, 0);
+        let secs = refresh_token_grant("rt").unwrap().expires_in_secs;
+        assert!((8 * 86_400 - 60..=8 * 86_400).contains(&secs), "got {secs}");
     });
     let _ = handle.join();
 }

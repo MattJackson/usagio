@@ -189,7 +189,14 @@ fn latch_holds(latch: &Latch, a: &AccountIn, now: DateTime<Utc>) -> bool {
     if w.resets_at.is_some_and(|r| r <= now) {
         return false; // its reset passed: a new epoch
     }
-    if w.resets_at.map(|r| r.timestamp()) != latch.resets_at {
+    let same_epoch = match (w.resets_at.map(|r| r.timestamp()), latch.resets_at) {
+        (None, None) => true,
+        // Tolerant: a provider that reports a relative reset (Codex) yields
+        // a `resets_at` that jitters by seconds between reads.
+        (Some(now_reset), Some(latched)) => (now_reset - latched).abs() <= EPOCH_MATCH_TOLERANCE_S,
+        _ => false,
+    };
+    if !same_epoch {
         return false; // a different epoch
     }
     w.pct + 1e-9 >= latch.pct // a lower reading starts a new epoch

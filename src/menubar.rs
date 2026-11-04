@@ -2034,9 +2034,16 @@ fn build_snapshot() -> Snapshot {
         } else {
             st.providers.get(slug).and_then(|p| p.active.clone())
         };
+        let keys: Vec<&str> = provider_rows.iter().map(|r| r.email.as_str()).collect();
         let mut accounts: Vec<AcctView> = provider_rows
-            .into_iter()
-            .map(|r| acctview_from_row(r, &active_for_slug, slug, provider.window_order()))
+            .iter()
+            .map(|r| {
+                let mut view =
+                    acctview_from_row(r, &active_for_slug, slug, provider.window_order());
+                view.display =
+                    crate::providers::trait_def::account_label(&r.email, keys.iter().copied());
+                view
+            })
             .collect();
         // The ONE canonical order (v0.5.18 "1 order only"): soonest WEEKLY
         // reset first (use credits top-down so no weekly is left behind),
@@ -3575,7 +3582,9 @@ fn capture_serialized(slug: &str) {
 
 /// Sign-in window store for a renew: the store the account was added with
 /// (Claude: `Account::login_store`; any other provider: its slot's
-/// `login_stores`), else one keyed by the account key.
+/// `login_stores`), else one keyed by the account's email: workspaces of one
+/// email share its vendor session (the sign-in page picks the workspace), and
+/// keys from before workspace keying keep theirs.
 pub(crate) fn renew_login_store(st: &State, slug: &str, key: &str) -> String {
     let added = if slug == CLAUDE_SLUG {
         st.find(key).and_then(|a| a.login_store.clone())
@@ -3584,7 +3593,7 @@ pub(crate) fn renew_login_store(st: &State, slug: &str, key: &str) -> String {
             .and_then(|pa| pa.login_store(key))
             .map(String::from)
     };
-    added.unwrap_or_else(|| key.to_string())
+    added.unwrap_or_else(|| crate::providers::trait_def::key_email(key).to_string())
 }
 
 /// "Renew login…": run the provider's own login in usagio's sign-in window —
@@ -3606,7 +3615,7 @@ fn begin_renew(slug: &str, key: &str) {
     let store = State::load()
         .ok()
         .map(|st| renew_login_store(&st, slug, key))
-        .unwrap_or_else(|| key.to_string());
+        .unwrap_or_else(|| crate::providers::trait_def::key_email(key).to_string());
     let target = crate::login::Target::Renew(key.to_string());
     let started = crate::login::start(provider, target, |result| {
         sweep_sign_in_stores_later();
@@ -3619,7 +3628,15 @@ fn begin_renew(slug: &str, key: &str) {
         }
     });
     match started {
-        Ok(s) => show_sign_in(&format!("Renew {key} — usagio"), slug, &store, &s),
+        Ok(s) => show_sign_in(
+            &format!(
+                "Renew {} — usagio",
+                crate::providers::trait_def::key_email(key)
+            ),
+            slug,
+            &store,
+            &s,
+        ),
         Err(e) => notify(&format!("Renew failed: {e:#}")),
     }
 }

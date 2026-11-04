@@ -476,6 +476,9 @@ pub struct LoginSpec {
     /// Loopback redirect port; `None` = any free port. Some vendors register
     /// one fixed port (Codex: 1455).
     pub redirect_port: Option<u16>,
+    /// A second registered port, used when `redirect_port` stays busy
+    /// (Codex: 1457, as in openai/codex `login/src/server.rs`).
+    pub fallback_redirect_port: Option<u16>,
     /// Registered loopback host (localhost or the IPv4 loopback literal).
     pub redirect_host: &'static str,
     /// Loopback redirect path, e.g. `/callback`.
@@ -748,6 +751,14 @@ pub trait Provider: Send + Sync + 'static {
         Err(ProviderError::Unsupported)
     }
 
+    /// [`Self::fetch_usage`] for a stored account, whose `secret_blob` may
+    /// carry request context the token alone lacks (Codex's ChatGPT
+    /// workspace id). Defaults to `fetch_usage`.
+    fn fetch_account_usage(&self, access_token: &str, secret_blob: &str) -> PResult<UsageSnapshot> {
+        let _ = secret_blob;
+        self.fetch_usage(access_token)
+    }
+
     /// Ask the provider which plan the account is on, WITHOUT touching the
     /// usage endpoint (so it's safe to call while that endpoint 403s/429s a
     /// lapsed account). Used to confirm a suspected lapse and to notice a
@@ -901,6 +912,14 @@ pub trait Provider: Send + Sync + 'static {
 
     // --- Account identity helpers ---
 
+    /// The key a stored account should have under this build's keying, when
+    /// it differs from `account.key` (an older build keyed it differently).
+    /// `State::from_value` renames such entries on load. Default: never.
+    fn upgraded_account_key(&self, account: &crate::store::ProviderAccount) -> Option<String> {
+        let _ = account;
+        None
+    }
+
     /// Stable per-provider key used inside state.json's `providers.<slug>
     /// .accounts.<key>` namespace. Default: lowercased email, then UUID,
     /// then a short hash of `native_blob`.
@@ -921,9 +940,47 @@ pub trait Provider: Send + Sync + 'static {
     }
 }
 
+/// Separates an account key's email from the workspace it belongs to, for
+/// providers where one email signs into several workspaces (Codex keys are
+/// `email#chatgpt_account_id`). Emails never contain it.
+pub const WORKSPACE_KEY_SEP: char = '#';
+
+/// The email part of an account key (the whole key when it has no workspace).
+pub fn key_email(key: &str) -> &str {
+    key.split_once(WORKSPACE_KEY_SEP)
+        .map_or(key, |(email, _)| email)
+}
+
+/// `email` (lowercased) qualified by `workspace` when known.
+pub fn workspace_key(email: &str, workspace: Option<&str>) -> String {
+    let email = email.to_ascii_lowercase();
+    match workspace.map(str::trim).filter(|w| !w.is_empty()) {
+        Some(w) => format!("{email}{WORKSPACE_KEY_SEP}{}", w.to_ascii_lowercase()),
+        None => email,
+    }
+}
+
+/// Human label for account `key` among the keys of the same provider: the
+/// email, plus a short workspace tag only when another account shares it.
+pub fn account_label<'a>(key: &str, siblings: impl IntoIterator<Item = &'a str>) -> String {
+    let Some((email, workspace)) = key.split_once(WORKSPACE_KEY_SEP) else {
+        return key.to_string();
+    };
+    let shared = siblings
+        .into_iter()
+        .filter(|k| !k.eq_ignore_ascii_case(key))
+        .any(|k| key_email(k).eq_ignore_ascii_case(email));
+    if shared {
+        let tag: String = workspace.chars().take(8).collect();
+        format!("{email} (workspace {tag})")
+    } else {
+        email.to_string()
+    }
+}
+
 /// Short deterministic id derived from a JSON blob. Used only as an
 /// account-identifier fallback when neither email nor UUID is available.
-fn short_hash(v: &Value) -> String {
+pub(crate) fn short_hash(v: &Value) -> String {
     use sha2::{Digest, Sha256};
     let bytes = serde_json::to_vec(v).unwrap_or_default();
     let digest = Sha256::digest(&bytes);

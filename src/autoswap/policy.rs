@@ -59,6 +59,12 @@ pub const SWAP_COOLDOWN_S: i64 = 300;
 pub const MANUAL_PICK_SETTLE_S: i64 = 300;
 /// A Real post-leave reading this far under the trigger clears `trigger_left`.
 pub const LATCH_CLEAR_PTS: f64 = 5.0;
+/// Two readings whose reported `resets_at` differ by at most this many seconds
+/// are the same reset epoch. Codex derives `resets_at` from `now +
+/// reset_after_seconds` on each read, so it drifts by a few seconds between
+/// reads; Claude's is fixed. Real epochs are hours apart, so a few minutes of
+/// tolerance cannot merge two of them.
+pub const EPOCH_MATCH_TOLERANCE_S: i64 = 300;
 /// Rebalance only toward a weekly reset sooner than this (hours).
 pub const REBALANCE_HORIZON_H: i64 = 6;
 /// Active poll floor in the TIGHT band / Draining (seconds).

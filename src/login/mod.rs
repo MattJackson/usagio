@@ -149,6 +149,55 @@ pub fn parse_callback(target: &str, path: &str, state: &str) -> Callback {
     }
 }
 
+/// Tries per port while it is in use, and the pause between them (as
+/// openai/codex `login/src/server.rs` `bind_server`: 10 × 200 ms).
+const BIND_ATTEMPTS: u32 = 10;
+const BIND_RETRY_DELAY: Duration = Duration::from_millis(200);
+
+/// Bind the loopback redirect listener the way the Codex client does: retry
+/// `port` while it is in use, then move to the registered `fallback` port
+/// (retried the same way). Any other bind error fails at once. Unlike the
+/// Codex client, no `/cancel` is sent to the port's holder: that may be the
+/// user's own `codex login`, which usagio must not end.
+fn bind_redirect_listener(
+    port: u16,
+    fallback: Option<u16>,
+    attempts: u32,
+    delay: Duration,
+) -> Result<TcpListener> {
+    let try_port = |port: u16| -> Result<Option<TcpListener>> {
+        for attempt in 1..=attempts.max(1) {
+            match TcpListener::bind(("127.0.0.1", port)) {
+                Ok(listener) => return Ok(Some(listener)),
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    if attempt < attempts {
+                        std::thread::sleep(delay);
+                    }
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("listening on localhost:{port} for the sign-in redirect")
+                    })
+                }
+            }
+        }
+        Ok(None)
+    };
+    if let Some(listener) = try_port(port)? {
+        return Ok(listener);
+    }
+    if let Some(fallback) = fallback.filter(|f| port != 0 && *f != port) {
+        crate::logging::log(&format!(
+            "login: redirect port {port} is in use; using registered fallback port {fallback}"
+        ));
+        if let Some(listener) = try_port(fallback)? {
+            return Ok(listener);
+        }
+        bail!("sign-in redirect ports {port} and {fallback} are both in use");
+    }
+    bail!("sign-in redirect port {port} is already in use")
+}
+
 pub struct Loopback {
     /// `127.0.0.1:port`, plus `[::1]:port` when the redirect host is the name
     /// `localhost`: the browser may resolve that to either address, and an
@@ -173,10 +222,15 @@ impl Loopback {
         };
         let mut last_err = None;
         for _ in 0..attempts {
-            let want = fixed.unwrap_or(0);
-            let v4 = TcpListener::bind(("127.0.0.1", want)).with_context(|| {
-                format!("listening on localhost:{want} for the sign-in redirect")
-            })?;
+            // A fixed port is retried while busy, then the provider's
+            // registered fallback port; the redirect_uri names whichever
+            // was bound.
+            let v4 = bind_redirect_listener(
+                fixed.unwrap_or(0),
+                spec.fallback_redirect_port,
+                BIND_ATTEMPTS,
+                BIND_RETRY_DELAY,
+            )?;
             let port = v4.local_addr()?.port();
             let mut listeners = vec![v4];
             if both {
@@ -522,7 +576,10 @@ pub fn start(
         &pkce.challenge,
         &state,
         &loopback.redirect_uri,
-        target.expected(),
+        // The vendor knows the email, not usagio's workspace-qualified key.
+        target
+            .expected()
+            .map(crate::providers::trait_def::key_email),
     )?;
     let redirect_uri = loopback.redirect_uri.clone();
     let progress = Arc::new(Progress::default());
@@ -571,7 +628,15 @@ pub fn start(
 /// Refuse a sign-in as anyone but the account being renewed: the window's
 /// cookie store could hold another account's session.
 pub fn check_signed_in_as(key: &str, expected: Option<&str>) -> Result<()> {
+    use crate::providers::trait_def::{key_email, WORKSPACE_KEY_SEP};
     match expected {
+        // A legacy email-only key (its workspace was never recorded) is
+        // renewed by any workspace of that email, which then upgrades it.
+        Some(want)
+            if !want.contains(WORKSPACE_KEY_SEP) && key_email(key).eq_ignore_ascii_case(want) =>
+        {
+            Ok(())
+        }
         Some(want) if !key.eq_ignore_ascii_case(want) => {
             bail!("signed in as {key}, not {want} — nothing was changed")
         }

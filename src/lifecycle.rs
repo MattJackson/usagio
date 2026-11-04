@@ -608,10 +608,16 @@ pub(crate) fn prepare_handoff(
             .is_none_or(|accounts| accounts.pending_switch.is_none())
     {
         if let Some(account) = state.find_provider_account(slug, key) {
+            // The daemon reports the signed-in email; the workspace is
+            // checked through `account_id` below.
+            let email = account
+                .identity_email
+                .as_deref()
+                .unwrap_or(crate::providers::trait_def::key_email(key));
             if status
                 .account_key
                 .as_deref()
-                .is_some_and(|current| current.eq_ignore_ascii_case(key))
+                .is_some_and(|current| current.eq_ignore_ascii_case(email))
                 && status.account_id == account.identity_uuid
                 && matching_active_blob(provider, &account.identity_snapshot())?.is_some()
             {
