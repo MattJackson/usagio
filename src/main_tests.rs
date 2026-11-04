@@ -6286,7 +6286,15 @@ fn qualified_codex_selector_does_not_switch_same_email_claude_account() {
         let codex = codex_auth_json("shared@example.com", 4_000_000_000, "codex-at", "codex-rt");
         std::fs::write(dir.path().join("auth.json"), &codex).unwrap();
         capture_current_generic("codex").unwrap();
+        // A different Codex account is the one currently signed in.
+        let other = codex_auth_json("other@example.com", 4_000_000_000, "other-at", "other-rt");
+        std::fs::write(dir.path().join("auth.json"), &other).unwrap();
+        capture_current_generic("codex").unwrap();
         let mut state = State::load().unwrap();
+        assert_eq!(
+            state.provider_accounts("codex").unwrap().active.as_deref(),
+            Some("other@example.com")
+        );
         let mut claude = Account::from_keychain_blob(&mock_claude_blob(
             "claude-at",
             "claude-rt",
@@ -6295,12 +6303,25 @@ fn qualified_codex_selector_does_not_switch_same_email_claude_account() {
         .unwrap();
         claude.email = Some("shared@example.com".into());
         state.accounts.push(claude);
-        state.active = Some("shared@example.com".into());
+        let mut claude_active = Account::from_keychain_blob(&mock_claude_blob(
+            "claude-active-at",
+            "claude-active-rt",
+            4_000_000_000_000,
+        ))
+        .unwrap();
+        claude_active.email = Some("claude-active@example.com".into());
+        state.accounts.push(claude_active);
+        state.active = Some("claude-active@example.com".into());
         state.save().unwrap();
         cmd_switch(Some("codex:shared"), None).unwrap();
         let saved = State::load().unwrap();
-        assert_eq!(saved.accounts[0].access_token, "claude-at");
-        assert_eq!(saved.active.as_deref(), Some("shared@example.com"));
+        // Claude is untouched: same active account, same tokens.
+        assert_eq!(saved.active.as_deref(), Some("claude-active@example.com"));
+        assert_eq!(
+            saved.find("shared@example.com").unwrap().access_token,
+            "claude-at"
+        );
+        // Codex moved to the qualified account, and its login file followed.
         assert_eq!(
             saved.provider_accounts("codex").unwrap().active.as_deref(),
             Some("shared@example.com")
@@ -6836,4 +6857,11 @@ fn rm_refuses_a_selector_matching_two_providers() {
     assert!(cmd_rm(Some("dev@a.com")).is_err());
     assert_eq!(State::load().unwrap().accounts.len(), 1);
     cmd_rm(Some("codex:dev@a.com")).unwrap();
+    // The qualified selector removed the Codex account and only that one.
+    let after = State::load().unwrap();
+    assert_eq!(after.accounts.len(), 1, "the Claude dev@a.com survives");
+    assert_eq!(after.accounts[0].email.as_deref(), Some("dev@a.com"));
+    assert!(after
+        .provider_accounts("codex")
+        .is_none_or(|p| p.accounts.is_empty()));
 }
