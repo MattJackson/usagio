@@ -3714,15 +3714,17 @@ fn codex_account(key: &str, cache: Option<CachedUsage>) -> crate::store::Provide
     }
 }
 
-/// Token-endpoint requests made by one `refresh_provider_usage_caches` pass
-/// over Codex `accounts` (the first is active when `active_first`).
-fn codex_gate(
+/// `(token-endpoint, usage-endpoint)` requests made by one
+/// `refresh_provider_usage_caches` pass over Codex `accounts`. Separate mock
+/// servers, so a refresh POST and a usage GET can never be mistaken for each other.
+fn codex_gate_split(
     accounts: Vec<crate::store::ProviderAccount>,
     active: Option<&str>,
     force: bool,
-) -> usize {
+) -> (usize, usize) {
     let _cfg = crate::store::ScopedConfigDir::new();
-    let (url, hits) = spawn_mock_usage_server(500, String::new());
+    let (token_url, token_hits) = spawn_mock_usage_server(500, String::new());
+    let (usage_url, usage_hits) = spawn_mock_usage_server(500, String::new());
     let mut st = State::default();
     for a in accounts {
         st.upsert_provider_account("codex", a);
@@ -3731,14 +3733,25 @@ fn codex_gate(
     st.save().unwrap();
     crate::env_lock::scoped_env_var(
         "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
-        Some(&format!("{url}/oauth/token")),
+        Some(&format!("{token_url}/oauth/token")),
         || {
-            providers::codex::set_usage_url_override(Some(format!("{url}/usage")));
+            providers::codex::set_usage_url_override(Some(format!("{usage_url}/usage")));
             refresh_provider_usage_caches(force, 95.0);
             providers::codex::set_usage_url_override(None);
         },
     );
-    hit_count(&hits)
+    (hit_count(&token_hits), hit_count(&usage_hits))
+}
+
+/// Total requests (token + usage) made by one pass: either proves the account
+/// passed its scheduling gates.
+fn codex_gate(
+    accounts: Vec<crate::store::ProviderAccount>,
+    active: Option<&str>,
+    force: bool,
+) -> usize {
+    let (token, usage) = codex_gate_split(accounts, active, force);
+    token + usage
 }
 
 fn codex_one(key: &str, cache: CachedUsage, active: bool, force: bool) -> usize {
@@ -3753,6 +3766,11 @@ fn codex_one(key: &str, cache: CachedUsage, active: bool, force: bool) -> usize 
 fn codex_account_past_every_skip_rule_gets_its_token_refreshed() {
     let k = uniq("codex-basic");
     assert_eq!(codex_one(&k, cu(10.0, 10.0, 2000), false, false), 1);
+    // The one request is the token refresh, not a usage call with a stale token;
+    // the active account reaches usage directly and never spends its grant.
+    let acct = || codex_account(&k, Some(cu(10.0, 10.0, 2000)));
+    assert_eq!(codex_gate_split(vec![acct()], None, false), (1, 0));
+    assert_eq!(codex_gate_split(vec![acct()], Some(&k), false), (0, 1));
     // A token inside the refresh skew counts as due, an unexpired one beyond it
     // would not (that case needs the real endpoint, so only the edge is pinned).
     let mut soon = codex_account(&k, Some(cu(10.0, 10.0, 2000)));
