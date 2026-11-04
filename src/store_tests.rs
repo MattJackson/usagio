@@ -465,6 +465,7 @@ fn save_state_safe_backup_dir_is_0700_and_file_is_0600() {
     assert_eq!(file_mode, 0o600, "backup file is 0600");
 }
 
+#[cfg(unix)]
 #[test]
 fn config_dir_itself_is_0700() {
     // security-01 (v0.5.2 audit): the top-level `~/.config/usagio` dir must
