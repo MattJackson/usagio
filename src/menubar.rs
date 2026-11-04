@@ -7904,6 +7904,9 @@ mod tests {
         );
     }
 
+    // The inode in the cache key is unix-only; elsewhere two same-length
+    // saves at one mtime are indistinguishable.
+    #[cfg(unix)]
     #[test]
     fn cached_state_reloads_a_save_that_lands_on_the_same_mtime() {
         let _l = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
