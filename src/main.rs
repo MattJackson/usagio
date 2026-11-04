@@ -1487,26 +1487,40 @@ fn switch_if_still_active(slug: &str, target: &str, expect_active: &str) -> Resu
     lifecycle::ensure_provider_fresh(provider, target)?;
     let _refresh = lifecycle::refresh_lock()?;
     let status = provider.client_status()?;
-    with_state_lock(|| {
+    switch_provider_if_still_active(provider, &status, target, expect_active)
+}
+
+/// Compare-and-set + handoff preparation under the state lock; the commit (which
+/// runs the seconds-long client handoff) happens AFTER the lock is released so
+/// `commit_provider_switch` can keep state reads responsive during the handoff.
+fn switch_provider_if_still_active(
+    provider: &dyn Provider,
+    status: &providers::ClientStatus,
+    target: &str,
+    expect_active: &str,
+) -> Result<Option<String>> {
+    let slug = provider.provider_id();
+    let ready = with_state_lock(|| {
         let mut state = State::load()?;
         if state
             .provider_accounts(slug)
             .is_some_and(|pa| pa.pending_switch.is_some())
         {
-            return Ok(None);
+            return Ok(false);
         }
         let current = provider_active(&state, slug);
         if !current
             .as_deref()
             .is_some_and(|c| c.eq_ignore_ascii_case(expect_active))
         {
-            return Ok(None);
+            return Ok(false);
         }
-        if !lifecycle::prepare_handoff(provider, &status, &mut state, target, false)? {
-            return Ok(None);
-        }
-        commit_provider_switch(provider, slug, target, false, false).map(Some)
-    })
+        lifecycle::prepare_handoff(provider, status, &mut state, target, false)
+    })?;
+    if !ready {
+        return Ok(None);
+    }
+    commit_provider_switch(provider, slug, target, false, false).map(Some)
 }
 
 /// `switch_if_still_active`, writing the engine's leave latch for the account

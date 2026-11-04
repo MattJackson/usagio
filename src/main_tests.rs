@@ -1060,6 +1060,7 @@ struct MockActiveSlotProvider {
     retry_drain: bool,
     process_alive: std::sync::atomic::AtomicBool,
     drains: std::sync::Mutex<Vec<String>>,
+    lock_held_at_handoff: std::sync::atomic::AtomicBool,
     email: String,
     slot: std::sync::Mutex<Option<String>>,
 }
@@ -1074,6 +1075,7 @@ impl MockActiveSlotProvider {
             retry_drain: false,
             process_alive: std::sync::atomic::AtomicBool::new(false),
             drains: std::sync::Mutex::new(Vec::new()),
+            lock_held_at_handoff: std::sync::atomic::AtomicBool::new(false),
             email: "active@example.com".into(),
             slot: std::sync::Mutex::new(Some(initial.to_string())),
         }
@@ -1159,6 +1161,10 @@ impl crate::providers::Provider for MockActiveSlotProvider {
         _identity: &providers::IdentitySnapshot,
         _token: Option<&str>,
     ) -> providers::PResult<()> {
+        self.lock_held_at_handoff.store(
+            crate::credentials::state_lock_held(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         if self
             .fail_handoff
             .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -6337,4 +6343,28 @@ fn menu_order_active_locked_account_uses_unlock_time() {
     for selected in [Some("dev8"), Some("dev4"), None] {
         assert!(menu_order(&earlier, &active, selected, now).is_lt());
     }
+}
+
+#[test]
+fn auto_switch_hands_off_client_without_holding_state_lock() {
+    use std::sync::atomic::Ordering;
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let provider = MockActiveSlotProvider::new("outgoing");
+    let slug = provider.provider_id();
+    let mut account = codex_account("target@example.com", None);
+    account.identity_email = Some("target@example.com".into());
+    account.secret_blob = "target".into();
+    let mut state = State::default();
+    state.provider_accounts_mut(slug).accounts.push(account);
+    state.provider_accounts_mut(slug).active = Some("old@example.com".into());
+    state.save().unwrap();
+    let status = provider.client_status().unwrap();
+    let out =
+        switch_provider_if_still_active(&provider, &status, "target@example.com", "old@example.com")
+            .unwrap();
+    assert!(out.is_some());
+    assert!(
+        !provider.lock_held_at_handoff.load(Ordering::SeqCst),
+        "state lock was held across client handoff"
+    );
 }
