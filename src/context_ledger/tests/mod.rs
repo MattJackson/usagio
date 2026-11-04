@@ -1402,3 +1402,137 @@ fn codex_launch_rejects_remote_env_vars_and_defaults_cwd_to_project() {
     let e = mcp::codex_launch(&serde_json::json!({ "url": "https://x" }), None).unwrap_err();
     assert!(e.contains("http transport"), "{e}");
 }
+
+fn item<'a>(l: &'a Ledger, name: &str) -> Option<&'a LedgerItem> {
+    l.items.iter().find(|i| i.name == name)
+}
+
+#[test]
+fn opencode_global_config_files_merge_with_jsonc_on_top() {
+    with_home(|home| {
+        let dir = home.join(".config/opencode");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(home.join("a.md"), "aaa").unwrap();
+        fs::write(home.join("b.md"), "bbb").unwrap();
+        let cfg = serde_json::json!({
+            "prompt": "from json",
+            "instructions": ["~/a.md"],
+            "mcp": { "good": working_mcp_server() }
+        });
+        fs::write(dir.join("opencode.json"), cfg.to_string()).unwrap();
+        fs::write(
+            dir.join("opencode.jsonc"),
+            r#"{ // later file wins
+  "prompt": "from jsonc!",
+  "instructions": ["~/b.md"],
+}"#,
+        )
+        .unwrap();
+        let l = build_ledger("opencode", None).unwrap();
+        let p = item(&l, "opencode prompt").expect("prompt");
+        assert_eq!(p.content_bytes, "from jsonc!".len());
+        assert_eq!(p.path, dir.join("opencode.jsonc"));
+        // The json's MCP server survives the merge; its row points at json.
+        let m = item(&l, "mcp: good").expect("mcp from opencode.json");
+        assert_eq!(m.path, dir.join("opencode.json"));
+        // Within the global files, instructions replace rather than append.
+        assert!(item(&l, "instructions: ~/b.md").is_some());
+        assert!(item(&l, "instructions: ~/a.md").is_none());
+    });
+}
+
+#[test]
+fn opencode_env_and_project_configs_layer_over_global() {
+    let home = tempdir().unwrap();
+    let h = home.path();
+    let dir = h.join(".config/opencode");
+    fs::create_dir_all(&dir).unwrap();
+    let marker = h.join("ran");
+    for f in ["g.md", "e.md", "r.md"] {
+        fs::write(h.join(f), f).unwrap();
+    }
+    let global = serde_json::json!({
+        "prompt": "global",
+        "instructions": ["~/g.md"],
+        "mcp": { "noisy": mcp_marker_server(&marker) }
+    });
+    fs::write(dir.join("opencode.json"), global.to_string()).unwrap();
+    let custom = h.join("custom.json");
+    fs::write(
+        &custom,
+        r#"{"prompt":"custom env","instructions":["~/e.md"]}"#,
+    )
+    .unwrap();
+    let repo = tempdir().unwrap();
+    let repo_root = fs::canonicalize(repo.path()).unwrap();
+    fs::create_dir_all(repo_root.join(".git")).unwrap();
+    fs::write(
+        repo_root.join("opencode.json"),
+        r#"{"prompt":"repo root","instructions":["~/r.md"],"mcp":{"noisy":{"enabled":false}}}"#,
+    )
+    .unwrap();
+    let sub = repo_root.join("pkg");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("opencode.jsonc"), r#"{"prompt":"nearest"}"#).unwrap();
+
+    let run = |extra: &[(&str, Option<&str>)]| {
+        let mut vars = vec![("HOME", h.to_str()), ("OPENCODE_CONFIG", custom.to_str())];
+        vars.extend_from_slice(extra);
+        let mut out = None;
+        with_env(&vars, || {
+            out = Some(build_ledger("opencode", Some(&sub)).unwrap())
+        });
+        out.unwrap()
+    };
+
+    let l = run(&[]);
+    let p = item(&l, "opencode prompt").unwrap();
+    assert_eq!(p.content_bytes, "nearest".len());
+    assert_eq!(p.path, sub.join("opencode.jsonc"));
+    // instructions concatenate across global, $OPENCODE_CONFIG and project.
+    for n in ["~/g.md", "~/e.md", "~/r.md"] {
+        assert!(item(&l, &format!("instructions: {n}")).is_some(), "{n}");
+    }
+    // The project disabled the global server: deep merge keeps it off.
+    assert!(item(&l, "mcp: noisy").is_none());
+    assert!(!marker.exists(), "project-disabled server was started");
+
+    // Project config disabled: $OPENCODE_CONFIG wins, global server runs.
+    let l = run(&[("OPENCODE_DISABLE_PROJECT_CONFIG", Some("true"))]);
+    assert_eq!(
+        item(&l, "opencode prompt").unwrap().content_bytes,
+        "custom env".len()
+    );
+    assert!(item(&l, "instructions: ~/r.md").is_none());
+    assert!(
+        marker.exists(),
+        "global server should run without the project override"
+    );
+}
+
+#[test]
+fn opencode_dot_opencode_dir_and_inline_content_take_precedence() {
+    let home = tempdir().unwrap();
+    let h = home.path();
+    let repo = tempdir().unwrap();
+    let root = fs::canonicalize(repo.path()).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("opencode.json"), r#"{"prompt":"project"}"#).unwrap();
+    fs::create_dir_all(root.join(".opencode")).unwrap();
+    fs::write(
+        root.join(".opencode/opencode.json"),
+        r#"{"prompt":"dot-opencode"}"#,
+    )
+    .unwrap();
+    let mut got = Vec::new();
+    for content in [None, Some(r#"{"prompt":"inline content wins"}"#)] {
+        with_env(
+            &[("HOME", h.to_str()), ("OPENCODE_CONFIG_CONTENT", content)],
+            || {
+                let l = build_ledger("opencode", Some(&root)).unwrap();
+                got.push(item(&l, "opencode prompt").unwrap().content_bytes);
+            },
+        );
+    }
+    assert_eq!(got, vec!["dot-opencode".len(), "inline content wins".len()]);
+}
