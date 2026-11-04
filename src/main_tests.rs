@@ -6458,3 +6458,37 @@ fn renewing_active_account_keeps_a_queued_switch_to_another_account() {
         "renewed-at"
     );
 }
+
+#[test]
+fn poll_merge_does_not_reflag_a_renewed_login() {
+    let mut stored = claude_account("m@e.com", 3_600_000);
+    stored.refresh_token = "renewed-rt".into();
+    let mut snap = claude_account("m@e.com", 3_600_000);
+    snap.refresh_token = "superseded-rt".into();
+    snap.needs_relogin = true;
+    merge_poll_update(&mut stored, &snap, None, None);
+    assert!(!stored.needs_relogin);
+    snap.refresh_token = "renewed-rt".into();
+    merge_poll_update(&mut stored, &snap, None, None);
+    assert!(stored.needs_relogin);
+}
+
+#[test]
+fn poll_merge_keeps_newer_usage_and_expiry_warning() {
+    let mut stored = claude_account("m@e.com", 3_600_000);
+    let mut newer = cu(10.0, 10.0, 2000);
+    newer.fetched_at = 2000;
+    stored.cached_usage = Some(newer);
+    stored.notif_state.login_expiry_warned = Some(42);
+    let snap = claude_account("m@e.com", 3_600_000);
+    let mut older = cu(50.0, 50.0, 2000);
+    older.fetched_at = 1000;
+    let ns = notifications::NotifState {
+        pace_fired_this_window: true,
+        ..Default::default()
+    };
+    merge_poll_update(&mut stored, &snap, Some(&older), Some(&ns));
+    assert_eq!(stored.cached_usage.as_ref().unwrap().fetched_at, 2000);
+    assert_eq!(stored.notif_state.login_expiry_warned, Some(42));
+    assert!(stored.notif_state.pace_fired_this_window);
+}

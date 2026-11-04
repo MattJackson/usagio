@@ -2070,7 +2070,10 @@ fn mirror_inactive_rotation(
     let outcome = with_state_lock(|| {
         let vendor_identity = match provider.read_active_identity() {
             Ok(Some(id)) => id,
-            _ => return Ok(None),
+            Ok(None) => return Ok(None),
+            // Surface the failure (logged as mirror_back=err) instead of
+            // passing it off as a benign identity mismatch.
+            Err(e) => return Ok(Some(Err(e.to_string()))),
         };
         let matches = identity_matches(
             acct.identity_uuid().as_deref(),
@@ -3137,9 +3140,12 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
                 }
             }
         } else {
-            match oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
+            // Fingerprint BEFORE the refresh replaces the token in place.
+            let old_prefix = logging::token_fingerprint(&acct.access_token);
+            // Same disk-fallback as the other reactive entry points, so a
+            // rotation that exists only on disk doesn't flag needs_relogin.
+            match ensure_fresh_with_fallback(provider, email, &mut acct) {
                 Ok(true) => {
-                    let old_prefix = logging::token_fingerprint(&acct.access_token);
                     // mirror_back is `skip` (not `ok`/`err`) when the vendor
                     // CLI's own active identity doesn't match this account —
                     // Claude Code's keychain/credentials-file slot is a
@@ -3447,23 +3453,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
         sync_active_claude_identity(&mut st);
         for (email, acct, cu, ns) in &updates {
             if let Some(a) = st.find_mut(email) {
-                // Tokens are already saved: rotations by `oauth::ensure_fresh`,
-                // active-slot adoptions by the CAS above.
-                // Propagate the flag from the phase-1/2 snapshot to the
-                // locked state — but only ever OR it in. A plain overwrite (`a.needs_relogin =
-                // acct.needs_relogin`) could silently clobber `true` back to
-                // `false` if a concurrent path (switch, capture,
-                // `flag_needs_relogin`) set the flag on the locked state
-                // between our phase-1 snapshot and this merge (errors-01,
-                // v0.5.2 codeaudit) — a re-login that genuinely IS needed
-                // would stop being shown.
-                a.needs_relogin = a.needs_relogin || acct.needs_relogin;
-                if let Some(cu) = cu {
-                    a.cached_usage = Some(cu.clone());
-                }
-                if let Some(ns) = ns {
-                    a.notif_state = ns.clone();
-                }
+                merge_poll_update(a, acct, cu.as_ref(), ns.as_ref());
             }
         }
         st.save()?;
@@ -3477,6 +3467,40 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
         rate_limited,
         active_fetched,
         saw_429,
+    }
+}
+
+/// Fold one poll update (computed from a phase-1 snapshot, `snap`) into the
+/// freshly reloaded account `a`. Tokens are already saved (rotations by
+/// `oauth::ensure_fresh`, active-slot adoptions by the CAS). Everything here
+/// guards against reverting what a concurrent writer saved since the snapshot.
+fn merge_poll_update(
+    a: &mut Account,
+    snap: &Account,
+    cu: Option<&CachedUsage>,
+    ns: Option<&notifications::NotifState>,
+) {
+    // Only ever OR the flag in (a plain overwrite could clear a concurrent
+    // `flag_needs_relogin`), and only when the stored refresh token is still the
+    // one that was rejected: a renewal that landed mid-poll must not be
+    // re-flagged by a failure of the superseded token.
+    if a.refresh_token == snap.refresh_token {
+        a.needs_relogin = a.needs_relogin || snap.needs_relogin;
+    }
+    // An older poll result never replaces a newer reading saved meanwhile.
+    if let Some(cu) = cu {
+        if a.cached_usage
+            .as_ref()
+            .is_none_or(|stored| stored.fetched_at <= cu.fetched_at)
+        {
+            a.cached_usage = Some(cu.clone());
+        }
+    }
+    // The poll never touches `login_expiry_warned`; keep whatever is stored.
+    if let Some(ns) = ns {
+        let warned = a.notif_state.login_expiry_warned;
+        a.notif_state = ns.clone();
+        a.notif_state.login_expiry_warned = warned;
     }
 }
 
