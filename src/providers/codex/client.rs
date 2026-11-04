@@ -180,8 +180,29 @@ fn read_instance_token(home: &Path) -> Option<String> {
     ["daemon.pid", "app-server.pid"]
         .into_iter()
         .find_map(|name| {
-            let bytes = std::fs::read(home.join("app-server-daemon").join(name)).ok()?;
-            let record: Value = serde_json::from_slice(&bytes).ok()?;
+            let path = home.join("app-server-daemon").join(name);
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(e) => {
+                    // Not "absent": say why the handoff token is missing.
+                    crate::logging::log(&format!(
+                        "codex: cannot read daemon pid record {}: {e}",
+                        path.display()
+                    ));
+                    return None;
+                }
+            };
+            let record: Value = match serde_json::from_slice(&bytes) {
+                Ok(r) => r,
+                Err(e) => {
+                    crate::logging::log(&format!(
+                        "codex: daemon pid record {} is unreadable JSON: {e}",
+                        path.display()
+                    ));
+                    return None;
+                }
+            };
             let pid = record
                 .get("pid")
                 .and_then(Value::as_u64)
