@@ -241,8 +241,9 @@ your active session hit the wall. It does this two ways:
   rate-limits (HTTP 429) and the active account was within 5 points of the threshold
   when last read, usagio projects its usage forward from the last reading at a
   conservative burn rate and moves once that projection reaches the threshold,
-  rather than running out blind. A projection only ever moves you onto an account
-  whose usage was freshly verified.
+  rather than running out blind. A projection moves you onto an account whose usage
+  was freshly verified or, when a 429 storm defers that read, one with a post-leave
+  reading and at least 30 minutes of runway.
 - **Proactive rebalance.** The usual reason you leave an account is that its **5h
   session** filled — its weekly still has room. When an account's weekly resets
   within the next 6 hours and it has usable room, the daemon moves to it to spend
@@ -268,7 +269,9 @@ Among ready accounts the one whose weekly resets soonest is used first.
 
 Every account that can be switched — Claude and Codex alike — goes through the same
 rules, each provider with its own cooldown and backoff. If no account has room it
-doesn't swap — it notifies you of the soonest reset. It runs inside the menu-bar app (so
+notifies you of the soonest reset, and once the cooldown has passed it may move
+to the account that unlocks soonest (even over a manual pick) so it is ready when
+that reset lands. It runs inside the menu-bar app (so
 `usagio install` keeps it on), or headless via `usagio watch` on a machine with no
 menu bar; both run the same loop and use the threshold and auto-swap setting from
 the menu (`usagio watch --trigger` overrides the threshold).
