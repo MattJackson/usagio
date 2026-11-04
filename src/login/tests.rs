@@ -374,3 +374,27 @@ fn supersede_cancels_and_marks_the_flow() {
     q.cancel();
     assert!(!q.is_superseded(), "a closed window is not a supersede");
 }
+
+#[test]
+fn an_idle_connection_does_not_delay_cancel() {
+    // A browser preconnect that never sends a request must not hold the
+    // listener (and its fixed port) past a supersede/cancel.
+    let lb = Loopback::bind(&spec("http://unused", TokenRequestStyle::Form)).unwrap();
+    let port = lb.listener.local_addr().unwrap().port();
+    let idle = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let cancel = std::sync::Arc::new(AtomicBool::new(false));
+    let c = std::sync::Arc::clone(&cancel);
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        c.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let start = Instant::now();
+    let err = lb
+        .wait_for_code("S", Duration::from_secs(30), &cancel)
+        .unwrap_err();
+    let took = start.elapsed();
+    canceller.join().unwrap();
+    drop(idle);
+    assert!(format!("{err}").contains("closed"), "{err}");
+    assert!(took < Duration::from_millis(1500), "cancel took {took:?}");
+}
