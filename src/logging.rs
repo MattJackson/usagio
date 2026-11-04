@@ -5,7 +5,7 @@
 //! other secrets — only account names, percentages, and error descriptions.
 
 use std::io::Write;
-use std::sync::Once;
+use std::sync::Mutex;
 
 use crate::store;
 
@@ -53,7 +53,10 @@ fn open_append_private(path: &std::path::Path) -> std::io::Result<std::fs::File>
 /// same failing `rename` on every call thereafter with no diagnostic, and
 /// `usagio.log` grew unbounded past its documented 1 MB cap for the rest of
 /// the process's life.
-static ROTATE_FAILURE_LOGGED: Once = Once::new();
+///
+/// Keyed per path: `usagio.log` and `history.jsonl` share `rotate_if_large`,
+/// so one file's failure must not consume the other's one diagnostic.
+static ROTATE_FAILURE_LOGGED: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
 
 /// If `path` has grown past `max_bytes`, rename it to `<path>.1` (keeping one
 /// previous generation). Best-effort. Shared by the debug log and history.jsonl
@@ -63,7 +66,7 @@ static ROTATE_FAILURE_LOGGED: Once = Once::new();
 /// still held open by another process), fall back to a uniquified name
 /// (`.2`, `.3`, ...) so a single lock-contention event doesn't permanently
 /// disable rotation for the rest of the process's life. The very first
-/// failure across ALL attempts is logged once per process (`Once`-guarded,
+/// failure across ALL attempts is logged once per process (guarded per path,
 /// so a persistently-locked file doesn't spam the log it's trying to
 /// rotate).
 pub fn rotate_if_large(path: &std::path::Path, max_bytes: u64) {
@@ -113,23 +116,37 @@ pub fn rotate_if_large(path: &std::path::Path, max_bytes: u64) {
         }
     }
     if let Some(e) = last_err {
-        ROTATE_FAILURE_LOGGED.call_once(|| {
+        let first = {
+            let mut seen = ROTATE_FAILURE_LOGGED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if seen.iter().any(|p| p == path) {
+                false
+            } else {
+                seen.push(path.to_path_buf());
+                true
+            }
+        };
+        if first {
             // Best-effort direct write (bypass `log()` — it calls this
             // function, which would recurse into the same failing rotation
-            // we're trying to report). Falls back to stderr if even that
-            // fails, so the failure is never fully silent.
+            // we're trying to report). Only `usagio.log` itself carries the
+            // line (history.jsonl is machine-parsed JSONL); anything else, or
+            // a failed write, goes to stderr so it is never fully silent.
             let msg = format!(
-                "usagio.log rotation failed after {ROTATE_UNIQUIFY_ATTEMPTS} attempts \
+                "log rotation failed after {ROTATE_UNIQUIFY_ATTEMPTS} attempts \
                  for {}: {e}",
                 path.display()
             );
-            if let Ok(mut f) = open_append_private(path) {
-                let ts = chrono::Utc::now().to_rfc3339();
-                let _ = writeln!(f, "{ts} event=log_rotation_failed reason={msg}");
-            } else {
-                eprintln!("usagio: {msg}");
+            let is_debug_log = path.file_name().is_some_and(|n| n == "usagio.log");
+            match is_debug_log.then(|| open_append_private(path)) {
+                Some(Ok(mut f)) => {
+                    let ts = chrono::Utc::now().to_rfc3339();
+                    let _ = writeln!(f, "{ts} event=log_rotation_failed reason={msg}");
+                }
+                _ => eprintln!("usagio: {msg}"),
             }
-        });
+        }
     }
 }
 
@@ -233,6 +250,26 @@ mod tests {
             contents.contains("event=log_rotation_failed"),
             "expected the rotation-failed event to be appended, got: {contents}"
         );
+    }
+
+    /// A failing history.jsonl rotation must neither pollute the JSONL file
+    /// nor use up the one diagnostic usagio.log is owed.
+    #[test]
+    fn rotation_failure_diagnostic_is_per_path_and_not_written_to_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let fail = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"0123456789").unwrap();
+            for gen in 1..=ROTATE_UNIQUIFY_ATTEMPTS {
+                std::fs::create_dir(dir.path().join(format!("{name}.{gen}"))).unwrap();
+            }
+            rotate_if_large(&path, 5);
+            std::fs::read_to_string(&path).unwrap()
+        };
+        let history = fail("history.jsonl");
+        assert_eq!(history, "0123456789", "history.jsonl must stay pure JSONL");
+        let log = fail("usagio.log");
+        assert!(log.contains("event=log_rotation_failed"), "{log}");
     }
 
     /// log-rotate-race: a writer that loses the rotation lock must skip
