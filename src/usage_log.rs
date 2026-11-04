@@ -315,6 +315,17 @@ fn read_range_cached(
 /// as UNIX_EPOCH/0 so a later create-and-write invalidates it). The parse runs
 /// outside the cache lock so other readers never wait on it.
 fn load_month_cached(path: &Path, year: i32, month: u32) -> Arc<MonthIndex> {
+    load_month_cached_with(path, year, month, || {})
+}
+
+/// `after_parse` runs between the parse and the re-stat (a test seam for a
+/// writer landing mid-parse).
+fn load_month_cached_with(
+    path: &Path,
+    year: i32,
+    month: u32,
+    after_parse: impl FnOnce(),
+) -> Arc<MonthIndex> {
     let stamp = file_stamp(path);
 
     if let Ok(cache) = month_cache().lock() {
@@ -326,6 +337,12 @@ fn load_month_cached(path: &Path, year: i32, month: u32) -> Arc<MonthIndex> {
     }
     // Cache miss / stale — parse (unlocked), index by account, and store.
     let index = Arc::new(MonthIndex::build(parse_month(path)));
+    after_parse();
+    // Cache only if the file did not move during the parse: an index that may
+    // hold rows newer than its stamp would be double-patched by a later append.
+    if file_stamp(path) != stamp {
+        return index;
+    }
     if let Ok(mut cache) = month_cache().lock() {
         cache
             .months
@@ -1574,6 +1591,32 @@ mod tests {
             PARSE_COUNT.with(|c| c.get()),
             parses,
             "an append must not force a whole-month re-parse"
+        );
+    }
+
+    #[test]
+    fn a_file_that_moves_during_the_parse_is_not_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = month_path_ym(dir.path(), 2041, 5);
+        let line = |d: u32| {
+            format!(
+                "{}\n",
+                serde_json::to_string(&snap("claude", "a@x.io", utc(2041, 5, d, 0), Some(1.0)))
+                    .unwrap()
+            )
+        };
+        std::fs::write(&path, line(1)).unwrap();
+        let _ = load_month_cached_with(&path, 2041, 5, || {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(line(2).as_bytes()).unwrap();
+        });
+        assert!(
+            !month_cache()
+                .lock()
+                .unwrap()
+                .months
+                .contains_key(&(2041, 5)),
+            "an index built before a concurrent write must not be cached"
         );
     }
 
