@@ -120,7 +120,7 @@ pub fn binding_window_at(a: &AccountIn, now: DateTime<Utc>, trigger: f64) -> Opt
             .map(|w| Binding {
                 window: w.id,
                 pct: w.pct,
-                time_to_block: w.ttb.is_finite().then_some(w.ttb),
+                time_to_block: (w.binds && w.ttb.is_finite()).then_some(w.ttb),
                 by_rate: false,
             })
     };
@@ -202,9 +202,12 @@ impl BindingShown {
         if cur_pct >= BLOCKED_PCT || !cur_binds {
             return Some(switch);
         }
-        // Never switch away from a window at or over the trigger.
+        // A window at or over the trigger is kept unless the other window is
+        // also over it and higher, or about to block (the §4 override).
         if cur_pct >= trigger {
-            return Some(prev);
+            let other_first = (oth_pct >= trigger && oth_pct > cur_pct)
+                || (oth_ttb.is_finite() && oth_ttb < BIND_OVERRIDE_MIN);
+            return Some(if other_first { switch } else { prev });
         }
         // Override, no dwell: the other window is about to block or already at
         // the trigger.

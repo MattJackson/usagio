@@ -205,7 +205,9 @@ Per account:
 
 **Ranking** (`rank_key`; also used by `auto_pick`, `optimize_now` and `switch` with no selector):
 
-- `Ready`: `(expiring = weekly reset < now + REBALANCE_HORIZON ? reset : MAX, −soft_runway, email)`
+- `Ready`: `(weekly reset or MAX, −soft_runway, email)`. Room left at a reset is lost, so the soonest reset is
+  spent first; the `MIN_LANDING` gate on Ready keeps D2 from recurring. (Was: earliest reset only inside
+  `REBALANCE_HORIZON`, else most runway, which served a 0% account over an 86% one resetting 6 h sooner.)
 - `Draining`: `(−hard_runway, email)`
 - `Credits`: `(unit == provider's dominant unit ? 0 : 1, −spendable.amount_minor, email)`. Amounts are compared
   only within a unit (B11).
@@ -261,7 +263,9 @@ decide(s):
   if blind_in_band(act) && !pick:
       if proj binding ≥ limit && t = best(verified && Ready) → Switch(t, Trigger)
       if best Ready candidate is unverified → NeedReading(it)          // pre-verify
-      // the projection never drives Drain, Serve, Credits, Prepare or an unverified target
+      // the projection never drives Drain, Serve, Credits or Prepare, and never an unverified target
+      // except through the post-pass fallback below (failed/deferred read, post-leave reading, 2×MIN_LANDING),
+      // which S4/S4'/S5' require so a 429 storm's storm-guard deferral cannot strand the user on a blocking account
 
   // 4. Ready active
   if act binding est ≥ limit (within the 10 min cap) → treated as Draining (arm 3); only Trigger can fire

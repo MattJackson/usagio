@@ -49,7 +49,16 @@ pub fn estimate(
         Window::Session => 1, // 5h fits in 1 day
         Window::Weekly => 8,
     };
-    let mut samples = usage_log::last_n_days(account, lookback_days);
+    let samples = usage_log::last_n_days(account, lookback_days);
+    estimate_from(samples, window, now)
+}
+
+/// The fit over already-loaded samples (testable without the log).
+fn estimate_from(
+    mut samples: Vec<Snapshot>,
+    window: Window,
+    now: DateTime<Utc>,
+) -> Option<BurnRateEstimate> {
     // Keep only the ones whose target-window pct is Some, ordered by ts asc.
     samples.retain(|s| pct_for(s, window).is_some());
     samples.sort_by_key(|s| s.ts);
@@ -61,6 +70,21 @@ pub fn estimate(
     };
     let cutoff = now - horizon;
     samples.retain(|s| s.ts >= cutoff);
+
+    // The log does no reset filtering: keep only samples after the last
+    // significant drop (a reset), as `usage_log::pace_from_snaps` does.
+    let mut start = 0usize;
+    for i in 1..samples.len() {
+        if let (Some(prev), Some(cur)) = (
+            pct_for(&samples[i - 1], window),
+            pct_for(&samples[i], window),
+        ) {
+            if cur + 5.0 < prev {
+                start = i;
+            }
+        }
+    }
+    samples.drain(..start);
 
     if samples.len() < MIN_SAMPLES {
         return None;
@@ -77,8 +101,10 @@ pub fn estimate(
         now + Duration::hours(MAX_EMPTY_IN_HOURS)
     } else {
         // hours_from_now = (100 - current_pct) / slope
-        let hours_to_empty = ((100.0 - current_pct) / slope_per_hour).max(0.0) as i64;
-        now + Duration::hours(hours_to_empty.min(MAX_EMPTY_IN_HOURS))
+        let hours_to_empty = ((100.0 - current_pct) / slope_per_hour)
+            .max(0.0)
+            .min(MAX_EMPTY_IN_HOURS as f32);
+        now + Duration::seconds((hours_to_empty * 3600.0) as i64)
     };
 
     // Silence unused-var lint on intercept — kept for debug/logging clarity.
@@ -119,12 +145,10 @@ fn pct_for(s: &Snapshot, w: Window) -> Option<f32> {
 }
 
 fn reset_for(s: &Snapshot, w: Window) -> Option<DateTime<Utc>> {
-    // Snapshot doesn't carry reset time today; the caller (renderer) supplies it from
-    // the account's cached usage.  We keep the field on BurnRateEstimate so the
-    // renderer can populate it after `estimate`.  Return None here so the module is
-    // testable standalone.
-    let _ = (s, w);
-    None
+    match w {
+        Window::Session => s.session_reset,
+        Window::Weekly => s.weekly_reset,
+    }
 }
 
 /// Weighted linear fit of pct vs hours-from-now.  Weights: exponential decay, most
@@ -494,7 +518,7 @@ mod tests {
             use std::io::Write;
             writeln!(f, "{}", serde_json::to_string(&snap).unwrap()).unwrap();
         }
-        crate::usage_log::invalidate_cache();
+        crate::usage_log::evict_recent_months();
         (
             lock,
             guard,
@@ -504,7 +528,7 @@ mod tests {
     }
 
     /// 10 pct/hr climb ending at 35% (one minute ago): 65 points left -> 6.5h,
-    /// truncated to 6h.
+    /// 6.5h (no truncation to whole hours).
     fn climbing_rows() -> Vec<(i64, f32)> {
         (0..7)
             .map(|k| (1 + k * 30, 35.0 - 5.0 * k as f32))
@@ -521,15 +545,17 @@ mod tests {
             "{}",
             est.rate_pct_per_hour
         );
-        assert_eq!(est.empty_at - now, Duration::hours(6));
+        assert_eq!(est.empty_at - now, Duration::minutes(390));
         assert!(est.reset_at.is_none());
     }
 
     #[test]
     fn estimate_ignores_samples_outside_session_horizon() {
         let mut rows = climbing_rows();
-        // Older than the 5h session horizon: must not influence the fit.
-        rows.extend([(330, 90.0), (360, 95.0), (420, 99.0)]);
+        // Older than the 5h session horizon: must not influence the fit. Lower
+        // than the in-horizon start (5%), so the reset-drop filter cannot
+        // discard them: only the horizon filter keeps them out.
+        rows.extend([(330, 0.0), (360, 0.0), (420, 0.0)]);
         let (_l, _g, key, now) = with_history(true, &rows);
         let est = estimate(&key, Window::Session, now).expect("enough in-horizon samples");
         assert!(
@@ -537,7 +563,7 @@ mod tests {
             "{}",
             est.rate_pct_per_hour
         );
-        assert_eq!(est.empty_at - now, Duration::hours(6));
+        assert_eq!(est.empty_at - now, Duration::minutes(390));
     }
 
     #[test]
@@ -561,6 +587,48 @@ mod tests {
         assert_eq!(est.empty_at - now, Duration::hours(MAX_EMPTY_IN_HOURS));
     }
 
+    #[test]
+    fn estimate_weekly_uses_multi_day_history_and_7d_horizon() {
+        // 0.6 %/h climb, exactly MIN_SAMPLES readings every 28h spanning ~5.8
+        // days, ending at 85%: a horizon shorter than 7d drops samples.
+        let mut rows: Vec<(i64, f32)> = (0..MIN_SAMPLES as i64)
+            .map(|k| (60 + k * 1680, 85.0 - 16.8 * k as f32))
+            .collect();
+        // Older than the 7-day weekly horizon (but inside the 8-day read
+        // window): must not influence the fit. Below the in-horizon start so the
+        // reset-drop filter cannot discard them: only the horizon filter does.
+        rows.extend([(7 * 24 * 60 + 600, 0.0), (7 * 24 * 60 + 1300, 0.0)]);
+        let (_l, _g, key, now) = with_history(false, &rows);
+        let est = estimate(&key, Window::Weekly, now).expect("weekly history is enough");
+        assert_eq!(est.window, Window::Weekly);
+        assert_eq!(est.current_pct, 85.0);
+        assert!(
+            (est.rate_pct_per_hour - 0.6).abs() < 0.01,
+            "{}",
+            est.rate_pct_per_hour
+        );
+        let eta = (est.empty_at - now).num_hours();
+        assert!((20..=30).contains(&eta), "empty in {eta}h");
+        // A weekly estimate never reads the session pct column.
+        drop((_l, _g));
+        let (_l, _g, key, now) = with_history(true, &rows);
+        assert!(estimate(&key, Window::Weekly, now).is_none());
+    }
+
+    #[test]
+    fn format_menu_row_labels_each_window() {
+        let now = Utc::now();
+        let mk = |window| BurnRateEstimate {
+            window,
+            current_pct: 50.0,
+            rate_pct_per_hour: 0.0,
+            empty_at: now + Duration::hours(MAX_EMPTY_IN_HOURS),
+            reset_at: None,
+        };
+        assert!(format_menu_row(&mk(Window::Session)).starts_with("Session"));
+        assert!(format_menu_row(&mk(Window::Weekly)).starts_with("Weekly"));
+    }
+
     // Ignored by default — this hits the live usage_log crate function, which panics
     // in unit-test mode without a fixture harness.  See tests/integration when wiring.
     #[test]
@@ -568,5 +636,98 @@ mod tests {
     fn estimate_via_public_api() {
         let key = AccountKey::default();
         let _ = estimate(&key, Window::Weekly, Utc::now());
+    }
+
+    fn mk_series(window: Window, pcts: &[f32], step_min: i64, now: DateTime<Utc>) -> Vec<Snapshot> {
+        let n = pcts.len() as i64;
+        pcts.iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let ts = now - Duration::minutes((n - 1 - i as i64) * step_min);
+                let mut sn = Snapshot {
+                    ts,
+                    provider: "claude".into(),
+                    account: "matt@example.com".into(),
+                    ..Default::default()
+                };
+                match window {
+                    Window::Session => sn.session_pct = Some(*p),
+                    Window::Weekly => sn.weekly_pct = Some(*p),
+                }
+                sn
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sub_hour_projection_is_not_truncated_to_now() {
+        // 15 pct/h, 90% now: ~40 minutes to empty, not 0.
+        let now = Utc::now();
+        let pcts = [75.0, 77.5, 80.0, 82.5, 85.0, 87.5, 90.0];
+        let est = estimate_from(
+            mk_series(Window::Session, &pcts, 10, now),
+            Window::Session,
+            now,
+        )
+        .unwrap();
+        let mins = (est.empty_at - now).num_minutes();
+        assert!((30..=50).contains(&mins), "~40m expected, got {mins}m");
+    }
+
+    #[test]
+    fn a_small_dip_is_noise_not_a_reset() {
+        // 41.0 -> 40.9 (0.1pp) and 46.0 -> 41.0 (exactly 5pp) are jitter: the
+        // fit keeps the whole series instead of truncating at the dip.
+        let now = Utc::now();
+        for pcts in [
+            [30.0, 35.0, 41.0, 40.9, 45.0, 50.0, 55.0],
+            [30.0, 35.0, 46.0, 41.0, 45.0, 50.0, 55.0],
+        ] {
+            let est = estimate_from(
+                mk_series(Window::Session, &pcts, 10, now),
+                Window::Session,
+                now,
+            )
+            .expect("the full series is used");
+            // Truncated at the dip, 4 samples would remain and the slope would
+            // be ~30 %/h; the whole series averages ~20 %/h.
+            assert!(
+                (est.rate_pct_per_hour - 25.0).abs() < 10.0 && est.rate_pct_per_hour < 28.0,
+                "{pcts:?} -> {}",
+                est.rate_pct_per_hour
+            );
+        }
+    }
+
+    #[test]
+    fn pre_reset_samples_do_not_flatten_the_fit() {
+        let now = Utc::now();
+        let pcts = [90.0, 92.0, 95.0, 1.0, 3.0, 5.0, 7.0, 9.0, 11.0];
+        let est = estimate_from(
+            mk_series(Window::Session, &pcts, 10, now),
+            Window::Session,
+            now,
+        )
+        .unwrap();
+        assert!(
+            est.rate_pct_per_hour > FLAT_SLOPE_THRESHOLD_PCT_PER_HOUR,
+            "rate {}",
+            est.rate_pct_per_hour
+        );
+    }
+
+    #[test]
+    fn estimate_carries_the_latest_reset() {
+        let now = Utc::now();
+        let mut v = mk_series(
+            Window::Weekly,
+            &[10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
+            30,
+            now,
+        );
+        let r = now + Duration::hours(3);
+        v.last_mut().unwrap().weekly_reset = Some(r);
+        let est = estimate_from(v, Window::Weekly, now).unwrap();
+        assert_eq!(est.reset_at, Some(r));
     }
 }

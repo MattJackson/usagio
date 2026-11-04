@@ -40,7 +40,14 @@ where
 {
     with_state_lock(|| {
         let mut st = State::load()?;
+        // Skip the (fsync-heavy, backup-rotating) save when the closure left
+        // the state untouched: the steady-state absorb rewrites identical
+        // credentials every cycle.
+        let before = serde_json::to_value(&st).ok();
         f(&mut st)?;
+        if before.is_some() && before == serde_json::to_value(&st).ok() {
+            return Ok(());
+        }
         st.save()
     })
     .map_err(|e| ProviderError::Other(format!("state lock: {e:#}")))
@@ -69,6 +76,12 @@ impl Drop for DepthGuard {
     }
 }
 
+/// Whether this thread currently holds the state lock (test hook).
+#[cfg(test)]
+pub(crate) fn state_lock_held() -> bool {
+    STATE_LOCK_DEPTH.with(|d| d.get()) > 0
+}
+
 /// Run `f` holding the shared exclusive advisory lock on the state file.
 /// Serialises state read-modify-write across processes; reentrant within a
 /// single thread so callers can nest without self-deadlocking.
@@ -82,7 +95,7 @@ pub fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
         return f();
     }
     let dir = store::config_dir()?;
-    std::fs::create_dir_all(&dir).context("creating ~/.config/usagio")?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let lock_path = dir.join("lock");
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -122,7 +135,7 @@ pub fn read_blob(path: &Path) -> Option<String> {
 /// `last_chance_fallback` does) should check `read_blob` itself rather than
 /// use this helper for that path. Both current callers only need the
 /// "recognised or not" split, which `identified` already gives them.
-fn for_each_credential_path<F>(provider: &dyn Provider, mut f: F)
+fn for_each_credential_path<F>(provider: &dyn Provider, online_identify: bool, mut f: F)
 where
     F: FnMut(&Path, &str, Option<(AccountKey, CredentialFreshness)>),
 {
@@ -130,9 +143,20 @@ where
         let Some(blob) = read_blob(&path) else {
             continue;
         };
-        let identified = provider
-            .identify_credential(&blob)
-            .map(|key| (key.clone(), provider.credential_freshness(&blob)));
+        let key = provider.identify_credential(&blob).or_else(|| {
+            if !online_identify {
+                return None;
+            }
+            let k = provider.identify_credential_online(&blob);
+            if k.is_some() {
+                crate::logging::log(&format!(
+                    "credentials: identified unlabelled blob at {} via the profile endpoint",
+                    path.display()
+                ));
+            }
+            k
+        });
+        let identified = key.map(|key| (key, provider.credential_freshness(&blob)));
         f(&path, &blob, identified);
     }
 }
@@ -147,7 +171,7 @@ where
 /// polling for another). Absorb those too.
 pub fn absorb_all_lagging(provider: &dyn Provider) -> Vec<AccountKey> {
     let mut seen = Vec::new();
-    for_each_credential_path(provider, |path, blob, identified| {
+    for_each_credential_path(provider, false, |path, blob, identified| {
         let Some((key, freshness)) = identified else {
             return;
         };
@@ -167,6 +191,44 @@ pub fn absorb_all_lagging(provider: &dyn Provider) -> Vec<AccountKey> {
         seen.push(key);
     });
     seen
+}
+
+/// Case-insensitive "is `key` the active account" — matches every other
+/// identity check in `State` (`find`, `still_active`, `from_value`).
+pub(crate) fn is_active_key(key: &str, active: Option<&str>) -> bool {
+    active.is_some_and(|a| a.eq_ignore_ascii_case(key))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FlagOutcome {
+    Flagged,
+    Rotated,
+    AlreadyFlagged,
+    Missing,
+}
+
+/// Set `needs_relogin` on `email` under the state lock, but only if the
+/// account still holds `failed_refresh_token` (the grant that just got
+/// `invalid_grant`). Returns whether the flag was newly set.
+pub(crate) fn flag_needs_relogin_if_unchanged(
+    email: &str,
+    failed_refresh_token: &str,
+) -> Result<FlagOutcome> {
+    with_state_lock(|| {
+        let mut st = State::load()?;
+        let Some(a) = st.find_mut(email) else {
+            return Ok(FlagOutcome::Missing);
+        };
+        if a.refresh_token != failed_refresh_token {
+            return Ok(FlagOutcome::Rotated);
+        }
+        if a.needs_relogin {
+            return Ok(FlagOutcome::AlreadyFlagged);
+        }
+        a.needs_relogin = true;
+        st.save()?;
+        Ok(FlagOutcome::Flagged)
+    })
 }
 
 /// Proactively refresh any INACTIVE Claude account whose stored access
@@ -198,7 +260,7 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
                 .accounts
                 .iter()
                 .filter(|a| !a.needs_relogin)
-                .filter(|a| Some(a.key()) != active.as_deref())
+                .filter(|a| !is_active_key(a.key(), active.as_deref()))
                 .cloned()
                 .collect();
             Ok((accounts, active))
@@ -216,7 +278,7 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
         // below re-checks `active` under the lock immediately before saving
         // and no-ops if so — so a stale skip decision here can only cause a
         // harmless extra refresh attempt, never a clobbered write.
-        if active_at_snapshot.as_deref() == Some(email.as_str()) {
+        if is_active_key(&email, active_at_snapshot.as_deref()) {
             continue;
         }
         match crate::providers::claude::oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
@@ -235,30 +297,42 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
                     crate::logging::log(&format!(
                         "event=needs_relogin account={email} reason=invalid_grant"
                     ));
-                    // Alert on the TRANSITION into needs_relogin. The snapshot
-                    // at the top of this fn already filters out accounts that
-                    // were ALREADY flagged (`.filter(|a| !a.needs_relogin)`), so
-                    // any account reaching this branch is flipping clear→flagged
-                    // right now — a stuck account never re-notifies on later
-                    // polls. Without this the account silently freezes and its
-                    // cached numbers rot for days (the exact "no notification,
-                    // just stale" failure this path was patched for).
-                    crate::notify(&format!(
-                        "{email}: re-login required — run `usagio capture`"
-                    ));
-                    // R2-EH-01 (round-2 codeaudit): mirror flag_needs_relogin's
-                    // logging on save-Err so a state.json write failure here is
-                    // visible instead of being silently discarded.
-                    if let Err(e) = with_state_lock(|| {
-                        let mut st = State::load()?;
-                        if let Some(a) = st.find_mut(&email) {
-                            a.needs_relogin = true;
+                    // R2-EH-01 (round-2 codeaudit): log a state.json write
+                    // failure instead of discarding it. The flag is only set
+                    // if the account still holds the refresh token that just
+                    // failed (a concurrent rotation/re-login must not be
+                    // clobbered). The grant really is dead, so the alert also
+                    // fires when the save fails; it is skipped only when the
+                    // token rotated or the account was already flagged.
+                    let alert = || {
+                        crate::notify(&format!(
+                            "{email}: re-login required — run `usagio capture`"
+                        ))
+                    };
+                    // When the save keeps failing the flag never persists and
+                    // the dead grant is retried every interval; alert once per
+                    // process per (account, refresh token) on that path.
+                    let alert_once = || {
+                        if first_relogin_alert(&email, &acct.refresh_token) {
+                            alert()
                         }
-                        st.save()
-                    }) {
-                        crate::logging::log(&format!(
-                            "credentials: flag_needs_relogin({email}): save failed: {e:#}"
-                        ));
+                    };
+                    match flag_needs_relogin_if_unchanged(&email, &acct.refresh_token) {
+                        Ok(FlagOutcome::Flagged) => alert(),
+                        Ok(FlagOutcome::Rotated) => crate::logging::log(&format!(
+                            "credentials: {email}: refresh token changed since the \
+                             invalid_grant; not flagging needs_relogin"
+                        )),
+                        Ok(FlagOutcome::AlreadyFlagged) => crate::logging::log(&format!(
+                            "credentials: {email}: already flagged needs_relogin"
+                        )),
+                        Ok(FlagOutcome::Missing) => {}
+                        Err(e) => {
+                            crate::logging::log(&format!(
+                                "credentials: flag_needs_relogin({email}): save failed: {e:#}"
+                            ));
+                            alert_once();
+                        }
                     }
                 }
             }
@@ -269,6 +343,19 @@ pub fn refresh_inactive_if_stale(_active_email_hint: Option<&str>) {
             }
         }
     }
+}
+
+/// True the first time this process sees `(email, refresh token)`; only a hash
+/// of the token is kept in memory.
+pub(crate) fn first_relogin_alert(email: &str, refresh_token: &str) -> bool {
+    use std::hash::{Hash, Hasher};
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(String, u64)>>> =
+        std::sync::Mutex::new(None);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    refresh_token.hash(&mut h);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(Default::default)
+        .insert((email.to_string(), h.finish()))
 }
 
 /// Absorb any lagging rotations for the outgoing account BEFORE the caller
@@ -290,7 +377,7 @@ pub fn absorb_before_switch(provider: &dyn Provider) {
 /// the data in hand, no reason not to update it.
 pub fn last_chance_fallback(provider: &dyn Provider, target: &AccountKey) -> bool {
     let mut best_for_target: Option<(String, CredentialFreshness)> = None;
-    for_each_credential_path(provider, |path, blob, identified| {
+    for_each_credential_path(provider, true, |path, blob, identified| {
         let Some((key, freshness)) = identified else {
             // L6 (round-1 codeaudit): log unrecognised blobs so a mismatched
             // rotation shape (e.g. vendor CLI schema change) is visible.
@@ -338,8 +425,8 @@ pub fn last_chance_fallback(provider: &dyn Provider, target: &AccountKey) -> boo
 }
 
 /// Handle emitted by `spawn_watchers`. Dropping it drops the underlying
-/// notify::RecommendedWatcher and stops the background thread.
-#[allow(dead_code)]
+/// notify::RecommendedWatcher and stops the background thread. Owned by
+/// `WATCHER_REGISTRY` once installed via [`install_watchers`].
 pub struct WatcherHandle {
     // The watcher must outlive the thread, so we keep it here. The thread
     // owns the receiver end and shuts down when we drop the sender-carrying
@@ -350,9 +437,9 @@ pub struct WatcherHandle {
 
 /// Spawn a background thread that fsnotifies every provider's credential
 /// paths and calls `absorb_all_lagging` + `refresh_inactive_if_stale` on
-/// change. Returns a `WatcherHandle` whose Drop shuts everything down —
-/// callers that want the watcher to live for the process lifetime should
-/// `Box::leak` or store the handle in a `OnceLock`.
+/// change. Returns a `WatcherHandle` whose Drop shuts everything down.
+/// Daemon callers should go through [`install_watchers`], which stores the
+/// handle in `WATCHER_REGISTRY` for the process lifetime.
 ///
 /// Errors from watch setup are logged and swallowed: the daemon must not
 /// crash if `~/.claude/` doesn't exist yet on a fresh install.
@@ -391,9 +478,9 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
     // maxing out RLIMIT_NOFILE (256 on stock macOS) within days. Any
     // credential file whose parent lands here (e.g. `~/.claude.json` under
     // `$HOME`) is picked up by the periodic `absorb_all_lagging` poll every
-    // watch cycle instead. Latency goes from ~2s to ~30s for that one file;
+    // watch cycle instead. Latency goes from ~2s to one watch interval (`WATCH_INTERVAL_SECS`, 180s) for that one file;
     // capture still works.
-    let home_dir = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let home_dir = crate::paths::user_home();
     let root_dir = std::path::PathBuf::from("/");
 
     let mut any_watched = false;
@@ -440,7 +527,7 @@ pub fn spawn_watchers(providers: Vec<&'static dyn Provider>) -> Option<WatcherHa
                 let _ = crate::platform::current().secure_permissions(&parent);
             }
             // R2-EH-02: log watch failures (EMFILE/ENOSPC/permission/unsupported
-            // FS) so a silent watch drop doesn't degrade us to the 150s poll
+            // FS) so a silent watch drop doesn't degrade us to the periodic (180s) poll
             // cadence with no diagnostic.
             match watcher.watch(&parent, RecursiveMode::NonRecursive) {
                 Ok(()) => {
@@ -501,6 +588,20 @@ static WATCHER_REGISTRY: std::sync::Mutex<WatcherRegistry> =
         providers: Vec::new(),
     });
 
+/// Serializes the tests that install, respawn or clear the process-global
+/// `WATCHER_REGISTRY` (a respawn elsewhere would flip `respawn_watchers()`'s
+/// answer mid-test).
+#[cfg(test)]
+pub(crate) static WATCHER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test-only: empty the registry so the next test starts with no watcher.
+#[cfg(test)]
+pub(crate) fn clear_watchers_for_test() {
+    let mut reg = WATCHER_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    reg.handle = None;
+    reg.providers.clear();
+}
+
 /// Build the fsnotify watcher for `providers` and store it in the process-global
 /// registry (replacing the `Box::leak` the daemon used to do). Keeps the
 /// provider list around so the watchdog can rebuild the watcher later without
@@ -550,7 +651,7 @@ const WATCHER_PANIC_BACKOFF: Duration = Duration::from_millis(500);
 /// `identify_credential`/`credential_freshness`/`absorb_credential` (or in
 /// `refresh_inactive_if_stale`) can't silently kill the whole watcher thread.
 /// Without this, a single panicking event permanently degrades real-time
-/// credential absorption to the slow (150s) poll path for the rest of the
+/// credential absorption to the slow (180s) poll path for the rest of the
 /// process's life, with no diagnostic (errors-03, v0.5.2 audit).
 fn fsnotify_watcher_supervisor(
     rx: mpsc::Receiver<notify::Event>,

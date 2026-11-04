@@ -51,7 +51,7 @@ impl Provider for KimiProvider {
         // TODO: read `~/.kimi/` TOML plus the macOS Keychain entry under
         // service `kimi-code`, decode the OAuth refresh material, and emit a
         // single CapturedAccount for the currently-active slot.
-        Ok(None)
+        Err(ProviderError::Unsupported)
     }
 
     fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
@@ -86,6 +86,9 @@ mod tests {
 
     #[test]
     fn capture_returns_none_placeholder() {
-        assert!(matches!(KimiProvider.capture_current_login(), Ok(None)));
+        assert!(matches!(
+            KimiProvider.capture_current_login(),
+            Err(ProviderError::Unsupported)
+        ));
     }
 }

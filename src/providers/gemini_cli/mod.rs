@@ -48,7 +48,7 @@ impl Provider for GeminiCliProvider {
         // TODO: read the macOS Keychain entry `gemini-cli-oauth`/`main-account`
         // (falling back to `~/.gemini/oauth_creds.json`) and pair the
         // credentials with the email cached in `~/.gemini/google_accounts.json`.
-        Ok(None)
+        Err(ProviderError::Unsupported)
     }
 
     fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
@@ -81,7 +81,7 @@ mod tests {
     fn capture_returns_none_placeholder() {
         assert!(matches!(
             GeminiCliProvider.capture_current_login(),
-            Ok(None)
+            Err(ProviderError::Unsupported)
         ));
     }
 }

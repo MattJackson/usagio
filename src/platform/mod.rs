@@ -304,6 +304,10 @@ pub trait Paths: Send + Sync {
     fn data_dir(&self, app: &str) -> PathBuf;
     fn log_dir(&self, app: &str) -> PathBuf;
     fn cache_dir(&self, app: &str) -> PathBuf;
+    /// Environment variables consulted for the user's home directory, in
+    /// priority order. Matches what the vendor CLIs resolve on this OS
+    /// (Windows: `USERPROFILE` first; Unix: `HOME` first).
+    fn home_env_order(&self) -> [&'static str; 2];
 }
 
 // ---------- FileDialog -----------------------------------------------------
@@ -469,6 +473,21 @@ pub fn current() -> Box<dyn Platform> {
 mod tests {
     use super::secure_permissions_unix;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn daemon_pid_guard_rejects_group_and_wrapping_pids() {
+        // 0 and 1 would signal our process group / init; anything above
+        // i32::MAX wraps to a negative pid_t (kill(-n) signals a group).
+        for pid in [0u32, 1, i32::MAX as u32 + 1, u32::MAX] {
+            let e = super::daemon_instance_alive(pid, "x").unwrap_err();
+            assert!(e.to_string().contains("invalid daemon PID"), "{pid}: {e}");
+            let e = super::graceful_daemon_signal(pid, "x").unwrap_err();
+            assert!(e.to_string().contains("invalid daemon PID"), "{pid}: {e}");
+        }
+        // A sane pid with no recorded generation is rejected before any ps.
+        let e = super::daemon_instance_alive(std::process::id(), "").unwrap_err();
+        assert!(e.to_string().contains("missing daemon generation"), "{e}");
+    }
 
     #[test]
     fn exited_unreaped_daemon_does_not_block_handoff() {

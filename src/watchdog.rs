@@ -81,6 +81,10 @@ pub const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 use std::sync::atomic::{AtomicU32, Ordering};
 
 static KEYCHAIN_CONSEC_FAILURES: AtomicU32 = AtomicU32::new(0);
+/// Total successful keychain writes this process; lets the watchdog tell that
+/// a write succeeded after a respawn (the respawn zeroes the failure counter,
+/// so "0 failures" alone does not prove the keychain is healthy again).
+static KEYCHAIN_OK_TOTAL: AtomicU32 = AtomicU32::new(0);
 
 /// Record the outcome of a keychain/secret write. A success resets the
 /// consecutive-failure counter to zero; a failure increments it. Called from
@@ -90,6 +94,7 @@ static KEYCHAIN_CONSEC_FAILURES: AtomicU32 = AtomicU32::new(0);
 pub fn record_keychain_result(ok: bool) {
     if ok {
         KEYCHAIN_CONSEC_FAILURES.store(0, Ordering::Relaxed);
+        KEYCHAIN_OK_TOTAL.fetch_add(1, Ordering::Relaxed);
     } else {
         KEYCHAIN_CONSEC_FAILURES.fetch_add(1, Ordering::Relaxed);
     }
@@ -218,6 +223,11 @@ pub trait WatchdogEffects {
 pub struct Watchdog {
     last_check: Option<Instant>,
     already_respawned: bool,
+    /// A keychain-driven respawn happened and no keychain write has succeeded
+    /// since: a quiet check is "no information", not "healthy", so the
+    /// escalation flag is kept.
+    keychain_unproven: bool,
+    ok_total_at_respawn: u32,
 }
 
 impl Watchdog {
@@ -232,6 +242,11 @@ impl Watchdog {
             }
         }
         self.last_check = Some(now);
+        if self.keychain_unproven
+            && KEYCHAIN_OK_TOTAL.load(Ordering::Relaxed) != self.ok_total_at_respawn
+        {
+            self.keychain_unproven = false;
+        }
         let fd_count = count_open_fds();
         let keychain_failures = keychain_consecutive_failures();
         self.run_check(fd_count, keychain_failures, effects);
@@ -256,11 +271,18 @@ impl Watchdog {
         match action {
             WatchdogAction::None => {
                 // Back to healthy — clear the escalation flag so the next
-                // unhealthy episode starts fresh at the watcher-respawn rung.
-                self.already_respawned = false;
+                // unhealthy episode starts fresh at the watcher-respawn rung
+                // (unless a keychain failure episode is still unproven).
+                if !self.keychain_unproven {
+                    self.already_respawned = false;
+                }
             }
             WatchdogAction::Warn => {
-                self.already_respawned = false;
+                // Like `None`: an fd count in the warn band says nothing about
+                // an unproven keychain episode.
+                if !self.keychain_unproven {
+                    self.already_respawned = false;
+                }
                 let n = fd_count.unwrap_or(0);
                 effects.log(&format!("event=fd_watchdog level=warn count={n}"));
             }
@@ -276,6 +298,9 @@ impl Watchdog {
                          action=watcher_respawn"
                     ));
                 }
+                // Baseline before the respawn, so a keychain write that
+                // succeeds meanwhile counts as proof of recovery.
+                let ok_before = KEYCHAIN_OK_TOTAL.load(Ordering::Relaxed);
                 let (before, after) = effects.respawn_watcher();
                 effects.log(&format!(
                     "event=fd_watchdog action=watcher_respawn before={} after={}",
@@ -285,6 +310,10 @@ impl Watchdog {
                 // Remember we tried the cheap fix; if the next check is still
                 // unhealthy, `decide` escalates to SelfRestart.
                 self.already_respawned = true;
+                if keychain_failures >= KEYCHAIN_FAILURE_THRESHOLD {
+                    self.keychain_unproven = true;
+                    self.ok_total_at_respawn = ok_before;
+                }
             }
             WatchdogAction::SelfRestart => {
                 let n = fd_count.unwrap_or(0);
@@ -336,11 +365,15 @@ impl WatchdogEffects for RealEffects {
                 "event=fd_watchdog action=watcher_respawn result=no_watcher_installed",
             );
         }
-        // A respawn also resets the keychain-failure counter: if the respawn
+        // A real respawn also resets the keychain-failure counter: if it
         // released the descriptors, the next keychain write should succeed, and
         // we don't want a stale pre-respawn failure count to escalate us to a
-        // restart before that next write gets a chance.
-        KEYCHAIN_CONSEC_FAILURES.store(0, Ordering::Relaxed);
+        // restart before that next write gets a chance. With no watcher there
+        // was nothing to remediate, so keep the count and let a persisting
+        // failure escalate.
+        if respawned {
+            KEYCHAIN_CONSEC_FAILURES.store(0, Ordering::Relaxed);
+        }
         let after = count_open_fds();
         (before, after)
     }
@@ -556,6 +589,87 @@ mod tests {
         assert_eq!(keychain_consecutive_failures(), 0);
     }
 
+    /// The respawn zeroes the keychain failure counter; a quiet check right
+    /// after must not reset the ladder, or keychain failures never escalate.
+    #[test]
+    fn run_check_keychain_failures_escalate_after_a_quiet_check() {
+        let mut wd = Watchdog::default();
+        let mut fx = MockEffects::default();
+        wd.run_check(Some(40), KEYCHAIN_FAILURE_THRESHOLD, &mut fx);
+        assert_eq!(fx.respawns, 1);
+        wd.run_check(Some(40), 0, &mut fx); // few writes happened: quiet
+        wd.run_check(Some(40), KEYCHAIN_FAILURE_THRESHOLD, &mut fx);
+        assert_eq!(fx.respawns, 1, "must not respawn a second time");
+        assert_eq!(fx.self_restarts, 1, "persisting failures self-restart");
+    }
+
+    /// A warn-band fd count is not proof the keychain recovered: the ladder
+    /// must still escalate to SelfRestart while no write has succeeded.
+    #[test]
+    fn run_check_warn_does_not_reset_an_unproven_keychain_episode() {
+        let mut wd = Watchdog::default();
+        let mut fx = MockEffects::default();
+        wd.run_check(Some(40), KEYCHAIN_FAILURE_THRESHOLD, &mut fx);
+        assert_eq!(fx.respawns, 1);
+        wd.run_check(Some(FD_WARN_THRESHOLD), 0, &mut fx); // warn band, quiet
+        wd.run_check(Some(FD_WARN_THRESHOLD), KEYCHAIN_FAILURE_THRESHOLD, &mut fx);
+        assert_eq!(fx.respawns, 1, "must not respawn a second time");
+        assert_eq!(fx.self_restarts, 1, "persisting failures self-restart");
+    }
+
+    /// A keychain success that lands while the respawn runs counts as proof
+    /// of recovery: the baseline is taken before the respawn.
+    #[test]
+    fn run_check_takes_the_keychain_baseline_before_the_respawn() {
+        struct SuccessDuringRespawn;
+        impl WatchdogEffects for SuccessDuringRespawn {
+            fn log(&mut self, _: &str) {}
+            fn respawn_watcher(&mut self) -> (Option<usize>, Option<usize>) {
+                record_keychain_result(true);
+                (None, None)
+            }
+            fn self_restart(&mut self) -> bool {
+                false
+            }
+        }
+        let _kc = KC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut wd = Watchdog::default();
+        wd.run_check(
+            Some(40),
+            KEYCHAIN_FAILURE_THRESHOLD,
+            &mut SuccessDuringRespawn,
+        );
+        assert!(wd.keychain_unproven);
+        assert_ne!(
+            KEYCHAIN_OK_TOTAL.load(Ordering::Relaxed),
+            wd.ok_total_at_respawn,
+            "the mid-respawn success must be visible to maybe_run"
+        );
+    }
+
+    /// maybe_run keeps an unproven keychain episode until a write succeeds
+    /// after the respawn, and only then lets a quiet check reset the ladder.
+    #[test]
+    fn maybe_run_clears_keychain_unproven_only_after_a_later_success() {
+        let _kc = KC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        record_keychain_result(true); // zero the failure counter
+        let mut wd = Watchdog {
+            keychain_unproven: true,
+            already_respawned: true,
+            ok_total_at_respawn: KEYCHAIN_OK_TOTAL.load(Ordering::Relaxed),
+            ..Watchdog::default()
+        };
+        let mut fx = MockEffects::default();
+        wd.maybe_run(&mut fx);
+        assert!(wd.keychain_unproven, "no write succeeded since the respawn");
+        assert!(wd.already_respawned, "a quiet check reset the ladder");
+        record_keychain_result(true);
+        wd.last_check = None; // the next call is due
+        wd.maybe_run(&mut fx);
+        assert!(!wd.keychain_unproven, "the later success proves recovery");
+        assert!(!wd.already_respawned, "healthy again: the ladder resets");
+    }
+
     /// A self_restart that fails to issue (bare foreground watch: returns
     /// `false`) must NOT loop back into repeated watcher respawns — the
     /// escalation flag stays set so we don't churn the watcher every cycle.
@@ -686,7 +800,11 @@ mod tests {
     }
 
     #[test]
-    fn real_effects_respawn_reports_fd_counts_and_resets_keychain_counter() {
+    fn real_effects_respawn_reports_fd_counts_and_keeps_keychain_counter_without_a_watcher() {
+        let _w = crate::credentials::WATCHER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::credentials::clear_watchers_for_test();
         let _cfg = crate::store::ScopedConfigDir::new();
         let _kc = KC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         record_keychain_result(false);
@@ -705,9 +823,10 @@ mod tests {
 
         assert_eq!(
             keychain_consecutive_failures(),
-            0,
-            "respawn must reset the stale failure count"
+            2,
+            "nothing was remediated, so the failure count must survive to escalate"
         );
+        record_keychain_result(true);
         // No watcher is installed under test, so the miss is logged.
         let path = crate::store::config_dir().unwrap().join("usagio.log");
         let contents = std::fs::read_to_string(path).unwrap();
@@ -715,6 +834,34 @@ mod tests {
             contents.contains("result=no_watcher_installed"),
             "{contents}"
         );
+    }
+
+    #[test]
+    fn real_effects_respawn_resets_the_keychain_counter_after_a_real_respawn() {
+        let _w = crate::credentials::WATCHER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cfg = crate::store::ScopedConfigDir::new();
+        let _kc = KC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = cfg.home();
+        crate::env_lock::scoped_env_var("HOME", Some(home.to_str().unwrap()), || {
+            let claude = crate::providers::get("claude").unwrap();
+            crate::credentials::install_watchers(vec![claude]);
+            record_keychain_result(false);
+            record_keychain_result(false);
+            record_keychain_result(false);
+            assert_eq!(keychain_consecutive_failures(), 3);
+
+            RealEffects.respawn_watcher();
+
+            assert_eq!(
+                keychain_consecutive_failures(),
+                0,
+                "a real respawn must reset the pre-respawn failure count"
+            );
+        });
+        crate::credentials::clear_watchers_for_test();
+        record_keychain_result(true);
     }
 
     /// Explicitly unmanaged, even if cargo inherited a launchd environment.

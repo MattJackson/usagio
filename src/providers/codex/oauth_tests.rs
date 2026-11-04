@@ -125,6 +125,7 @@ fn spawn_mock_token_server(
             200 => "200 OK",
             400 => "400 Bad Request",
             401 => "401 Unauthorized",
+            403 => "403 Forbidden",
             429 => "429 Too Many Requests",
             _ => "500 Internal Server Error",
         };
@@ -166,11 +167,117 @@ fn refresh_token_grant_maps_400_to_invalid_grant() {
 }
 
 #[test]
+fn refresh_token_grant_403_html_waf_block_is_transient() {
+    let (url, handle) = spawn_mock_token_server(403, "<html>blocked by WAF</html>".into(), || {});
+    crate::env_lock::scoped_env_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE", Some(&url), || {
+        let err = refresh_token_grant("healthy-rt").unwrap_err();
+        assert!(matches!(err, RefreshError::Transient(_)), "got {err:?}");
+    });
+    let _ = handle.join();
+}
+
+#[test]
+fn refresh_token_grant_403_with_invalid_grant_body_is_terminal() {
+    let (url, handle) = spawn_mock_token_server(
+        403,
+        r#"{"error":{"code":"refresh_token_expired"}}"#.into(),
+        || {},
+    );
+    crate::env_lock::scoped_env_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE", Some(&url), || {
+        let err = refresh_token_grant("dead-rt").unwrap_err();
+        assert!(matches!(err, RefreshError::InvalidGrant), "got {err:?}");
+    });
+    let _ = handle.join();
+}
+
+#[test]
+fn refresh_token_grant_403_empty_body_is_transient_and_json_error_is_terminal() {
+    let (url, handle) = spawn_mock_token_server(403, String::new(), || {});
+    crate::env_lock::scoped_env_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE", Some(&url), || {
+        let err = refresh_token_grant("rt").unwrap_err();
+        assert!(matches!(err, RefreshError::Transient(_)), "got {err:?}");
+    });
+    let _ = handle.join();
+    let (url, handle) = spawn_mock_token_server(403, r#"{"error":"access_denied"}"#.into(), || {});
+    crate::env_lock::scoped_env_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE", Some(&url), || {
+        let err = refresh_token_grant("rt").unwrap_err();
+        assert!(matches!(err, RefreshError::InvalidGrant), "got {err:?}");
+    });
+    let _ = handle.join();
+}
+
+#[test]
 fn refresh_token_grant_maps_429_to_rate_limited() {
     let (url, handle) = spawn_mock_token_server(429, "{}".into(), || {});
     crate::env_lock::scoped_env_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE", Some(&url), || {
         let err = refresh_token_grant("rt").unwrap_err();
         assert!(matches!(err, RefreshError::RateLimited));
+    });
+    let _ = handle.join();
+}
+
+#[test]
+fn refresh_token_grant_maps_statuses_and_missing_access_token() {
+    // (status, body, expect)
+    #[derive(Clone, Copy)]
+    enum Want {
+        Invalid,
+        Transient,
+    }
+    let cases: [(u16, &str, Want); 8] = [
+        (401, "{}", Want::Invalid),
+        // 403 is terminal only with a JSON OAuth error body; a bare 403
+        // (firewall/CDN page, empty object) is transient.
+        (403, r#"{"error":"invalid_grant"}"#, Want::Invalid),
+        (403, "{}", Want::Transient),
+        // Not a JSON `error` object: only the dead-grant code list can make
+        // these terminal (plain text, and a JSON object keyed `code`).
+        (403, "refresh_token_reused", Want::Invalid),
+        (403, r#"{"code":"refresh_token_reused"}"#, Want::Invalid),
+        (500, "{}", Want::Transient),
+        // 200 without access_token is a malformed reply, not a grant.
+        (200, r#"{"refresh_token":"x"}"#, Want::Transient),
+        (200, "not json", Want::Transient),
+    ];
+    for (status, body, want) in cases {
+        let (url, handle) = spawn_mock_token_server(status, body.into(), || {});
+        crate::env_lock::scoped_env_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE", Some(&url), || {
+            let err = refresh_token_grant("rt").unwrap_err();
+            match want {
+                Want::Invalid => assert!(
+                    matches!(err, RefreshError::InvalidGrant),
+                    "HTTP {status} must be InvalidGrant, got {err:?}"
+                ),
+                Want::Transient => assert!(
+                    matches!(err, RefreshError::Transient(_)),
+                    "HTTP {status} {body} must be Transient, got {err:?}"
+                ),
+            }
+        });
+        let _ = handle.join();
+    }
+}
+
+#[test]
+fn refresh_token_grant_expiry_falls_back_to_access_token_jwt() {
+    // No id_token: exp is read from the access token when it is a JWT.
+    let at = make_id_token("u@e.com", chrono::Utc::now().timestamp() + 3600);
+    let body = serde_json::json!({ "access_token": at }).to_string();
+    let (url, handle) = spawn_mock_token_server(200, body, || {});
+    crate::env_lock::scoped_env_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE", Some(&url), || {
+        let grant = refresh_token_grant("rt").unwrap();
+        assert!(
+            (3500..=3600).contains(&grant.expires_in_secs),
+            "got {}",
+            grant.expires_in_secs
+        );
+    });
+    let _ = handle.join();
+    // Opaque access token and no id_token: unknown expiry is 0, not an error.
+    let body = serde_json::json!({ "access_token": "opaque" }).to_string();
+    let (url, handle) = spawn_mock_token_server(200, body, || {});
+    crate::env_lock::scoped_env_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE", Some(&url), || {
+        assert_eq!(refresh_token_grant("rt").unwrap().expires_in_secs, 0);
     });
     let _ = handle.join();
 }

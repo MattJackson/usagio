@@ -99,6 +99,21 @@ fn parse_callback_accepts_only_our_path_and_state() {
         ),
         Callback::Denied("User said no".into())
     );
+    // An error callback must carry OUR state: a stray local page hitting the
+    // loopback port with `error=` and no/other state must not abort sign-in.
+    assert_eq!(
+        parse_callback("/callback?error=x", "/callback", "S"),
+        Callback::Ignore
+    );
+    assert_eq!(
+        parse_callback("/callback?error=x&state=OTHER", "/callback", "S"),
+        Callback::Ignore
+    );
+    // An empty code is never forwarded to the token exchange.
+    assert_eq!(
+        parse_callback("/callback?code=&state=S", "/callback", "S"),
+        Callback::Ignore
+    );
 }
 
 fn get(url: &str) -> String {
@@ -132,7 +147,7 @@ fn loopback_serves_the_redirect_and_returns_the_code() {
     assert_eq!(code, "the-code");
     let (stray, done) = client.join().unwrap();
     assert!(stray.starts_with("HTTP/1.1 404"));
-    assert!(done.starts_with("HTTP/1.1 200") && done.contains("Signed in"));
+    assert!(done.starts_with("HTTP/1.1 200") && done.contains("Sign-in received"));
 }
 
 #[test]
@@ -326,4 +341,95 @@ fn an_add_never_reuses_an_existing_store_or_expects_an_account() {
     let renew = Target::Renew("dev@example.com".into());
     assert_eq!(renew.expected(), Some("dev@example.com"));
     assert_eq!(renew.new_store(), None);
+}
+
+#[test]
+fn transient_accept_errors_are_retried_not_fatal() {
+    use std::io::ErrorKind::*;
+    for k in [WouldBlock, Interrupted, ConnectionAborted, ConnectionReset] {
+        assert!(is_transient_accept_error(k), "{k:?} must be retried");
+    }
+    for k in [PermissionDenied, AddrInUse, InvalidInput] {
+        assert!(!is_transient_accept_error(k), "{k:?} must stay fatal");
+    }
+}
+
+#[test]
+fn a_cancelled_flow_frees_its_port_before_it_returns() {
+    let lb = Loopback::bind(&spec("http://unused", TokenRequestStyle::Form)).unwrap();
+    let port = lb.listener.local_addr().unwrap().port();
+    let cancel = AtomicBool::new(true);
+    let r = wait_and_release(lb, "st", Duration::from_secs(5), &cancel);
+    assert!(r.is_err());
+    TcpListener::bind(("127.0.0.1", port)).expect("port must be bindable right after cancel");
+}
+
+#[test]
+fn supersede_cancels_and_marks_the_flow() {
+    let p = Progress::default();
+    assert!(!p.is_superseded());
+    p.supersede();
+    assert!(p.is_cancelled() && p.is_superseded());
+    let q = Progress::default();
+    q.cancel();
+    assert!(!q.is_superseded(), "a closed window is not a supersede");
+}
+
+#[test]
+fn an_idle_connection_does_not_delay_cancel() {
+    // A browser preconnect that never sends a request must not hold the
+    // listener (and its fixed port) past a supersede/cancel.
+    let lb = Loopback::bind(&spec("http://unused", TokenRequestStyle::Form)).unwrap();
+    let port = lb.listener.local_addr().unwrap().port();
+    let idle = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let cancel = std::sync::Arc::new(AtomicBool::new(false));
+    let c = std::sync::Arc::clone(&cancel);
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        c.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let start = Instant::now();
+    let err = lb
+        .wait_for_code("S", Duration::from_secs(30), &cancel)
+        .unwrap_err();
+    let took = start.elapsed();
+    canceller.join().unwrap();
+    drop(idle);
+    assert!(format!("{err}").contains("closed"), "{err}");
+    assert!(took < Duration::from_millis(1500), "cancel took {took:?}");
+}
+
+/// Run `wait_for_code` on a worker with no client ever connecting; the result
+/// arrives on the channel, or the receive times out if accept() blocks.
+fn wait_in_background(
+    timeout: Duration,
+    cancel: Arc<AtomicBool>,
+) -> std::sync::mpsc::Receiver<Result<String>> {
+    let lb = Loopback::bind(&spec("http://unused", TokenRequestStyle::Form)).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(lb.wait_for_code("S", timeout, &cancel));
+    });
+    rx
+}
+
+#[test]
+fn closing_the_window_while_waiting_in_accept_ends_the_wait() {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let rx = wait_in_background(Duration::from_secs(30), Arc::clone(&cancel));
+    std::thread::sleep(Duration::from_millis(200));
+    cancel.store(true, Ordering::SeqCst);
+    let r = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("wait_for_code never re-checked cancel: accept() blocked");
+    assert!(format!("{}", r.unwrap_err()).contains("closed"));
+}
+
+#[test]
+fn a_sign_in_nobody_completes_times_out() {
+    let rx = wait_in_background(Duration::from_millis(300), Arc::new(AtomicBool::new(false)));
+    let r = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("wait_for_code never re-checked its deadline: accept() blocked");
+    assert!(format!("{}", r.unwrap_err()).contains("timed out"));
 }

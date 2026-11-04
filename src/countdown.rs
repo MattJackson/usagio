@@ -11,7 +11,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 
-const LOCKED_THRESHOLD_PCT: f64 = 99.5;
+pub(crate) const LOCKED_THRESHOLD_PCT: f64 = 99.5;
 
 #[derive(Clone, Debug)]
 pub struct AccountUsage {
@@ -117,6 +117,16 @@ pub fn compute_display(usage: &AccountUsage, now: DateTime<Utc>) -> DisplayState
             }
         }
     }
+}
+
+/// A window at/above the lock threshold whose reset time is unknown stays
+/// blocked indefinitely: no other window's unlock time says when the account
+/// is usable again, so callers must not present one as a countdown.
+pub(crate) fn has_indefinite_block(u: &AccountUsage) -> bool {
+    let unknown = |pct: Option<f64>, reset: Option<DateTime<Utc>>| {
+        pct.is_some_and(|p| p >= LOCKED_THRESHOLD_PCT) && reset.is_none()
+    };
+    unknown(u.session_pct, u.session_reset) || unknown(u.weekly_pct, u.weekly_reset)
 }
 
 fn is_blocking(
@@ -289,6 +299,32 @@ mod tests {
         // 10 years — well beyond any real weekly reset. Must not panic.
         let s = format_countdown(Duration::days(3650));
         assert!(s.ends_with(" 0h") && s.starts_with("3650d"));
+    }
+
+    #[test]
+    fn has_indefinite_block_sees_a_maxed_weekly_with_no_reset() {
+        // Weekly maxed with no reset time, session maxed but resetting soon:
+        // the 2h session unlock is not when the account is usable again.
+        assert!(has_indefinite_block(&usage(
+            Some(100.0),
+            Some(7200),
+            Some(100.0),
+            None
+        )));
+        // Both windows' resets known: not indefinite.
+        assert!(!has_indefinite_block(&usage(
+            Some(100.0),
+            Some(7200),
+            Some(100.0),
+            Some(9000)
+        )));
+        // A weekly without a reset but below the lock threshold: not blocked.
+        assert!(!has_indefinite_block(&usage(
+            Some(100.0),
+            Some(7200),
+            Some(10.0),
+            None
+        )));
     }
 
     // ---- compute_display ----
@@ -547,6 +583,64 @@ mod tests {
             DisplayState::Locked {
                 until: t(session_reset),
                 window: BlockingWindow::Session,
+            }
+        );
+    }
+
+    #[test]
+    fn stale_session_and_session_priority_over_weekly() {
+        let now = t(10_000);
+        // Session alone stale.
+        let u = usage_with_fetched_at(Some(100.0), Some(9_970), None, None, 9_700);
+        assert_eq!(
+            compute_display(&u, now),
+            DisplayState::StaleAfterReset {
+                window: BlockingWindow::Session,
+                reset: t(9_970),
+            }
+        );
+        // Both stale: the session window wins even though weekly reset later.
+        let u = usage_with_fetched_at(Some(100.0), Some(9_900), Some(100.0), Some(9_970), 9_700);
+        assert_eq!(
+            compute_display(&u, now),
+            DisplayState::StaleAfterReset {
+                window: BlockingWindow::Session,
+                reset: t(9_900),
+            }
+        );
+    }
+
+    #[test]
+    fn missing_fetched_at_is_never_stale() {
+        let now = t(10_000);
+        let mut u = usage_with_fetched_at(None, None, Some(100.0), Some(9_970), 9_700);
+        u.fetched_at = None;
+        assert_eq!(
+            compute_display(&u, now),
+            DisplayState::Usage {
+                session_pct: None,
+                weekly_pct: Some(100.0),
+            }
+        );
+    }
+
+    #[test]
+    fn reset_exactly_now_is_stale_not_locked_and_one_second_later_is_locked() {
+        let now = t(10_000);
+        let u = usage_with_fetched_at(None, None, Some(100.0), Some(10_000), 9_700);
+        assert_eq!(
+            compute_display(&u, now),
+            DisplayState::StaleAfterReset {
+                window: BlockingWindow::Weekly,
+                reset: t(10_000),
+            }
+        );
+        let u = usage_with_fetched_at(None, None, Some(100.0), Some(10_001), 9_700);
+        assert_eq!(
+            compute_display(&u, now),
+            DisplayState::Locked {
+                until: t(10_001),
+                window: BlockingWindow::Weekly,
             }
         );
     }

@@ -98,9 +98,18 @@ pub fn fetch_tools(config: &Value) -> Result<McpSummary, String> {
         serde_json::from_value(config.clone()).map_err(|e| format!("bad stdio config: {}", e))?;
 
     let start = Instant::now();
-    let mut cmd = Command::new(&cfg.command);
-    cmd.args(&cfg.args)
-        .envs(&cfg.env)
+    // Claude Code expands `${VAR}` / `${VAR:-default}` in command, args and env
+    // values of MCP server configs; do the same so we spawn what it would.
+    let command = expand_env_vars(&cfg.command);
+    let args: Vec<String> = cfg.args.iter().map(|a| expand_env_vars(a)).collect();
+    let env: std::collections::HashMap<&String, String> = cfg
+        .env
+        .iter()
+        .map(|(k, v)| (k, expand_env_vars(v)))
+        .collect();
+    let mut cmd = Command::new(&command);
+    cmd.args(&args)
+        .envs(env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -150,11 +159,9 @@ pub fn fetch_tools(config: &Value) -> Result<McpSummary, String> {
     // Wait for initialize response; if the server rejected our handshake
     // (JSON-RPC error object at top level), surface it now instead of
     // proceeding into a `tools/list` that would fail the same way.
-    let init_response = read_line_with_timeout(&rx, start)?;
-    if let Ok(parsed) = serde_json::from_str::<Value>(&init_response) {
-        if let Some(err) = parsed.get("error") {
-            return Err(format!("initialize failed: {}", err));
-        }
+    let init_response = read_response(&rx, start, 1)?;
+    if let Some(err) = init_response.get("error") {
+        return Err(format!("initialize failed: {}", err));
     }
 
     // Send initialized notification (no id — no response expected)
@@ -164,24 +171,44 @@ pub fn fetch_tools(config: &Value) -> Result<McpSummary, String> {
     });
     writeln!(&mut stdin, "{}", initialized).map_err(|e| format!("write initialized: {}", e))?;
 
-    // tools/list
-    let tools_req = json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/list",
-        "params": {}
-    });
-    writeln!(&mut stdin, "{}", tools_req).map_err(|e| format!("write tools/list: {}", e))?;
-
-    let tools_response = read_line_with_timeout(&rx, start)?;
-    let parsed: Value =
-        serde_json::from_str(&tools_response).map_err(|e| format!("parse tools/list: {}", e))?;
-    let tools = parsed
-        .get("result")
-        .and_then(|r| r.get("tools"))
-        .and_then(|t| t.as_array())
-        .ok_or("tools/list missing result.tools")?
-        .clone();
+    // tools/list, following `result.nextCursor` pagination (MCP spec) under
+    // the same wall-clock deadline. Capped so a server that never stops
+    // returning a cursor can't loop forever.
+    let mut tools: Vec<Value> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for page in 0..MAX_TOOL_PAGES {
+        let id = 2 + page as i64;
+        let params = match &cursor {
+            Some(c) => json!({ "cursor": c }),
+            None => json!({}),
+        };
+        let tools_req = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/list",
+            "params": params
+        });
+        writeln!(&mut stdin, "{}", tools_req).map_err(|e| format!("write tools/list: {}", e))?;
+        let parsed = read_response(&rx, start, id)?;
+        if let Some(err) = parsed.get("error") {
+            return Err(format!("tools/list failed: {}", err));
+        }
+        let page_tools = parsed
+            .get("result")
+            .and_then(|r| r.get("tools"))
+            .and_then(|t| t.as_array())
+            .ok_or("tools/list missing result.tools")?;
+        tools.extend(page_tools.iter().cloned());
+        cursor = parsed
+            .get("result")
+            .and_then(|r| r.get("nextCursor"))
+            .and_then(|c| c.as_str())
+            .filter(|c| !c.is_empty())
+            .map(String::from);
+        if cursor.is_none() {
+            break;
+        }
+    }
 
     // Happy path: ChildGuard::Drop at end-of-scope will kill+reap the child.
     let serialized = serde_json::to_string(&tools).unwrap_or_default();
@@ -191,6 +218,63 @@ pub fn fetch_tools(config: &Value) -> Result<McpSummary, String> {
         token_count,
         byte_count: serialized.len(),
     })
+}
+
+/// Upper bound on `tools/list` pages followed per server.
+const MAX_TOOL_PAGES: usize = 50;
+
+/// Read lines until the JSON-RPC response whose `id` equals `id` arrives,
+/// skipping anything else a server may interleave on stdout: notifications
+/// and server->client requests (they carry `method`), responses to other ids,
+/// and non-JSON log lines. All within the shared `RPC_TIMEOUT` deadline.
+fn read_response(rx: &mpsc::Receiver<LineMsg>, start: Instant, id: i64) -> Result<Value, String> {
+    loop {
+        let line = read_line_with_timeout(rx, start)?;
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if v.get("method").is_some() {
+            continue;
+        }
+        if v.get("id").and_then(|i| i.as_i64()) == Some(id) {
+            return Ok(v);
+        }
+    }
+}
+
+/// Expand `${VAR}` and `${VAR:-default}` against the process environment.
+/// An unset variable with no default is left as the literal text (the server
+/// will fail visibly rather than us guessing a value).
+fn expand_env_vars(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let body = &after[..end];
+        let (name, default) = match body.split_once(":-") {
+            Some((n, d)) => (n, Some(d)),
+            None => (body, None),
+        };
+        match std::env::var(name) {
+            Ok(v) => out.push_str(&v),
+            Err(_) => match default {
+                Some(d) => out.push_str(d),
+                None => {
+                    out.push_str("${");
+                    out.push_str(body);
+                    out.push('}');
+                }
+            },
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// One outcome of the background reader thread's attempt to produce the next

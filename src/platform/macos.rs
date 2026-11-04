@@ -305,6 +305,36 @@ impl SecurityRun {
     }
 }
 
+/// How long the legacy login-item purge may run (a first-run TCC Automation
+/// dialog must not hang uninstall).
+const LOGIN_ITEM_PURGE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Delete the System Events login item `name` with `program` (normally
+/// `osascript`), bounded by `LOGIN_ITEM_PURGE_TIMEOUT` natively. A non-zero
+/// exit (item already absent) is the desired state and is not an error; only a
+/// failure to spawn is.
+fn purge_login_item(program: &str, name: &str) -> Result<()> {
+    let child = Command::new(program)
+        .args([
+            "-e",
+            &format!("tell application \"System Events\" to delete login item \"{name}\""),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .with_context(|| format!("spawning `{program}`"))?;
+    let run = run_with_timeout(child, LOGIN_ITEM_PURGE_TIMEOUT)?;
+    if run.timed_out {
+        bail!(
+            "`{program}` timed out after {}s; the login item was not deleted",
+            LOGIN_ITEM_PURGE_TIMEOUT.as_secs()
+        );
+    }
+    Ok(())
+}
+
 /// Run `security(1)` with `args` under the native hang guard. stdout/stderr
 /// are captured; stdin is closed so an interactive prompt can't block on
 /// input while we wait.
@@ -408,18 +438,11 @@ fn run_with_timeout(mut child: Child, timeout: Duration) -> Result<SecurityRun> 
     })
 }
 
-fn real_get(service: &str, account: &str) -> Result<Option<String>> {
-    // Only exit code 44 ("SecItem not found" per <Security/SecBase.h> /
-    // `security(1)` conventions) is a genuine "not present". Any other
-    // non-zero — keychain locked, permission denied, IPC failure —
-    // surfaces as Err so callers like `sync_active_from_keychain` treat
-    // it as "don't touch anything" rather than "assume gone" (which
-    // would let a subsequent switch overwrite a still-valid token).
-    // See H7 in the round-1 codeaudit findings.
-    let out = run_security(&["find-generic-password", "-s", service, "-a", account, "-w"])
-        .context("running `security find-generic-password`")?;
-    let timed_out = out.timed_out;
-    let result = if timed_out {
+/// Pure mapping of a finished `security find-generic-password -w` run to the
+/// caller-visible result: exit 44 is "not found" (`Ok(None)`); a timeout or
+/// any other failure is `Err` so callers never mistake it for "absent".
+fn interpret_get(out: &SecurityRun, service: &str, account: &str) -> Result<Option<String>> {
+    if out.timed_out {
         // robustness-01: locked keychain / unattended SecurityAgent dialog.
         // Distinct error branch, but still just an Err to the caller — same
         // "don't touch anything" treatment as any other failure above.
@@ -442,7 +465,21 @@ fn real_get(service: &str, account: &str) -> Result<Option<String>> {
     } else {
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
         Ok(if s.is_empty() { None } else { Some(s) })
-    };
+    }
+}
+
+fn real_get(service: &str, account: &str) -> Result<Option<String>> {
+    // Only exit code 44 ("SecItem not found" per <Security/SecBase.h> /
+    // `security(1)` conventions) is a genuine "not present". Any other
+    // non-zero — keychain locked, permission denied, IPC failure —
+    // surfaces as Err so callers like `sync_active_from_keychain` treat
+    // it as "don't touch anything" rather than "assume gone" (which
+    // would let a subsequent switch overwrite a still-valid token).
+    // See H7 in the round-1 codeaudit findings.
+    let out = run_security(&["find-generic-password", "-s", service, "-a", account, "-w"])
+        .context("running `security find-generic-password`")?;
+    let timed_out = out.timed_out;
+    let result = interpret_get(&out, service, account);
     // Belt-and-suspenders: log every keychain touch so a bug that leaves
     // nothing else logged still shows up here (M4-audit finding).
     crate::logging::log(&format!(
@@ -462,6 +499,17 @@ fn real_get(service: &str, account: &str) -> Result<Option<String>> {
 }
 
 fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
+    real_set_with(&run_security, service, account, secret)
+}
+
+/// `real_set` over an injectable `security(1)` runner (a test seam for the
+/// delete -> add -> restore sequence).
+fn real_set_with(
+    run: &dyn Fn(&[&str]) -> Result<SecurityRun>,
+    service: &str,
+    account: &str,
+    secret: &str,
+) -> Result<()> {
     // L5 (round-1 codeaudit): passing the secret via argv (`-w <secret>`)
     // briefly exposes it in `ps(1)` output. Acknowledged limitation of
     // `security(1)` — its stdin variant does not exist for
@@ -479,7 +527,14 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
     // differently-ACL'd existing item ever happens.
     let mut timed_out = false;
     let result = (|| -> Result<()> {
-        let del = run_security(&["delete-generic-password", "-s", service, "-a", account])
+        // Remember the current value so a failed add (after the delete has
+        // already succeeded) can put it back instead of leaving no credential.
+        let backup_run = run(&["find-generic-password", "-s", service, "-a", account, "-w"]);
+        if matches!(&backup_run, Ok(r) if r.timed_out) {
+            timed_out = true;
+        }
+        let prior = backup_prior(backup_run, service, account)?;
+        let del = run(&["delete-generic-password", "-s", service, "-a", account])
             .context("running `security delete-generic-password` (pre-set)")?;
         if del.timed_out {
             timed_out = true;
@@ -498,7 +553,7 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
                 stderr.trim(),
             );
         }
-        let out = run_security(&[
+        let out = match run(&[
             "add-generic-password",
             "-s",
             service,
@@ -506,18 +561,43 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
             account,
             "-w",
             secret,
-        ])
-        .context("running `security add-generic-password`")?;
+        ]) {
+            Ok(out) => out,
+            Err(e) => {
+                // Spawn / wait failure after the delete already succeeded.
+                let restored = restore_prior_secret(run, service, account, prior.as_deref());
+                return Err(anyhow::anyhow!(
+                    "running `security add-generic-password`: {e:#}{}",
+                    restore_note(restored)
+                ));
+            }
+        };
+        let restore_note = if out.timed_out || !out.success() {
+            restore_note(restore_prior_secret(
+                run,
+                service,
+                account,
+                prior.as_deref(),
+            ))
+        } else {
+            ""
+        };
         if out.timed_out {
             timed_out = true;
             bail!(
                 "`security add-generic-password` timed out after {SECURITY_TIMEOUT_SECS}s \
                  (locked keychain or an unattended SecurityAgent dialog) for \
-                 service={service} account={account}",
+                 service={service} account={account}{restore_note}",
             );
         }
         if !out.success() {
-            bail!("`security add-generic-password` failed for service={service} account={account}");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            bail!(
+                "`security add-generic-password` failed (exit {:?}) for \
+                 service={service} account={account}: {}{restore_note}",
+                out.code(),
+                stderr.trim(),
+            );
         }
         Ok(())
     })();
@@ -536,6 +616,91 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
     result
 }
 
+/// Map the pre-delete backup read to the prior secret. Exit 44 (no item) is
+/// `Ok(None)`; any other failure (spawn error, timeout, denied) is an error so
+/// `real_set` aborts BEFORE the destructive delete rather than losing the
+/// credential with no way to restore it.
+fn backup_prior(out: Result<SecurityRun>, service: &str, account: &str) -> Result<Option<String>> {
+    let out = out.with_context(|| {
+        format!(
+            "running `security find-generic-password` to back up the existing item \
+             (service={service} account={account})"
+        )
+    })?;
+    if out.success() {
+        return Ok(Some(
+            String::from_utf8_lossy(&out.stdout)
+                .trim_end_matches('\n')
+                .to_string(),
+        ));
+    }
+    interpret_get(&out, service, account)
+        .context("backing up the existing keychain item before replacing it")
+}
+
+/// Best-effort: re-add the secret that `real_set` deleted when the following
+/// add failed, so the keychain isn't left with no credential at all.
+fn restore_prior_secret(
+    run: &dyn Fn(&[&str]) -> Result<SecurityRun>,
+    service: &str,
+    account: &str,
+    prior: Option<&str>,
+) -> bool {
+    let Some(prior) = prior else { return true };
+    let ok = run(&[
+        "add-generic-password",
+        "-s",
+        service,
+        "-a",
+        account,
+        "-w",
+        prior,
+    ])
+    .map(|r| r.success())
+    .unwrap_or(false);
+    crate::logging::log(&format!(
+        "event=keychain_write_restore svc={service} acct={account} result={}",
+        if ok { "ok" } else { "failed" }
+    ));
+    ok
+}
+
+/// Suffix for the add error when restoring the deleted item also failed.
+fn restore_note(restored: bool) -> &'static str {
+    if restored {
+        ""
+    } else {
+        " (restoring the previous credential also failed; the keychain item is now \
+         absent, run `usagio switch` again)"
+    }
+}
+
+/// Run `launchctl bootout` and return its output (stderr included).
+#[cfg(unix)]
+fn launchctl_bootout(uid: u32, label: &str) -> std::io::Result<std::process::Output> {
+    Command::new("launchctl")
+        .args(launchctl_bootout_argv(uid, label))
+        .output()
+}
+
+/// Surface a failed bootout (spawn error or non-zero exit) in the log instead
+/// of dropping it.
+#[cfg(unix)]
+fn log_bootout_failure(label: &str, out: std::io::Result<std::process::Output>) {
+    let why = match out {
+        Ok(o) if o.status.success() => return,
+        Ok(o) => format!(
+            "exit {:?}: {}",
+            o.status.code(),
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => e.to_string(),
+    };
+    crate::logging::log(&format!(
+        "event=launchd_bootout label={label} result=err:{why}"
+    ));
+}
+
 fn real_delete(service: &str, account: &str) -> Result<()> {
     // Same class as H7 (round-1 codeaudit): distinguish "item not found"
     // (exit 44, benign) from every other failure. Collapsing all non-zero
@@ -548,6 +713,14 @@ fn real_delete(service: &str, account: &str) -> Result<()> {
         crate::logging::log(&format!(
             "event=keychain_delete_timeout svc={service} acct={account}"
         ));
+    }
+    interpret_delete(&out, service, account)
+}
+
+/// Pure mapping of a finished `security delete-generic-password` run: exit 0
+/// and exit 44 (not found) are `Ok`; a timeout or any other failure is `Err`.
+fn interpret_delete(out: &SecurityRun, service: &str, account: &str) -> Result<()> {
+    if out.timed_out {
         bail!(
             "`security delete-generic-password` timed out after {SECURITY_TIMEOUT_SECS}s \
              (locked keychain or an unattended SecurityAgent dialog) for \
@@ -675,6 +848,9 @@ pub struct MacOsAutostart;
 impl MacOsAutostart {
     fn plist_path(label: &str) -> Result<PathBuf> {
         let home = std::env::var_os("HOME").context("HOME is not set")?;
+        if !Path::new(&home).is_absolute() {
+            bail!("HOME must be an absolute path (got {home:?})");
+        }
         Ok(PathBuf::from(home)
             .join("Library")
             .join("LaunchAgents")
@@ -947,9 +1123,7 @@ impl Autostart for MacOsAutostart {
                 // fresh plist. bootout is the modern form and should succeed
                 // here; a real failure now is worth seeing (unlike the
                 // spurious "nothing loaded" error we used to emit).
-                let _ = Command::new("launchctl")
-                    .args(launchctl_bootout_argv(uid, label))
-                    .output();
+                log_bootout_failure(label, launchctl_bootout(uid, label));
             }
             // If NOT loaded we skip both bootout AND the legacy `unload`
             // entirely: there is nothing to unload, and the legacy `unload`
@@ -972,15 +1146,27 @@ impl Autostart for MacOsAutostart {
             // emit). When it IS loaded, a real failure is worth surfacing.
             if is_agent_loaded(uid, label) {
                 // Bootout is the modern counterpart to `unload`.
-                let _ = Command::new("launchctl")
-                    .args(launchctl_bootout_argv(uid, label))
-                    .output();
+                log_bootout_failure(label, launchctl_bootout(uid, label));
                 // Also drop any legacy `load`-registered entry before removing
                 // the file, so a switch from an older usagio that used the
                 // legacy form doesn't leave a stale live job behind.
-                let _ = Command::new("launchctl")
-                    .args(["unload", &path.to_string_lossy()])
-                    .status();
+                // Skip it once bootout removed the job: a legacy `unload` of a
+                // not-loaded plist prints "Unload failed: 5" to the terminal.
+                if is_agent_loaded(uid, label) {
+                    let _ = Command::new("launchctl")
+                        .args(["unload", &path.to_string_lossy()])
+                        .status();
+                }
+                if is_agent_loaded(uid, label) {
+                    crate::logging::log(&format!(
+                        "event=launchd_uninstall label={label} result=err:agent still loaded \
+                         after bootout/unload; it runs until logout"
+                    ));
+                    eprintln!(
+                        "warning: launch agent {label} is still loaded after uninstall; \
+                         it will stop at next logout"
+                    );
+                }
             }
         }
         if path.exists() {
@@ -993,22 +1179,17 @@ impl Autostart for MacOsAutostart {
         // is gone — the exact bug that had usagio silently respawning
         // post-uninstall. Best-effort: osascript exits non-zero if the item
         // is already absent (the desired state), so all output is swallowed.
-        // Wrap in `timeout(1) 3` so a first-run TCC Automation dialog can't
-        // hang `brew uninstall` indefinitely — this login-item purge is
-        // best-effort defense-in-depth; if TCC prompts and the user doesn't
-        // dismiss it in 3 seconds, we move on (the plist deletion above is
-        // what actually stops autostart).
+        // Bounded natively (3s, process-group kill) rather than via
+        // `timeout(1)`, which stock macOS does not ship: a first-run TCC
+        // Automation dialog can't hang `brew uninstall`, and the purge still
+        // actually runs. Best-effort defense-in-depth; the plist deletion
+        // above is what actually stops autostart.
         for name in ["usagio", "claude-usage"] {
-            let _ = Command::new("timeout")
-                .args([
-                    "3",
-                    "osascript",
-                    "-e",
-                    &format!("tell application \"System Events\" to delete login item \"{name}\""),
-                ])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            if let Err(e) = purge_login_item("osascript", name) {
+                crate::logging::log(&format!(
+                    "event=legacy_login_item_purge name={name} result=err:{e:#}"
+                ));
+            }
         }
         Ok(())
     }
@@ -1039,6 +1220,9 @@ impl Autostart for MacOsAutostart {
 pub struct MacOsPaths;
 
 impl Paths for MacOsPaths {
+    fn home_env_order(&self) -> [&'static str; 2] {
+        ["HOME", "USERPROFILE"]
+    }
     fn config_dir(&self, app: &str) -> PathBuf {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -1065,6 +1249,237 @@ impl Paths for MacOsPaths {
 mod tests {
     use super::*;
 
+    fn run(code: Option<i32>, timed_out: bool, stdout: &str) -> SecurityRun {
+        use std::os::unix::process::ExitStatusExt;
+        SecurityRun {
+            timed_out,
+            status: code.map(|c| ExitStatus::from_raw(c << 8)),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: b"boom".to_vec(),
+        }
+    }
+
+    /// Drive `real_set_with` against a scripted `security(1)`: the backup find
+    /// returns `find`, the delete succeeds, the add of `new-secret` returns
+    /// `add_new`, and every call is recorded.
+    fn real_set_scripted_full(
+        find: Result<SecurityRun>,
+        add_new: Result<SecurityRun>,
+    ) -> (Result<()>, Vec<Vec<String>>, String) {
+        let cfg = crate::store::ScopedConfigDir::new();
+        let calls = std::cell::RefCell::new(Vec::<Vec<String>>::new());
+        let find = std::cell::RefCell::new(Some(find));
+        let add_new = std::cell::RefCell::new(Some(add_new));
+        let runner = |args: &[&str]| -> Result<SecurityRun> {
+            calls
+                .borrow_mut()
+                .push(args.iter().map(|a| a.to_string()).collect());
+            match args[0] {
+                "find-generic-password" => find.borrow_mut().take().unwrap(),
+                "delete-generic-password" => Ok(run(Some(0), false, "")),
+                _ if args.contains(&"new-secret") => add_new.borrow_mut().take().unwrap(),
+                _ => Ok(run(Some(0), false, "")),
+            }
+        };
+        let res = real_set_with(&runner, "svc", "acct", "new-secret");
+        let log = std::fs::read_to_string(cfg.home().join(".config/usagio/usagio.log"))
+            .unwrap_or_default();
+        (res, calls.into_inner(), log)
+    }
+
+    /// The backup find succeeds with a prior secret; the add returns `add_new`.
+    fn real_set_scripted(add_new: SecurityRun) -> (Result<()>, Vec<Vec<String>>) {
+        let (res, calls, _) =
+            real_set_scripted_full(Ok(run(Some(0), false, "prior-secret\n")), Ok(add_new));
+        (res, calls)
+    }
+
+    fn verbs(calls: &[Vec<String>]) -> Vec<&str> {
+        calls.iter().map(|c| c[0].as_str()).collect()
+    }
+
+    /// keychain-restore-failure-unreported: when the add fails and the restore
+    /// add fails too, the error must say the item is now absent.
+    #[test]
+    fn real_set_reports_when_the_restore_also_fails() {
+        let _cfg = crate::store::ScopedConfigDir::new();
+        let runner = |args: &[&str]| -> Result<SecurityRun> {
+            match args[0] {
+                "find-generic-password" => Ok(run(Some(0), false, "prior-secret\n")),
+                "delete-generic-password" => Ok(run(Some(0), false, "")),
+                _ => Ok(run(Some(36), false, "")),
+            }
+        };
+        let err = real_set_with(&runner, "svc", "acct", "new-secret").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("now absent"), "{msg}");
+    }
+
+    #[test]
+    fn real_set_aborts_before_delete_when_the_backup_read_fails() {
+        for find in [
+            Ok(run(Some(1), false, "")),
+            Ok(run(Some(51), false, "")),
+            Ok(run(None, true, "")),
+            Err(anyhow::anyhow!("spawn failed")),
+        ] {
+            let (res, calls, _) = real_set_scripted_full(find, Ok(run(Some(0), false, "")));
+            let err = format!("{:#}", res.unwrap_err());
+            assert!(
+                err.contains("service=svc") && err.contains("account=acct"),
+                "error must name the real service/account: {err}"
+            );
+            assert_eq!(
+                verbs(&calls),
+                ["find-generic-password"],
+                "nothing destructive may run after a failed backup read"
+            );
+        }
+    }
+
+    #[test]
+    fn real_set_backup_failure_keeps_the_underlying_reason() {
+        let (res, _, _) = real_set_scripted_full(
+            Err(anyhow::anyhow!("spawn failed")),
+            Ok(run(Some(0), false, "")),
+        );
+        assert!(format!("{:#}", res.unwrap_err()).contains("spawn failed"));
+    }
+
+    #[test]
+    fn real_set_backup_timeout_is_logged_as_a_write_timeout() {
+        let (res, _, log) =
+            real_set_scripted_full(Ok(run(None, true, "")), Ok(run(Some(0), false, "")));
+        assert!(res.is_err());
+        assert!(log.contains("event=keychain_write_timeout"), "log: {log}");
+    }
+
+    #[test]
+    fn real_set_first_time_set_with_no_existing_item_proceeds() {
+        let (res, calls, _) =
+            real_set_scripted_full(Ok(run(Some(44), false, "")), Ok(run(Some(0), false, "")));
+        res.unwrap();
+        assert_eq!(
+            verbs(&calls),
+            [
+                "find-generic-password",
+                "delete-generic-password",
+                "add-generic-password"
+            ]
+        );
+    }
+
+    #[test]
+    fn real_set_first_time_failed_add_has_nothing_to_restore() {
+        let (res, calls, _) =
+            real_set_scripted_full(Ok(run(Some(44), false, "")), Ok(run(Some(1), false, "")));
+        assert!(res.is_err());
+        assert_eq!(adds(&calls), ["new-secret"], "no prior secret to restore");
+    }
+
+    #[test]
+    fn real_set_restores_the_prior_secret_when_the_add_fails_to_spawn() {
+        let (res, calls, _) = real_set_scripted_full(
+            Ok(run(Some(0), false, "prior-secret\n")),
+            Err(anyhow::anyhow!("spawn failed")),
+        );
+        assert!(format!("{:#}", res.unwrap_err()).contains("spawn failed"));
+        assert_eq!(adds(&calls), ["new-secret", "prior-secret"]);
+    }
+
+    fn adds(calls: &[Vec<String>]) -> Vec<&str> {
+        calls
+            .iter()
+            .filter(|c| c[0] == "add-generic-password")
+            .map(|c| c.last().unwrap().as_str())
+            .collect()
+    }
+
+    #[test]
+    fn real_set_restores_the_prior_secret_when_the_add_fails() {
+        let (res, calls) = real_set_scripted(run(Some(1), false, ""));
+        assert!(res.is_err());
+        assert_eq!(adds(&calls), ["new-secret", "prior-secret"]);
+    }
+
+    #[test]
+    fn real_set_restores_the_prior_secret_when_the_add_times_out() {
+        let (res, calls) = real_set_scripted(run(None, true, ""));
+        assert!(format!("{:#}", res.unwrap_err()).contains("timed out"));
+        assert_eq!(adds(&calls), ["new-secret", "prior-secret"]);
+    }
+
+    #[test]
+    fn real_set_reads_the_prior_secret_before_deleting_and_skips_restore_on_success() {
+        let (res, calls) = real_set_scripted(run(Some(0), false, ""));
+        res.unwrap();
+        assert_eq!(adds(&calls), ["new-secret"], "no restore after a good add");
+        assert_eq!(calls[0][0], "find-generic-password");
+        assert_eq!(calls[1][0], "delete-generic-password");
+    }
+
+    #[test]
+    fn backup_prior_fails_unless_success_or_not_found() {
+        assert_eq!(
+            backup_prior(Ok(run(Some(0), false, "tok\n")), "s", "a")
+                .unwrap()
+                .as_deref(),
+            Some("tok")
+        );
+        assert_eq!(
+            backup_prior(Ok(run(Some(44), false, "")), "s", "a").unwrap(),
+            None
+        );
+        assert!(backup_prior(Ok(run(Some(1), false, "")), "s", "a").is_err());
+        assert!(backup_prior(Ok(run(None, true, "")), "s", "a").is_err());
+        assert!(backup_prior(Err(anyhow::anyhow!("spawn")), "s", "a").is_err());
+    }
+
+    #[test]
+    fn plist_path_rejects_empty_or_relative_home() {
+        crate::env_lock::scoped_env_var("HOME", Some(""), || {
+            assert!(MacOsAutostart::plist_path("x").is_err());
+        });
+        crate::env_lock::scoped_env_var("HOME", Some("rel/home"), || {
+            assert!(MacOsAutostart::plist_path("x").is_err());
+        });
+        crate::env_lock::scoped_env_var("HOME", Some("/Users/t"), || {
+            assert_eq!(
+                MacOsAutostart::plist_path("x").unwrap(),
+                PathBuf::from("/Users/t/Library/LaunchAgents/x.plist")
+            );
+        });
+    }
+
+    #[test]
+    fn interpret_get_only_exit_44_is_not_found() {
+        assert_eq!(
+            interpret_get(&run(Some(0), false, "tok\n"), "s", "a").unwrap(),
+            Some("tok".to_string())
+        );
+        assert_eq!(
+            interpret_get(&run(Some(0), false, "\n"), "s", "a").unwrap(),
+            None
+        );
+        assert_eq!(
+            interpret_get(&run(Some(44), false, ""), "s", "a").unwrap(),
+            None
+        );
+        // Locked keychain / permission / any other failure must be Err.
+        assert!(interpret_get(&run(Some(51), false, ""), "s", "a").is_err());
+        assert!(interpret_get(&run(Some(1), false, ""), "s", "a").is_err());
+        // Timeout (status None) must be Err, never "absent".
+        assert!(interpret_get(&run(None, true, ""), "s", "a").is_err());
+    }
+
+    #[test]
+    fn interpret_delete_only_exit_44_is_benign() {
+        assert!(interpret_delete(&run(Some(0), false, ""), "s", "a").is_ok());
+        assert!(interpret_delete(&run(Some(44), false, ""), "s", "a").is_ok());
+        assert!(interpret_delete(&run(Some(51), false, ""), "s", "a").is_err());
+        assert!(interpret_delete(&run(None, true, ""), "s", "a").is_err());
+    }
+
     #[test]
     fn paths_config_dir_uses_home_dot_config() {
         // Serialised against every other in-crate `$HOME` mutator via the
@@ -1084,6 +1499,38 @@ mod tests {
                 std::path::PathBuf::from("/tmp/platform-test-home/Library/Caches/usagio")
             );
         });
+    }
+
+    fn fake_osascript(dir: &std::path::Path, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-osascript");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// mac-uninstall-timeout-missing: the purge must actually run the
+    /// osascript program (no dependency on `timeout(1)`).
+    #[test]
+    fn purge_login_item_runs_the_program_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let prog = fake_osascript(dir.path(), &format!("echo \"$2\" > {}", marker.display()));
+        purge_login_item(&prog, "usagio").expect("purge");
+        let got = std::fs::read_to_string(&marker).expect("program must have run");
+        assert!(got.contains("delete login item \"usagio\""), "{got}");
+    }
+
+    /// The purge is bounded: a hung osascript is killed at the deadline, and
+    /// the overrun is reported (so uninstall logs it) rather than swallowed.
+    #[test]
+    fn purge_login_item_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let prog = fake_osascript(dir.path(), "sleep 30");
+        let start = Instant::now();
+        let err = purge_login_item(&prog, "usagio").expect_err("timeout must be an error");
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+        assert!(start.elapsed() < Duration::from_secs(10));
     }
 
     /// Helper: spawn an arbitrary command with captured pipes so the
@@ -1317,6 +1764,8 @@ mod tests {
     #[test]
     #[ignore = "touches the real login keychain; run with --ignored"]
     fn macos_secrets_set_after_existing_item_created_by_another_process() {
+        // real_set logs via store::config_dir(); needs a HOME_OVERRIDE.
+        let _g = crate::store::ScopedConfigDir::new();
         let service = format!("usagio-platform-test-foreign-{}", std::process::id());
         let account = "foreign-owner";
         let _ = Command::new("security")

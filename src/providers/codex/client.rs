@@ -167,20 +167,62 @@ pub(crate) fn probe() -> Result<Option<ClientState>> {
     if !path.exists() {
         return Ok(None);
     }
+    // Pin the token before AND after inspect(): if the daemon restarted in
+    // between, busy/email describe one instance and the token another.
+    let before = read_instance_token(&home);
     let mut state = with_control("ws://localhost/", inspect)?;
-    state.instance_token = ["daemon.pid", "app-server.pid"]
+    let after = read_instance_token(&home);
+    state.instance_token = stable_instance_token(before, after)?;
+    Ok(Some(state))
+}
+
+fn read_instance_token(home: &Path) -> Option<String> {
+    ["daemon.pid", "app-server.pid"]
         .into_iter()
         .find_map(|name| {
-            let bytes = std::fs::read(home.join("app-server-daemon").join(name)).ok()?;
-            let record: Value = serde_json::from_slice(&bytes).ok()?;
+            let path = home.join("app-server-daemon").join(name);
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(e) => {
+                    // Not "absent": say why the handoff token is missing.
+                    crate::logging::log(&format!(
+                        "codex: cannot read daemon pid record {}: {e}",
+                        path.display()
+                    ));
+                    return None;
+                }
+            };
+            let record: Value = match serde_json::from_slice(&bytes) {
+                Ok(r) => r,
+                Err(e) => {
+                    crate::logging::log(&format!(
+                        "codex: daemon pid record {} is unreadable JSON: {e}",
+                        path.display()
+                    ));
+                    return None;
+                }
+            };
             let pid = record
                 .get("pid")
                 .and_then(Value::as_u64)
                 .and_then(|id| u32::try_from(id).ok())?;
             let start = record.get("processStartTime").and_then(Value::as_str)?;
             Some(json!({"pid":pid,"start":start}).to_string())
-        });
-    Ok(Some(state))
+        })
+}
+
+const UNSTABLE_DAEMON_MSG: &str = "Codex daemon changed while being inspected; retry next cycle";
+
+fn is_unstable_daemon(e: &anyhow::Error) -> bool {
+    e.to_string() == UNSTABLE_DAEMON_MSG
+}
+
+fn stable_instance_token(before: Option<String>, after: Option<String>) -> Result<Option<String>> {
+    if before != after {
+        bail!("{UNSTABLE_DAEMON_MSG}");
+    }
+    Ok(after)
 }
 
 fn with_control<T: Send + 'static>(
@@ -301,24 +343,150 @@ pub(crate) fn start_and_verify(expected: &crate::providers::IdentitySnapshot) ->
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    let actual = probe()?.context("Codex daemon did not return after restart")?;
-    if !actual
-        .email
-        .as_deref()
-        .is_some_and(|actual| actual.eq_ignore_ascii_case(email))
-        || expected
-            .uuid
-            .as_ref()
-            .is_some_and(|id| actual.account_id.as_ref() != Some(id))
-    {
+    // The pid file can land mid-probe; retry the token-mismatch error within
+    // the handoff deadline instead of failing a verification that never uses
+    // the token.
+    let actual = loop {
+        match probe() {
+            Ok(state) => break state.context("Codex daemon did not return after restart")?,
+            Err(e) if is_unstable_daemon(&e) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    if !identity_matches(&actual, email, expected.uuid.as_ref()) {
         bail!("Codex daemon did not load the selected account");
     }
     Ok(())
 }
 
+/// Whether the daemon's reported identity is the account we asked it to load:
+/// email must match (case-insensitively) and, when a uuid is expected, the
+/// account id must match too.
+fn identity_matches(actual: &ClientState, email: &str, uuid: Option<&String>) -> bool {
+    actual
+        .email
+        .as_deref()
+        .is_some_and(|actual| actual.eq_ignore_ascii_case(email))
+        && uuid.is_none_or(|id| actual.account_id.as_ref() == Some(id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run `inspect` against a scripted daemon over a loopback socket pair.
+    /// `status` maps a thread id to its `thread/read` status type; loaded
+    /// threads come in two pages, `t1` then `t2`.
+    fn inspect_scripted(status: fn(&str) -> &'static str) -> Result<ClientState> {
+        use tungstenite::protocol::Role;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut ws = WebSocket::from_raw_socket(tcp, Role::Server, None);
+            while let Ok(msg) = ws.read() {
+                let Message::Text(body) = msg else { continue };
+                let req: Value = serde_json::from_str(&body).unwrap();
+                let Some(id) = req.get("id").cloned() else {
+                    continue; // the `initialized` notification
+                };
+                let result = match req["method"].as_str().unwrap() {
+                    "accountSession/list" => json!({"sessions": [
+                        {"isActive": false, "email": "other@example.com"},
+                        {"isActive": true, "email": "a@example.com",
+                         "selectedWorkspaceAccountId": "acct-1"},
+                    ]}),
+                    "thread/loaded/list" if req["params"]["cursor"].is_null() => {
+                        json!({"data": ["t1"], "nextCursor": "page-2"})
+                    }
+                    "thread/loaded/list" => json!({"data": ["t2"], "nextCursor": null}),
+                    "thread/read" => {
+                        let t = req["params"]["threadId"].as_str().unwrap();
+                        json!({"thread": {"status": {"type": status(t)}}})
+                    }
+                    _ => json!({}),
+                };
+                let reply = json!({"id": id, "result": result}).to_string();
+                if ws.send(Message::Text(reply.into())).is_err() {
+                    break;
+                }
+            }
+        });
+        let tcp = std::net::TcpStream::connect(addr).unwrap();
+        let mut ws = WebSocket::from_raw_socket(tcp, Role::Client, None);
+        let state = inspect(&mut ws);
+        drop(ws);
+        server.join().unwrap();
+        state
+    }
+
+    #[test]
+    fn inspect_reports_busy_for_an_active_thread_on_a_later_page() {
+        let state = inspect_scripted(|t| if t == "t2" { "active" } else { "idle" }).unwrap();
+        assert!(state.busy, "the active thread on page 2 was missed");
+        assert_eq!(state.email.as_deref(), Some("a@example.com"));
+        assert_eq!(state.account_id.as_deref(), Some("acct-1"));
+        let idle = inspect_scripted(|t| if t == "t1" { "notLoaded" } else { "idle" }).unwrap();
+        assert!(!idle.busy);
+    }
+
+    #[test]
+    fn inspect_refuses_an_unknown_thread_state() {
+        assert!(inspect_scripted(|_| "somethingNew").is_err());
+    }
+
+    #[test]
+    fn identity_matches_checks_email_and_uuid() {
+        let st = |email: Option<&str>, id: Option<&str>| ClientState {
+            busy: false,
+            email: email.map(String::from),
+            account_id: id.map(String::from),
+            instance_token: None,
+        };
+        let u = "u-1".to_string();
+        assert!(identity_matches(
+            &st(Some("A@x.com"), Some("u-1")),
+            "a@x.com",
+            Some(&u)
+        ));
+        assert!(identity_matches(
+            &st(Some("a@x.com"), None),
+            "a@x.com",
+            None
+        ));
+        assert!(!identity_matches(
+            &st(Some("b@x.com"), Some("u-1")),
+            "a@x.com",
+            Some(&u)
+        ));
+        assert!(!identity_matches(
+            &st(None, Some("u-1")),
+            "a@x.com",
+            Some(&u)
+        ));
+        assert!(!identity_matches(
+            &st(Some("a@x.com"), Some("u-2")),
+            "a@x.com",
+            Some(&u)
+        ));
+        assert!(!identity_matches(
+            &st(Some("a@x.com"), None),
+            "a@x.com",
+            Some(&u)
+        ));
+    }
+
+    #[test]
+    fn instance_token_must_match_before_and_after_inspect() {
+        let a = Some("a".to_string());
+        assert_eq!(stable_instance_token(a.clone(), a.clone()).unwrap(), a);
+        assert!(stable_instance_token(a, Some("b".into())).is_err());
+        assert_eq!(stable_instance_token(None, None).unwrap(), None);
+        let e = stable_instance_token(None, Some("b".into())).unwrap_err();
+        assert!(is_unstable_daemon(&e));
+    }
 
     /// Hold a synthetic Responses stream open until the test releases it.
     /// No credentials or prompts are recorded or sent beyond loopback.
@@ -544,7 +712,14 @@ stream_max_retries = 0
     #[test]
     #[ignore = "explicit read-only inspection of the installed Codex daemon"]
     fn inspect_installed_daemon() {
-        let result = probe().unwrap();
+        // Read-only on purpose: resolve the real Codex home (test builds only
+        // see scoped variables), and keep usagio's own log in a temp dir.
+        let _cfg = crate::store::ScopedConfigDir::new();
+        let (key, real) = match std::env::var("CODEX_HOME") {
+            Ok(h) if !h.is_empty() => ("CODEX_HOME", h),
+            _ => ("HOME", std::env::var("HOME").expect("HOME is set")),
+        };
+        let result = crate::env_lock::scoped_env_var(key, Some(&real), || probe().unwrap());
         assert!(result.is_some());
         eprintln!("Codex daemon metadata: {result:?}");
     }

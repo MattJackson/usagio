@@ -415,7 +415,7 @@ fn save_state_safe_prunes_backups_to_cap() {
             .set_modified(ts)
             .unwrap();
     }
-    prune_backups(&backups_dir, BACKUP_KEEP_COUNT).unwrap();
+    prune_backups(&backups_dir, BACKUP_KEEP_COUNT, None).unwrap();
     let count = std::fs::read_dir(&backups_dir).unwrap().count();
     assert_eq!(count, BACKUP_KEEP_COUNT);
     // The oldest 5 must have been removed (the ones with the smallest mtime).
@@ -715,8 +715,9 @@ fn stash_pre_restore_lands_under_config_backups_not_tmp() {
         stash_path.display()
     );
 
-    // The live state.json is gone (moved), and the stash carries its bytes.
-    assert!(!config_dir().unwrap().join("state.json").exists());
+    // The live state.json stays in place (copied, not moved, so lock-free
+    // readers never see a missing file), and the stash carries its bytes.
+    assert!(config_dir().unwrap().join("state.json").exists());
     let stashed = std::fs::read_to_string(&stash_path).unwrap();
     assert!(stashed.contains("a@e.com"));
 
@@ -734,58 +735,6 @@ fn stash_pre_restore_is_noop_when_no_live_state() {
     let dir = config_dir().unwrap();
     assert!(stash_pre_restore(&dir).unwrap().is_none());
 }
-
-#[test]
-fn unstash_pre_restore_rolls_the_live_state_back_exactly() {
-    // Audit finding 11: if a restore WRITE fails after stash_pre_restore has
-    // already moved state.json aside, unstash_pre_restore must put the original
-    // back so state.json is never left MISSING (which State::load would read as
-    // zero accounts). Round-trip: stash removes the live file, unstash restores
-    // it byte-for-byte, owner-only.
-    let _g = ScopedConfigDir::new();
-    make_state_with(&["keep@e.com"]).save().unwrap();
-    let live = config_dir().unwrap().join("state.json");
-    let original = std::fs::read(&live).unwrap();
-
-    let dir = config_dir().unwrap();
-    let stash = stash_pre_restore(&dir)
-        .unwrap()
-        .expect("live state existed");
-    assert!(
-        !live.exists(),
-        "stash should have moved the live file aside"
-    );
-
-    unstash_pre_restore(&stash).expect("rollback must restore the stashed state");
-
-    assert!(live.exists(), "state.json must exist again after rollback");
-    assert_eq!(
-        std::fs::read(&live).unwrap(),
-        original,
-        "rolled-back state.json must match the pre-restore bytes exactly"
-    );
-    assert!(
-        !stash.exists(),
-        "the stash file should be consumed by the rollback"
-    );
-    // The recovered accounts load correctly (not the zero-account default).
-    assert!(State::load()
-        .unwrap()
-        .accounts
-        .iter()
-        .any(|a| a.email.as_deref() == Some("keep@e.com")));
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&live).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "rolled-back state.json must stay owner-only");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// M1 — notification_config parse failures must not be silent.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn corrupt_notification_config_falls_back_to_default_and_logs() {
@@ -1219,11 +1168,11 @@ fn stash_pre_restore_in_the_same_second_gets_unique_names_and_never_overwrites()
     let name = stash.file_name().unwrap().to_string_lossy().into_owned();
     assert!(name.ends_with("-2.json"), "counter advances by one: {name}");
     assert!(std::fs::read_to_string(&stash).unwrap().contains("a@e.com"));
+    // Old stashes may be pruned past the cap, but none may be overwritten.
     for t in now - 1..=now + 3 {
-        assert_eq!(
-            std::fs::read_to_string(backups.join(format!("pre-restore-{t}-1.json"))).unwrap(),
-            "seed"
-        );
+        if let Ok(c) = std::fs::read_to_string(backups.join(format!("pre-restore-{t}-1.json"))) {
+            assert_eq!(c, "seed");
+        }
     }
 }
 
@@ -1275,7 +1224,7 @@ fn prune_backups_only_touches_state_json_files() {
     touch_at(&d, "other.json", 2);
     touch_at(&d, "state-b.txt", 3);
     touch_at(&d, "state-rejected-1.json", 4);
-    prune_backups(&d, 0).unwrap();
+    prune_backups(&d, 0, None).unwrap();
     // Only the rolling backup goes; look-alikes and rejected dumps stay.
     assert_eq!(
         file_names(&d),
@@ -1295,11 +1244,11 @@ fn prune_rejected_dumps_evicts_oldest_beyond_cap_and_only_rejected_json() {
     touch_at(&d, "state-rejected-4.txt", 0);
 
     // At the cap exactly: nothing is evicted.
-    prune_rejected_dumps(&d, 3).unwrap();
+    prune_rejected_dumps(&d, 3, None).unwrap();
     assert!(d.join("state-rejected-1.json").exists());
 
     // Over the cap: oldest evicted, exactly `keep` remain, others untouched.
-    prune_rejected_dumps(&d, 2).unwrap();
+    prune_rejected_dumps(&d, 2, None).unwrap();
     assert_eq!(
         file_names(&d),
         vec![
@@ -1498,4 +1447,238 @@ fn adopt_login_drops_an_expiry_the_new_login_does_not_state() {
     .unwrap();
     a.adopt_login(&fresh);
     assert_eq!(a.refresh_token_expires_at(), None);
+}
+
+// ---------------------------------------------------------------------------
+// provider-slot-drop (codeaudit r1 C4): one malformed provider account entry
+// must not take the provider's good accounts with it, and must never be
+// silently erased by a later save.
+// ---------------------------------------------------------------------------
+
+/// Write a state.json whose `providers.codex.accounts` holds one good entry
+/// and one entry missing required fields.
+fn seed_state_with_bad_codex_entry() {
+    let good = serde_json::to_value(provider_account("good@e.com")).unwrap();
+    let raw = serde_json::json!({
+        "schema_version": 2,
+        "accounts": [],
+        "providers": { "codex": {
+            "active": "good@e.com",
+            "accounts": [ good, { "key": "bad@e.com", "unexpected": true } ]
+        }}
+    });
+    let path = config_dir().unwrap().join("state.json");
+    std::fs::write(path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+}
+
+#[test]
+fn bad_provider_entry_keeps_the_good_accounts_at_load() {
+    let _g = ScopedConfigDir::new();
+    seed_state_with_bad_codex_entry();
+    let st = State::load().unwrap();
+    let pa = st.providers.get("codex").expect("codex slot must survive");
+    let keys: Vec<&str> = pa.accounts.iter().map(|a| a.key.as_str()).collect();
+    assert_eq!(keys, vec!["good@e.com"]);
+}
+
+#[test]
+fn bad_provider_entry_is_preserved_across_a_save() {
+    let _g = ScopedConfigDir::new();
+    seed_state_with_bad_codex_entry();
+    let st = State::load().unwrap();
+    st.save().expect("a load-save round trip must succeed");
+    let on_disk = std::fs::read_to_string(config_dir().unwrap().join("state.json")).unwrap();
+    assert!(
+        on_disk.contains("bad@e.com") && on_disk.contains("good@e.com"),
+        "unparseable entry must be kept verbatim: {on_disk}"
+    );
+}
+
+#[test]
+fn save_refuses_to_drop_an_unparseable_on_disk_provider_entry() {
+    let _g = ScopedConfigDir::new();
+    seed_state_with_bad_codex_entry();
+    // A state that knows nothing of the bad entry (e.g. built from a lossy
+    // parse) must not be allowed to overwrite it.
+    let mut stale = State::default();
+    stale
+        .providers
+        .entry("codex".to_string())
+        .or_default()
+        .accounts
+        .push(provider_account("good@e.com"));
+    let err = stale.save().expect_err("must refuse to erase bad@e.com");
+    assert!(format!("{err:#}").contains("bad@e.com"), "{err:#}");
+    let on_disk = std::fs::read_to_string(config_dir().unwrap().join("state.json")).unwrap();
+    assert!(on_disk.contains("bad@e.com"));
+}
+
+#[test]
+fn pre_restore_stashes_are_pruned_to_a_small_cap() {
+    let _g = ScopedConfigDir::new();
+    make_state_with(&["a@e.com"]).save().unwrap();
+    let dir = config_dir().unwrap();
+    for _ in 0..9 {
+        stash_pre_restore(&dir).unwrap().unwrap();
+    }
+    let n = std::fs::read_dir(dir.join("backups"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("pre-restore-"))
+        .count();
+    assert!(n <= 5, "pre-restore stashes must be capped, found {n}");
+}
+
+#[test]
+fn unparsed_entry_that_now_parses_is_promoted_on_load() {
+    let _g = ScopedConfigDir::new();
+    let good = serde_json::to_value(provider_account("fixed@e.com")).unwrap();
+    let raw = serde_json::json!({
+        "schema_version": 2, "accounts": [],
+        "providers": { "codex": { "accounts": [], "unparsed_accounts": [good] } }
+    });
+    std::fs::write(config_dir().unwrap().join("state.json"), raw.to_string()).unwrap();
+    let st = State::load().unwrap();
+    let pa = &st.providers["codex"];
+    assert_eq!(pa.accounts.len(), 1);
+    assert!(pa.unparsed_accounts.is_empty());
+}
+
+#[test]
+fn upsert_and_remove_drop_the_stale_raw_entry() {
+    let _g = ScopedConfigDir::new();
+    seed_state_with_bad_codex_entry();
+    let mut st = State::load().unwrap();
+    st.upsert_provider_account("codex", provider_account("bad@e.com"));
+    assert!(st.providers["codex"].unparsed_accounts.is_empty());
+    st.save().unwrap();
+
+    seed_state_with_bad_codex_entry();
+    let mut st = State::load().unwrap();
+    assert!(st.remove_provider_account("codex", "bad@e.com"));
+    st.save()
+        .expect("authorised removal of a raw entry must save");
+    let on_disk = std::fs::read_to_string(config_dir().unwrap().join("state.json")).unwrap();
+    assert!(!on_disk.contains("bad@e.com"), "{on_disk}");
+}
+
+#[test]
+fn redact_state_for_dump_leaks_no_token_material_for_claude_or_providers() {
+    // Tokens embedded in keychain_blob / secret_blob appear JSON-escaped in
+    // the dump, so check for raw distinctive substrings (and the key names
+    // that would only appear if a blob were dumped verbatim).
+    let mut st = State::default();
+    let mut a = Account::from_keychain_blob(&blob("LEAKACC-claude", "LEAKREF-claude", 1)).unwrap();
+    a.email = Some("c@e.com".into());
+    st.accounts.push(a);
+    let mut pa = provider_account("p@e.com");
+    pa.access_token = "LEAKACC-prov".into();
+    pa.refresh_token = "LEAKREF-prov".into();
+    pa.secret_blob = "{\"tokens\":{\"access_token\":\"LEAKACC-blob\"}}".into();
+    st.providers
+        .entry("codex".into())
+        .or_default()
+        .accounts
+        .push(pa);
+    let dump = redact_state_for_dump(&st).to_string();
+    assert!(
+        dump.contains("c@e.com") && dump.contains("p@e.com"),
+        "{dump}"
+    );
+    for needle in [
+        "LEAKACC",
+        "LEAKREF",
+        "accessToken",
+        "refreshToken",
+        "access_token\\\"",
+    ] {
+        assert!(!dump.contains(needle), "{needle} leaked in dump: {dump}");
+    }
+}
+
+#[test]
+fn adopt_login_on_non_object_blob_does_not_panic() {
+    for blob in ["[]", "\"x\"", "7", "true"] {
+        let mut a = acct("dev@example.com");
+        a.keychain_blob = blob.to_string();
+        let fresh = Account::from_keychain_blob(
+            &serde_json::json!({ "claudeAiOauth": {
+                "accessToken": "new-at", "refreshToken": "new-rt", "expiresAt": 5 }})
+            .to_string(),
+        )
+        .unwrap();
+        a.adopt_login(&fresh);
+        let o: serde_json::Value = serde_json::from_str(&a.keychain_blob).unwrap();
+        assert_eq!(o["claudeAiOauth"]["accessToken"], "new-at", "blob {blob}");
+    }
+}
+
+#[test]
+fn prune_backups_never_evicts_the_file_just_written() {
+    let g = ScopedConfigDir::new();
+    let d = g.home();
+    // Future-dated old backups sort "newest"; the fresh one has the oldest mtime.
+    touch_at(&d, "state-a.json", 9_000_000_000);
+    touch_at(&d, "state-b.json", 9_000_000_001);
+    touch_at(&d, "state-fresh.json", 1);
+    prune_backups(&d, 2, Some(&d.join("state-fresh.json"))).unwrap();
+    assert!(d.join("state-fresh.json").exists());
+    assert_eq!(file_names(&d).len(), 2);
+}
+
+#[test]
+fn prune_backups_after_a_backward_clock_jump_keeps_recent_history() {
+    let g = ScopedConfigDir::new();
+    let d = g.home();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 1_700_000_000; // touch_at's base
+                         // Written before the clock went back a long way: dated in the future.
+    touch_at(&d, "state-f1.json", 9_000_000_000);
+    touch_at(&d, "state-f2.json", 9_000_000_001);
+    touch_at(&d, "state-f3.json", 9_000_000_002);
+    // Post-jump history: the previous save and the one just written.
+    touch_at(&d, "state-prev.json", now - 10);
+    touch_at(&d, "state-fresh.json", now);
+    prune_backups(&d, 3, Some(&d.join("state-fresh.json"))).unwrap();
+    assert!(
+        d.join("state-prev.json").exists(),
+        "previous post-jump backup evicted: {:?}",
+        file_names(&d)
+    );
+    assert!(d.join("state-fresh.json").exists());
+    assert_eq!(file_names(&d).len(), 3);
+}
+
+#[test]
+fn prune_rejected_dumps_never_evicts_the_dump_just_written() {
+    let g = ScopedConfigDir::new();
+    let d = g.home();
+    touch_at(&d, "state-rejected-a.json", 9_000_000_000);
+    touch_at(&d, "state-rejected-b.json", 9_000_000_001);
+    touch_at(&d, "state-rejected-new.json", 1);
+    prune_rejected_dumps(&d, 2, Some(&d.join("state-rejected-new.json"))).unwrap();
+    assert!(
+        d.join("state-rejected-new.json").exists(),
+        "fresh dump evicted: {:?}",
+        file_names(&d)
+    );
+    assert_eq!(file_names(&d).len(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn write_private_tightens_a_preexisting_wide_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let g = ScopedConfigDir::new();
+    let p = g.home().join("tok.tmp");
+    std::fs::write(&p, "old").unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    write_private(&p, b"secret").unwrap();
+    assert_eq!(
+        std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }

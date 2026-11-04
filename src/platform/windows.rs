@@ -636,6 +636,9 @@ fn userprofile_fallback() -> PathBuf {
 }
 
 impl Paths for WindowsPaths {
+    fn home_env_order(&self) -> [&'static str; 2] {
+        ["USERPROFILE", "HOME"]
+    }
     fn config_dir(&self, app: &str) -> PathBuf {
         appdata_root().join(app)
     }
@@ -830,8 +833,8 @@ mod tests {
     /// effect on the machine running it. Run explicitly on Windows with
     /// `cargo test --all-features -- --ignored windows_autostart_writes_registry_key`,
     /// or via CI's Windows-only "cargo test --ignored" step
-    /// (`.github/workflows/ci.yml`), which runs on every push since
-    /// `windows-latest` runners are disposable per-job VMs.
+    /// (`.github/workflows/ci.yml`), which is currently disabled
+    /// (`if: false`), so this test does not run in CI today.
     #[test]
     #[ignore = "writes to the real HKCU Run key; run with --ignored on Windows"]
     fn windows_autostart_writes_registry_key() {

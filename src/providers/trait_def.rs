@@ -211,6 +211,9 @@ impl Money {
     pub const CREDITS: &'static str = "credits";
     /// Largest exponent we'll format; anything bigger is a garbled response.
     const MAX_EXPONENT: u32 = 12;
+    /// `amount_minor` standing for "unlimited" (see `Credits::spendable`):
+    /// ranks above any real amount and renders as "unlimited".
+    const UNLIMITED_MINOR: i64 = i64::MAX;
 
     pub fn new(amount_minor: i64, exponent: u32, unit: impl Into<String>) -> Option<Self> {
         (exponent <= Self::MAX_EXPONENT).then(|| Money {
@@ -264,6 +267,16 @@ impl Money {
     }
 
     fn render(&self, whole_only: bool) -> String {
+        if self.amount_minor == Self::UNLIMITED_MINOR {
+            return "unlimited".to_string();
+        }
+        // `Deserialize` bypasses `new`'s exponent check; a corrupt cached value
+        // must not overflow `pow` (panic) or wrap it to 0 (divide by zero).
+        if self.exponent > Self::MAX_EXPONENT {
+            return format!("{}e-{} {}", self.amount_minor, self.exponent, self.unit)
+                .trim_end()
+                .to_string();
+        }
         let scale = 10i128.pow(self.exponent);
         let abs = i128::from(self.amount_minor).abs();
         let whole = group_thousands(abs / scale);
@@ -346,9 +359,23 @@ impl Credits {
     /// balance and what's left under the spend cap, whichever are reported.
     /// `None` when credits are off, the cap is reached, nothing is reported,
     /// or nothing is left — i.e. "can this account keep working on credits".
+    /// Unlimited credits are always spendable (until the cap is reported
+    /// reached), whatever balance is reported.
     pub fn spendable(&self) -> Option<Money> {
         if !(self.enabled || self.unlimited) || self.limit_reached {
             return None;
+        }
+        if self.unlimited {
+            let unit = [&self.balance, &self.limit, &self.used]
+                .into_iter()
+                .flatten()
+                .next()
+                .map_or(Money::CREDITS, |m| m.unit.as_str());
+            return Some(Money {
+                amount_minor: Money::UNLIMITED_MINOR,
+                exponent: 0,
+                unit: unit.to_string(),
+            });
         }
         let under_cap = match (&self.limit, &self.used) {
             (Some(limit), Some(used))
@@ -842,6 +869,15 @@ pub trait Provider: Send + Sync + 'static {
         None
     }
 
+    /// Last-resort identification for a blob `identify_credential` could not
+    /// place (e.g. tokens but no embedded identity). May perform ONE network
+    /// request, so it is only called from the invalid_grant last-chance
+    /// fallback, never from polling or watcher paths. Default is `None`.
+    fn identify_credential_online(&self, blob: &str) -> Option<AccountKey> {
+        let _ = blob;
+        None
+    }
+
     /// Report how fresh the blob's access token is right now. Used to pick
     /// the freshest of several observed rotations, and to decide when to
     /// pre-emptively refresh an inactive account.
@@ -896,6 +932,18 @@ fn short_hash(v: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deserialized_money_with_huge_exponent_renders_without_panic() {
+        for exp in [39u32, 200] {
+            let m: Money = serde_json::from_str(&format!(
+                r#"{{"amount_minor":5,"exponent":{exp},"unit":"USD"}}"#
+            ))
+            .unwrap();
+            assert!(m.display().contains('5'));
+            assert!(m.display_whole().contains('5'));
+        }
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -955,6 +1003,27 @@ mod tests {
             ..on(None, None, usd(500))
         };
         assert_eq!(amt(capped), None);
+    }
+
+    #[test]
+    fn unlimited_credits_are_spendable_without_a_balance() {
+        let unlimited = |balance| Credits {
+            enabled: true,
+            unlimited: true,
+            balance,
+            ..Credits::default()
+        };
+        // Codex reports {has_credits, unlimited, balance: "0"}: still spendable.
+        let zero = unlimited(Money::from_decimal_str("0", Money::CREDITS));
+        let left = zero.spendable().expect("unlimited is spendable");
+        assert_eq!(left.display(), "unlimited");
+        assert!(unlimited(None).spendable().is_some());
+        // ...unless the provider says the cap is reached.
+        let capped = Credits {
+            limit_reached: true,
+            ..unlimited(None)
+        };
+        assert_eq!(capped.spendable(), None);
     }
 
     #[test]

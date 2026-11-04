@@ -67,7 +67,17 @@ pub fn migrate_config_dir_if_needed() -> Result<MigrationResult, MigrationError>
     // `parent()` of the new-slug config dir is the base we'd have joined
     // `LEGACY_APP_SLUG` onto), so we derive the base by trimming the app
     // segment off `platform().paths().config_dir(APP_SLUG)`.
-    let new_dir = crate::platform().paths().config_dir(crate::APP_SLUG);
+    migrate_for_config_dir(crate::platform().paths().config_dir(crate::APP_SLUG))
+}
+
+/// Migrate the legacy sibling of `new_dir` into it.
+fn migrate_for_config_dir(new_dir: PathBuf) -> Result<MigrationResult, MigrationError> {
+    // Mirror `store::config_dir`'s guard: an empty or relative config dir
+    // (e.g. `$HOME` unset) means there is no real config to migrate, and
+    // anything matched would be relative to the cwd.
+    if !new_dir.is_absolute() {
+        return Ok(MigrationResult::FreshInstall);
+    }
     let base = new_dir
         .parent()
         .ok_or(MigrationError::NoConfigBase)?
@@ -104,22 +114,68 @@ pub fn migrate_between(old: &Path, new: &Path) -> Result<MigrationResult, Migrat
             }
 
             match std::fs::rename(old, new) {
-                Ok(()) => {
-                    eprintln!(
-                        "usagio: migrated config {} → {}",
-                        old.display(),
-                        new.display()
-                    );
-                    Ok(MigrationResult::Migrated {
-                        from: old.to_path_buf(),
-                        to: new.to_path_buf(),
-                    })
-                }
+                // Silent: the caller prints the user-facing message.
+                Ok(()) => Ok(MigrationResult::Migrated {
+                    from: old.to_path_buf(),
+                    to: new.to_path_buf(),
+                }),
                 Err(e) if is_cross_device(&e) => copy_delete_fallback(old, new),
                 Err(e) => Err(MigrationError::RenameFailed(e)),
             }
         }
     }
+}
+
+/// The user's home directory. The variables are read in the order given by
+/// `Paths::home_env_order` (Windows: `USERPROFILE` then `HOME`, matching
+/// Claude Code's libuv and Codex's `dirs`; Unix: `HOME` then `USERPROFILE`).
+/// An empty value counts as unset (an empty `HOME` would otherwise yield
+/// cwd-relative paths). Env-only so tests that scope `$HOME` stay hermetic.
+pub(crate) fn user_home() -> Option<PathBuf> {
+    let [first, second] = crate::platform().paths().home_env_order();
+    #[cfg(test)]
+    {
+        // Test isolation: only env vars a test explicitly scoped count, and
+        // never another thread's scope over this thread's own config dir. With
+        // none visible, use the thread's HOME_OVERRIDE, else fail loudly like
+        // `store::config_dir` rather than resolve the developer's real home.
+        let any_scoped = crate::env_lock::is_visible(first) || crate::env_lock::is_visible(second);
+        if !any_scoped {
+            return Some(crate::store::home_override().expect(
+                "paths::user_home() called from a unit test with neither HOME \
+                 scoped (env_lock::scoped_env_var) nor a ScopedConfigDir installed",
+            ));
+        }
+        home_from(
+            crate::env_lock::guarded_var(first),
+            crate::env_lock::guarded_var(second),
+        )
+    }
+    #[cfg(not(test))]
+    home_from(std::env::var_os(first), std::env::var_os(second))
+}
+
+/// Read an env var that feeds Claude/Codex path resolution
+/// (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`). Under `cfg(test)` only a value a test
+/// explicitly scoped is visible.
+pub(crate) fn path_env_var(key: &str) -> Option<std::ffi::OsString> {
+    #[cfg(test)]
+    {
+        crate::env_lock::guarded_var(key)
+    }
+    #[cfg(not(test))]
+    std::env::var_os(key)
+}
+
+/// First non-empty of the two values, in priority order.
+fn home_from(
+    first: Option<std::ffi::OsString>,
+    second: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    first
+        .filter(|h| !h.is_empty())
+        .or_else(|| second.filter(|h| !h.is_empty()))
+        .map(PathBuf::from)
 }
 
 // -------------------------------------------------------------------------
@@ -437,6 +493,76 @@ mod tests {
     fn is_cross_device_false_for_other_errors() {
         assert!(!is_cross_device(&io::Error::from_raw_os_error(2)));
         assert!(!is_cross_device(&io::Error::other("boom")));
+    }
+
+    /// With `$HOME` unset the platform config dir is cwd-relative; the
+    /// migration must not move a cwd-relative `.config/claude-usage`.
+    #[test]
+    fn relative_config_dir_is_never_migrated() {
+        let cwd = tempfile::tempdir_in(".").unwrap();
+        let rel = PathBuf::from(cwd.path().file_name().unwrap());
+        write(
+            &rel.join(crate::LEGACY_APP_SLUG).join("state.json"),
+            b"{}",
+            0o600,
+        );
+        let r = migrate_for_config_dir(rel.join(crate::APP_SLUG)).unwrap();
+        assert!(matches!(r, MigrationResult::FreshInstall), "{r:?}");
+        assert!(rel.join(crate::LEGACY_APP_SLUG).join("state.json").exists());
+    }
+
+    // --- user_home ---
+
+    #[test]
+    fn home_from_prefers_home_then_userprofile_and_treats_empty_as_unset() {
+        use std::ffi::OsString;
+        let o = |s: &str| Some(OsString::from(s));
+        assert_eq!(home_from(o("/h"), o("/u")), Some(PathBuf::from("/h")));
+        assert_eq!(home_from(None, o("/u")), Some(PathBuf::from("/u")));
+        assert_eq!(home_from(o(""), o("/u")), Some(PathBuf::from("/u")));
+        assert_eq!(home_from(o(""), o("")), None);
+        assert_eq!(home_from(None, None), None);
+    }
+
+    #[test]
+    fn user_home_with_empty_home_is_not_cwd_relative() {
+        crate::env_lock::scoped_env_var("HOME", Some(""), || {
+            assert_ne!(user_home(), Some(PathBuf::from("")));
+        });
+    }
+
+    #[test]
+    fn user_home_reads_the_platform_env_order_first() {
+        // Whatever variable the platform ranks first wins over the second,
+        // even when the second is set to something else.
+        let [first, second] = crate::platform().paths().home_env_order();
+        let _l = crate::env_lock::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct Restore([(&'static str, Option<std::ffi::OsString>); 2]);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (k, v) in &self.0 {
+                    #[allow(clippy::disallowed_methods)]
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+        let _restore = Restore([
+            (first, std::env::var_os(first)),
+            (second, std::env::var_os(second)),
+        ]);
+        #[allow(clippy::disallowed_methods)]
+        {
+            std::env::set_var(first, "/usagio-first-home");
+            std::env::set_var(second, "/usagio-second-home");
+        }
+        let _m1 = crate::env_lock::mark_scoped(first);
+        let _m2 = crate::env_lock::mark_scoped(second);
+        assert_eq!(user_home(), Some(PathBuf::from("/usagio-first-home")));
     }
 
     // --- config_base (XDG-first resolution) ---
