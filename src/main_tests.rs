@@ -7582,7 +7582,11 @@ fn cli_wait_loop_does_not_replay_its_pick_over_a_newer_queued_one() {
         });
         let after = State::load().unwrap();
         let now = after.provider_accounts("codex").unwrap();
-        assert_ne!(now.active.as_deref(), Some(a), "stale CLI pick replaced the newer one");
+        assert_ne!(
+            now.active.as_deref(),
+            Some(a),
+            "stale CLI pick replaced the newer one"
+        );
         assert_eq!(now.pending_switch.as_ref().map(|p| p.key.as_str()), Some(b));
     });
 }
@@ -7611,7 +7615,10 @@ fn guarded_switch_refuses_a_target_removed_during_phase_one() {
         st.save().unwrap();
         let _ = switch_to_guarded(provider, "b@e.com", &acct, &identity, false, None, false);
         assert_eq!(State::load().unwrap().active.as_deref(), Some("a@e.com"));
-        assert_ne!(keychain_access_token().as_deref(), Some(acct.access_token.as_str()));
+        assert_ne!(
+            keychain_access_token().as_deref(),
+            Some(acct.access_token.as_str())
+        );
     });
 }
 
@@ -7727,5 +7734,9 @@ fn report_counts_only_claude_swaps() {
         ..sample("a@e.com", 0.0, 1)
     };
     let samples = [swap(Some("codex")), swap(Some("claude")), swap(None)];
-    assert_eq!(report_swap_count(&samples), 2, "codex swaps entered the Claude report");
+    assert_eq!(
+        report_swap_count(&samples),
+        2,
+        "codex swaps entered the Claude report"
+    );
 }
