@@ -521,8 +521,17 @@ fn login_expiring_in(a: &AcctView, now: DateTime<Utc>) -> Option<chrono::Duratio
     (left <= chrono::Duration::seconds(crate::login::RENEW_WINDOW_SECS)).then_some(left)
 }
 
+/// A login whose expiry has already passed (it can't be renewed in place by
+/// a refresh any more; the renew flow is the only way back).
+fn login_expired(left: chrono::Duration) -> bool {
+    left <= chrono::Duration::zero()
+}
+
 /// Coarse "time left" for a login expiry: days, then hours.
 fn login_left_label(left: chrono::Duration) -> String {
+    if login_expired(left) {
+        return "expired".to_string();
+    }
     match (left.num_days(), left.num_hours()) {
         (d, _) if d >= 1 => format!("{d}d"),
         (_, h) if h >= 1 => format!("{h}h"),
@@ -617,6 +626,12 @@ fn trailing_usage_for_account(
     // A login about to die outranks usage: once it's gone the numbers freeze
     // and the account can't be switched to. Full detail is in the submenu.
     if let Some(left) = login_expiring_in(a, now) {
+        // Already past its expiry: the same treatment as a rejected login.
+        if login_expired(left) {
+            let t = "⚠ renew".to_string();
+            let len = u16len(&t);
+            return (t, vec![(0, len, Severity::Red)]);
+        }
         let t = format!("renew · {}", login_left_label(left));
         let len = u16len(&t);
         return (t, vec![(0, len, Severity::Amber)]);
@@ -1423,33 +1438,57 @@ pub(crate) fn poll_loop_with(opts: &LoopOpts) {
     }
 }
 
+/// The engine role held by `poll_loop_with`. Dropping it (the loop unwinding
+/// on a panic, before the supervisor's respawn backoff) releases the flock, so
+/// it also marks this process display-only: another process may take the lock
+/// in that window, and a manual refresh here must not run a second engine.
+struct EngineLock {
+    _file: Option<std::fs::File>,
+}
+
+impl Drop for EngineLock {
+    fn drop(&mut self) {
+        ENGINE_DISPLAY_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Take the engine lock (`~/.config/usagio/engine.lock`, a non-blocking
-/// flock), waiting while another process holds it. Returns the open file (the
-/// lock lives as long as it does), or `None` if the lock file can't be used at
-/// all — then this process runs the engine anyway rather than never polling.
-fn acquire_engine_lock() -> Option<std::fs::File> {
+/// flock), waiting while another process holds it. The returned guard holds the
+/// open file (the lock lives as long as it does); it holds no file if the lock
+/// file can't be used at all — then this process runs the engine anyway rather
+/// than never polling.
+fn acquire_engine_lock() -> EngineLock {
     use fs2::FileExt;
     let mut logged = false;
     loop {
-        let file = crate::store::config_dir().ok().and_then(|d| {
-            let _ = std::fs::create_dir_all(&d);
-            std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(d.join("engine.lock"))
-                .ok()
-        });
-        let Some(file) = file else {
-            crate::logging::log("event=engine_lock_unavailable ; running the engine unlocked");
-            return None;
+        let opened = crate::store::config_dir()
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|d| {
+                let _ = std::fs::create_dir_all(&d);
+                let path = d.join("engine.lock");
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(&path)
+                    .map_err(|e| format!("{}: {e}", path.display()))
+            });
+        let file = match opened {
+            Ok(f) => f,
+            Err(why) => {
+                crate::logging::log(&format!(
+                    "event=engine_lock_unavailable error={why} ; running the engine unlocked"
+                ));
+                ENGINE_DISPLAY_ONLY.store(false, std::sync::atomic::Ordering::SeqCst);
+                return EngineLock { _file: None };
+            }
         };
         if file.try_lock_exclusive().is_ok() {
             ENGINE_DISPLAY_ONLY.store(false, std::sync::atomic::Ordering::SeqCst);
             if logged {
                 crate::logging::log("event=engine_lock_acquired");
             }
-            return Some(file);
+            return EngineLock { _file: Some(file) };
         }
         ENGINE_DISPLAY_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
         if !logged {
@@ -1603,6 +1642,7 @@ fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     static LAST_CHECK: Mutex<Option<Instant>> = Mutex::new(None);
+    static FAILED_TARGET: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
     {
         let mut g = LAST_CHECK.lock().unwrap();
         let should_check = !matches!(*g, Some(t) if t.elapsed() < Duration::from_secs(10));
@@ -1616,7 +1656,8 @@ fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
     let Ok(now) = std::fs::canonicalize(&stable) else {
         return;
     };
-    if now == start {
+    let mut failed = FAILED_TARGET.lock().unwrap_or_else(|e| e.into_inner());
+    if !relaunch_due(start, &now, failed.as_deref()) {
         return;
     }
     crate::logging::log("binary changed on disk (brew upgrade); relaunching");
@@ -1630,7 +1671,10 @@ fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
             // Under launchd but the kickstart didn't take. Staying on the current
             // (old) binary — alive — is far better than exiting into a dead,
             // never-restarted state (KeepAlive=false won't bring us back).
-            crate::logging::log("launchctl kickstart failed; staying on current version");
+            crate::logging::log(
+                "launchctl kickstart failed; staying on current version until the binary changes again",
+            );
+            *failed = Some(now);
         }
         LaunchdRestart::NotManaged => {
             // Bare run (no launchd job): an orphaned child re-parents to
@@ -1638,12 +1682,26 @@ fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
             // actually succeeded, else we'd vanish with no replacement.
             match std::process::Command::new(&stable).arg("menubar").spawn() {
                 Ok(_) => std::process::exit(0),
-                Err(e) => crate::logging::log(&format!(
-                    "relaunch spawn failed: {e}; staying on current version"
-                )),
+                Err(e) => {
+                    crate::logging::log(&format!(
+                        "relaunch spawn failed: {e}; staying on current version until the binary changes again"
+                    ));
+                    *failed = Some(now);
+                }
             }
         }
     }
+}
+
+/// Whether the binary at `now` should be relaunched into: it differs from the
+/// one this process started from, and a relaunch into it hasn't already failed
+/// (a failure isn't retried every 10s; a newer binary is tried again).
+fn relaunch_due(
+    start: &std::path::Path,
+    now: &std::path::Path,
+    failed: Option<&std::path::Path>,
+) -> bool {
+    now != start && failed != Some(now)
 }
 
 /// Outcome of attempting a launchd-driven restart.
@@ -2123,21 +2181,34 @@ fn probe_installed(_slug: &str) -> bool {
     true
 }
 
-/// Return the parsed state, re-reading state.json only when its mtime changed.
-/// The 0.75s UI tick would otherwise read+parse the file every tick forever.
-/// Only the main thread calls this, but a Mutex keeps it trivially sound.
+/// Identity of one version of state.json: mtime, length and (on unix) inode.
+/// Every save is a tmp+rename, so a new inode tells two saves apart even when
+/// a coarse filesystem clock gives them the same mtime.
+type StateFileKey = Option<(std::time::SystemTime, u64, u64)>;
+
+fn state_file_key(path: &std::path::Path) -> StateFileKey {
+    let m = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(&m);
+    #[cfg(not(unix))]
+    let ino = 0;
+    Some((m.modified().ok()?, m.len(), ino))
+}
+
+/// Return the parsed state, re-reading state.json only when the file changed
+/// (see [`state_file_key`]). The 0.75s UI tick would otherwise read+parse the
+/// file every tick forever. A Mutex keeps the shared cache sound.
 fn cached_state() -> State {
     use std::sync::{Mutex, OnceLock};
-    use std::time::SystemTime;
     struct C {
-        mtime: Option<SystemTime>,
+        key: StateFileKey,
         state: State,
         loaded: bool,
     }
     static CELL: OnceLock<Mutex<C>> = OnceLock::new();
     let cell = CELL.get_or_init(|| {
         Mutex::new(C {
-            mtime: None,
+            key: None,
             state: State::default(),
             loaded: false,
         })
@@ -2145,11 +2216,11 @@ fn cached_state() -> State {
     let path = crate::store::config_dir()
         .map(|d| d.join("state.json"))
         .unwrap_or_default();
-    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    let key = state_file_key(&path);
     let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.loaded || g.mtime != mtime {
+    if !g.loaded || g.key != key {
         g.state = State::load().unwrap_or_default();
-        g.mtime = mtime;
+        g.key = key;
         g.loaded = true;
     }
     g.state.clone()
@@ -2364,13 +2435,15 @@ fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)
         return rows;
     }
     if let Some(left) = login_expiring_in(a, now_utc()) {
-        rows.push((
+        let row = if login_expired(left) {
+            "⚠ Login expired — Renew login… below".to_string()
+        } else {
             format!(
                 "Login expires in {} — Renew login… below",
                 login_left_label(left)
-            ),
-            true,
-        ));
+            )
+        };
+        rows.push((row, true));
     }
     if let Some(err) = &a.error {
         rows.push((format!("⚠ Refresh error: {err}"), true));
@@ -2399,6 +2472,7 @@ fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)
             // line (its countdown is meaningless while the weekly limit blocks all
             // use). The "Weekly locked · unlocks in X" row says everything.
             let weekly_locked = a.windows.iter().any(|w| w.id == "weekly" && locked_now(w));
+            let before = rows.len();
             for w in ordered {
                 if weekly_locked && !locked_now(w) {
                     continue;
@@ -2413,8 +2487,10 @@ fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)
             // What the provider itself reported beyond the windows (credits,
             // where the week went, per-model limits) — never estimates.
             rows.extend(reported_rows(&a.reported).into_iter().map(|r| (r, false)));
-            if !rows.iter().any(|(r, _)| !r.starts_with("Plan · ")) {
-                rows.push(("no data yet".to_string(), false));
+            // Usage is known (the header shows it); only the reset times are
+            // missing, so say that rather than "no data yet".
+            if rows.len() == before {
+                rows.push(("reset times not reported".to_string(), false));
             }
         } else {
             rows.push(("no data yet".to_string(), false));
@@ -3681,11 +3757,15 @@ static BROWSER_LOGINS: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 fn track_browser_login(slug: &str, progress: std::sync::Arc<crate::login::Progress>) {
-    BROWSER_LOGINS
+    let replaced = BROWSER_LOGINS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(Default::default)
-        .insert(slug.to_string(), progress);
+        .insert(slug.to_string(), std::sync::Arc::clone(&progress));
+    // A flow replaced here would otherwise keep its listener, untracked.
+    if let Some(old) = replaced.filter(|old| !std::sync::Arc::ptr_eq(old, &progress)) {
+        old.supersede();
+    }
 }
 
 /// Supersede the previous browser login for `slug`, if any. Never blocks; the
@@ -3697,6 +3777,11 @@ fn supersede_previous_login(slug: &str) -> Option<std::sync::Arc<crate::login::P
         .unwrap_or_else(|e| e.into_inner())
         .as_mut()
         .and_then(|m| m.remove(slug))?;
+    // A finished flow holds no listener: nothing to wait for, so the new
+    // sign-in runs inline and may use the sign-in window.
+    if prev.is_finished() {
+        return None;
+    }
     prev.supersede();
     Some(prev)
 }
@@ -3964,6 +4049,15 @@ fn confirm(question: &str) -> bool {
     confirm_with_button(question, "Remove")
 }
 
+/// What the user answered: `Some(true)` for `button`, `Some(false)` for any
+/// other button, `None` when the dialog produced no button at all.
+fn confirm_answer(result: rfd::MessageDialogResult, button: &str) -> Option<bool> {
+    match result {
+        rfd::MessageDialogResult::Custom(label) => Some(label == button),
+        _ => None,
+    }
+}
+
 fn confirm_with_button(question: &str, button: &str) -> bool {
     let result = rfd::MessageDialog::new()
         .set_title("usagio")
@@ -3974,7 +4068,19 @@ fn confirm_with_button(question: &str, button: &str) -> bool {
             "Cancel".to_string(),
         ))
         .show();
-    matches!(result, rfd::MessageDialogResult::Custom(label) if label == button)
+    // Both buttons are custom, so a non-button result means the dialog was
+    // dismissed without one or could not be shown at all (Linux without
+    // zenity). Still fail closed, but say so instead of doing nothing.
+    confirm_answer(result, button).unwrap_or_else(|| {
+        crate::logging::log(&format!(
+            "event=confirm_dialog_no_answer button={button:?} ; nothing changed"
+        ));
+        notify(
+            "No answer from the confirmation dialog — nothing was changed \
+             (on Linux this dialog needs zenity installed)",
+        );
+        false
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -5121,6 +5227,21 @@ mod tests {
         assert_eq!(trailing_for_account(&a, bands(), now).0, "⚠ renew");
         let rows = submenu_info_rows(&claude_section(), &a);
         assert_eq!(rows, vec!["⚠ Login expired — Renew login… below"]);
+    }
+
+    #[test]
+    fn a_lapsed_renewable_login_reads_expired_not_under_an_hour() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        with_now(now, || {
+            let mut a = acct("dev@example.com", Some(10.0), Some(20.0), false);
+            a.renewable = true;
+            a.login_expires_at = Some(now - chrono::Duration::hours(3));
+            let (t, colors) = trailing_for_account(&a, bands(), now);
+            assert_eq!(t, "⚠ renew");
+            assert_eq!(colors[0].2, Severity::Red);
+            let rows = submenu_info_rows(&claude_section(), &a);
+            assert_eq!(rows[0], "⚠ Login expired — Renew login… below", "{rows:?}");
+        });
     }
 
     #[test]
@@ -7298,6 +7419,37 @@ mod tests {
         let mut a = acct("a@x.com", None, Some(40.0), true);
         a.windows[0].reset.clear();
         assert_eq!(submenu_info_rows(&sec, &a), ["Weekly renews in 2d"]);
+
+        // Usage known but no reset times reported: the header shows the
+        // percentages, so the submenu must not claim there is no data.
+        let mut a = acct("a@x.com", Some(40.0), Some(20.0), true);
+        for w in &mut a.windows {
+            w.reset.clear();
+        }
+        a.plan = Some("Max".into());
+        assert_eq!(
+            submenu_info_rows(&sec, &a),
+            ["Plan · Max", "reset times not reported"]
+        );
+    }
+
+    #[test]
+    fn an_expiring_login_row_does_not_hide_the_usage_fallback() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        with_now(now, || {
+            let mut a = acct("a@x.com", Some(40.0), Some(20.0), true);
+            for w in &mut a.windows {
+                w.reset.clear();
+            }
+            a.renewable = true;
+            a.login_expires_at = Some(now + chrono::Duration::days(2));
+            let rows = submenu_info_rows(&claude_section(), &a);
+            assert_eq!(
+                rows.last().map(String::as_str),
+                Some("reset times not reported"),
+                "{rows:?}"
+            );
+        });
     }
 
     #[test]
@@ -7729,14 +7881,46 @@ mod tests {
             "changed mtime reloads"
         );
 
-        // New content but the SAME mtime → the cache is trusted (no re-parse
-        // every 0.75s tick).
-        st.trigger_pct = Some(70.0);
-        save_state_with_mtime(&st, tag2);
+        // The same file rewritten in place (same inode, length and mtime) → the
+        // cache is trusted (no re-parse every 0.75s tick).
+        let path = crate::store::config_dir().unwrap().join("state.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("80.0", "70.0");
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut &f, text.as_bytes()).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000 + tag2))
+            .unwrap();
+        drop(f);
         assert_eq!(
             cached_state().trigger_pct,
             Some(80.0),
             "unchanged mtime hits the cache"
+        );
+    }
+
+    #[test]
+    fn cached_state_reloads_a_save_that_lands_on_the_same_mtime() {
+        let _l = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::store::ScopedConfigDir::new();
+        let tag = next_mtime_tag();
+        let mut st = State {
+            trigger_pct: Some(90.0),
+            ..State::default()
+        };
+        save_state_with_mtime(&st, tag);
+        assert_eq!(cached_state().trigger_pct, Some(90.0));
+        // A second atomic save within one coarse timestamp tick.
+        st.trigger_pct = Some(85.5);
+        save_state_with_mtime(&st, tag);
+        assert_eq!(
+            cached_state().trigger_pct,
+            Some(85.5),
+            "a new save must not be hidden behind an equal mtime"
         );
     }
 
@@ -8369,6 +8553,26 @@ mod tests {
     }
 
     #[test]
+    fn dropping_the_engine_lock_makes_the_process_display_only() {
+        use std::sync::atomic::Ordering;
+        let _l = REFRESH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::store::ScopedConfigDir::new();
+        ENGINE_DISPLAY_ONLY.store(true, Ordering::SeqCst);
+        let lock = acquire_engine_lock();
+        let owner = !ENGINE_DISPLAY_ONLY.load(Ordering::SeqCst);
+        // A poll_loop panic unwinds and drops the lock before the respawn
+        // backoff; another process may take it then.
+        drop(lock);
+        let after_drop = ENGINE_DISPLAY_ONLY.load(Ordering::SeqCst);
+        ENGINE_DISPLAY_ONLY.store(false, Ordering::SeqCst);
+        assert!(owner, "holding engine.lock makes this process the owner");
+        assert!(
+            after_drop,
+            "a released engine.lock must not leave Refresh-now running an engine"
+        );
+    }
+
+    #[test]
     fn panic_loop_exits_only_when_a_restart_was_issued() {
         assert_eq!(
             panic_loop_response(&LaunchdRestart::Issued),
@@ -8381,6 +8585,68 @@ mod tests {
                 "KeepAlive=false means a bare exit is never restarted"
             );
         }
+    }
+
+    #[test]
+    fn a_finished_browser_login_is_not_superseded_and_leaves_the_registry() {
+        let done = std::sync::Arc::new(crate::login::Progress::default());
+        track_browser_login("t-login-done", done.clone());
+        done.mark_finished();
+        assert!(
+            supersede_previous_login("t-login-done").is_none(),
+            "a finished flow holds no listener: the next sign-in may use the window"
+        );
+        assert!(supersede_previous_login("t-login-done").is_none());
+    }
+
+    #[test]
+    fn tracking_a_new_browser_login_supersedes_the_one_it_replaces() {
+        let old = std::sync::Arc::new(crate::login::Progress::default());
+        let new = std::sync::Arc::new(crate::login::Progress::default());
+        track_browser_login("t-login-replace", old.clone());
+        track_browser_login("t-login-replace", new.clone());
+        assert!(
+            old.is_superseded(),
+            "a replaced flow must not keep its listener untracked"
+        );
+        assert!(!new.is_cancelled());
+        let prev = supersede_previous_login("t-login-replace").expect("tracked");
+        assert!(std::sync::Arc::ptr_eq(&prev, &new));
+    }
+
+    #[test]
+    fn a_failed_relaunch_is_not_retried_until_the_binary_changes_again() {
+        use std::path::Path;
+        let (a, b, c) = (
+            Path::new("/v1/usagio"),
+            Path::new("/v2/usagio"),
+            Path::new("/v3/usagio"),
+        );
+        assert!(!relaunch_due(a, a, None), "unchanged binary");
+        assert!(relaunch_due(a, b, None), "first sight of a new binary");
+        assert!(
+            !relaunch_due(a, b, Some(b)),
+            "a relaunch into this binary already failed"
+        );
+        assert!(relaunch_due(a, c, Some(b)), "a newer binary retries");
+    }
+
+    #[test]
+    fn confirm_tells_a_dialog_failure_from_a_cancel() {
+        use rfd::MessageDialogResult as R;
+        assert_eq!(
+            confirm_answer(R::Custom("Remove".into()), "Remove"),
+            Some(true)
+        );
+        assert_eq!(
+            confirm_answer(R::Custom("Cancel".into()), "Remove"),
+            Some(false)
+        );
+        assert_eq!(
+            confirm_answer(R::Cancel, "Remove"),
+            None,
+            "a non-button result means the dialog could not be shown"
+        );
     }
 
     #[test]
