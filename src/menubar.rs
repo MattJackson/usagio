@@ -2453,6 +2453,7 @@ fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)
             // line (its countdown is meaningless while the weekly limit blocks all
             // use). The "Weekly locked · unlocks in X" row says everything.
             let weekly_locked = a.windows.iter().any(|w| w.id == "weekly" && locked_now(w));
+            let before = rows.len();
             for w in ordered {
                 if weekly_locked && !locked_now(w) {
                     continue;
@@ -2467,8 +2468,10 @@ fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)
             // What the provider itself reported beyond the windows (credits,
             // where the week went, per-model limits) — never estimates.
             rows.extend(reported_rows(&a.reported).into_iter().map(|r| (r, false)));
-            if !rows.iter().any(|(r, _)| !r.starts_with("Plan · ")) {
-                rows.push(("no data yet".to_string(), false));
+            // Usage is known (the header shows it); only the reset times are
+            // missing, so say that rather than "no data yet".
+            if rows.len() == before {
+                rows.push(("reset times not reported".to_string(), false));
             }
         } else {
             rows.push(("no data yet".to_string(), false));
@@ -7367,6 +7370,37 @@ mod tests {
         let mut a = acct("a@x.com", None, Some(40.0), true);
         a.windows[0].reset.clear();
         assert_eq!(submenu_info_rows(&sec, &a), ["Weekly renews in 2d"]);
+
+        // Usage known but no reset times reported: the header shows the
+        // percentages, so the submenu must not claim there is no data.
+        let mut a = acct("a@x.com", Some(40.0), Some(20.0), true);
+        for w in &mut a.windows {
+            w.reset.clear();
+        }
+        a.plan = Some("Max".into());
+        assert_eq!(
+            submenu_info_rows(&sec, &a),
+            ["Plan · Max", "reset times not reported"]
+        );
+    }
+
+    #[test]
+    fn an_expiring_login_row_does_not_hide_the_usage_fallback() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        with_now(now, || {
+            let mut a = acct("a@x.com", Some(40.0), Some(20.0), true);
+            for w in &mut a.windows {
+                w.reset.clear();
+            }
+            a.renewable = true;
+            a.login_expires_at = Some(now + chrono::Duration::days(2));
+            let rows = submenu_info_rows(&claude_section(), &a);
+            assert_eq!(
+                rows.last().map(String::as_str),
+                Some("reset times not reported"),
+                "{rows:?}"
+            );
+        });
     }
 
     #[test]
