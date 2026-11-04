@@ -511,9 +511,12 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
     let result = (|| -> Result<()> {
         // Remember the current value so a failed add (after the delete has
         // already succeeded) can put it back instead of leaving no credential.
-        let prior = backup_prior(
-            run_security(&["find-generic-password", "-s", service, "-a", account, "-w"]).ok(),
-        )?;
+        let backup_run =
+            run_security(&["find-generic-password", "-s", service, "-a", account, "-w"]);
+        if matches!(&backup_run, Ok(r) if r.timed_out) {
+            timed_out = true;
+        }
+        let prior = backup_prior(backup_run, service, account)?;
         let del = run_security(&["delete-generic-password", "-s", service, "-a", account])
             .context("running `security delete-generic-password` (pre-set)")?;
         if del.timed_out {
@@ -590,9 +593,13 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
 /// `Ok(None)`; any other failure (spawn error, timeout, denied) is an error so
 /// `real_set` aborts BEFORE the destructive delete rather than losing the
 /// credential with no way to restore it.
-fn backup_prior(out: Option<SecurityRun>) -> Result<Option<String>> {
-    let out =
-        out.context("could not run `security find-generic-password` to back up the existing item")?;
+fn backup_prior(out: Result<SecurityRun>, service: &str, account: &str) -> Result<Option<String>> {
+    let out = out.with_context(|| {
+        format!(
+            "running `security find-generic-password` to back up the existing item \
+             (service={service} account={account})"
+        )
+    })?;
     if out.success() {
         return Ok(Some(
             String::from_utf8_lossy(&out.stdout)
@@ -600,7 +607,8 @@ fn backup_prior(out: Option<SecurityRun>) -> Result<Option<String>> {
                 .to_string(),
         ));
     }
-    interpret_get(&out, "", "").context("backing up the existing keychain item before replacing it")
+    interpret_get(&out, service, account)
+        .context("backing up the existing keychain item before replacing it")
 }
 
 /// Best-effort: re-add the secret that `real_set` deleted when the following
@@ -1208,15 +1216,18 @@ mod tests {
     #[test]
     fn backup_prior_fails_unless_success_or_not_found() {
         assert_eq!(
-            backup_prior(Some(run(Some(0), false, "tok\n")))
+            backup_prior(Ok(run(Some(0), false, "tok\n")), "s", "a")
                 .unwrap()
                 .as_deref(),
             Some("tok")
         );
-        assert_eq!(backup_prior(Some(run(Some(44), false, ""))).unwrap(), None);
-        assert!(backup_prior(Some(run(Some(1), false, ""))).is_err());
-        assert!(backup_prior(Some(run(None, true, ""))).is_err());
-        assert!(backup_prior(None).is_err());
+        assert_eq!(
+            backup_prior(Ok(run(Some(44), false, "")), "s", "a").unwrap(),
+            None
+        );
+        assert!(backup_prior(Ok(run(Some(1), false, "")), "s", "a").is_err());
+        assert!(backup_prior(Ok(run(None, true, "")), "s", "a").is_err());
+        assert!(backup_prior(Err(anyhow::anyhow!("spawn")), "s", "a").is_err());
     }
 
     #[test]
