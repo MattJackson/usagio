@@ -239,7 +239,7 @@ pub(crate) fn expand_opencode_env(input: &str) -> String {
 }
 
 /// Convert an opencode `mcp` entry to the Claude-style `{command, args, env}`
-/// (or `{url}`) shape `mcp::fetch_tools` understands. opencode local servers
+/// (or `{url}`) shape `mcp::claude_launch` understands. opencode local servers
 /// use `command` as an argv ARRAY and `environment` for env vars; entries with
 /// `"enabled": false` are not loaded at all (returns `None`). Entries already
 /// in Claude shape (string `command`) pass through unchanged.
@@ -269,10 +269,19 @@ fn translate_mcp_entry(cfg: &serde_json::Value) -> Option<serde_json::Value> {
             "env": env,
         }));
     }
-    if cfg.get("type").and_then(|t| t.as_str()) == Some("remote") && cfg.get("url").is_some() {
-        return Some(serde_json::json!({ "url": cfg["url"] }));
+    match cfg.get("type").and_then(|t| t.as_str()) {
+        // A remote server is never spawned, with or without a `url`.
+        Some("remote") => Some(serde_json::json!({ "type": "remote", "url": cfg.get("url") })),
+        // opencode's local type is stdio.
+        Some("local") => {
+            let mut c = cfg.clone();
+            if let Some(o) = c.as_object_mut() {
+                o.remove("type");
+            }
+            Some(c)
+        }
+        _ => Some(cfg.clone()),
     }
-    Some(cfg.clone())
 }
 
 fn push_file_if_exists(items: &mut Vec<LedgerItem>, path: PathBuf, kind: ItemKind, name: &str) {

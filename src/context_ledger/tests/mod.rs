@@ -1311,3 +1311,94 @@ fn provider_aliases_agree_across_ledger_cost_and_display() {
         );
     });
 }
+
+#[test]
+fn remote_typed_mcp_server_without_url_is_never_spawned() {
+    let td = tempdir().unwrap();
+    for t in ["sse", "http", "ws"] {
+        let marker = td.path().join(t);
+        let cfg = serde_json::json!({
+            "type": t, "command": "/usr/bin/touch", "args": [marker.to_str().unwrap()]
+        });
+        let e = mcp::fetch_tools(&cfg).unwrap_err();
+        assert!(e.contains(&format!("{t} transport")), "{t}: {e}");
+        assert!(!marker.exists(), "{t} server was spawned as stdio");
+    }
+    // An explicit stdio type still probes.
+    let script = format!("read a; echo '{INIT_OK}'; read b; read c; echo '{TOOLS_OK}'; sleep 5");
+    let mut cfg = sh_server(&script);
+    cfg["type"] = "stdio".into();
+    assert_eq!(mcp::fetch_tools(&cfg).unwrap().tool_count, 2);
+}
+
+#[test]
+fn opencode_remote_server_without_url_is_never_spawned() {
+    with_home(|home| {
+        let dir = home.join(".config/opencode");
+        fs::create_dir_all(&dir).unwrap();
+        let marker = home.join("ran");
+        let cfg = serde_json::json!({ "mcp": { "r": {
+            "type": "remote", "command": "/usr/bin/touch", "args": [marker.to_str().unwrap()]
+        } } });
+        fs::write(dir.join("opencode.json"), cfg.to_string()).unwrap();
+        let l = build_ledger("opencode", None).unwrap();
+        assert!(l.items.is_empty(), "{:?}", l.items);
+        assert!(!marker.exists(), "remote server was spawned");
+    });
+}
+
+#[test]
+fn codex_mcp_server_gets_codex_env_and_cwd() {
+    let home = tempdir().unwrap();
+    let dir = home.path().join(".codex");
+    fs::create_dir_all(&dir).unwrap();
+    let work = tempdir().unwrap();
+    let work_dir = fs::canonicalize(work.path()).unwrap();
+    let out = home.path().join("env.txt");
+    let script = format!(
+        "printf '%s|%s|%s|%s|%s' \"$USAGIO_T_PASS\" \"$USAGIO_T_OBJ\" \"$USAGIO_T_LEAK\" \"$USAGIO_T_SET\" \"$(pwd -P)\" > '{}'; \
+         read a; echo '{INIT_OK}'; read b; read c; echo '{TOOLS_OK}'; sleep 5",
+        out.display()
+    );
+    fs::write(
+        dir.join("config.toml"),
+        format!(
+            "[mcp_servers.s]\ncommand = \"/bin/sh\"\nargs = [\"-c\", {script:?}]\n\
+             env_vars = [\"USAGIO_T_PASS\", {{ name = \"USAGIO_T_OBJ\", source = \"local\" }}]\n\
+             env = {{ USAGIO_T_SET = \"set\" }}\ncwd = {:?}\n",
+            work_dir.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    with_env(
+        &[
+            ("HOME", home.path().to_str()),
+            ("USAGIO_T_PASS", Some("pass")),
+            ("USAGIO_T_OBJ", Some("obj")),
+            ("USAGIO_T_LEAK", Some("leak")),
+        ],
+        || {
+            let l = build_ledger("codex", None).unwrap();
+            assert_eq!(l.items.len(), 1, "{:?}", l.items);
+            assert_eq!(l.items[0].tool_count, Some(2));
+        },
+    );
+    let got = fs::read_to_string(&out).unwrap();
+    assert_eq!(got, format!("pass|obj||set|{}", work_dir.display()));
+}
+
+#[test]
+fn codex_launch_rejects_remote_env_vars_and_defaults_cwd_to_project() {
+    let cfg = serde_json::json!({
+        "command": "x", "env_vars": [{ "name": "A", "source": "remote" }]
+    });
+    assert!(mcp::codex_launch(&cfg, None)
+        .unwrap_err()
+        .contains("remote"));
+    let cfg = serde_json::json!({ "command": "x" });
+    let l = mcp::codex_launch(&cfg, Some(std::path::Path::new("/proj"))).unwrap();
+    assert!(l.clear_env);
+    assert_eq!(l.cwd.as_deref(), Some(std::path::Path::new("/proj")));
+    let e = mcp::codex_launch(&serde_json::json!({ "url": "https://x" }), None).unwrap_err();
+    assert!(e.contains("http transport"), "{e}");
+}

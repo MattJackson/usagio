@@ -186,16 +186,34 @@ pub(crate) fn read_capped_max(path: &Path, max: u64) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// Probe every MCP server concurrently (each has its own wall-clock budget, so
-/// serial probing made total latency the SUM of all servers). Results keep the
-/// input order.
+/// Probe every Claude-Code-shaped MCP server config concurrently.
 pub(crate) fn probe_servers(
     servers: Vec<(String, serde_json::Value)>,
+) -> Vec<(String, Result<mcp::McpSummary, String>)> {
+    probe_launches(
+        servers
+            .into_iter()
+            .map(|(name, cfg)| (name, mcp::claude_launch(&cfg)))
+            .collect(),
+    )
+}
+
+/// Probe every resolved MCP launch concurrently (each has its own wall-clock
+/// budget, so serial probing made total latency the SUM of all servers).
+/// A server that failed to resolve keeps its error. Results keep the input
+/// order.
+pub(crate) fn probe_launches(
+    servers: Vec<(String, Result<mcp::Launch, String>)>,
 ) -> Vec<(String, Result<mcp::McpSummary, String>)> {
     std::thread::scope(|scope| {
         let handles: Vec<_> = servers
             .iter()
-            .map(|(_, cfg)| scope.spawn(move || mcp::fetch_tools(cfg)))
+            .map(|(_, launch)| {
+                scope.spawn(move || match launch {
+                    Ok(l) => mcp::fetch_launch(l),
+                    Err(e) => Err(e.clone()),
+                })
+            })
             .collect();
         servers
             .iter()
