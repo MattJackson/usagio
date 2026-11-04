@@ -6,7 +6,7 @@
 //! Path layout: `~/.config/usagio/history.YYYY-MM.ndjson`. One JSON
 //! object per line, keyed by (`provider`, `account`), always in UTC.
 //!
-//! The append path is O_APPEND-atomic per line (single small `writeln!`), so
+//! The append path is O_APPEND-atomic per line (one `write_all` of the whole line; see `write_line`), so
 //! concurrent writers from the daemon and menu-bar can never interleave a
 //! record. Writes are batched-fsynced (every 24 rows, or when the appender is
 //! dropped) so a crash loses at most a couple of poll cycles.
@@ -151,11 +151,17 @@ pub fn append(snap: &Snapshot) -> Result<()> {
     let mut guard = appender_slot().lock().unwrap();
     let reopen = guard.as_ref().map(|a| a.path != path).unwrap_or(true);
     if reopen {
+        // A new month file: prune expired ones now too, so a long-lived
+        // daemon enforces the retention bound without a restart.
+        let _ = rotate_files(&dir, Utc::now());
         // Dropping the old appender flushes any un-fsynced rows.
         *guard = None;
         *guard = Some(Appender::open(&path)?);
     }
-    guard.as_mut().unwrap().write_snap(snap)
+    let before = file_stamp(&path);
+    let written = guard.as_mut().unwrap().write_snap(snap)?;
+    cache_note_append(&path, snap, before, written);
+    Ok(())
 }
 
 /// Explicit rotation entry point: prune history files older than
@@ -204,7 +210,7 @@ pub fn last_n_days(account: &AccountKey, days: u32) -> Vec<Snapshot> {
 /// O(accounts × month_rows) per poll tick (last_snapshot + pace, per account)
 /// plus two more full scans per account per menu redraw. Indexing by
 /// `AccountKey` once at parse time makes each read O(that account's rows).
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct MonthIndex {
     by_account: HashMap<AccountKey, Vec<Snapshot>>,
 }
@@ -227,7 +233,31 @@ impl MonthIndex {
 /// have opened anyway are cached — no proactive scan.
 /// Value: (mtime at parse time, the account-indexed snapshots). The index is
 /// wrapped in `Arc` so a cache hit is a refcount bump, not a clone.
-type MonthCacheEntry = (SystemTime, Arc<MonthIndex>);
+type MonthCacheEntry = (FileStamp, Arc<MonthIndex>);
+
+/// Cache validity key: mtime alone misses an append inside one coarse mtime
+/// tick, so the length is part of the stamp.
+type FileStamp = (SystemTime, u64);
+
+fn file_stamp(path: &Path) -> FileStamp {
+    match std::fs::metadata(path) {
+        Ok(m) => (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len()),
+        Err(_) => (SystemTime::UNIX_EPOCH, 0),
+    }
+}
+
+/// Months a reader can ask for (35 days back) plus slack; older cache entries
+/// are dropped on insert so a long-lived daemon doesn't keep every month.
+const CACHE_KEEP_MONTHS: i32 = 4;
+
+fn month_ordinal(year: i32, month: u32) -> i32 {
+    year * 12 + month as i32
+}
+
+#[cfg(test)]
+thread_local! {
+    static PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Default)]
 struct MonthCache {
@@ -280,42 +310,98 @@ fn read_range_cached(
     out
 }
 
-/// Return all snapshots in month file `path`, using the cached copy when its
-/// mtime matches. Missing file yields an empty vec (cached as UNIX_EPOCH so
-/// a later create-and-write invalidates it).
+/// Return all snapshots in month file `path`, using the cached copy while its
+/// stamp (mtime + length) matches. Missing file yields an empty index (stamped
+/// as UNIX_EPOCH/0 so a later create-and-write invalidates it). The parse runs
+/// outside the cache lock so other readers never wait on it.
 fn load_month_cached(path: &Path, year: i32, month: u32) -> Arc<MonthIndex> {
-    let mtime = std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH);
+    load_month_cached_with(path, year, month, || {})
+}
 
-    if let Ok(mut cache) = month_cache().lock() {
-        if let Some((stamp, index)) = cache.months.get(&(year, month)) {
-            if *stamp == mtime {
+/// `after_parse` runs between the parse and the re-stat (a test seam for a
+/// writer landing mid-parse).
+fn load_month_cached_with(
+    path: &Path,
+    year: i32,
+    month: u32,
+    after_parse: impl FnOnce(),
+) -> Arc<MonthIndex> {
+    let stamp = file_stamp(path);
+
+    if let Ok(cache) = month_cache().lock() {
+        if let Some((cached, index)) = cache.months.get(&(year, month)) {
+            if *cached == stamp {
                 return Arc::clone(index);
             }
         }
-        // Cache miss / stale — parse, index by account, and store.
-        let index = Arc::new(MonthIndex::build(parse_month(path)));
-        cache
-            .months
-            .insert((year, month), (mtime, Arc::clone(&index)));
+    }
+    // Cache miss / stale — parse (unlocked), index by account, and store.
+    let index = Arc::new(MonthIndex::build(parse_month(path)));
+    after_parse();
+    // Cache only if the file did not move during the parse: an index that may
+    // hold rows newer than its stamp would be double-patched by a later append.
+    if file_stamp(path) != stamp {
         return index;
     }
-    // Fallback if lock is poisoned: skip cache.
-    Arc::new(MonthIndex::build(parse_month(path)))
+    if let Ok(mut cache) = month_cache().lock() {
+        cache
+            .months
+            .insert((year, month), (stamp, Arc::clone(&index)));
+        let now = Utc::now();
+        let floor = month_ordinal(now.year(), now.month()) - CACHE_KEEP_MONTHS;
+        cache
+            .months
+            .retain(|(y, m), _| month_ordinal(*y, *m) >= floor);
+    }
+    index
+}
+
+/// After `append` wrote `line_len` bytes to `path`: patch the cached month in
+/// place when nothing else touched the file (so the next read does not re-parse
+/// the whole month), otherwise drop the entry.
+fn cache_note_append(path: &Path, snap: &Snapshot, before: FileStamp, line_len: u64) {
+    let after = file_stamp(path);
+    let (year, month) = (snap.ts.year(), snap.ts.month());
+    let Ok(mut cache) = month_cache().lock() else {
+        return;
+    };
+    let patched = match cache.months.get_mut(&(year, month)) {
+        Some((stamp, index)) if *stamp == before && after.1 == before.1 + line_len => {
+            Arc::make_mut(index)
+                .by_account
+                .entry(AccountKey::new(snap.provider.clone(), snap.account.clone()))
+                .or_default()
+                .push(snap.clone());
+            *stamp = after;
+            true
+        }
+        _ => false,
+    };
+    if !patched {
+        cache.months.remove(&(year, month));
+    }
 }
 
 fn parse_month(path: &Path) -> Vec<Snapshot> {
-    let mut out = Vec::new();
+    #[cfg(test)]
+    PARSE_COUNT.with(|c| c.set(c.get() + 1));
     let Ok(f) = File::open(path) else {
-        return out;
+        return Vec::new();
     };
-    let rdr = BufReader::new(f);
-    // See the note in `read_range` for why filter_map (not map_while): one
-    // corrupt / non-UTF8 line must not halt the iterator and silently drop
-    // every valid snapshot after it.
-    #[allow(clippy::lines_filter_map_ok)]
-    for line in rdr.lines().filter_map(|r| r.ok()) {
+    parse_reader(BufReader::new(f))
+}
+
+/// Parse snapshots from `rdr`. A non-UTF8 line (`InvalidData`) is skipped —
+/// its bytes are consumed, so later valid lines still count. Any other read
+/// error is persistent (it would repeat forever), so stop there.
+fn parse_reader<R: BufRead>(rdr: R) -> Vec<Snapshot> {
+    let mut out = Vec::new();
+    for line in rdr.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(_) => break,
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -330,11 +416,16 @@ fn parse_month(path: &Path) -> Vec<Snapshot> {
 /// check in `load_month_cached` invalidates a single month lazily. Kept
 /// exposed to tests so a follow-up cache-behaviour test can pin state
 /// without waiting for an mtime tick.
+/// Test-only: drop the cache entries for the months a "last N days" read can
+/// touch. Targeted (never a whole-cache clear) so it can't evict another
+/// test's entry for a far-future month mid-assertion.
 #[cfg(test)]
-#[allow(dead_code)]
-pub(crate) fn invalidate_cache() {
-    if let Ok(mut c) = month_cache().lock() {
-        c.months.clear();
+pub(crate) fn evict_recent_months() {
+    let now = Utc::now();
+    let mut c = month_cache().lock().unwrap_or_else(|e| e.into_inner());
+    for back in 0..=3 {
+        let d = now - Duration::days(31 * back);
+        c.months.remove(&(d.year(), d.month()));
     }
 }
 
@@ -348,8 +439,34 @@ pub fn last_snapshot(account: &AccountKey) -> Option<Snapshot> {
     // R2-PERF-01: use the mtime-gated cache; called per account per poll
     // from the notifications eval branch, so an uncached scan of ~35 days
     // of NDJSON per tick is wasteful.
-    let snaps = read_range_cached(&dir, account, now - Duration::days(35), now);
-    snaps.into_iter().rev().find(Snapshot::is_reading)
+    let (from, to) = (now - Duration::days(35), now);
+    // Scan the cached per-account rows for the newest reading; clone only it.
+    let (mut y, mut m) = (from.year(), from.month());
+    let mut best: Option<Snapshot> = None;
+    loop {
+        let index = load_month_cached(&month_path_ym(&dir, y, m), y, m);
+        if let Some(rows) = index.by_account.get(account) {
+            let newest = rows
+                .iter()
+                .filter(|s| s.ts >= from && s.ts <= to && s.is_reading())
+                .max_by_key(|s| s.ts);
+            if let Some(n) = newest {
+                if best.as_ref().is_none_or(|b| n.ts >= b.ts) {
+                    best = Some(n.clone());
+                }
+            }
+        }
+        if (y, m) == (to.year(), to.month()) {
+            break;
+        }
+        if m == 12 {
+            y += 1;
+            m = 1;
+        } else {
+            m += 1;
+        }
+    }
+    best
 }
 
 /// Seven-character sparkline of the last seven local days' peak weekly usage
@@ -381,8 +498,8 @@ fn decisions_path(dir: &Path, ts: DateTime<Utc>) -> PathBuf {
 
 /// Append one auto-swap decision line to this month's
 /// `decisions.YYYY-MM.ndjson` (same directory, rotation and retention as the
-/// history log). One small `writeln!` with O_APPEND, so concurrent writers
-/// never interleave a line. Rare (one line per decision change), so no
+/// history log). One `write_all` of the whole line with O_APPEND, so
+/// concurrent writers never interleave a line. Rare (one line per decision change), so no
 /// batching.
 pub fn append_decision(v: &serde_json::Value) -> Result<()> {
     let dir = log_dir()?;
@@ -399,7 +516,7 @@ pub fn append_decision(v: &serde_json::Value) -> Result<()> {
         opts.mode(0o600);
     }
     let mut f = opts.open(&path).context("opening decisions log")?;
-    writeln!(f, "{v}").context("writing decisions log")?;
+    write_line(&mut f, &v.to_string()).context("writing decisions log")?;
     Ok(())
 }
 
@@ -460,16 +577,28 @@ impl Appender {
         })
     }
 
-    fn write_snap(&mut self, snap: &Snapshot) -> Result<()> {
+    /// Returns the bytes written (the line plus its newline).
+    fn write_snap(&mut self, snap: &Snapshot) -> Result<u64> {
         let line = serde_json::to_string(snap).context("serializing snapshot")?;
-        writeln!(self.file, "{line}").context("appending history line")?;
+        let n = write_line(&mut self.file, &line).context("appending history line")?;
         self.rows_since_fsync += 1;
         if self.rows_since_fsync >= FSYNC_BATCH {
             let _ = self.file.sync_data();
             self.rows_since_fsync = 0;
         }
-        Ok(())
+        Ok(n)
     }
+}
+
+/// Write `line` plus a newline with ONE `write_all`, so an O_APPEND file gets
+/// the whole record in a single write and concurrent writers cannot interleave
+/// inside it (`writeln!` issues one write per formatted fragment).
+fn write_line<W: Write>(w: &mut W, line: &str) -> std::io::Result<u64> {
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
+    w.write_all(buf.as_bytes())?;
+    Ok(buf.len() as u64)
 }
 
 impl Drop for Appender {
@@ -484,6 +613,10 @@ impl Drop for Appender {
 // Directory helpers (pure / dir-parameterized for tests)
 // ---------------------------------------------------------------------------
 
+/// How old the newest kept history file must be before an idle-gap prune is
+/// trusted (see `rotate_files`).
+const CLOCK_SETTLE_DAYS: i64 = 1;
+
 /// Prune history files under `dir` whose mtime is older than `RETAIN_DAYS`
 /// days before `now`. Non-history files and unparsable names are left alone.
 fn rotate_files(dir: &Path, now: DateTime<Utc>) -> Result<()> {
@@ -491,6 +624,7 @@ fn rotate_files(dir: &Path, now: DateTime<Utc>) -> Result<()> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Ok(());
     };
+    let mut found: Vec<(std::path::PathBuf, DateTime<Utc>, i64)> = Vec::new();
     for entry in rd.flatten() {
         let name = entry.file_name();
         let n = name.to_string_lossy();
@@ -501,11 +635,56 @@ fn rotate_files(dir: &Path, now: DateTime<Utc>) -> Result<()> {
         let Ok(md) = entry.metadata() else { continue };
         let Ok(mt) = md.modified() else { continue };
         let mt_utc: DateTime<Utc> = mt.into();
-        if mt_utc < cutoff {
-            let _ = std::fs::remove_file(entry.path());
+        let month = month_index(&n).unwrap_or_else(|| month_of(mt_utc));
+        found.push((entry.path(), mt_utc, month));
+    }
+    // A file is pruned only if it is past the cutoff AND some kept file lies
+    // within the retention span after it (by month in the filename). A forward
+    // clock jump leaves the real files with no such neighbour, so they survive
+    // even once a file written under the bad clock exists.
+    let kept: Vec<i64> = found
+        .iter()
+        .filter(|(_, t, _)| *t >= cutoff)
+        .map(|(_, _, m)| *m)
+        .collect();
+    // After a genuine long idle gap no kept file is near the old ones, so the
+    // bridge rule alone would keep them forever. When no kept file is ahead of
+    // `now` and the oldest kept one has outlived the settling period, the
+    // clock has been consistent for a while, so retention applies normally.
+    // The oldest (not the newest) is used so a continuously running daemon,
+    // whose current file is always fresh, still prunes at a later rotation. A
+    // transient forward jump (files written under the bad clock: brand new,
+    // then ahead of the corrected clock) never satisfies this.
+    let kept_times: Vec<DateTime<Utc>> = found
+        .iter()
+        .filter(|(_, t, _)| *t >= cutoff)
+        .map(|(_, t, _)| *t)
+        .collect();
+    let clock_settled = kept_times.iter().all(|t| *t <= now)
+        && kept_times
+            .iter()
+            .min()
+            .is_some_and(|oldest| *oldest <= now - Duration::days(CLOCK_SETTLE_DAYS));
+    for (path, mt_utc, month) in &found {
+        if *mt_utc < cutoff
+            && (clock_settled || kept.iter().any(|k| (*month..=*month + 7).contains(k)))
+        {
+            let _ = std::fs::remove_file(path);
         }
     }
     Ok(())
+}
+
+fn month_of(t: DateTime<Utc>) -> i64 {
+    i64::from(t.year()) * 12 + i64::from(t.month0())
+}
+
+/// `history.YYYY-MM.ndjson` / `decisions.YYYY-MM.ndjson` → a month index.
+fn month_index(name: &str) -> Option<i64> {
+    let ym = name.split('.').nth(1)?;
+    let (y, m) = ym.split_once('-')?;
+    let (y, m) = (y.parse::<i64>().ok()?, m.parse::<i64>().ok()?);
+    (1..=12).contains(&m).then_some(y * 12 + m - 1)
 }
 
 /// Read every snapshot for `account` whose `ts` falls in `[from, to]` from
@@ -705,7 +884,7 @@ mod tests {
     #[test]
     fn rotate_removes_files_older_than_retention() {
         let dir = tempfile::tempdir().unwrap();
-        let old = dir.path().join("history.2024-01.ndjson");
+        let old = dir.path().join("history.2026-01.ndjson");
         let recent = dir.path().join("history.2026-08.ndjson");
         std::fs::write(&old, b"").unwrap();
         std::fs::write(&recent, b"").unwrap();
@@ -1035,6 +1214,111 @@ mod tests {
         assert!(!old.exists(), "190-day-old history must be pruned");
     }
 
+    /// `YYYY-MM` of roughly `n` months before the real now.
+    fn ym_ago(n: i64) -> String {
+        (Utc::now() - Duration::days(31 * n))
+            .format("%Y-%m")
+            .to_string()
+    }
+
+    #[test]
+    fn rotate_skips_pruning_when_the_clock_is_implausibly_ahead() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2027, 11, 1, 0, 0, 0).unwrap();
+        let a = dir.path().join("history.2026-08.ndjson");
+        let d = dir.path().join("decisions.2026-09.ndjson");
+        let t = SystemTime::from(Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap());
+        touch_with_mtime(&a, t);
+        touch_with_mtime(&d, t);
+        // The first process wrote a file under the jumped clock; the second
+        // rotation then sees a "fresh" newest file next to the real ones.
+        touch_with_mtime(
+            &dir.path().join("history.2027-11.ndjson"),
+            SystemTime::from(now),
+        );
+        rotate_files(dir.path(), now).unwrap();
+        rotate_files(dir.path(), now).unwrap();
+        assert!(
+            a.exists() && d.exists(),
+            "a clock jump must not wipe history"
+        );
+    }
+
+    #[test]
+    fn rotate_prunes_after_a_long_idle_gap_once_the_clock_has_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2027, 3, 1, 0, 0, 0).unwrap();
+        let old = dir.path().join("history.2026-01.ndjson");
+        touch_with_mtime(
+            &old,
+            SystemTime::from(Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).unwrap()),
+        );
+        let recent = dir.path().join("history.2027-02.ndjson");
+        touch_with_mtime(&recent, SystemTime::from(now - Duration::days(2)));
+        rotate_files(dir.path(), now).unwrap();
+        assert!(!old.exists(), "pre-gap history must age out");
+        assert!(recent.exists());
+    }
+
+    #[test]
+    fn rotate_prunes_after_an_idle_gap_in_a_continuously_running_daemon() {
+        // Jan/Feb 2026, idle Mar-Oct, then running nonstop from Nov: at the
+        // Jan 2027 month rollover the current file is seconds old, but the
+        // Nov file shows the clock has been consistent for weeks.
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2027, 1, 1, 0, 0, 5).unwrap();
+        let ts = |y, m, d| SystemTime::from(Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap());
+        let jan = dir.path().join("history.2026-01.ndjson");
+        let feb = dir.path().join("history.2026-02.ndjson");
+        touch_with_mtime(&jan, ts(2026, 1, 31));
+        touch_with_mtime(&feb, ts(2026, 2, 28));
+        let nov = dir.path().join("history.2026-11.ndjson");
+        touch_with_mtime(&nov, ts(2026, 11, 30));
+        let dec = dir.path().join("history.2026-12.ndjson");
+        touch_with_mtime(&dec, SystemTime::from(now - Duration::seconds(5)));
+        rotate_files(dir.path(), now).unwrap();
+        assert!(
+            !jan.exists() && !feb.exists(),
+            "pre-gap history must age out"
+        );
+        assert!(nov.exists() && dec.exists());
+    }
+
+    #[test]
+    fn rotate_keeps_history_when_the_newest_file_is_ahead_of_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2027, 3, 1, 0, 0, 0).unwrap();
+        let old = dir.path().join("history.2026-01.ndjson");
+        touch_with_mtime(
+            &old,
+            SystemTime::from(Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).unwrap()),
+        );
+        touch_with_mtime(
+            &dir.path().join("history.2027-03.ndjson"),
+            SystemTime::from(now + Duration::days(2)),
+        );
+        rotate_files(dir.path(), now).unwrap();
+        assert!(old.exists(), "clock went backwards: do not prune");
+    }
+
+    #[test]
+    fn parse_reader_stops_on_a_persistent_read_error() {
+        struct Failing(std::cell::Cell<u32>);
+        impl std::io::Read for &Failing {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                self.0.set(self.0.get() + 1);
+                if self.0.get() > 1000 {
+                    return Ok(0);
+                }
+                Err(std::io::Error::other("EIO"))
+            }
+        }
+        let f = Failing(std::cell::Cell::new(0));
+        let out = parse_reader(BufReader::new(&f));
+        assert!(out.is_empty());
+        assert_eq!(f.0.get(), 1, "a persistent error must end the loop");
+    }
+
     #[test]
     fn rotate_keeps_file_exactly_at_cutoff() {
         let dir = tempfile::tempdir().unwrap();
@@ -1057,10 +1341,14 @@ mod tests {
         let ancient = SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_700_000_000);
         let wrong_suffix = dir.path().join("history.2024-01.txt");
         let wrong_prefix = dir.path().join("other.2024-01.ndjson");
-        let real = dir.path().join("history.2024-01.ndjson");
+        let real = dir.path().join(format!("history.{}.ndjson", ym_ago(3)));
         for p in [&wrong_suffix, &wrong_prefix, &real] {
             touch_with_mtime(p, ancient);
         }
+        touch_with_mtime(
+            &dir.path().join(format!("history.{}.ndjson", ym_ago(0))),
+            SystemTime::now(),
+        );
         rotate_files(dir.path(), Utc::now()).unwrap();
         assert!(wrong_suffix.exists());
         assert!(wrong_prefix.exists());
@@ -1314,18 +1602,6 @@ mod tests {
     /// once-per-process rotation flag.
     static APPEND_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Drop the cache entries for the months a "last N days" read can touch.
-    /// Targeted (not `invalidate_cache`) so it can't evict another test's
-    /// entry for a far-future month mid-assertion.
-    fn evict_recent_months() {
-        let now = Utc::now();
-        let mut c = month_cache().lock().unwrap();
-        for back in 0..=3 {
-            let d = now - Duration::days(31 * back);
-            c.months.remove(&(d.year(), d.month()));
-        }
-    }
-
     fn cfg_dir() -> PathBuf {
         store::config_dir().unwrap()
     }
@@ -1374,25 +1650,247 @@ mod tests {
     }
 
     #[test]
-    fn append_prunes_only_on_first_append_per_process() {
+    fn append_prunes_on_first_append_and_again_when_the_month_file_changes() {
         let _l = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _cfg = store::ScopedConfigDir::new();
-        let stale = cfg_dir().join("history.2020-01.ndjson");
+        // Rotation has already happened in this process.
+        BOOT_ROTATED.store(true, Ordering::SeqCst);
+        append(&snap("claude", "a@x.io", utc(2049, 9, 5, 5), Some(1.0))).unwrap();
+        let stale = cfg_dir().join("history.2049-07.ndjson");
         touch_with_mtime(
             &stale,
             SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_700_000_000),
         );
-        // Rotation has already happened in this process: no prune now.
-        BOOT_ROTATED.store(true, Ordering::SeqCst);
+        // A long-lived daemon rolling into a new month prunes without a restart.
+        append(&snap("claude", "a@x.io", utc(2049, 10, 1, 5), Some(1.0))).unwrap();
+        assert!(!stale.exists(), "month change must prune expired files");
+    }
+
+    #[test]
+    fn write_line_is_a_single_write() {
+        struct Counting(usize, Vec<u8>);
+        impl Write for Counting {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0 += 1;
+                self.1.extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut w = Counting(0, Vec::new());
+        let v = serde_json::json!({"ts": 1, "a": [1, 2, 3], "b": "x"});
+        let n = write_line(&mut w, &v.to_string()).unwrap();
+        assert_eq!(w.0, 1, "one write per record");
+        assert_eq!(n as usize, w.1.len());
+        assert!(w.1.ends_with(b"}\n"));
+    }
+
+    #[test]
+    fn cache_sees_an_append_that_leaves_the_mtime_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = AccountKey::new("claude", "a@x.io");
+        let path = month_path_ym(dir.path(), 2044, 3);
+        let line = |d: u32, pct: f32| {
+            format!(
+                "{}\n",
+                serde_json::to_string(&snap("claude", "a@x.io", utc(2044, 3, d, 0), Some(pct)))
+                    .unwrap()
+            )
+        };
+        let read = || {
+            weeklies(&read_range_cached(
+                dir.path(),
+                &key,
+                utc(2044, 3, 1, 0),
+                utc(2044, 3, 30, 0),
+            ))
+        };
+        std::fs::write(&path, line(1, 1.0)).unwrap();
+        let stamp = SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_800_000_000);
+        let set_mtime = || {
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(stamp)
+                .unwrap();
+        };
+        set_mtime();
+        assert_eq!(read(), vec![1.0]);
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(line(2, 2.0).as_bytes()).unwrap();
+        drop(f);
+        set_mtime(); // same mtime tick, longer file
+        assert_eq!(read(), vec![1.0, 2.0], "a longer file must re-parse");
+    }
+
+    #[test]
+    fn append_patches_the_cached_month_instead_of_reparsing_it() {
+        let _l = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cfg = store::ScopedConfigDir::new();
+        let key = AccountKey::new("claude", "a@x.io");
+        let t1 = utc(2043, 2, 3, 0);
+        let t2 = utc(2043, 2, 4, 0);
+        let read = || {
+            weeklies(&read_range_cached(
+                &cfg_dir(),
+                &key,
+                utc(2043, 2, 1, 0),
+                utc(2043, 2, 28, 0),
+            ))
+        };
+        append(&snap("claude", "a@x.io", t1, Some(1.0))).unwrap();
+        assert_eq!(read(), vec![1.0]);
+        let parses = PARSE_COUNT.with(|c| c.get());
+        append(&snap("claude", "a@x.io", t2, Some(2.0))).unwrap();
+        assert_eq!(read(), vec![1.0, 2.0], "the new row is visible");
+        assert_eq!(
+            PARSE_COUNT.with(|c| c.get()),
+            parses,
+            "an append must not force a whole-month re-parse"
+        );
+    }
+
+    #[test]
+    fn a_file_that_moves_during_the_parse_is_not_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = month_path_ym(dir.path(), 2041, 5);
+        let line = |d: u32| {
+            format!(
+                "{}\n",
+                serde_json::to_string(&snap("claude", "a@x.io", utc(2041, 5, d, 0), Some(1.0)))
+                    .unwrap()
+            )
+        };
+        std::fs::write(&path, line(1)).unwrap();
+        let _ = load_month_cached_with(&path, 2041, 5, || {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(line(2).as_bytes()).unwrap();
+        });
+        assert!(
+            !month_cache()
+                .lock()
+                .unwrap()
+                .months
+                .contains_key(&(2041, 5)),
+            "an index built before a concurrent write must not be cached"
+        );
+    }
+
+    #[test]
+    fn month_cache_drops_months_no_reader_can_ask_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = utc(2019, 1, 15, 0);
+        std::fs::write(month_path(dir.path(), old), "").unwrap();
+        let _ = load_month_cached(&month_path_ym(dir.path(), 2019, 1), 2019, 1);
+        let now = Utc::now();
+        let _ = load_month_cached(
+            &month_path_ym(dir.path(), now.year(), now.month()),
+            now.year(),
+            now.month(),
+        );
+        assert!(
+            !month_cache()
+                .lock()
+                .unwrap()
+                .months
+                .contains_key(&(2019, 1)),
+            "a month older than any reader's lookback is evicted"
+        );
+    }
+
+    #[test]
+    fn first_append_per_process_prunes_stale_history_and_decisions() {
+        let _l = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cfg = store::ScopedConfigDir::new();
+        let old = SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_700_000_000);
+        let stale_hist = cfg_dir().join(format!("history.{}.ndjson", ym_ago(3)));
+        let stale_dec = cfg_dir().join(format!("decisions.{}.ndjson", ym_ago(3)));
+        touch_with_mtime(&stale_hist, old);
+        touch_with_mtime(&stale_dec, old);
+        // A current file proves the clock is sane (pruning is skipped when
+        // every file is past the cutoff).
+        touch_with_mtime(
+            &cfg_dir().join(format!("history.{}.ndjson", ym_ago(0))),
+            SystemTime::now(),
+        );
+        // append(): the first call in a process rotates.
+        BOOT_ROTATED.store(false, Ordering::SeqCst);
         append(&snap("claude", "a@x.io", utc(2049, 9, 5, 5), Some(1.0))).unwrap();
-        assert!(stale.exists(), "later appends must not re-run the prune");
+        assert!(!stale_hist.exists(), "append must prune stale history");
+        assert!(!stale_dec.exists(), "rotation must cover decisions files");
+        // append_decision(): same once-per-process rotation.
+        touch_with_mtime(&stale_hist, old);
+        touch_with_mtime(&stale_dec, old);
+        BOOT_ROTATED.store(false, Ordering::SeqCst);
+        append_decision(&serde_json::json!({"k": 1})).unwrap();
+        assert!(
+            !stale_hist.exists(),
+            "append_decision must prune stale history"
+        );
+        assert!(
+            !stale_dec.exists(),
+            "append_decision must prune stale decisions"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_and_decision_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let _l = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cfg = store::ScopedConfigDir::new();
+        BOOT_ROTATED.store(true, Ordering::SeqCst);
+        let ts = utc(2049, 10, 5, 5);
+        append(&snap("claude", "a@x.io", ts, Some(1.0))).unwrap();
+        append_decision(&serde_json::json!({"k": 1})).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&month_path(&cfg_dir(), ts)), 0o600);
+        assert_eq!(mode(&decisions_path(&cfg_dir(), Utc::now())), 0o600);
+        assert_eq!(mode(&cfg_dir()), 0o700);
+    }
+
+    #[test]
+    fn non_reading_rows_are_excluded_from_last_n_days_and_last_snapshot() {
+        let _cfg = store::ScopedConfigDir::new();
+        evict_recent_months();
+        let now = Utc::now();
+        let dir = cfg_dir();
+        let ok = Snapshot {
+            outcome: Some("ok".into()),
+            ..snap("claude", "r@x.io", now - Duration::hours(3), Some(10.0))
+        };
+        write_snap(&dir, &ok);
+        for (i, outcome) in ["429", "err", "skip"].iter().enumerate() {
+            write_snap(
+                &dir,
+                &Snapshot {
+                    outcome: Some((*outcome).into()),
+                    ..snap(
+                        "claude",
+                        "r@x.io",
+                        now - Duration::hours(2) + Duration::minutes(i as i64),
+                        Some(10.0),
+                    )
+                },
+            );
+        }
+        evict_recent_months();
+        let key = AccountKey::new("claude", "r@x.io");
+        let rows = last_n_days(&key, 1);
+        assert_eq!(rows.len(), 1, "only the ok row is a reading: {rows:?}");
+        assert_eq!(rows[0].ts, ok.ts);
+        let last = last_snapshot(&key).expect("a reading exists");
+        assert_eq!(last.ts, ok.ts, "repeated-cache rows must not be 'latest'");
     }
 
     #[test]
     fn rotate_if_needed_prunes_stale_files_in_config_dir() {
         let _l = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _cfg = store::ScopedConfigDir::new();
-        let stale = cfg_dir().join("history.2020-01.ndjson");
+        let stale = cfg_dir().join("history.2026-03.ndjson");
         let fresh = cfg_dir().join("history.2026-08.ndjson");
         let now = utc(2026, 9, 1, 0);
         touch_with_mtime(&stale, SystemTime::from(now - Duration::days(300)));

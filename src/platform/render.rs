@@ -196,6 +196,74 @@ mod tests {
         assert!(render_menu(&tree(vec![])).is_empty());
     }
 
+    fn action(label: &str, enabled: bool, checkable: bool, checked: bool) -> MenuItem {
+        MenuItem::Action {
+            id: "x:y".into(),
+            label: label.into(),
+            icon_png: None,
+            enabled,
+            checked,
+            checkable,
+        }
+    }
+
+    fn only_row(item: MenuItem) -> Row {
+        match render_menu(&tree(vec![item])).items.remove(0) {
+            Item::Row(r) => r,
+            other => panic!("expected row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn action_rows_carry_enabled_and_only_checkable_rows_get_a_check() {
+        let disabled = only_row(action("Nope", false, false, false));
+        assert!(!disabled.enabled, "disabled action must stay inert");
+        assert!(only_row(action("Yes", true, false, false)).enabled);
+        // Not checkable: no check column even if `checked` is set.
+        assert_eq!(only_row(action("A", true, false, true)).checked, None);
+        // Checkable: the column reflects the state.
+        assert_eq!(only_row(action("A", true, true, true)).checked, Some(true));
+        assert_eq!(
+            only_row(action("A", true, true, false)).checked,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn action_label_tab_splits_into_label_and_trailing_value() {
+        let row = only_row(action("Quit\tusagio v1.2.3", true, false, false));
+        assert_eq!(row.segments.len(), 2);
+        assert_eq!(row.segments[0].text, "Quit");
+        assert_eq!(row.segments[1].text, "usagio v1.2.3");
+        assert_eq!(
+            only_row(action("Plain", true, false, false)).segments.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn info_color_run_spans_the_utf16_length_of_the_label() {
+        let label = "\u{1F512} locked";
+        let row = only_row(MenuItem::Info {
+            label: label.into(),
+            color: Some(ValueColor::Red),
+        });
+        assert!(row.id.is_none());
+        assert_eq!(
+            row.segments[0].runs,
+            vec![StyleRun::new(
+                0,
+                label.encode_utf16().count(),
+                Color::SystemRed
+            )]
+        );
+        let plain = only_row(MenuItem::Info {
+            label: "x".into(),
+            color: None,
+        });
+        assert!(plain.segments[0].runs.is_empty());
+    }
+
     #[test]
     fn submenu_children_are_built_recursively() {
         let t = tree(vec![MenuItem::Submenu {

@@ -192,6 +192,33 @@ fn rm_removes_seeded_account_by_prefix() {
 }
 
 #[test]
+fn rm_of_active_account_clears_active() {
+    let home = TempDir::new().unwrap();
+    seed_state(
+        &home,
+        &TWO_ACCOUNTS.replace("\"active\": null", "\"active\": \"dev@example.com\""),
+    );
+    assert!(
+        fs::read_to_string(state_path(&home))
+            .unwrap()
+            .contains("\"active\": \"dev@example.com\""),
+        "fixture must seed an active account"
+    );
+    bin(&home)
+        .args(["rm", "dev"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Removed dev@example.com"));
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(state_path(&home)).unwrap()).unwrap();
+    assert!(
+        state["active"].is_null(),
+        "removing the active account must clear state.active, got {}",
+        state["active"]
+    );
+}
+
+#[test]
 fn rm_is_case_insensitive() {
     let home = TempDir::new().unwrap();
     seed_state(&home, TWO_ACCOUNTS);

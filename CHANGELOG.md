@@ -5,7 +5,30 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.0] - 2026-11-03
+
+### Fixed
+
+- macOS: with `CLAUDE_CONFIG_DIR` set, switching now writes the per-directory keychain item Claude Code reads (`Claude Code-credentials-<hash>`), so the active login and the displayed account no longer diverge.
+- Switching no longer discards a renewed Claude login whose vendor write failed, no longer commits an account removed mid-switch, and a queued CLI switch can no longer overwrite a newer menu pick.
+- Manual holds are judged against the saved trigger while auto-swap is off; the leave latch is keyed to the window that caused the leave; future-stamped usage readings are treated as stale.
+- Unlimited-credit accounts count as able to run on credits. Reset notices fire only for windows that were meaningfully used; pace alerts no longer fire from last week's slope on the reset tick.
+- The menu shows refresh errors on the account row, "Refresh usage now" reports failures, expired logins show as expired, and the watchdog escalates correctly while a keychain failure is unresolved.
+- State backups and diagnostic dumps are no longer pruned wrongly after a clock change; the context ledger counts project `.claude/skills` and `.claude/agents` and follows Codex/opencode instruction-file rules.
+- Windows: resolve the home directory from `HOME`, else `USERPROFILE` (empty `HOME` counts as unset) for `~/.claude.json`, Claude credential watching and the Codex `auth.json`.
+- Linux/Windows: Claude account switch and capture now use `~/.claude/.credentials.json`, the file Claude Code reads, instead of the OS secret store. A stale "Claude Code-credentials" secret-store entry from earlier versions is orphaned and harmless.
+- Auto-swap now moves to the ready account whose weekly limit resets soonest, so remaining quota is spent before it expires. Previously it chose the account with the most runway unless a reset was within 6 hours, which picked a fresh account over one 6 hours from losing its room. Accounts without 15 minutes of runway are still skipped. The engine now matches the menu order.
+- The stuck-swap notice now names the soonest time any account unlocks (session or weekly), not the soonest weekly reset. A pin set while a swap was being verified is respected, and a missing target reading shows as a dash rather than 0%.
+- Burn-rate forecasts keep sub-hour precision, ignore samples from before the last reset, and show "lasts to reset" when the window resets first.
+- Pace alerts no longer fire for a projection that lands after the weekly reset. A window reset now needs a real drop, and a threshold crossed in the same reading as a reset still alerts.
+- Refreshing a vendor-owned login now fails closed if the vendor slot or saved state cannot be read, keeps the saved refresh token when the vendor copy has none, and no longer matches a uuid-only saved account to an unrelated identity.
+- History and decision log lines are written in a single write; the month cache notices appends that keep the same modified time, is patched on append instead of re-parsed, no longer holds its lock while parsing, drops months no reader needs, and expired history is pruned when a long-running daemon moves to a new month.
+- Credits in different non-dominant currencies are no longer ranked by raw amounts, the blind projection applies only to windows that were near the threshold, an out-of-range usage value can no longer crash scheduling, and a failed watcher respawn no longer clears the keychain failure count.
+- A malformed provider account entry in `state.json` no longer drops the provider's other accounts; it is preserved as `unparsed_accounts` and re-parsed on each load. Downgrading to an older build that does not know `unparsed_accounts` will discard those preserved entries on its next save (a rolling backup under `backups/` still holds them).
+
+### Changed
+
+- `usagio rm` now removes Codex accounts as well as Claude accounts, and accepts `claude:` and `codex:` selectors (for example `usagio rm codex:me@x.com`). An unqualified selector that matches accounts in more than one provider, such as the same email on Claude and Codex, is refused with a prompt to qualify it with a provider prefix instead of removing one of them.
 
 ## [1.0.8] - 2026-10-31
 

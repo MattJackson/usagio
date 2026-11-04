@@ -3749,7 +3749,7 @@ dependencies = [
 
 [[package]]
 name = "usagio"
-version = "1.0.8"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3760,6 +3760,7 @@ dependencies = [
  "embed-manifest",
  "fs2",
  "gtk",
+ "icu_normalizer",
  "image",
  "keyring 3.6.3",
  "keyring 4.2.0",

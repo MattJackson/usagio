@@ -216,7 +216,7 @@ pub(crate) fn parse_credits(body: &serde_json::Value) -> Option<Credits> {
     let flag = |k: &str| c.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
     // The backend sends ten decimal places ("636.4935245000"); two read fine.
     let cents = |s: &str| match s.split_once('.') {
-        Some((whole, frac)) => format!("{whole}.{}", &frac[..frac.len().min(2)]),
+        Some((whole, frac)) => format!("{whole}.{}", frac.chars().take(2).collect::<String>()),
         None => s.to_string(),
     };
     let balance = c.get("balance").and_then(|b| match b {
@@ -847,10 +847,35 @@ impl Provider for CodexProvider {
             .unwrap_or_default();
         let expires_at = id_claims.get("exp").and_then(|x| x.as_i64()).unwrap_or(0);
         let access = parsed.tokens.access_token.clone();
-        let refresh = parsed.tokens.refresh_token.clone().unwrap_or_default();
+        // A blob without a refresh token must not wipe the stored grant (or
+        // clear needs_relogin); Claude's absorb refuses such blobs too.
+        let Some(refresh) = parsed
+            .tokens
+            .refresh_token
+            .clone()
+            .filter(|r| !r.is_empty())
+        else {
+            return Ok(());
+        };
+        let incoming_account_id = blob_account_id(&parsed);
         let blob_owned = blob.to_string();
         crate::credentials::with_state_lock_absorb(|st| {
             if let Some(a) = st.find_provider_account_mut(self.provider_id(), &account.key) {
+                // One email can sign into several workspaces, each with its
+                // own account_id and quota. Never let another workspace's
+                // login replace this account's grant.
+                let stored_account_id = a.identity_uuid.clone().or_else(|| {
+                    parse_codex_blob(&a.secret_blob)
+                        .ok()
+                        .and_then(|p| blob_account_id(&p))
+                });
+                if let (Some(stored), Some(incoming)) = (&stored_account_id, &incoming_account_id) {
+                    if stored != incoming {
+                        anyhow::bail!(
+                            "credential belongs to a different Codex workspace (account_id mismatch); not absorbed"
+                        );
+                    }
+                }
                 if expires_at >= a.expires_at {
                     a.secret_blob = blob_owned;
                     a.access_token = access;
@@ -897,6 +922,27 @@ pub(super) struct TokenData {
     pub(super) account_id: Option<String>,
 }
 
+/// The Codex workspace id of a parsed blob: `tokens.account_id`, else the
+/// id_token's `chatgpt_account_id` claim (same precedence as capture).
+fn blob_account_id(parsed: &AuthDotJson) -> Option<String> {
+    parsed
+        .tokens
+        .account_id
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            parsed
+                .tokens
+                .id_token
+                .as_deref()
+                .and_then(jwt_payload_claims)?
+                .get("https://api.openai.com/auth")
+                .and_then(|p| p.get("chatgpt_account_id"))
+                .and_then(|x| x.as_str())
+                .map(String::from)
+        })
+}
+
 pub(super) fn parse_codex_blob(blob: &str) -> PResult<AuthDotJson> {
     let v: AuthDotJson = serde_json::from_str(blob)
         .map_err(|e| ProviderError::Other(format!("parsing codex auth.json: {e}")))?;
@@ -932,11 +978,12 @@ fn ensure_file_backend(auth_path: &std::path::Path) -> PResult<()> {
 }
 
 pub(super) fn auth_json_path() -> Option<PathBuf> {
-    if let Some(h) = std::env::var_os("CODEX_HOME") {
+    // An empty `CODEX_HOME` counts as unset (as in Codex itself and
+    // `context_ledger::codex`); otherwise the path would be cwd-relative.
+    if let Some(h) = crate::paths::path_env_var("CODEX_HOME").filter(|h| !h.is_empty()) {
         return Some(PathBuf::from(h).join("auth.json"));
     }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".codex").join("auth.json"))
+    Some(crate::paths::user_home()?.join(".codex").join("auth.json"))
 }
 
 /// Map a filesystem `io::Result` into `PResult`, naming the operation and
@@ -1001,7 +1048,10 @@ pub(super) fn write_auth_json_atomically(path: &std::path::Path, contents: &str)
             .create_new(true)
             .mode(0o600)
             .open(&tmp_path)?;
-        f.write_all(contents.as_bytes())
+        f.write_all(contents.as_bytes())?;
+        // Durable before the rename: a crash must not leave a zero-length
+        // auth.json (matches `store::write_private`).
+        f.sync_all()
     })();
     if let Err(e) = fs_ctx(create_and_write, "open/write", &tmp_path) {
         let _ = std::fs::remove_file(&tmp_path);
@@ -1010,6 +1060,10 @@ pub(super) fn write_auth_json_atomically(path: &std::path::Path, contents: &str)
     if let Err(e) = fs_ctx(std::fs::rename(&tmp_path, path), "rename", &tmp_path) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e);
+    }
+    // Best effort: persist the rename itself.
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
     }
     Ok(())
 }
@@ -1088,6 +1142,12 @@ pub(super) fn jwt_payload_claims(jwt: &str) -> Option<serde_json::Map<String, Va
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_credits_does_not_panic_on_multibyte_fraction() {
+        let body = serde_json::json!({ "credits": { "balance": "1.a\u{20ac}" } });
+        let _ = parse_credits(&body); // must not panic slicing mid-char
+    }
 
     #[test]
     fn parse_credits_preserves_explicit_zero_and_omits_unknown() {
@@ -1853,6 +1913,53 @@ mod tests {
     }
 
     #[test]
+    fn absorb_credential_without_refresh_token_keeps_stored_grant() {
+        let _cfg = crate::store::ScopedConfigDir::new();
+        crate::credentials::with_state_lock(|| {
+            let mut st = crate::store::State::load()?;
+            st.upsert_provider_account(
+                "codex",
+                crate::store::ProviderAccount {
+                    key: "user@example.com".into(),
+                    secret_blob: make_blob("user@example.com", 1000),
+                    access_token: "old-at".into(),
+                    refresh_token: "old-rt".into(),
+                    expires_at: 1000,
+                    identity_email: Some("user@example.com".into()),
+                    identity_uuid: None,
+                    identity_display_name: None,
+                    identity_native_blob: Value::Null,
+                    cached_usage: None,
+                    notif_state: Default::default(),
+                    needs_relogin: true,
+                    no_subscription: false,
+                    plan: None,
+                },
+            );
+            st.save()
+        })
+        .unwrap();
+        let no_rt = serde_json::json!({"tokens": {
+            "id_token": make_id_token("user@example.com", 5_000_000_000i64),
+            "access_token": "at"
+        }})
+        .to_string();
+        let k = AccountKey::new("codex", "user@example.com");
+        CodexProvider.absorb_credential(&k, &no_rt).unwrap();
+        let st = crate::store::State::load().unwrap();
+        let a = st
+            .find_provider_account("codex", "user@example.com")
+            .unwrap();
+        assert_eq!(a.refresh_token, "old-rt");
+        // The refresh-token-less event is not a re-login: the flag, access
+        // token and stored blob are all left alone.
+        assert!(a.needs_relogin, "must not clear needs_relogin");
+        assert_eq!(a.access_token, "old-at");
+        assert_eq!(a.secret_blob, make_blob("user@example.com", 1000));
+        assert_eq!(a.expires_at, 1000);
+    }
+
+    #[test]
     fn absorb_credential_does_not_create_a_new_account() {
         // Absorb must never CREATE an account from a bare fsnotify event —
         // only refresh one that was already captured through
@@ -1865,6 +1972,72 @@ mod tests {
         assert!(st
             .find_provider_account("codex", "nobody@example.com")
             .is_none());
+    }
+
+    #[test]
+    fn empty_codex_home_is_treated_as_unset() {
+        let _cfg = crate::store::ScopedConfigDir::new();
+        crate::env_lock::scoped_env_var("CODEX_HOME", Some(""), || {
+            let p = auth_json_path();
+            assert_ne!(p, Some(PathBuf::from("auth.json")));
+            if let Some(p) = p {
+                assert!(p.ends_with(".codex/auth.json"), "{p:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn absorb_credential_refuses_a_different_workspace_for_the_same_email() {
+        let _cfg = crate::store::ScopedConfigDir::new();
+        let blob_for = |acct: &str, exp: i64| {
+            serde_json::json!({"tokens": {
+                "id_token": make_id_token("user@example.com", exp),
+                "access_token": "at-new",
+                "refresh_token": "rt-new",
+                "account_id": acct
+            }})
+            .to_string()
+        };
+        crate::credentials::with_state_lock(|| {
+            let mut st = crate::store::State::load()?;
+            st.upsert_provider_account(
+                "codex",
+                crate::store::ProviderAccount {
+                    key: "user@example.com".into(),
+                    secret_blob: blob_for("ws-personal", 1000),
+                    access_token: "old-at".into(),
+                    refresh_token: "old-rt".into(),
+                    expires_at: 1000,
+                    identity_email: Some("user@example.com".into()),
+                    identity_uuid: Some("ws-personal".into()),
+                    identity_display_name: None,
+                    identity_native_blob: Value::Null,
+                    cached_usage: None,
+                    notif_state: Default::default(),
+                    needs_relogin: false,
+                    no_subscription: false,
+                    plan: None,
+                },
+            );
+            st.save()
+        })
+        .unwrap();
+        let k = AccountKey::new("codex", "user@example.com");
+        let team = blob_for("ws-team", 5_000_000_000);
+        assert!(CodexProvider.absorb_credential(&k, &team).is_err());
+        let st = crate::store::State::load().unwrap();
+        let a = st
+            .find_provider_account("codex", "user@example.com")
+            .unwrap();
+        assert_eq!(a.refresh_token, "old-rt", "other workspace must not absorb");
+        // Same workspace still absorbs.
+        let same = blob_for("ws-personal", 5_000_000_000);
+        CodexProvider.absorb_credential(&k, &same).unwrap();
+        let st = crate::store::State::load().unwrap();
+        let a = st
+            .find_provider_account("codex", "user@example.com")
+            .unwrap();
+        assert_eq!(a.refresh_token, "rt-new");
     }
 
     #[test]

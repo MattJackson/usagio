@@ -208,9 +208,47 @@ fn t4_today_session_vs_weekly_ranking() {
         .into_iter()
         .filter(|a| !a.is_active)
         .collect();
-    c.sort_by(|a, b| rank_cmp(a, b, now, None));
+    c.sort_by(|a, b| rank_cmp(a, b, None));
     assert_eq!(c[0].key, "dev8", "40/90 ranks above 16/92");
     assert_eq!(c[1].key, "dev4");
+}
+
+/// 2026-11-04 00:08: dev3 hit a real 100%. matthew (86%, weekly reset Nov 10
+/// 17:00) and dev5 (0%, reset Nov 10 23:00) were both Ready; v2 served dev5
+/// on runway and matthew's room would have expired first. Earliest reset wins.
+#[test]
+fn ready_serve_spends_the_earliest_weekly_reset_first() {
+    let now = ymd(11, 4, 0, 8, 52);
+    let acct_w = |key: &str, w: f64, reset| {
+        let mut a = acct(key, 0.0, w, now).wreset(Some(reset));
+        a.session = None;
+        a
+    };
+    let s = snap(
+        now,
+        "dev3",
+        vec![
+            acct_w("dev3", 100.0, ymd(11, 13, 0, 0, 0)),
+            acct_w("dev5", 0.0, ymd(11, 10, 23, 0, 0)),
+            acct_w("matthew", 86.0, ymd(11, 10, 17, 0, 0)),
+        ],
+    );
+    let d = decide(&s);
+    assert_eq!(switched(&d), Some(("matthew", Kind::Serve)), "{d:?}");
+
+    // D2 still holds: an earlier reset without MIN_LANDING runway is not Ready
+    // and loses to a roomy account.
+    let s = snap(
+        now,
+        "dev3",
+        vec![
+            acct_w("dev3", 100.0, ymd(11, 13, 0, 0, 0)),
+            acct_w("dev5", 0.0, ymd(11, 10, 23, 0, 0)),
+            acct_w("matthew", 93.0, ymd(11, 10, 17, 0, 0)),
+        ],
+    );
+    let d = decide(&s);
+    assert_eq!(switched(&d), Some(("dev5", Kind::Serve)), "{d:?}");
 }
 
 #[test]
@@ -1667,4 +1705,454 @@ fn blocked_manual_pick_prepares_earlier_session_reset_after_cooldown() {
             "never prepare to a later reset"
         );
     }
+}
+
+#[test]
+fn stuck_notice_names_the_soonest_unlock_not_the_soonest_weekly_reset() {
+    let now = at(12, 0, 0);
+    // Both session-blocked, weekly has room and resets days out.
+    let s = snap(
+        now,
+        "a",
+        vec![
+            acct("a", 100.0, 40.0, now).sreset(Some(now + Duration::hours(1))),
+            acct("b", 100.0, 70.0, now).sreset(Some(now + Duration::hours(3))),
+        ],
+    );
+    let soonest = super::shell::soonest_unlock(&assess_all(&s), now);
+    assert_eq!(soonest, Some(now + Duration::hours(1)));
+    // A block whose reset already passed is not "soonest".
+    assert_eq!(
+        super::shell::soonest_unlock(&assess_all(&s), now + Duration::hours(2)),
+        Some(now + Duration::hours(3))
+    );
+}
+
+#[test]
+fn stale_stuck_decision_never_touches_the_new_actives_memory() {
+    use super::shell::stuck_update;
+    let now = at(12, 0, 0);
+    let s = snap(
+        now,
+        "a",
+        vec![
+            acct("a", 100.0, 100.0, now).sreset(Some(now + Duration::hours(1))),
+            acct("b", 100.0, 100.0, now).sreset(Some(now + Duration::hours(2))),
+        ],
+    );
+    let d = decide(&s);
+    assert!(d.stuck, "{d:?}");
+    // A concurrent manual switch moved the memory on to "b".
+    let mut m = SwapMemory {
+        last_seen_active: Some("b".to_string()),
+        ..Default::default()
+    };
+    assert!(!stuck_update(&mut m, &d, "a"));
+    assert!(!m.stuck_notified && m.real_tier.is_none() && m.draining.is_none());
+    // The matching active still arms and fires as before.
+    m.last_seen_active = Some("a".to_string());
+    assert!(stuck_update(&mut m, &d, "a"));
+}
+
+#[test]
+fn a_pick_set_after_the_cycle_began_is_detected() {
+    use crate::store::State;
+    let before = State {
+        active: Some("a@x.io".to_string()),
+        ..Default::default()
+    };
+    let mut after = before.clone();
+    assert!(!super::shell::pick_changed(&before, &after, "claude"));
+    after.set_manual_pick("claude", Some("a@x.io"));
+    assert!(super::shell::pick_changed(&before, &after, "claude"));
+}
+
+#[test]
+fn a_missing_pct_is_shown_as_a_dash_not_zero() {
+    assert_eq!(super::shell::fmt_pct(None), "—");
+    assert_eq!(super::shell::fmt_pct(Some(41.6)), "42%");
+}
+
+#[test]
+fn credits_in_different_non_dominant_units_are_not_ranked_by_raw_minor_units() {
+    let now = at(12, 0, 0);
+    let s = snap(
+        now,
+        "x",
+        vec![
+            acct("x", 100.0, 100.0, now),
+            acct("b", 100.0, 100.0, now),
+            acct("c", 100.0, 100.0, now),
+        ],
+    );
+    let mut v = assess_all(&s);
+    for a in v.iter_mut() {
+        a.tier = Tier::Credits;
+    }
+    v[1].credits = Money::new(5_000, 2, "EUR");
+    v[2].credits = Money::new(100_000, 0, "JPY");
+    // Neither is the dominant unit ("USD"): group by unit, not raw amount.
+    let order = |a: &Assessed, b: &Assessed| rank_cmp(a, b, Some("USD"));
+    // EUR sorts before JPY by unit name regardless of the raw minor amounts.
+    assert_eq!(order(&v[1], &v[2]), std::cmp::Ordering::Less);
+    assert_eq!(order(&v[2], &v[1]), std::cmp::Ordering::Greater);
+}
+
+#[test]
+fn credits_rank_richest_first_within_the_dominant_unit_and_ahead_of_other_units() {
+    let now = at(12, 0, 0);
+    let s = snap(
+        now,
+        "x",
+        vec![
+            acct("x", 100.0, 100.0, now),
+            acct("b", 100.0, 100.0, now),
+            acct("c", 100.0, 100.0, now),
+        ],
+    );
+    let mut v = assess_all(&s);
+    for a in v.iter_mut() {
+        a.tier = Tier::Credits;
+    }
+    let usd = Some("USD");
+    let order = |a: &Assessed, b: &Assessed| rank_cmp(a, b, usd);
+
+    // Same unit: the larger balance sorts first.
+    v[0].credits = Money::new(1_000, 2, "USD");
+    v[1].credits = Money::new(9_000, 2, "USD");
+    assert_eq!(order(&v[1], &v[0]), std::cmp::Ordering::Less);
+    assert_eq!(order(&v[0], &v[1]), std::cmp::Ordering::Greater);
+
+    // The dominant unit sorts ahead of another unit, however large the
+    // foreign raw amount is.
+    v[2].credits = Money::new(99_999_999, 2, "EUR");
+    assert_eq!(order(&v[0], &v[2]), std::cmp::Ordering::Less);
+    assert_eq!(order(&v[2], &v[0]), std::cmp::Ordering::Greater);
+}
+
+#[test]
+fn blind_projection_only_applies_to_windows_that_were_in_the_band() {
+    let read = at(12, 0, 0);
+    let now = read + Duration::minutes(4);
+    // Weekly 94 (in band, binding is irrelevant); session 85 is outside the
+    // band and must not get a projection that could cross the limit.
+    let s = snap(now, "act", vec![acct("act", 85.0, 94.0, read).backoff()]);
+    let act = assess_all(&s).into_iter().find(|a| a.is_active).unwrap();
+    let sess = act
+        .windows
+        .iter()
+        .find(|w| w.id == WindowId::Session)
+        .unwrap();
+    assert!(sess.proj.is_none(), "{sess:?}");
+}
+
+#[test]
+fn an_absurd_negative_pct_does_not_panic_the_next_check() {
+    let now = at(12, 0, 0);
+    let s = snap(
+        now,
+        "act",
+        vec![
+            acct("act", 20.0, -1.0e300, now).rate(1.0, 1.0).wreset(None),
+            acct("b", 10.0, 10.0, now),
+        ],
+    );
+    let _ = decide(&s);
+}
+
+#[test]
+fn stuck_notice_falls_back_to_the_earliest_window_reset_when_nothing_is_blocked() {
+    let now = at(12, 0, 0);
+    let s = snap(
+        now,
+        "a",
+        vec![
+            acct("a", 50.0, 50.0, now).sreset(Some(now + Duration::hours(2))),
+            acct("b", 60.0, 60.0, now).sreset(Some(now + Duration::hours(1))),
+        ],
+    );
+    let v = assess_all(&s);
+    assert!(v.iter().all(|a| a.blocked_until.is_none()));
+    assert_eq!(
+        super::shell::soonest_unlock(&v, now),
+        Some(now + Duration::hours(1))
+    );
+}
+
+#[test]
+fn stuck_notice_stays_unknown_when_a_blocked_account_has_no_known_unlock() {
+    let now = at(12, 0, 0);
+    // Session maxed with no reset time: blocked indefinitely. Its weekly
+    // window resets in 1h, but nothing unlocks then.
+    let s = snap(
+        now,
+        "a",
+        vec![acct("a", 100.0, 40.0, now)
+            .sreset(None)
+            .wreset(Some(now + Duration::hours(1)))],
+    );
+    let v = assess_all(&s);
+    assert!(v.iter().any(|a| a.blocked));
+    assert_eq!(super::shell::soonest_unlock(&v, now), None);
+}
+
+#[test]
+fn prune_clamps_future_timestamps_to_now() {
+    let now = Utc.with_ymd_and_hms(2026, 11, 3, 12, 0, 0).unwrap();
+    let nt = now.timestamp();
+    let future = nt + 90 * 86_400;
+    let mut m = SwapMemory::default();
+    m.left_at.insert("b@e.com".into(), future);
+    m.left_at.insert("c@e.com".into(), nt + 30); // within slack: untouched
+    m.last_switch_at = Some(future);
+    m.trigger_left.insert(
+        "b@e.com".into(),
+        Latch {
+            window: WindowId::Session,
+            resets_at: None,
+            pct: 95.0,
+            at: future,
+        },
+    );
+    m.prune(now);
+    assert_eq!(m.left_at("b@e.com"), Some(nt));
+    assert_eq!(m.left_at("c@e.com"), Some(nt + 30));
+    assert_eq!(m.last_switch_at, Some(nt));
+    assert_eq!(m.trigger_latch("b@e.com").map(|l| l.at), Some(nt));
+}
+
+#[test]
+fn failed_switch_notifies_once_per_target_and_kind() {
+    use super::shell::should_notify_failure as notify;
+    let mut last = None;
+    assert!(notify(&mut last, "B@e.com", "auth"));
+    assert!(!notify(&mut last, "b@e.com", "auth"), "same episode");
+    assert!(notify(&mut last, "b@e.com", "client-handoff"), "new kind");
+    assert!(notify(&mut last, "c@e.com", "client-handoff"), "new target");
+    last = None; // a success clears it
+    assert!(notify(&mut last, "c@e.com", "client-handoff"));
+}
+
+#[test]
+fn stay_cycle_ends_the_failure_episode() {
+    use super::shell::{clear_failure_on_stay, should_notify_failure as notify};
+    let mut last = None;
+    assert!(notify(&mut last, "b@e.com", "auth"));
+    let sw = Action::Switch {
+        to: "b@e.com".into(),
+        kind: Kind::Trigger,
+    };
+    clear_failure_on_stay(&mut last, &sw);
+    assert!(
+        !notify(&mut last, "b@e.com", "auth"),
+        "still the same episode"
+    );
+    clear_failure_on_stay(&mut last, &Action::Stay);
+    assert!(
+        notify(&mut last, "b@e.com", "auth"),
+        "a new episode notifies"
+    );
+}
+
+#[test]
+fn failure_kind_classifies_causes() {
+    let k = |s: &str| super::shell::failure_kind(&anyhow::anyhow!("{s}"), "b@e.com");
+    assert_eq!(k("keychain write denied"), "credential-write");
+    assert_eq!(
+        k("client has no supported graceful handoff"),
+        "client-handoff"
+    );
+    assert_eq!(k("refresh failed"), "auth");
+    assert_eq!(k("boom"), "other");
+}
+
+// --- audit round 3 (B3) ----------------------------------------------------
+
+#[test]
+fn r3_display_switches_off_an_over_trigger_window_when_the_other_is_higher() {
+    // Session shown at 96 (over the 95 trigger); weekly climbs to 99.4 and
+    // then 100: the tray must show the weekly window (§4 override).
+    let now = at(17, 16, 0);
+    let prev = Some(BindingShown {
+        window: WindowId::Session,
+        since: now - Duration::minutes(1),
+    });
+    for w in [99.4, 100.0] {
+        let a = display(96.0, w, Some(0.1), Some(0.01));
+        let next = BindingShown::update(prev, &a, now, 95.0).unwrap();
+        assert_eq!(next.window, WindowId::Weekly, "weekly {w}");
+    }
+    // Both over the trigger, the shown one still higher: keep it.
+    let a = display(98.0, 96.0, Some(0.1), Some(0.01));
+    let next = BindingShown::update(prev, &a, now, 95.0).unwrap();
+    assert_eq!(next.window, WindowId::Session);
+}
+
+#[test]
+fn r3_binding_time_to_block_is_none_for_a_non_binding_window() {
+    let now = at(17, 16, 0);
+    // Neither window binds: session resets in 1 h (ttb 250 min), weekly in
+    // 2 days (ttb ~4.9 days).
+    let a = display(50.0, 30.0, Some(0.2), Some(0.01))
+        .sreset(Some(now + Duration::minutes(60)))
+        .wreset(Some(now + Duration::days(2)));
+    let b = super::runway::binding_window_at(&a, now, 95.0).unwrap();
+    assert_eq!(b.window, WindowId::Session);
+    assert_eq!(b.time_to_block, None, "{b:?}");
+    // Over the trigger but resetting before it could block.
+    let a = display(92.0, 10.0, Some(0.05), Some(0.0)).sreset(Some(now + Duration::minutes(30)));
+    let b = super::runway::binding_window_at(&a, now, 90.0).unwrap();
+    assert_eq!(b.window, WindowId::Session);
+    assert_eq!(b.time_to_block, None, "{b:?}");
+}
+
+#[test]
+fn r3_trigger_latch_keys_on_the_binding_window_not_a_resetting_one() {
+    // Session 97 resets in 1 min (non-binding); weekly 96 binds and drives
+    // the leave: the latch must last until the weekly reset.
+    let now = at(12, 0, 0);
+    let s = snap(
+        now,
+        "act",
+        vec![acct("act", 97.0, 96.0, now - Duration::seconds(20))
+            .sreset(Some(now + Duration::minutes(1)))],
+    );
+    let a = assessed(&s, "act");
+    let ses = a
+        .windows
+        .iter()
+        .find(|w| w.id == WindowId::Session)
+        .unwrap();
+    assert!(!ses.binds, "precondition: the session resets first");
+    assert_eq!(a.binding_window().unwrap().id, WindowId::Weekly);
+    let l = a.latch(now).unwrap();
+    assert_eq!(l.window, WindowId::Weekly);
+    assert_eq!(l.resets_at, Some(far().timestamp()));
+}
+
+#[test]
+fn r3_a_future_fetched_at_is_not_a_fresh_verified_reading() {
+    // Read while the clock was 3 h ahead, then corrected.
+    let now = at(12, 0, 0);
+    let future = now + Duration::hours(3);
+    let s = snap(
+        now,
+        "act",
+        vec![
+            acct("act", 92.0, 10.0, future).backoff(),
+            acct("b", 10.0, 10.0, future),
+        ],
+    );
+    let act = assessed(&s, "act");
+    assert_ne!(act.evidence, Evidence::Real, "{act:?}");
+    assert!(act.blind_in_band, "in band with an untrusted age: project");
+    let b = assessed(&s, "b");
+    assert!(!b.verified, "{b:?}");
+    assert_ne!(b.evidence, Evidence::Real);
+    // Within the slack it is still a fresh reading.
+    let s = snap(
+        now,
+        "act",
+        vec![acct("act", 50.0, 10.0, now + Duration::seconds(30))],
+    );
+    assert_eq!(assessed(&s, "act").evidence, Evidence::Real);
+}
+
+#[test]
+fn r3_failure_kind_ignores_the_account_key_and_flags_renewals() {
+    let k = |s: &str, to: &str| super::shell::failure_kind(&anyhow::anyhow!("{s}"), to);
+    assert_eq!(
+        k(
+            "stored credentials belong to another account; renew login for a@b.com",
+            "a@b.com"
+        ),
+        "auth"
+    );
+    assert_eq!(
+        k("renew login for client.ops@corp.com", "client.ops@corp.com"),
+        "auth"
+    );
+    assert_eq!(
+        k(
+            "no claude account matches 'auth.client@x.io'",
+            "auth.client@x.io"
+        ),
+        "other"
+    );
+}
+
+#[test]
+fn binding_by_rate_lead_waits_for_the_dwell() {
+    let t0 = at(17, 0, 0);
+    let shown = BindingShown::update(None, &display(0.0, 0.0, Some(1.0), Some(1.0)), t0, 95.0);
+    assert_eq!(shown.unwrap().window, WindowId::Session);
+    // Weekly blocks in 40 min vs session 100: decisive, but not an override.
+    let lead = display(0.0, 60.0, Some(1.0), Some(1.0));
+    let early = BindingShown::update(shown, &lead, t0 + Duration::seconds(30), 95.0);
+    assert_eq!(
+        early.unwrap().window,
+        WindowId::Session,
+        "switched before the dwell"
+    );
+    let just_before = t0 + Duration::seconds(super::policy::BIND_MIN_DWELL_S - 1);
+    let still = BindingShown::update(early, &lead, just_before, 95.0);
+    assert_eq!(still.unwrap().window, WindowId::Session);
+    let after = t0 + Duration::seconds(super::policy::BIND_MIN_DWELL_S + 1);
+    let later = BindingShown::update(still, &lead, after, 95.0);
+    assert_eq!(later.unwrap().window, WindowId::Weekly);
+}
+
+#[test]
+fn ready_serve_ranks_an_unknown_weekly_reset_after_a_known_one() {
+    // Room that resets in a day is spent before room whose reset is unknown,
+    // even when the unknown one is roomier and sorts first by key.
+    let now = ymd(11, 4, 0, 8, 52);
+    let s = snap(
+        now,
+        "dev3",
+        vec![
+            acct("dev3", 0.0, 100.0, now).wreset(Some(ymd(11, 13, 0, 0, 0))),
+            acct("aaa-unknown", 0.0, 0.0, now).wreset(None),
+            acct("known", 0.0, 50.0, now).wreset(Some(now + Duration::days(1))),
+        ],
+    );
+    let mut c: Vec<Assessed> = assess_all(&s)
+        .into_iter()
+        .filter(|a| !a.is_active)
+        .collect();
+    assert!(c.iter().all(|a| a.tier == Tier::Ready), "{c:?}");
+    c.sort_by(|a, b| rank_cmp(a, b, None));
+    assert_eq!(c[0].key, "known", "an unknown reset outranked a known one");
+    let d = decide(&s);
+    assert_eq!(switched(&d), Some(("known", Kind::Serve)), "{d:?}");
+}
+
+#[test]
+fn a_hold_or_a_cleared_or_moved_pick_after_the_cycle_began_is_detected() {
+    use crate::store::State;
+    let mut before = State {
+        active: Some("a@x.io".to_string()),
+        ..Default::default()
+    };
+    before.set_manual_pick("claude", Some("a@x.io"));
+    // A hold added with the pick unchanged.
+    let mut held = before.clone();
+    held.set_manual_hold("claude", Some("a@x.io"));
+    assert_eq!(held.manual_pick("claude"), before.manual_pick("claude"));
+    assert!(super::shell::pick_changed(&before, &held, "claude"));
+    // The hold cleared with the pick unchanged.
+    let mut unheld = held.clone();
+    unheld.set_manual_hold("claude", None);
+    assert!(super::shell::pick_changed(&held, &unheld, "claude"));
+    // The pick cleared, and the pick moved.
+    let mut cleared = before.clone();
+    cleared.set_manual_pick("claude", None);
+    assert!(super::shell::pick_changed(&before, &cleared, "claude"));
+    let mut moved = before.clone();
+    moved.set_manual_pick("claude", Some("b@x.io"));
+    assert!(super::shell::pick_changed(&before, &moved, "claude"));
+    // Another provider's pick is not this one's.
+    let mut other = before.clone();
+    other.set_manual_hold("codex", Some("c@x.io"));
+    assert!(!super::shell::pick_changed(&before, &other, "claude"));
 }

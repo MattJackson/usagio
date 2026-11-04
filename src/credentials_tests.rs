@@ -21,6 +21,8 @@ struct FakeProvider {
     /// Map blob -> (AccountKey identifier, freshness) for identify + freshness.
     routing: Vec<(String, Option<AccountKey>, CredentialFreshness)>,
     absorbed: Arc<Mutex<Vec<(AccountKey, String)>>>,
+    /// Blobs `identify_credential_online` can place (blob -> key).
+    online: Vec<(String, AccountKey)>,
 }
 
 impl FakeProvider {
@@ -30,7 +32,12 @@ impl FakeProvider {
             paths: Vec::new(),
             routing: Vec::new(),
             absorbed: Arc::new(Mutex::new(Vec::new())),
+            online: Vec::new(),
         }
+    }
+    fn route_online(mut self, blob: &str, key: AccountKey) -> Self {
+        self.online.push((blob.to_string(), key));
+        self
     }
     fn with_path(mut self, p: PathBuf) -> Self {
         self.paths.push(p);
@@ -85,6 +92,12 @@ impl Provider for FakeProvider {
             .iter()
             .find(|(b, _, _)| b == blob)
             .and_then(|(_, k, _)| k.clone())
+    }
+    fn identify_credential_online(&self, blob: &str) -> Option<AccountKey> {
+        self.online
+            .iter()
+            .find(|(b, _)| b == blob)
+            .map(|(_, k)| k.clone())
     }
     fn credential_freshness(&self, blob: &str) -> CredentialFreshness {
         self.routing
@@ -221,6 +234,27 @@ fn last_chance_fallback_adopts_freshest_matching_blob() {
         absorbs.iter().filter(|(k, _)| k == &target).collect();
     assert_eq!(target_absorbs.len(), 1);
     assert_eq!(target_absorbs[0].1, "FRESH_A");
+}
+
+#[test]
+fn last_chance_fallback_identifies_unlabelled_blob_online() {
+    // A blob with tokens but no embedded identity is placed via the
+    // provider's online identification, and only on the last-chance path.
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_blob(dir.path(), "creds.json", "TOKENS_ONLY");
+    let target = AccountKey::new("fake", "a@e.com");
+    let prov = FakeProvider::new("fake")
+        .with_path(path)
+        .route("TOKENS_ONLY", None, CredentialFreshness::Fresh)
+        .route_online("TOKENS_ONLY", target.clone());
+    // The watcher/absorb path never makes the extra request.
+    assert!(absorb_all_lagging(&prov).is_empty());
+    assert!(prov.absorbs().is_empty());
+    assert!(last_chance_fallback(&prov, &target));
+    let absorbs = prov.absorbs();
+    assert_eq!(absorbs.len(), 1);
+    assert_eq!(absorbs[0].1, "TOKENS_ONLY");
 }
 
 #[test]
@@ -404,6 +438,7 @@ fn nested_with_state_lock_does_not_deadlock() {
 // -----------------------------------------------------------------------------
 #[test]
 fn spawn_watchers_creates_missing_parent_dir() {
+    let _cfg = crate::store::ScopedConfigDir::new();
     let td = tempfile::tempdir().unwrap();
     // Parent dir does NOT exist yet — this is the fresh-install condition.
     let missing_parent = td.path().join("dot-claude");
@@ -470,6 +505,7 @@ fn refresh_inactive_if_stale_skips_currently_active_account() {
                 cached_usage: None,
                 notif_state: crate::notifications::NotifState::default(),
                 needs_relogin: false,
+                live_write_pending: None,
                 no_subscription: false,
                 plan: None,
                 profile_refresh_after: None,
@@ -514,6 +550,7 @@ fn far_future_account(email: &str) -> crate::store::Account {
         cached_usage: None,
         notif_state: crate::notifications::NotifState::default(),
         needs_relogin: false,
+        live_write_pending: None,
         no_subscription: false,
         plan: None,
         profile_refresh_after: None,
@@ -791,18 +828,51 @@ fn watcher_does_not_leak_an_fd_per_file_in_a_large_dir() {
 fn notify_backend_is_not_kqueue() {
     let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
         .expect("read Cargo.toml");
-    // Isolate the `notify = ...` dependency line(s) (ignore `notify-rust`).
-    for line in manifest.lines() {
-        let t = line.trim_start();
-        if t.starts_with("notify ") || t.starts_with("notify=") {
-            assert!(
-                !line.contains("macos_kqueue"),
-                "Cargo.toml enables the notify `macos_kqueue` backend, which \
-                 leaks a file descriptor per watched file and exhausted \
-                 RLIMIT_NOFILE (breaking keychain switch/refresh). Use the \
-                 default FSEvents backend: `notify = \"6\"`."
-            );
-        }
+    assert!(
+        !notify_enables_kqueue(&manifest),
+        "Cargo.toml enables the notify `macos_kqueue` backend, which \
+         leaks a file descriptor per watched file and exhausted \
+         RLIMIT_NOFILE (breaking keychain switch/refresh). Use the \
+         default FSEvents backend: `notify = \"6\"`."
+    );
+}
+
+/// Whether ANY `notify` dependency declaration in the manifest — inline,
+/// `[dependencies.notify]` table, multi-line features, or under
+/// `[target.*.dependencies]` — enables the `macos_kqueue` feature.
+fn notify_enables_kqueue(manifest: &str) -> bool {
+    fn walk(v: &toml::Value, in_deps: bool) -> bool {
+        let Some(t) = v.as_table() else { return false };
+        t.iter().any(|(k, child)| {
+            let is_deps_table = k.ends_with("dependencies");
+            if in_deps && k == "notify" {
+                return child
+                    .get("features")
+                    .and_then(|f| f.as_array())
+                    .is_some_and(|f| f.iter().any(|x| x.as_str() == Some("macos_kqueue")));
+            }
+            walk(child, is_deps_table)
+        })
+    }
+    let doc: toml::Value = manifest.parse().expect("parse Cargo.toml");
+    walk(&doc, false)
+}
+
+#[test]
+fn notify_kqueue_scan_sees_every_declaration_form() {
+    for bad in [
+        "[dependencies]\nnotify = { version = \"6\", features = [\"macos_kqueue\"] }\n",
+        "[dependencies.notify]\nversion = \"6\"\nfeatures = [\"macos_kqueue\"]\n",
+        "[dependencies]\nnotify = { version = \"6\", features = [\n  \"serde\",\n  \"macos_kqueue\",\n] }\n",
+        "[target.'cfg(target_os = \"macos\")'.dependencies]\nnotify = { version = \"6\", features = [\"macos_kqueue\"] }\n",
+    ] {
+        assert!(notify_enables_kqueue(bad), "missed: {bad}");
+    }
+    for good in [
+        "[dependencies]\nnotify = \"6\"\nnotify-rust = { version = \"4\", features = [\"macos_kqueue\"] }\n",
+        "[dependencies.notify]\nversion = \"6\"\nfeatures = [\"serde\"]\n",
+    ] {
+        assert!(!notify_enables_kqueue(good), "false positive: {good}");
     }
 }
 
@@ -1130,6 +1200,40 @@ fn ensure_fresh_never_spends_the_grant_of_an_account_that_went_active() {
 }
 
 #[test]
+fn active_key_case_mismatch_still_blocks_every_refresh_site() {
+    use crate::store::State;
+    with_isolated_home(|| {
+        seed_state(
+            vec![expired_account("now-active@example.com")],
+            Some("Now-Active@Example.com"),
+        );
+        let (url, hits) = spawn_token_server(200, || {});
+        let _u = TokenUrlGuard::set(&url);
+
+        // lifecycle::adopt_saved_rotation / save_rotation via ensure_fresh.
+        let mut stale = expired_account("now-active@example.com");
+        let changed = crate::providers::claude::oauth::ensure_fresh(&mut stale, 900).unwrap();
+        assert!(!changed);
+        // credentials.rs background refresh.
+        refresh_inactive_if_stale(None);
+
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the vendor-owned active account's grant must never be POSTed"
+        );
+        assert_eq!(
+            State::load()
+                .unwrap()
+                .find("now-active@example.com")
+                .unwrap()
+                .refresh_token,
+            "stale-rt"
+        );
+    });
+}
+
+#[test]
 fn refresh_inactive_if_stale_skips_accounts_already_flagged_needs_relogin() {
     use crate::store::State;
     with_isolated_home(|| {
@@ -1229,12 +1333,15 @@ fn spawn_watchers_refuses_to_watch_the_filesystem_root() {
 
 #[test]
 fn install_then_respawn_watchers_rebuilds_the_registered_watcher() {
+    let _w = WATCHER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _cfg = crate::store::ScopedConfigDir::new();
     let td = tempfile::tempdir().unwrap();
     let cred = td.path().join("creds").join("c.json");
     let prov = FakeProvider::new("fake-reg").with_path(cred);
     let prov_static: &'static FakeProvider = Box::leak(Box::new(prov));
 
-    // Start from an empty registry (nothing else in the suite touches it).
+    // Start from an empty registry (other registry tests serialize on
+    // WATCHER_TEST_LOCK).
     {
         let mut reg = WATCHER_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         reg.handle = None;
@@ -1259,4 +1366,145 @@ fn install_then_respawn_watchers_rebuilds_the_registered_watcher() {
         reg.handle = None;
         reg.providers.clear();
     }
+}
+
+// -----------------------------------------------------------------------------
+// relogin-flag-race / active-case-compare (codeaudit r1 C4)
+// -----------------------------------------------------------------------------
+
+fn claude_account_with_refresh(email: &str, refresh: &str) -> crate::store::Account {
+    let blob = format!(
+        r#"{{"claudeAiOauth":{{"accessToken":"at","refreshToken":"{refresh}","expiresAt":123}}}}"#
+    );
+    let mut a = crate::store::Account::from_keychain_blob(&blob).unwrap();
+    a.email = Some(email.to_string());
+    a
+}
+
+#[test]
+fn flag_needs_relogin_skips_account_whose_refresh_token_rotated() {
+    with_isolated_home(|| {
+        let mut st = State::default();
+        st.accounts
+            .push(claude_account_with_refresh("a@e.com", "new-rt"));
+        st.save().unwrap();
+        // The invalid_grant verdict was for the OLD token; another process
+        // has since rotated it. Must not flag.
+        let flagged = flag_needs_relogin_if_unchanged("a@e.com", "old-rt").unwrap();
+        assert_eq!(
+            flagged,
+            FlagOutcome::Rotated,
+            "stale verdict must not flag a rotated account"
+        );
+        assert!(!State::load().unwrap().accounts[0].needs_relogin);
+        // Same token that failed -> flag.
+        assert_eq!(
+            flag_needs_relogin_if_unchanged("a@e.com", "new-rt").unwrap(),
+            FlagOutcome::Flagged
+        );
+        assert_eq!(
+            flag_needs_relogin_if_unchanged("a@e.com", "new-rt").unwrap(),
+            FlagOutcome::AlreadyFlagged
+        );
+        assert!(State::load().unwrap().accounts[0].needs_relogin);
+    });
+}
+
+#[test]
+fn active_key_comparison_is_case_insensitive() {
+    assert!(is_active_key("Alice@E.com", Some("alice@e.com")));
+    assert!(!is_active_key("b@e.com", Some("alice@e.com")));
+    assert!(!is_active_key("b@e.com", None));
+}
+
+#[test]
+fn relogin_alert_fires_once_per_account_and_refresh_token() {
+    assert!(first_relogin_alert("once@e.com", "rt-1"));
+    assert!(
+        !first_relogin_alert("once@e.com", "rt-1"),
+        "repeat is suppressed"
+    );
+    assert!(
+        first_relogin_alert("once@e.com", "rt-2"),
+        "new grant alerts"
+    );
+    assert!(
+        first_relogin_alert("other@e.com", "rt-1"),
+        "other account alerts"
+    );
+}
+
+fn backup_count() -> usize {
+    let dir = crate::store::config_dir().unwrap().join("backups");
+    std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0)
+}
+
+#[test]
+fn absorb_that_changes_nothing_does_not_save() {
+    with_isolated_home(|| {
+        crate::store::State::default().save().unwrap();
+        crate::store::State::default().save().unwrap();
+        let before = backup_count();
+        with_state_lock_absorb(|_| Ok(())).unwrap();
+        assert_eq!(backup_count(), before, "no-op absorb must not save");
+        with_state_lock_absorb(|st| {
+            st.autoswap_disabled = true;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(backup_count(), before + 1, "a real change must save");
+        assert!(crate::store::State::load().unwrap().autoswap_disabled);
+    });
+}
+
+#[test]
+fn refresh_inactive_if_stale_refreshes_every_expired_inactive_account() {
+    use crate::store::State;
+    with_isolated_home(|| {
+        seed_state(
+            vec![
+                expired_account("one@e.com"),
+                expired_account("active@e.com"),
+                expired_account("two@e.com"),
+            ],
+            Some("active@e.com"),
+        );
+        let (url, hits) = spawn_token_server(200, || {});
+        let _u = TokenUrlGuard::set(&url);
+
+        refresh_inactive_if_stale(None);
+
+        let st = State::load().unwrap();
+        for email in ["one@e.com", "two@e.com"] {
+            assert_eq!(
+                st.find(email).unwrap().access_token,
+                "mock-refreshed-access-token",
+                "{email} was not refreshed"
+            );
+        }
+        assert_eq!(st.find("active@e.com").unwrap().access_token, "stale-at");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    });
+}
+
+#[test]
+fn a_dead_grant_does_not_stop_the_loop_before_the_next_inactive_account() {
+    use crate::store::State;
+    with_isolated_home(|| {
+        seed_state(
+            vec![expired_account("one@e.com"), expired_account("two@e.com")],
+            None,
+        );
+        let (url, hits) = spawn_token_server(400, || {});
+        let _u = TokenUrlGuard::set(&url);
+
+        refresh_inactive_if_stale(None);
+
+        // Each account spent its own POST and was flagged on its own.
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let st = State::load().unwrap();
+        for email in ["one@e.com", "two@e.com"] {
+            assert!(st.find(email).unwrap().needs_relogin, "{email} not flagged");
+        }
+    });
 }

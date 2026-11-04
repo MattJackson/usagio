@@ -236,6 +236,20 @@ fn metadata_profile_request_handles_http_and_parse_failures() {
 }
 
 #[test]
+fn fetch_profile_uses_only_the_test_mock() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    // No mock: no request at all (tests must never contact Anthropic).
+    set_profile_url_override(None);
+    assert!(fetch_profile("test-access").is_none());
+    let expected = sample_profile();
+    let (url, _) = crate::tests::spawn_mock_usage_server(200, expected.to_string());
+    set_profile_url_override(Some(&format!("{url}/api/oauth/profile")));
+    let actual = fetch_profile("test-access");
+    set_profile_url_override(None);
+    assert_eq!(actual, Some(expected));
+}
+
+#[test]
 fn fetch_error_display_texts() {
     assert_eq!(
         FetchError::RateLimited.to_string(),
@@ -531,4 +545,16 @@ fn scoped_opus_limit_defers_to_the_fixed_opus_window() {
     assert_eq!(r.scoped_limits[0].label, "Fable 7d");
     assert_eq!(r.scoped_limits[0].utilization, Some(42.0));
     assert!(r.scoped_limits[0].resets_at.is_none());
+}
+
+#[test]
+fn claim_outcome_from_status_only_reset_is_applied() {
+    assert_eq!(ClaimOutcome::from_status("reset"), ClaimOutcome::Reset);
+    for other in ["already_used", "not_limited", "cooldown", "unknown", ""] {
+        assert_eq!(
+            ClaimOutcome::from_status(other),
+            ClaimOutcome::NoChange(other.to_string()),
+            "{other:?} must not be reported as an applied reset"
+        );
+    }
 }

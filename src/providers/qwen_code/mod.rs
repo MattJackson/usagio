@@ -48,7 +48,7 @@ impl Provider for QwenCodeProvider {
         // TODO: read `~/.qwen/oauth_creds.json` and populate `TokenGrant` from
         // its `access_token` / `refresh_token` / `expiry_date` fields. Email
         // is not available at capture — the CLI never asks for it.
-        Ok(None)
+        Err(ProviderError::Unsupported)
     }
 
     fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
@@ -79,6 +79,9 @@ mod tests {
 
     #[test]
     fn capture_returns_none_placeholder() {
-        assert!(matches!(QwenCodeProvider.capture_current_login(), Ok(None)));
+        assert!(matches!(
+            QwenCodeProvider.capture_current_login(),
+            Err(ProviderError::Unsupported)
+        ));
     }
 }

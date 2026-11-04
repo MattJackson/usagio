@@ -119,6 +119,12 @@ pub struct Account {
     /// Cleared on any successful refresh or fresh capture.
     #[serde(default)]
     pub needs_relogin: bool,
+    /// Fingerprint of the refresh token whose renewal could not be written to
+    /// the live slot (`persist_claude_login`). While it matches the stored
+    /// refresh token the active-account CAS rewrites the slot instead of
+    /// adopting it; anything else is adopted as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_write_pending: Option<String>,
     /// True while the account's Claude subscription has lapsed (the usage
     /// endpoint answers 403/429 and the profile shows a free/canceled org).
     /// When set: the poller stops calling the usage endpoint for it (those
@@ -175,6 +181,7 @@ impl Account {
             cached_usage: None,
             notif_state: crate::notifications::NotifState::default(),
             needs_relogin: false,
+            live_write_pending: None,
             no_subscription: false,
             plan: None,
             profile_refresh_after: None,
@@ -187,8 +194,8 @@ impl Account {
         self.email.as_deref().unwrap_or("")
     }
 
-    /// The account's stable identity from its captured `oauthAccount`, preferring
-    /// the accountUuid and falling back to the email.
+    /// The account's stable identity from its captured `oauthAccount`: the
+    /// accountUuid, or `None` if it has not been captured.
     pub fn identity_uuid(&self) -> Option<String> {
         self.oauth_account
             .as_ref()
@@ -220,6 +227,7 @@ impl Account {
     /// Code put in the blob.
     pub fn adopt_login(&mut self, fresh: &Account) {
         self.profile_refresh_after = None;
+        self.live_write_pending = None;
         self.set_tokens(
             fresh.access_token.clone(),
             fresh.refresh_token.clone(),
@@ -233,6 +241,10 @@ impl Account {
         };
         let mut blob = serde_json::from_str::<serde_json::Value>(&self.keychain_blob)
             .unwrap_or_else(|_| serde_json::json!({}));
+        if !blob.is_object() {
+            // IndexMut panics on arrays/strings/numbers.
+            blob = serde_json::json!({});
+        }
         if !blob.get("claudeAiOauth").is_some_and(|x| x.is_object()) {
             blob["claudeAiOauth"] = serde_json::json!({});
         }
@@ -368,6 +380,24 @@ impl ProviderAccount {
     }
 }
 
+/// `State::resolve` found several accounts for a prefix (typed, so callers
+/// never match on message text).
+#[derive(Debug)]
+pub struct AmbiguousSelector(pub String);
+
+impl std::fmt::Display for AmbiguousSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AmbiguousSelector {}
+
+/// Whether `e` is an [`AmbiguousSelector`] error.
+pub fn is_ambiguous_selector(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<AmbiguousSelector>().is_some()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingSwitch {
     pub key: String,
@@ -382,6 +412,10 @@ pub struct PendingSwitch {
     /// A renewed active login waits here until the old client has drained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub renewed_account: Option<ProviderAccount>,
+    /// This queued "switch" is a login renewal of the already-active account:
+    /// its commit must leave the user's pick/hold alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub renewal: bool,
     #[serde(default)]
     pub leave_latch: Option<(
         crate::autoswap::memory::LatchKind,
@@ -405,9 +439,144 @@ pub struct ProviderAccounts {
     /// credential slot, if known.
     #[serde(default)]
     pub active: Option<String>,
+    /// Raw `accounts` entries that failed to deserialize at load. Kept
+    /// verbatim and written back so a single malformed entry is never
+    /// silently erased by the next save (and the overwrite guard counts them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unparsed_accounts: Vec<serde_json::Value>,
+}
+
+/// Parse one `providers.<slug>` value. Fast path is a whole-struct parse; when
+/// that fails, fall back to per-field / per-account parsing so one bad account
+/// entry only costs that entry (kept raw in `unparsed_accounts`), not the
+/// provider's whole slot. Every skipped piece is logged.
+fn parse_provider_accounts(slug: &str, val: &serde_json::Value) -> Option<ProviderAccounts> {
+    let mut pa = parse_provider_accounts_raw(slug, val)?;
+    pa.promote_unparsed(slug);
+    Some(pa)
+}
+
+fn parse_provider_accounts_raw(slug: &str, val: &serde_json::Value) -> Option<ProviderAccounts> {
+    let whole_err = match serde_json::from_value::<ProviderAccounts>(val.clone()) {
+        Ok(pa) => return Some(pa),
+        Err(e) => e,
+    };
+    let Some(obj) = val.as_object() else {
+        crate::logging::log(&format!(
+            "warn: providers.{slug} in state.json is not an object, ignoring it: {whole_err}"
+        ));
+        return None;
+    };
+    let mut pa = ProviderAccounts::default();
+    if let Some(ps) = obj.get("pending_switch").filter(|x| !x.is_null()) {
+        match serde_json::from_value(ps.clone()) {
+            Ok(p) => pa.pending_switch = Some(p),
+            Err(e) => crate::logging::log(&format!(
+                "warn: failed to parse providers.{slug}.pending_switch, dropping it: {e}"
+            )),
+        }
+    }
+    pa.active = obj.get("active").and_then(|x| x.as_str()).map(String::from);
+    for (field, is_raw) in [("accounts", false), ("unparsed_accounts", true)] {
+        let Some(arr) = obj.get(field).and_then(|x| x.as_array()) else {
+            continue;
+        };
+        for (i, entry) in arr.iter().enumerate() {
+            if is_raw {
+                pa.unparsed_accounts.push(entry.clone());
+                continue;
+            }
+            match serde_json::from_value::<ProviderAccount>(entry.clone()) {
+                Ok(a) => pa.accounts.push(a),
+                Err(e) => {
+                    crate::logging::log(&format!(
+                        "warn: failed to parse providers.{slug}.accounts[{i}] in state.json \
+                         ({e}); keeping the raw entry untouched, the account is unusable until \
+                         the entry is repaired"
+                    ));
+                    pa.unparsed_accounts.push(entry.clone());
+                }
+            }
+        }
+    }
+    Some(pa)
+}
+
+/// Lowercased `(slug, key)` of every provider account held in memory,
+/// including raw `unparsed_accounts` entries.
+fn provider_keys_in_state(state: &State) -> HashSet<(String, String)> {
+    let mut out = HashSet::new();
+    for (slug, pa) in &state.providers {
+        for a in &pa.accounts {
+            out.insert((slug.to_lowercase(), a.key.to_lowercase()));
+        }
+        for e in &pa.unparsed_accounts {
+            if let Some(k) = e.get("key").and_then(|x| x.as_str()) {
+                out.insert((slug.to_lowercase(), k.to_lowercase()));
+            }
+        }
+    }
+    out
+}
+
+/// Lowercased `(slug, key)` of every provider account recorded in the raw
+/// `state.json` value, including entries that no longer deserialize.
+fn raw_provider_account_keys(v: &serde_json::Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Some(providers) = v.get("providers").and_then(|p| p.as_object()) else {
+        return out;
+    };
+    for (slug, pv) in providers {
+        for field in ["accounts", "unparsed_accounts"] {
+            let Some(arr) = pv.get(field).and_then(|x| x.as_array()) else {
+                continue;
+            };
+            for entry in arr {
+                if let Some(k) = entry.get("key").and_then(|x| x.as_str()) {
+                    out.push((slug.to_lowercase(), k.to_lowercase()));
+                }
+            }
+        }
+    }
+    out
 }
 
 impl ProviderAccounts {
+    /// Re-attempt every preserved raw entry: those that now parse (hand
+    /// repaired, or written by a newer build) become real accounts unless that
+    /// key is already present; the rest stay raw.
+    fn promote_unparsed(&mut self, slug: &str) {
+        if self.unparsed_accounts.is_empty() {
+            return;
+        }
+        let raw = std::mem::take(&mut self.unparsed_accounts);
+        for entry in raw {
+            match serde_json::from_value::<ProviderAccount>(entry.clone()) {
+                Ok(a) => {
+                    if self.find(&a.key).is_none() {
+                        crate::logging::log(&format!(
+                            "providers.{slug}: preserved entry {} now parses; restored",
+                            a.key
+                        ));
+                        self.accounts.push(a);
+                    }
+                }
+                Err(_) => self.unparsed_accounts.push(entry),
+            }
+        }
+    }
+
+    /// Drop any preserved raw entry whose `key` matches `key`.
+    fn drop_unparsed(&mut self, key: &str) -> bool {
+        let before = self.unparsed_accounts.len();
+        self.unparsed_accounts.retain(|e| {
+            !e.get("key")
+                .and_then(|k| k.as_str())
+                .is_some_and(|k| k.eq_ignore_ascii_case(key))
+        });
+        self.unparsed_accounts.len() != before
+    }
+
     pub fn find(&self, key: &str) -> Option<&ProviderAccount> {
         self.accounts
             .iter()
@@ -421,6 +590,8 @@ impl ProviderAccounts {
     }
 
     pub fn upsert(&mut self, acct: ProviderAccount) {
+        // A fresh capture supersedes a stale unparseable copy of the same key.
+        self.drop_unparsed(&acct.key);
         if let Some(existing) = self.find_mut(&acct.key) {
             *existing = acct;
         } else {
@@ -559,6 +730,23 @@ fn migrate_manual_pick_tier(v: &serde_json::Value) -> std::collections::HashMap<
     tiers
 }
 
+/// Parse `v[field]` into `T`, defaulting when absent; a present-but-malformed
+/// value is logged (not silently dropped) before defaulting.
+fn parse_field_or_warn<T: serde::de::DeserializeOwned + Default>(
+    v: &serde_json::Value,
+    field: &str,
+) -> T {
+    match v.get(field) {
+        None => T::default(),
+        Some(x) => serde_json::from_value(x.clone()).unwrap_or_else(|e| {
+            crate::logging::log(&format!(
+                "warn: failed to parse {field} in state.json, resetting it: {e}"
+            ));
+            T::default()
+        }),
+    }
+}
+
 /// Per-app config directory. Delegates to the platform Paths backend so the
 /// path resolves to the OS-appropriate location (`~/.config/usagio` on
 /// macOS, XDG on Linux, `%APPDATA%\usagio` on Windows). Kept as a
@@ -654,6 +842,11 @@ impl State {
                 let refresh_token = obj.get("refresh_token").and_then(|x| x.as_str());
                 let (Some(access_token), Some(refresh_token)) = (access_token, refresh_token)
                 else {
+                    crate::logging::log(&format!(
+                        "warn: skipping state.json accounts[] entry without access_token/\
+                         refresh_token (email={:?}); it will not be loaded",
+                        obj.get("email").and_then(|x| x.as_str())
+                    ));
                     continue; // not a usable account entry
                 };
                 let legacy_name = obj.get("name").and_then(|x| x.as_str());
@@ -698,6 +891,10 @@ impl State {
                         .get("needs_relogin")
                         .and_then(|x| x.as_bool())
                         .unwrap_or(false),
+                    live_write_pending: obj
+                        .get("live_write_pending")
+                        .and_then(|x| x.as_str())
+                        .map(String::from),
                     no_subscription: obj
                         .get("no_subscription")
                         .and_then(|x| x.as_bool())
@@ -777,27 +974,26 @@ impl State {
         // accounts already live in `accounts` above, unchanged — so the
         // "migration" is simply defaulting `providers` to empty and always
         // reporting the in-memory result as the current schema version (see
-        // `STATE_SCHEMA_VERSION`'s doc). Deliberately no logging here:
-        // `from_value` is a pure parsing function called from contexts (e.g.
-        // `internal from_value round-trip tests) that never set up a
-        // `HOME_OVERRIDE`, and `logging::log` resolves `config_dir()`, which
-        // panics under `cfg(test)` without one.
+        // `STATE_SCHEMA_VERSION`'s doc). Parse problems below are logged via
+        // `logging::log`, which resolves `config_dir()` — under `cfg(test)`
+        // that panics without a `HOME_OVERRIDE`, so tests that feed
+        // malformed input here must hold a `ScopedConfigDir`.
+        if let Some(sv) = v.get("schema_version").and_then(|x| x.as_u64()) {
+            if sv > u64::from(STATE_SCHEMA_VERSION) {
+                crate::logging::log(&format!(
+                    "warn: state.json schema_version {sv} is newer than this build \
+                     understands ({STATE_SCHEMA_VERSION}); fields added by the newer \
+                     version will be lost on the next save"
+                ));
+            }
+        }
         let providers: std::collections::HashMap<String, ProviderAccounts> = v
             .get("providers")
             .and_then(|p| p.as_object())
             .map(|obj| {
                 obj.iter()
                     .filter_map(|(slug, val)| {
-                        match serde_json::from_value::<ProviderAccounts>(val.clone()) {
-                            Ok(pa) => Some((slug.clone(), pa)),
-                            Err(e) => {
-                                crate::logging::log(&format!(
-                                    "warn: failed to parse providers.{slug} in state.json, \
-                                     dropping that provider's accounts: {e}"
-                                ));
-                                None
-                            }
-                        }
+                        parse_provider_accounts(slug, val).map(|pa| (slug.clone(), pa))
                     })
                     .collect()
             })
@@ -833,28 +1029,24 @@ impl State {
                     }
                 })
                 .unwrap_or_default(),
-            manual_holds: v
-                .get("manual_holds")
-                .and_then(|x| serde_json::from_value(x.clone()).ok())
-                .unwrap_or_default(),
-            manual_picks: v
-                .get("manual_picks")
-                .and_then(|x| serde_json::from_value(x.clone()).ok())
-                .unwrap_or_default(),
-            manual_pick_at: v
-                .get("manual_pick_at")
-                .and_then(|x| serde_json::from_value(x.clone()).ok())
-                .unwrap_or_default(),
+            manual_holds: parse_field_or_warn(v, "manual_holds"),
+            manual_picks: parse_field_or_warn(v, "manual_picks"),
+            manual_pick_at: parse_field_or_warn(v, "manual_pick_at"),
             manual_pick_tier: migrate_manual_pick_tier(v),
             swap_memory: v
                 .get("swap_memory")
                 .and_then(|x| x.as_object())
                 .map(|obj| {
                     obj.iter()
-                        .filter_map(|(slug, val)| {
-                            serde_json::from_value(val.clone())
-                                .ok()
-                                .map(|m| (slug.clone(), m))
+                        .filter_map(|(slug, val)| match serde_json::from_value(val.clone()) {
+                            Ok(m) => Some((slug.clone(), m)),
+                            Err(e) => {
+                                crate::logging::log(&format!(
+                                    "warn: failed to parse swap_memory.{slug} in \
+                                         state.json, dropping it: {e}"
+                                ));
+                                None
+                            }
                         })
                         .collect()
                 })
@@ -988,10 +1180,10 @@ impl State {
         match matches.as_slice() {
             [one] => Ok((*one).to_string()),
             [] => Err(anyhow!("no account matches '{sel}'")),
-            many => Err(anyhow!(
+            many => Err(anyhow::Error::new(AmbiguousSelector(format!(
                 "'{sel}' is ambiguous — matches: {}",
                 many.join(", ")
-            )),
+            )))),
         }
     }
 
@@ -1074,7 +1266,8 @@ impl State {
         };
         let before = pa.accounts.len();
         pa.accounts.retain(|a| !a.key.eq_ignore_ascii_case(key));
-        let changed = pa.accounts.len() != before;
+        let dropped_raw = pa.drop_unparsed(key);
+        let changed = pa.accounts.len() != before || dropped_raw;
         if changed {
             if pa
                 .active
@@ -1121,15 +1314,15 @@ pub(crate) const BACKUP_KEEP_COUNT: usize = 20;
 ///    diffs its account emails against `state.accounts`, and REFUSES the
 ///    write if any old email is missing without being marked in
 ///    `state.pending_removals`. On refusal, dumps the rejected in-memory
-///    state to `/tmp/usagio-state-rejected-<unix_ts>.json` so the user has
-///    both the "before" (on disk) and the "would-have-been-written" (dumped)
-///    to reason about.
+///    state to `backups/state-rejected-<unix_ts>.json` (owner-only; account
+///    keys only, tokens redacted) so the user has both the "before" (on
+///    disk) and a token-free picture of the rejected in-memory state.
 /// 2. **Rolling backups.** Before overwriting, copies the current
 ///    `state.json` to `backups/state-YYYYMMDD-HHMMSS.json` (mode 0600 under
 ///    a 0700 dir), then prunes so at most [`BACKUP_KEEP_COUNT`] survive.
 pub fn save_state_safe(state: &State) -> Result<()> {
     let dir = config_dir()?;
-    std::fs::create_dir_all(&dir).context("creating ~/.config/usagio")?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = state_path()?;
 
     // (1) Overwrite protection.
@@ -1177,23 +1370,19 @@ pub fn save_state_safe(state: &State) -> Result<()> {
             // authorization) is refused for the same reason a Claude account
             // drop is — a stale/blank load must never silently wipe a
             // captured account.
+            //
+            // The on-disk side is read from the RAW json (not the lossy
+            // `from_value` parse) so an entry that failed to deserialize is
+            // still protected; it survives in memory as `unparsed_accounts`.
             let mut unauthorized_provider: Vec<String> = Vec::new();
-            for (slug, old_pa) in &old.providers {
-                let new_keys_for_slug: HashSet<String> = state
-                    .providers
-                    .get(slug)
-                    .map(|pa| pa.accounts.iter().map(|a| a.key.to_lowercase()).collect())
-                    .unwrap_or_default();
-                for a in &old_pa.accounts {
-                    let k = a.key.to_lowercase();
-                    let slug_lc = slug.to_lowercase();
-                    if !new_keys_for_slug.contains(&k)
-                        && !state
-                            .pending_provider_removals
-                            .contains(&(slug_lc.clone(), k.clone()))
-                    {
-                        unauthorized_provider.push(format!("{slug}:{}", a.key));
-                    }
+            let new_provider_keys = provider_keys_in_state(state);
+            for (slug_lc, k) in raw_provider_account_keys(&v) {
+                if !new_provider_keys.contains(&(slug_lc.clone(), k.clone()))
+                    && !state
+                        .pending_provider_removals
+                        .contains(&(slug_lc.clone(), k.clone()))
+                {
+                    unauthorized_provider.push(format!("{slug_lc}:{k}"));
                 }
             }
             if !unauthorized.is_empty() || !unauthorized_provider.is_empty() {
@@ -1216,22 +1405,30 @@ pub fn save_state_safe(state: &State) -> Result<()> {
                 }
                 let redacted = redact_state_for_dump(state);
                 let dump_bytes = serde_json::to_vec_pretty(&redacted).unwrap_or_default();
-                let _ = write_private(&dump_path, &dump_bytes);
+                let dump_note = match write_private(&dump_path, &dump_bytes) {
+                    Ok(()) => format!(
+                        "Redacted (token-free) diagnostic written to {}",
+                        dump_path.display()
+                    ),
+                    Err(e) => format!(
+                        "Redacted diagnostic could NOT be written to {} ({e})",
+                        dump_path.display()
+                    ),
+                };
                 // R2-1: cap the rejected-dump family separately so a run of
                 // consecutive refusals cannot grow unbounded, and cannot
                 // dilute the BACKUP_KEEP_COUNT cap shared with real backups
                 // (prune_backups matches both `state-*` prefixes).
-                let _ = prune_rejected_dumps(&backups_dir, BACKUP_KEEP_COUNT);
+                let _ = prune_rejected_dumps(&backups_dir, BACKUP_KEEP_COUNT, Some(&dump_path));
                 let msg = format!(
                     "REFUSED save_state: would drop {} claude account(s) without an explicit \
                      remove(): {:?}, and {} provider account(s) without an explicit \
-                     remove_provider_account(): {:?}. Redacted (token-free) diagnostic written \
-                     to {}. On-disk state.json is UNCHANGED.",
+                     remove_provider_account(): {:?}. {}. On-disk state.json is UNCHANGED.",
                     unauthorized.len(),
                     unauthorized,
                     unauthorized_provider.len(),
                     unauthorized_provider,
-                    dump_path.display(),
+                    dump_note,
                 );
                 crate::logging::log(&msg);
                 return Err(anyhow!("{msg}"));
@@ -1313,18 +1510,15 @@ pub fn accounts_dropped_by(new_state: &State) -> Result<Vec<String>> {
         .collect();
     // Provider-account drops are reported as "<slug>:<key>" so the caller can
     // distinguish them from Claude emails in the confirmation dialog.
-    for (slug, old_pa) in &old.providers {
-        let new_keys_for_slug: HashSet<String> = new_state
-            .providers
-            .get(slug)
-            .map(|pa| pa.accounts.iter().map(|a| a.key.to_lowercase()).collect())
-            .unwrap_or_default();
-        for a in &old_pa.accounts {
-            if !new_keys_for_slug.contains(&a.key.to_lowercase()) {
-                dropped.push(format!("{slug}:{}", a.key));
-            }
+    let new_provider_keys = provider_keys_in_state(new_state);
+    for (slug, k) in raw_provider_account_keys(&v) {
+        if !new_provider_keys.contains(&(slug.clone(), k.clone())) {
+            dropped.push(format!("{slug}:{k}"));
         }
     }
+    // `old.providers` is a HashMap: sort so repeated calls (and the Restore
+    // re-check under the lock) compare equal when nothing changed.
+    dropped.sort();
     Ok(dropped)
 }
 
@@ -1394,44 +1588,44 @@ pub fn stash_pre_restore(config_dir: &Path) -> Result<Option<PathBuf>> {
         dst = backups_dir.join(format!("pre-restore-{ts}-{n}.json"));
         n += 1;
     }
-    if std::fs::rename(&live, &dst).is_err() {
-        // Cross-filesystem rename (e.g. state.json and backups/ on different
-        // mounts): fall back to owner-only copy + remove-original.
-        let bytes =
-            std::fs::read(&live).context("reading live state.json for pre-restore stash")?;
-        write_private(&dst, &bytes).context("writing pre-restore stash")?;
-        std::fs::remove_file(&live).context("removing live state.json after stash")?;
-    } else {
-        // rename() preserves the source file's mode, which is already 0600
-        // (state.json is always written via write_private), but enforce it
-        // explicitly so this stash is never weaker than that guarantee.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600));
-        }
-    }
+    // Copy (never rename away) so lock-free `State::load` readers always see
+    // the live file; the restore's own tmp+rename write then replaces it
+    // atomically. `write_private` creates the stash owner-only.
+    let bytes = std::fs::read(&live).context("reading live state.json for pre-restore stash")?;
+    write_private(&dst, &bytes).context("writing pre-restore stash")?;
+    // Keep only a small number of stashes; they are not covered by
+    // `prune_backups` (which matches `state-*`).
+    let _ = prune_pre_restore_stashes(&backups_dir, PRE_RESTORE_KEEP_COUNT, &dst);
     Ok(Some(dst))
 }
 
-/// Roll back a [`stash_pre_restore`]: move the stashed pre-restore file back to
-/// the live `state.json` path. Used when the restore *write* fails after the
-/// stash already renamed the live file aside — without this, `state.json` is
-/// left MISSING and `State::load` would silently treat the user as having zero
-/// accounts (audit finding 11). Overwrites any partial `state.json` a failed
-/// write may have left behind, and re-enforces `0600`.
-pub fn unstash_pre_restore(stash: &Path) -> Result<()> {
-    let live = state_path()?;
-    if std::fs::rename(stash, &live).is_err() {
-        // Cross-filesystem fallback (mirrors stash_pre_restore).
-        let bytes = std::fs::read(stash).context("reading pre-restore stash for rollback")?;
-        write_private(&live, &bytes).context("restoring live state.json from stash")?;
-        let _ = std::fs::remove_file(stash);
-    } else {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o600));
+/// Number of `pre-restore-*.json` stashes kept under `backups/`.
+const PRE_RESTORE_KEEP_COUNT: usize = 5;
+
+/// Delete the oldest `pre-restore-*.json` stashes beyond `keep`, never
+/// touching `just_written`.
+fn prune_pre_restore_stashes(dir: &Path, keep: usize, just_written: &Path) -> Result<()> {
+    let mut entries: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    for e in std::fs::read_dir(dir)
+        .context("read backups dir")?
+        .flatten()
+    {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("pre-restore-") || !name.ends_with(".json") {
+            continue;
+        }
+        let mtime = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        entries.push((e.path(), mtime));
+    }
+    entries.sort_by_key(|(_, m)| *m);
+    while entries.len() > keep {
+        let (p, _) = entries.remove(0);
+        if p != just_written {
+            let _ = std::fs::remove_file(&p);
         }
     }
     Ok(())
@@ -1518,14 +1712,24 @@ fn write_rolling_backup(dir: &Path, _state_path: &Path, current_bytes: &[u8]) ->
         dst = backups_dir.join(format!("state-{ts}-{n}.json"));
         n += 1;
     }
-    write_private(&dst, current_bytes).context("writing backup file")?;
-    prune_backups(&backups_dir, BACKUP_KEEP_COUNT)?;
+    if let Err(e) = write_private(&dst, current_bytes) {
+        // Don't leave a truncated/empty backup that would count against (and
+        // eventually evict) good ones.
+        let _ = std::fs::remove_file(&dst);
+        return Err(e).context("writing backup file");
+    }
+    prune_backups(&backups_dir, BACKUP_KEEP_COUNT, Some(&dst))?;
     Ok(())
 }
 
 /// Enumerate `state-*.json` under `dir`, sort by mtime ascending, and delete
 /// the oldest until at most `keep` survive.
-pub(crate) fn prune_backups(dir: &Path, keep: usize) -> Result<()> {
+///
+/// Never evicts `just_written` (a skewed clock can make the newest backup
+/// sort as the oldest). Backups dated in the future (written before the clock
+/// went back) are evicted first, so post-jump history is not reduced to the
+/// one file just written.
+pub(crate) fn prune_backups(dir: &Path, keep: usize, just_written: Option<&Path>) -> Result<()> {
     let mut entries: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
     for e in std::fs::read_dir(dir).context("read backups dir")? {
         let e = match e {
@@ -1548,17 +1752,29 @@ pub(crate) fn prune_backups(dir: &Path, keep: usize) -> Result<()> {
             .unwrap_or(std::time::UNIX_EPOCH);
         entries.push((e.path(), mtime));
     }
-    entries.sort_by_key(|(_, m)| *m);
-    while entries.len() > keep {
-        let (p, _) = entries.remove(0);
+    // A little slack for filesystem timestamp rounding.
+    let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    entries.sort_by_key(|(_, m)| (*m <= future, *m));
+    let mut i = 0;
+    while entries.len() > keep && i < entries.len() {
+        if Some(entries[i].0.as_path()) == just_written {
+            i += 1;
+            continue;
+        }
+        let (p, _) = entries.remove(i);
         let _ = std::fs::remove_file(&p);
     }
     Ok(())
 }
 
 /// R2-1: cap `state-rejected-*.json` diagnostic dumps at `keep` so a run of
-/// consecutive save refusals cannot grow unbounded. Oldest are evicted first.
-pub(crate) fn prune_rejected_dumps(dir: &Path, keep: usize) -> Result<()> {
+/// consecutive save refusals cannot grow unbounded. Oldest are evicted first,
+/// never `just_written` (the dump the REFUSED log line points at).
+pub(crate) fn prune_rejected_dumps(
+    dir: &Path,
+    keep: usize,
+    just_written: Option<&Path>,
+) -> Result<()> {
     let mut entries: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
     for e in std::fs::read_dir(dir).context("read backups dir")? {
         let e = match e {
@@ -1577,8 +1793,13 @@ pub(crate) fn prune_rejected_dumps(dir: &Path, keep: usize) -> Result<()> {
         entries.push((e.path(), mtime));
     }
     entries.sort_by_key(|(_, m)| *m);
-    while entries.len() > keep {
-        let (p, _) = entries.remove(0);
+    let mut i = 0;
+    while entries.len() > keep && i < entries.len() {
+        if Some(entries[i].0.as_path()) == just_written {
+            i += 1;
+            continue;
+        }
+        let (p, _) = entries.remove(i);
         let _ = std::fs::remove_file(&p);
     }
     Ok(())
@@ -1650,6 +1871,11 @@ pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Re
         .truncate(true)
         .mode(0o600)
         .open(path)?;
+    // `mode` only applies on creation; tighten a pre-existing wider file.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     f.write_all(bytes)?;
     // Flush the data to disk before the handle drops. For the state.json
     // atomic-replace path this is what makes the tmp file's contents durable

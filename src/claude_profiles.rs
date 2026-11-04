@@ -86,9 +86,10 @@ fn commit(snapshot: &Account, profile: &serde_json::Value) -> anyhow::Result<boo
     // A malformed or wrong-account response must never rename another slot.
     let email = identity.get("emailAddress").and_then(|v| v.as_str());
     let uuid = identity.get("accountUuid").and_then(|v| v.as_str());
-    if plan.label.is_none()
-        || email.is_some_and(|email| !email.eq_ignore_ascii_case(snapshot.key()))
-        || (email.is_none() && uuid.is_none())
+    if plan.label.is_none() || (email.is_none() && uuid.is_none()) {
+        return Ok(false);
+    }
+    if email.is_some_and(|email| !email.eq_ignore_ascii_case(snapshot.key()))
         || !identity_matches(
             snapshot.identity_uuid().as_deref(),
             snapshot.email.as_deref(),
@@ -96,6 +97,14 @@ fn commit(snapshot: &Account, profile: &serde_json::Value) -> anyhow::Result<boo
             email,
         )
     {
+        // The slot's token authenticated as a different account: a
+        // cross-wired credential. Leave a trace (identifiers only, no tokens).
+        logging::log(&format!(
+            "profile refresh: identity mismatch for account={} (profile email={} uuid={}); not saved",
+            snapshot.key(),
+            email.unwrap_or("-"),
+            uuid.unwrap_or("-"),
+        ));
         return Ok(false);
     }
     let changed = with_state_lock(|| {

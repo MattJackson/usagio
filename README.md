@@ -143,31 +143,38 @@ Notes:
 
 ## Menu bar app
 
-`usagio menubar` is the primary interface: a status-bar item showing your
-active account's **session %** at a glance. Click it for a dropdown:
+`usagio menubar` is the primary interface: a status-bar item showing the
+`%` of the account at risk (or the provider you pin under **Settings ▸ Tray
+Icon**). Click it for a dropdown:
 
-- **One submenu per account**, labelled `email` on the left with `S% / W%`
-  right-aligned battery-menu style. Accounts are **ordered by swap priority** — the
-  account you'd use next is at the top, maxed-out ones sink to the bottom — so the
-  list reads top-to-bottom as "use this first, then this." The **active account is
-  bold**; any percentage in a danger band is colored (amber ≥80%, red ≥95%) so a
-  nearly-spent account jumps out. Each opens:
-  - **Switch to this account** (the active account shows a disabled **✓ Active**
-    here instead)
-  - a stats block — `Session X% · resets in …`, `Weekly X% · resets in …`, Opus if
-    present, and `updated Xm ago`
+- **Accounts, grouped by provider** (Claude, Codex, … in alphabetical order),
+  each provider under a header row. Each account is a submenu labelled `email`
+  on the left with `S% / W%` right-aligned battery-menu style. Within a provider,
+  accounts are **ordered by swap priority** — usable accounts by soonest weekly
+  reset, then locked accounts by when they unlock — so the list reads
+  top-to-bottom as "use this first, then this." The **active account is bold with
+  a checkmark**; any percentage in a danger band is colored (amber ≥80%, red
+  ≥95%) so a nearly-spent account jumps out. A locked account shows its unlock
+  countdown instead of the percentages. Each submenu opens:
+  - a stats block — which window binds and when it frees (`Weekly locked ·
+    unlocks in …`, `Session renews in …`), the plan, and `updated Xm ago`
   - anything extra the provider itself reports, only when there's something to
-    show: credits / extra-usage spend (`Credits · $12.34 / $50 used`,
-    `Credits · 120 left`), where this week's usage went
+    show: the spendable credit balance (`Credits · 120`,
+    `Credits · unlimited`; never spend or a cap), where this week's usage went
     (`This week · Claude Code 82% · Chats 18%`), and per-model weekly limits in
     use (`Fable 7d · 42% · resets in 2d 3h`). Never estimated.
+  - **Switch to this account** (not shown for the active account)
   - **Renew login…** — sign this account in again in usagio's own window
   - **Remove…**
-- **Auto-swap at high usage ▸ Off / 90% / 95% / 98%**, plus **Switch to best
-  account now** (jump immediately to the account with room that resets soonest)
-- **Sign in to a new Claude account…** / **Capture current login…**
-- **Launch at login** (toggle)
+- **Sign in to a new account ▸** and **Capture current login ▸**, one entry per
+  provider
+- **Settings ▸** **Refresh usage now**, **Auto-swap ▸** (Off / 70% / 85% / 95% /
+  98%, **Use credits when every plan is used up**, **Switch to best account
+  now**), **Tray Icon ▸** (At risk, or pin one provider), **Backups ▸**
+  (Save… / Restore…) and **Notifications ▸**
 - **Quit**
+
+Starting at login is not a menu item: use `usagio install` / `usagio uninstall`.
 
 The menu bar also runs the auto-swap daemon in the same process. `usagio
 install` registers a `launchd` agent so it starts at every login (and runs
@@ -184,7 +191,7 @@ usagio capture             Capture the account you're currently logged into
 usagio switch [acct]       Make <acct> the active login (no launch)
 usagio start [acct]        Switch, then launch the selected provider CLI
 usagio continue [acct]     Switch, then resume the selected provider session
-usagio token <acct>        Print a fresh access token (for scripting)
+usagio token <acct>        Print an access token (for scripting; see below)
 usagio login               Sign in to a new account in your browser (adds it)
 usagio renew <acct>        Sign <acct> in again in your browser (fresh login)
 usagio rm <acct>           Forget an account
@@ -204,6 +211,10 @@ usagio start               # auto-pick the best account and open claude
 usagio continue dev        # prefix-match dev@…, switch, resume last conversation
 TOKEN=$(usagio token dev)  # a fresh access token for scripts
 ```
+
+`usagio token` refreshes an inactive account's token when it is due. For the
+active account it prints the token Claude Code is using and never refreshes it
+(that would sign Claude Code out); it warns on stderr if that token has expired.
 
 For Codex, use an explicit provider when accounts share an email:
 
@@ -235,36 +246,43 @@ The daemon's goal is to **exhaust each account's weekly quota in order of soones
 reset** — spend what's about to expire before it evaporates — without ever letting
 your active session hit the wall. It does this two ways:
 
-- **Reactive.** When the active account's session **or** weekly usage crosses your
+- **Reactive.** When the active account's session **or** weekly usage reaches your
   threshold (default **95%**, set from the menu), it switches to another account with
   room, so a long session keeps going instead of blocking. If the usage endpoint
-  rate-limits (HTTP 429) the active account while it's within 5 points of the
-  threshold, that counts as crossing it: usagio can't see the real number, so it
-  moves rather than letting you run out blind.
-- **Proactive flip-back.** The usual reason you leave an account is that its **5h
-  session** filled — its weekly still has room. When that session resets, the daemon
-  **returns to the account** to keep draining its weekly, as long as it's still the
-  best one to be on (soonest weekly reset). Over a week this rides each account down
-  to nearly-spent, in order, instead of stranding quota you left behind.
+  rate-limits (HTTP 429) and the active account was within 5 points of the threshold
+  when last read, usagio projects its usage forward from the last reading at a
+  conservative burn rate and moves once that projection reaches the threshold,
+  rather than running out blind. A projection moves you onto an account whose usage
+  was freshly verified or, when a 429 storm defers that read, one with a post-leave
+  reading and at least 30 minutes of runway.
+- **Proactive rebalance.** The usual reason you leave an account is that its **5h
+  session** filled — its weekly still has room. When an account's weekly resets
+  within the next 6 hours and it has usable room, the daemon moves to it to spend
+  that quota before it evaporates. Accounts whose weekly reset is further away
+  are not rebalanced to; they are chosen by soonest weekly reset when a switch is
+  needed.
 
 Hysteresis keeps it from thrashing:
 
-- only swap **to** an account whose session and weekly are both more than 5 points
-  under your threshold (inside that band a single 429 would force it straight back
-  out), and whose reading is fresh — a target is re-checked right before the
-  swap if its last reading is more than two minutes old;
-- a **swap cooldown** on optional swaps (flip-backs) so it can't flip rapidly —
-  moving off an account that has hit the threshold is never delayed;
-- **no bounce-back** to an account it just left within a short window, and not
-  until it has a fresh reading taken after it was left; and
-- on a proactive flip-back between two accounts that reset at the same time, a
-  headroom margin so near-equal accounts don't ping-pong.
+- a target must be **ready**: after the move it must have at least 15 minutes of
+  runway before it would reach your threshold, at its recent burn rate (or a
+  default rate when there is no history), in both session and weekly. A target's
+  reading must also be fresh — it is re-checked right before the swap if its last
+  reading is more than two minutes old;
+- a **swap cooldown** (5 minutes) on optional moves such as rebalancing — moving
+  off an account that has hit the threshold is never delayed;
+- **no bounce-back** to an account it just left until it has a fresh reading taken
+  after it was left; and
+- when no account is ready, a fallback move to a non-ready account happens only if
+  it buys at least 5 more minutes of runway than staying.
+
+Among ready accounts the one whose weekly resets soonest is used first.
 
 Every account that can be switched — Claude and Codex alike — goes through the same
-rules, each provider with its own cooldown and backoff. If every other account is
-past your threshold too, it moves to the one with the most room left (when that's
-at least 5 points more than the active one). If no account has room it doesn't
-swap — it notifies you of the soonest reset. It runs inside the menu-bar app (so
+rules, each provider with its own cooldown and backoff. If no account has room it
+notifies you of the soonest reset, and once the cooldown has passed it may move
+to the account that unlocks soonest (even over a manual pick) so it is ready when
+that reset lands. It runs inside the menu-bar app (so
 `usagio install` keeps it on), or headless via `usagio watch` on a machine with no
 menu bar; both run the same loop and use the threshold and auto-swap setting from
 the menu (`usagio watch --trigger` overrides the threshold).

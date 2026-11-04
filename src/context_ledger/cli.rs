@@ -1,9 +1,12 @@
 //! `usagio context [--provider <slug>] [--project <path>]` subcommand.
 //!
-//! When no `--provider` is given, iterates the built-in known-CLI list.
-//! Providers not registered in the trait registry are silently skipped.
+//! When no `--provider` is given, iterates the fixed built-in list (claude,
+//! codex, opencode); it is not tied to the provider trait registry. An
+//! unknown provider name prints `unknown provider` to stderr, and the command
+//! exits non-zero if no provider produced a ledger at all.
 
 use super::{build_ledger, render_terminal};
+use std::io::Write;
 use std::path::PathBuf;
 
 pub fn run(provider: Option<String>, project: Option<PathBuf>) -> anyhow::Result<()> {
@@ -26,23 +29,29 @@ pub fn run(provider: Option<String>, project: Option<PathBuf>) -> anyhow::Result
     for prov in providers {
         match build_ledger(&prov, project.as_deref()) {
             Ok(ledger) => {
-                if !first {
-                    println!();
+                // `println!` panics on EPIPE (`usagio context | head`); a
+                // closed pipe is a normal, quiet exit.
+                let mut out = std::io::stdout().lock();
+                let sep = if first { "" } else { "\n" };
+                if let Err(e) = write!(out, "{sep}{}", render_terminal(&ledger)) {
+                    if e.kind() == std::io::ErrorKind::BrokenPipe {
+                        return Ok(());
+                    }
+                    return Err(e.into());
                 }
-                print!("{}", render_terminal(&ledger));
                 first = false;
                 printed_any = true;
             }
             Err(super::LedgerError::UnknownProvider(_)) => {
-                eprintln!("usagio context: unknown provider '{}'", prov);
+                ledger_warn!("usagio context: unknown provider '{}'", prov);
             }
             Err(err) => {
-                eprintln!("usagio context: {} failed: {}", prov, err);
+                ledger_warn!("usagio context: {} failed: {}", prov, err);
             }
         }
     }
     if !printed_any {
-        println!("Context Ledger — no context items discovered for any provider.");
+        anyhow::bail!("no context ledger could be built for the requested provider(s)");
     }
     Ok(())
 }

@@ -14,24 +14,72 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Patterns that indicate a direct OS check. Covers the attribute form
-/// (`#[cfg(target_os = "...")]`), nested forms (`#[cfg(all(target_os = ...`,
-/// `#[cfg(any(target_os = ...`, `#[cfg(not(target_os = ...`), and the
-/// expression-macro form (`cfg!(target_os = "...")`). Each nested wrapper
-/// needs its own needle — "cfg(not(target_os" does NOT contain "cfg(target_os"
-/// as a contiguous substring (there's a `not(` in between), so a single
-/// "cfg(target_os" needle would silently miss it. (Plain `cfg(unix)` /
-/// `cfg(windows)` — no `target_os` — are NOT covered here and don't need to
-/// be: those are the *sanctioned* per-OS-family escape hatch for code that
-/// merely varies by a std-lib-recognized family, not a `Platform`-trait-sized
-/// OS branch — see `menubar::relaunch_via_launchd_kickstart`.)
-const NEEDLES: &[&str] = &[
-    "cfg(target_os",
-    "cfg!(target_os",
-    "cfg(not(target_os",
-    "cfg(all(target_os",
-    "cfg(any(target_os",
-];
+/// Whether `line` mentions the `target_os` cfg predicate. Deliberately NOT
+/// tied to `cfg(`/`cfg_attr(` appearing on the same line: rustfmt wraps long
+/// attributes so `target_os = "..."` can sit alone on a continuation line
+/// (`#[cfg(\n    target_os = "linux"\n)]`). Any non-comment line outside
+/// `src/platform` containing the token is a candidate and must be allowlisted
+/// by its exact text. (Plain `cfg(unix)` / `cfg(windows)` — no `target_os` —
+/// are the *sanctioned* per-OS-family escape hatch and are not covered; see
+/// `menubar::relaunch_via_launchd_kickstart`.)
+fn is_os_cfg_line(line: &str) -> bool {
+    line.contains("target_os")
+}
+
+/// Source files that are `#[cfg(test)]`-only modules: those a parent file
+/// declares with `mod NAME;` directly under a `#[cfg(test)]` attribute
+/// (honouring `#[path = "..."]`). Determined from the declarations, never
+/// from the file name.
+fn cfg_test_module_files(files: &[PathBuf]) -> std::collections::HashSet<PathBuf> {
+    let mut out = std::collections::HashSet::new();
+    for file in files {
+        let contents = fs::read_to_string(file).unwrap_or_default();
+        let lines: Vec<&str> = contents.lines().collect();
+        let dir = file.parent().unwrap();
+        let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let is_mod_root = matches!(stem, "mod" | "main" | "lib");
+        let base = if is_mod_root {
+            dir.to_path_buf()
+        } else {
+            dir.join(stem)
+        };
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim();
+            let Some(name) = t
+                .strip_prefix("mod ")
+                .or_else(|| t.strip_prefix("pub(crate) mod "))
+                .or_else(|| t.strip_prefix("pub mod "))
+                .and_then(|r| r.strip_suffix(';'))
+            else {
+                continue;
+            };
+            // Contiguous attribute lines directly above the declaration.
+            let mut attrs = Vec::new();
+            let mut j = i;
+            while j > 0 && lines[j - 1].trim().starts_with("#[") {
+                j -= 1;
+                attrs.push(lines[j].trim());
+            }
+            if !attrs.contains(&"#[cfg(test)]") {
+                continue;
+            }
+            let explicit = attrs.iter().find_map(|a| {
+                a.strip_prefix("#[path = \"")
+                    .and_then(|r| r.strip_suffix("\"]"))
+            });
+            match explicit {
+                Some(rel) => {
+                    out.insert(dir.join(rel));
+                }
+                None => {
+                    out.insert(base.join(format!("{name}.rs")));
+                    out.insert(base.join(name).join("mod.rs"));
+                }
+            }
+        }
+    }
+    out
+}
 
 /// Documented exceptions. Every entry is `(relative path, line number,
 /// rationale)`. Additions require a comment explaining WHY the site can't
@@ -56,57 +104,91 @@ const NEEDLES: &[&str] = &[
 /// NOT gated (they compile everywhere and feed macOS too). Each entry below is
 /// grouped to keep this list as short as the dependency-gating requirement
 /// allows.
-/// Each entry is `(relative path, the trimmed source line the `cfg` guards)` —
-/// keyed on the *item* the attribute sits on, NOT a line number, so ordinary
-/// edits that shift line numbers don't desync this list (they did, repeatedly).
-/// A cfg site is allowed iff the first real line after it (skipping blank /
-/// comment / other-attribute lines) matches one of these verbatim. If a gated
-/// item's signature genuinely changes, the failure prints the new line to paste
-/// here.
-const ALLOWLIST: &[(&str, &str)] = &[
-    // src/main.rs — the single gated `mod ui;` for the custom-popup NSPopover
-    // renderer (docs/design/custom-tray-popup.md, Phase 1). macOS-only AND
-    // behind the off-by-default `custom-popup` feature; links `objc2-app-kit`'s
-    // NSPopover/NSView (real macOS-only deps), not routable through `Platform`.
-    ("src/main.rs", "mod ui;"),
-    // src/menubar.rs — `use std::cell::RefCell` (macOS run-loop tick's
-    // `last_sig`/`last_title` cells; only used by the macOS `run`).
-    ("src/menubar.rs", "use std::cell::RefCell;"),
-    // src/menubar.rs — `block2`/`objc2*`/`MenuEvent`/`TrayIconBuilder` imports
-    // for the macOS `NSApplication` run loop (real macOS-only deps).
-    ("src/menubar.rs", "use {"),
-    // src/menubar.rs — `pub fn run()` dispatcher, BOTH branches: non-macOS →
-    // `cross_platform::run` (MenuBackend loop); macOS → native `NSApplication`.
-    ("src/menubar.rs", "pub fn run() -> Result<()> {"),
-    // src/menubar.rs — `build_popover_host`: macOS + `custom-popup`-only
-    // (references `crate::ui::popover` / `MainThreadMarker`, macOS-only deps).
-    ("src/menubar.rs", "fn build_popover_host("),
-    // src/menubar.rs — `popover_model`: macOS + `custom-popup`-only (folds a
-    // `Snapshot` into `ui::PopoverModel`, compiled only on macOS under the feature).
+/// Each entry is `(relative path, the exact trimmed line containing
+/// `target_os`, the trimmed source line the attribute guards)` — keyed on the
+/// item, NOT a line number (so ordinary edits don't desync the list), AND on
+/// the exact cfg text, so e.g. a lint-only `cfg_attr(..., allow(dead_code))`
+/// can't be swapped for a real `cfg(target_os)` behaviour fork on the same
+/// item without the gate noticing. A multi-line attribute is keyed on its
+/// `target_os` continuation line. If a gated item or cfg changes, the failure
+/// prints the new lines to paste here.
+const ALLOWLIST: &[(&str, &str, &str)] = &[
+    // custom-popup NSPopover renderer: macOS + off-by-default feature; real macOS-only deps.
+    (
+        "src/main.rs",
+        "#[cfg(all(target_os = \"macos\", feature = \"custom-popup\"))]",
+        "mod ui;",
+    ),
     (
         "src/menubar.rs",
+        "#[cfg(target_os = \"macos\")]",
+        "use std::cell::RefCell;",
+    ),
+    ("src/menubar.rs", "#[cfg(target_os = \"macos\")]", "use {"),
+    (
+        "src/menubar.rs",
+        "#[cfg(target_os = \"macos\")]",
+        "pub fn run() -> Result<()> {",
+    ),
+    (
+        "src/menubar.rs",
+        "#[cfg(not(target_os = \"macos\"))]",
+        "pub fn run() -> Result<()> {",
+    ),
+    (
+        "src/menubar.rs",
+        "#[cfg(all(target_os = \"macos\", feature = \"custom-popup\"))]",
+        "fn build_popover_host(",
+    ),
+    (
+        "src/menubar.rs",
+        "#[cfg(all(target_os = \"macos\", feature = \"custom-popup\"))]",
         "fn popover_model(snap: &Snapshot) -> crate::ui::PopoverModel {",
     ),
-    // src/menubar.rs — inside `mod cross_platform`, `use platform::MenuHandle`:
-    // only the non-macOS `run`/`redraw_loop` consume it; macOS drives the
-    // handle-free `NSTimer` loop instead.
-    ("src/menubar.rs", "use crate::platform::MenuHandle;"),
-    // src/menubar.rs — `initial_icon_bytes`: the tray needs decodable icon bytes
-    // on Linux/Windows; macOS is happy with a text-only title (non-macOS only).
     (
         "src/menubar.rs",
+        "#[cfg(not(target_os = \"macos\"))]",
+        "use crate::platform::MenuHandle;",
+    ),
+    (
+        "src/menubar.rs",
+        "#[cfg(not(target_os = \"macos\"))]",
         "fn initial_icon_bytes(snap: &Snapshot) -> &'static [u8] {",
     ),
-    // src/menubar.rs — `redraw_loop`: the non-macOS background redraw ticker
-    // (pushes through the `Send` `MenuHandle`); macOS ticks on its own NSTimer.
     (
         "src/menubar.rs",
+        "#[cfg(not(target_os = \"macos\"))]",
         "fn redraw_loop(handle: Box<dyn MenuHandle>, initial: Snapshot) {",
     ),
-    // src/menubar.rs — `cross_platform::run`: the Linux/Windows MenuBackend
-    // event loop. Never compiled alongside the macOS `NSApplication` run. (The
-    // menu *content* builders in this module are NOT gated — they feed macOS too.)
-    ("src/menubar.rs", "pub(super) fn run() -> Result<()> {"),
+    (
+        "src/menubar.rs",
+        "#[cfg(not(target_os = \"macos\"))]",
+        "pub(super) fn run() -> Result<()> {",
+    ),
+    // Lint-level only (`allow(dead_code)`): no behaviour branch.
+    (
+        "src/icons.rs",
+        "#[cfg_attr(target_os = \"macos\", allow(dead_code))]",
+        "pub fn usagio_tray_icon() -> &'static [u8] {",
+    ),
+    // Lint-level only (`allow(dead_code)`): no behaviour branch.
+    (
+        "src/menubar.rs",
+        "#[cfg_attr(target_os = \"macos\", allow(dead_code))]",
+        "fn tray_icon_bytes(snap: &Snapshot) -> &'static [u8] {",
+    ),
+    // Lint-level only (`allow(dead_code)`): no behaviour branch.
+    (
+        "src/menubar.rs",
+        "#[cfg_attr(not(target_os = \"macos\"), allow(dead_code))]",
+        "fn tooltip_for(snap: &Snapshot) -> String {",
+    ),
+    // Test-only module compiled off-macOS; exact cfg form pinned below.
+    (
+        "src/menubar.rs",
+        "#[cfg(all(test, not(target_os = \"macos\")))]",
+        "mod tests {",
+    ),
 ];
 
 fn src_root() -> PathBuf {
@@ -137,9 +219,9 @@ fn no_scattered_target_os_cfg_outside_platform_module() {
     collect_rs_files(&root, &mut files);
 
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let allowlist: std::collections::HashSet<(PathBuf, &str)> = ALLOWLIST
+    let allowlist: std::collections::HashSet<(PathBuf, &str, &str)> = ALLOWLIST
         .iter()
-        .map(|(rel, guarded)| (manifest_dir.join(rel), *guarded))
+        .map(|(rel, cfg, guarded)| (manifest_dir.join(rel), *cfg, *guarded))
         .collect();
 
     // The first "real" source line at or after `idx` — skipping blank lines,
@@ -156,9 +238,12 @@ fn no_scattered_target_os_cfg_outside_platform_module() {
         })
     };
 
+    let test_modules = cfg_test_module_files(&files);
+
+    let mut used = std::collections::HashSet::new();
     let mut violations = Vec::new();
     for path in &files {
-        if path.starts_with(&platform_dir) {
+        if path.starts_with(&platform_dir) || test_modules.contains(path) {
             continue;
         }
         let contents = fs::read_to_string(path)
@@ -170,9 +255,21 @@ fn no_scattered_target_os_cfg_outside_platform_module() {
             if line.trim_start().starts_with("//") {
                 continue;
             }
-            if NEEDLES.iter().any(|needle| line.contains(needle)) {
+            if is_os_cfg_line(line) {
                 let guarded = guarded_line(&lines, lineno + 1).unwrap_or_default();
-                if allowlist.contains(&(path.clone(), guarded.as_str())) {
+                let key = (path.clone(), line.trim().to_string(), guarded.clone());
+                if allowlist.contains(&(path.clone(), line.trim(), guarded.as_str())) {
+                    // Each entry covers exactly one site: a second identical
+                    // site (e.g. another `mod tests {`) must be reviewed.
+                    if !used.insert(key) {
+                        violations.push(format!(
+                            "{}:{}: {}  (guards: {}) — duplicate of an allowlisted site",
+                            path.display(),
+                            lineno + 1,
+                            line.trim(),
+                            guarded
+                        ));
+                    }
                     continue;
                 }
                 violations.push(format!(

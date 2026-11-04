@@ -109,6 +109,11 @@ pub struct NotifState {
     /// "claim it now" notification fires once per grant.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub reset_grants_usable_fired: BTreeSet<String>,
+    /// State-driven notifications whose one retry after a failed delivery has
+    /// been spent ("pace", "avail:<id>", "usable:<id>"); a second failure
+    /// commits the dedup bit instead of retrying forever.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub retry_spent: BTreeSet<String>,
 }
 
 /// Thresholds we check on every tick, ascending so a `Vec<Trigger>` from
@@ -155,6 +160,9 @@ pub fn evaluate(prev: &Snapshot, curr: &Snapshot, cfg: &NotificationConfig) -> V
     if cfg.threshold_enabled {
         for (w, p, c) in pairs {
             let (Some(p), Some(c)) = (p, c) else { continue };
+            // A pair spanning a reset: the new window started from ~0, so
+            // judge crossings against that, not the pre-reset level.
+            let p = if is_reset(prev, curr, w) { 0.0 } else { p };
             for pct in THRESHOLDS {
                 let t = pct as f32;
                 if p < t && c >= t {
@@ -165,8 +173,11 @@ pub fn evaluate(prev: &Snapshot, curr: &Snapshot, cfg: &NotificationConfig) -> V
     }
     if cfg.reset_back_enabled {
         for (w, p, c) in pairs {
-            let (Some(p), Some(c)) = (p, c) else { continue };
-            if is_window_reset(p, c) {
+            // Only a window that was meaningfully used announces fresh
+            // headroom; a rollover of a barely-used window still re-arms
+            // crossings (dedup_and_apply) but says nothing.
+            let (Some(p), Some(_)) = (p, c) else { continue };
+            if p > 50.0 && is_reset(prev, curr, w) {
                 out.push(Trigger::ResetBack { window: w });
             }
         }
@@ -177,20 +188,41 @@ pub fn evaluate(prev: &Snapshot, curr: &Snapshot, cfg: &NotificationConfig) -> V
 /// True iff the (prev, curr) percentages for one window describe a reset:
 /// utilization dropped from a non-trivial prior level. The 50-percent floor
 /// keeps normal noise (small fluctuations near zero) from being mistaken for
-/// a reset — a genuine reset lands a high percentage back at (near-)zero.
+/// a reset — a genuine reset lands a high percentage back at (near-)zero, so
+/// the drop must also be substantial (>= 20 points) or land under 10%.
 fn is_window_reset(prev_pct: f32, curr_pct: f32) -> bool {
-    curr_pct < prev_pct && prev_pct > 50.0
+    prev_pct > 50.0 && curr_pct < prev_pct && (prev_pct - curr_pct >= 20.0 || curr_pct < 10.0)
 }
 
-/// True iff `curr` shows a reset for `w` relative to `prev`. Public so the
-/// watch loop can query it independently of `evaluate` (e.g. to log a reset
-/// even when `reset_back_enabled` is off).
+/// True iff `curr` shows a reset for `w` relative to `prev`: the window's
+/// reported reset time moved later, the old one was still ahead when `prev`
+/// was read and had passed by `curr`, or (when reset times are missing or
+/// unchanged) the pct heuristic above. A reset stamp already past at
+/// `prev.ts` is not a credible upcoming reset: a vendor that reports "now +
+/// 0 s" for an expired window would otherwise roll on every poll.
+/// Public so the watch loop can query it independently of `evaluate` (e.g. to
+/// log a reset even when `reset_back_enabled` is off).
 pub fn is_reset(prev: &Snapshot, curr: &Snapshot, w: Window) -> bool {
-    let (p, c) = match w {
-        Window::Session => (prev.session_pct, curr.session_pct),
-        Window::Weekly => (prev.weekly_pct, curr.weekly_pct),
+    let (p, c, pr, cr) = match w {
+        Window::Session => (
+            prev.session_pct,
+            curr.session_pct,
+            prev.session_reset,
+            curr.session_reset,
+        ),
+        Window::Weekly => (
+            prev.weekly_pct,
+            curr.weekly_pct,
+            prev.weekly_reset,
+            curr.weekly_reset,
+        ),
     };
-    matches!((p, c), (Some(p), Some(c)) if is_window_reset(p, c))
+    let (Some(p), Some(c)) = (p, c) else {
+        return false;
+    };
+    let rolled =
+        matches!((pr, cr), (Some(pr), Some(cr)) if pr < cr && pr > prev.ts && pr <= curr.ts);
+    rolled || is_window_reset(p, c)
 }
 
 /// Filter `triggers` against `state`, updating `state` in place. A Threshold
@@ -214,6 +246,7 @@ pub fn dedup_and_apply(
     if is_reset(prev, curr, Window::Weekly) {
         state.crossings.retain(|(w, _)| *w != Window::Weekly);
         state.pace_fired_this_window = false;
+        state.retry_spent.remove("pace");
     }
     let mut kept = Vec::with_capacity(triggers.len());
     for t in triggers {
@@ -228,8 +261,11 @@ pub fn dedup_and_apply(
             Trigger::ResetBack { .. } => kept.push(t),
             Trigger::WeeklyPace { .. } => {
                 // Guard against a caller that queued a pace trigger without
-                // going through `evaluate_pace` (which already dedups).
-                if state.pace_fired_this_window {
+                // going through `evaluate_pace` (which already dedups). On the
+                // weekly reset tick the pace fit still covers last week's
+                // samples (the new window has none yet), so it is dropped
+                // without spending the new window's one alert.
+                if state.pace_fired_this_window || is_reset(prev, curr, Window::Weekly) {
                     continue;
                 }
                 state.pace_fired_this_window = true;
@@ -275,7 +311,41 @@ pub fn evaluate_pace(
     // seconds — the printed body ends up wrong by up to 59s otherwise.
     let millis = (hours_to_100 * 3_600_000.0) as i64;
     let hit = now.checked_add_signed(Duration::milliseconds(millis))?;
+    // The window resets before the projection lands: nothing to warn about.
+    if curr.weekly_reset.is_some_and(|r| hit >= r) {
+        return None;
+    }
     Some(Trigger::WeeklyPace { hit_time: hit })
+}
+
+/// Undo the dedup bit a state-driven trigger set, after its delivery failed,
+/// so the next tick retries it. `grant_id` is the grant a reset-grant trigger
+/// was raised for. Threshold/reset crossings are edge-triggered on the
+/// (prev, curr) pair, which advances regardless, so they are not retried
+/// (fire is documented best-effort).
+pub fn release_dedup(state: &mut NotifState, trigger: &Trigger, grant_id: Option<&str>) {
+    let key = match (trigger, grant_id) {
+        (Trigger::WeeklyPace { .. }, _) => "pace".to_string(),
+        (Trigger::ResetGrantAvailable { .. }, Some(id)) => format!("avail:{id}"),
+        (Trigger::ResetUsableNow { .. }, Some(id)) => format!("usable:{id}"),
+        _ => return,
+    };
+    // One retry per event: the second failure keeps the dedup bit set, so a
+    // permanently failing backend (or a late-erroring one that already showed
+    // the alert) cannot cause a storm.
+    if !state.retry_spent.insert(key) {
+        return;
+    }
+    match (trigger, grant_id) {
+        (Trigger::WeeklyPace { .. }, _) => state.pace_fired_this_window = false,
+        (Trigger::ResetGrantAvailable { .. }, Some(id)) => {
+            state.reset_grants_seen.remove(id);
+        }
+        (Trigger::ResetUsableNow { .. }, Some(id)) => {
+            state.reset_grants_usable_fired.remove(id);
+        }
+        _ => {}
+    }
 }
 
 /// Reset-grant notifications for this tick, deduped in place against `state`.
@@ -596,6 +666,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reset_rearms_thresholds_even_when_reset_back_is_disabled() {
+        let mut state = NotifState::default();
+        let cfg = NotificationConfig {
+            reset_back_enabled: false,
+            ..NotificationConfig::default()
+        };
+        let prev = snap(Some(50.0), None);
+        let curr = snap(Some(75.0), None);
+        let _ = dedup_and_apply(&mut state, &prev, &curr, evaluate(&prev, &curr, &cfg));
+        assert!(state.crossings.contains(&(Window::Session, 70)));
+
+        // Reset tick: no ResetBack notification (disabled), but the window's
+        // crossings must still be cleared.
+        let reset = snap(Some(5.0), None);
+        let fired = dedup_and_apply(&mut state, &curr, &reset, evaluate(&curr, &reset, &cfg));
+        assert!(fired.is_empty(), "reset-back is disabled: {fired:?}");
+        assert!(state.crossings.is_empty(), "reset must still re-arm");
+
+        let lo = snap(Some(40.0), None);
+        let hi = snap(Some(75.0), None);
+        let fired = dedup_and_apply(&mut state, &lo, &hi, evaluate(&lo, &hi, &cfg));
+        assert_eq!(
+            fired,
+            vec![Trigger::Threshold {
+                window: Window::Session,
+                pct: 70
+            }]
+        );
+    }
+
+    #[test]
+    fn session_and_weekly_thresholds_dedup_independently() {
+        let mut state = NotifState::default();
+        let cfg = NotificationConfig::default();
+        let prev = snap(Some(50.0), Some(50.0));
+        let curr = snap(Some(75.0), Some(75.0));
+        let fired = dedup_and_apply(&mut state, &prev, &curr, evaluate(&prev, &curr, &cfg));
+        assert_eq!(fired.len(), 2, "both windows cross 70: {fired:?}");
+        assert!(state.crossings.contains(&(Window::Session, 70)));
+        assert!(state.crossings.contains(&(Window::Weekly, 70)));
+        // A weekly-only reset must leave the session crossing intact.
+        let reset = snap(Some(75.0), Some(3.0));
+        let _ = dedup_and_apply(&mut state, &curr, &reset, evaluate(&curr, &reset, &cfg));
+        assert!(state.crossings.contains(&(Window::Session, 70)));
+        assert!(!state.crossings.contains(&(Window::Weekly, 70)));
+    }
+
     // --- weekly reset clears both crossings and pace_fired -----------------
 
     #[test]
@@ -605,15 +723,25 @@ mod tests {
                 .into_iter()
                 .collect(),
             pace_fired_this_window: true,
+            retry_spent: ["pace".to_string(), "threshold:other".to_string()]
+                .into_iter()
+                .collect(),
             ..NotifState::default()
         };
-        // A weekly reset happens; `dedup_and_apply` must clear both.
+        // A weekly reset happens; `dedup_and_apply` must clear both, and re-arm
+        // the one-shot "pace" delivery retry (only that key).
         let prev = snap(None, Some(85.0));
         let curr = snap(None, Some(3.0));
         let cfg = NotificationConfig::default();
         let _ = dedup_and_apply(&mut state, &prev, &curr, evaluate(&prev, &curr, &cfg));
         assert!(state.crossings.is_empty());
         assert!(!state.pace_fired_this_window);
+        assert!(
+            !state.retry_spent.contains("pace"),
+            "a weekly reset re-arms the pace retry: {:?}",
+            state.retry_spent
+        );
+        assert!(state.retry_spent.contains("threshold:other"));
     }
 
     // --- session reset does NOT clear pace_fired (pace is weekly only) -----
@@ -949,5 +1077,236 @@ mod tests {
             sample_count: 12,
         };
         assert!(evaluate_pace(Some(&pace), &snap(None, Some(50.0)), &pace_cfg(), now).is_none());
+    }
+
+    #[test]
+    fn pace_alert_is_suppressed_when_the_window_resets_first() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+        let pace = PaceEstimate {
+            slope_pct_per_hour: 10.0,
+            confidence: 0.9,
+            sample_count: 12,
+        };
+        let mut curr = snap(None, Some(50.0));
+        curr.weekly_reset = Some(now + Duration::hours(2));
+        assert!(evaluate_pace(Some(&pace), &curr, &pace_cfg(), now).is_none());
+        curr.weekly_reset = Some(now + Duration::hours(6));
+        assert!(evaluate_pace(Some(&pace), &curr, &pace_cfg(), now).is_some());
+    }
+
+    #[test]
+    fn a_small_decrease_is_not_a_window_reset() {
+        assert!(!is_window_reset(91.0, 89.0));
+        assert!(!is_window_reset(80.0, 79.0));
+        assert!(is_window_reset(95.0, 5.0));
+        assert!(is_window_reset(95.0, 60.0));
+    }
+
+    #[test]
+    fn a_crossing_in_the_same_pair_as_a_reset_still_fires() {
+        let prev = snap(None, Some(95.0));
+        let curr = snap(None, Some(75.0));
+        let cfg = NotificationConfig::default();
+        let trig = evaluate(&prev, &curr, &cfg);
+        assert!(
+            trig.contains(&Trigger::Threshold {
+                window: Window::Weekly,
+                pct: 70
+            }),
+            "{trig:?}"
+        );
+        // Last week's crossings are still recorded when the pair arrives: the
+        // reset must clear them BEFORE dedup, or the new window's 70 is
+        // suppressed as "already crossed".
+        let mut state = NotifState {
+            crossings: [(Window::Weekly, 70), (Window::Weekly, 90)]
+                .into_iter()
+                .collect(),
+            ..NotifState::default()
+        };
+        let fired = dedup_and_apply(&mut state, &prev, &curr, trig);
+        assert!(
+            fired.contains(&Trigger::Threshold {
+                window: Window::Weekly,
+                pct: 70
+            }),
+            "{fired:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_delivery_releases_the_dedup_bit_for_retry() {
+        let mut st = NotifState::default();
+        let g = ResetGrant {
+            id: "g1".into(),
+            label: "L".into(),
+            resets_left: 1,
+            usable_now: true,
+            ..Default::default()
+        };
+        let trigs = reset_grant_triggers(&mut st, std::slice::from_ref(&g));
+        assert_eq!(trigs.len(), 2);
+        for t in &trigs {
+            release_dedup(&mut st, t, Some("g1"));
+        }
+        assert_eq!(reset_grant_triggers(&mut st, &[g]).len(), 2, "retried");
+        st.pace_fired_this_window = true;
+        release_dedup(
+            &mut st,
+            &Trigger::WeeklyPace {
+                hit_time: Utc::now(),
+            },
+            None,
+        );
+        assert!(!st.pace_fired_this_window);
+    }
+
+    #[test]
+    fn a_failed_delivery_is_retried_at_most_once() {
+        let mut st = NotifState::default();
+        let g = ResetGrant {
+            id: "g1".into(),
+            label: "L".into(),
+            resets_left: 1,
+            usable_now: false,
+            ..Default::default()
+        };
+        let t = reset_grant_triggers(&mut st, std::slice::from_ref(&g));
+        release_dedup(&mut st, &t[0], Some("g1"));
+        let t = reset_grant_triggers(&mut st, std::slice::from_ref(&g));
+        assert_eq!(t.len(), 1, "first failure: retried once");
+        release_dedup(&mut st, &t[0], Some("g1"));
+        assert!(
+            reset_grant_triggers(&mut st, std::slice::from_ref(&g)).is_empty(),
+            "second failure: dedup bit stays set"
+        );
+    }
+
+    // --- audit round 3 (B3) ---------------------------------------------------
+
+    #[test]
+    fn r3_a_reset_seen_by_the_reset_time_clears_crossings_and_fires_reset_back() {
+        // Offline across the weekly reset while usage continued elsewhere:
+        // 92 -> 75 is a small drop, but the reported reset moved past.
+        let r = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
+        let mut prev = snap(None, Some(92.0));
+        prev.ts = r - Duration::hours(1);
+        prev.weekly_reset = Some(r);
+        let mut curr = snap(None, Some(75.0));
+        curr.ts = r + Duration::days(3);
+        curr.weekly_reset = Some(r + Duration::days(7));
+        assert!(is_reset(&prev, &curr, Window::Weekly));
+        let cfg = NotificationConfig::default();
+        let trig = evaluate(&prev, &curr, &cfg);
+        assert!(
+            trig.contains(&Trigger::ResetBack {
+                window: Window::Weekly
+            }),
+            "{trig:?}"
+        );
+        let mut state = NotifState {
+            crossings: [(Window::Weekly, 70), (Window::Weekly, 90)]
+                .into_iter()
+                .collect(),
+            ..NotifState::default()
+        };
+        dedup_and_apply(&mut state, &prev, &curr, trig);
+        let mut next = curr.clone();
+        next.weekly_pct = Some(91.0);
+        let fired = dedup_and_apply(&mut state, &curr, &next, evaluate(&curr, &next, &cfg));
+        assert!(
+            fired.contains(&Trigger::Threshold {
+                window: Window::Weekly,
+                pct: 90
+            }),
+            "{fired:?}"
+        );
+        // A reset time that moved but has not passed yet is not a reset.
+        let mut early = curr.clone();
+        early.ts = r - Duration::minutes(30);
+        assert!(!is_reset(&prev, &early, Window::Weekly));
+    }
+
+    #[test]
+    fn a_rollover_of_a_barely_used_window_rearms_but_does_not_announce() {
+        let r = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+        let mut prev = snap(Some(4.0), None);
+        prev.ts = r - Duration::minutes(5);
+        prev.session_reset = Some(r);
+        let mut curr = snap(Some(1.0), None);
+        curr.ts = r + Duration::minutes(5);
+        curr.session_reset = Some(r + Duration::hours(5));
+        assert!(is_reset(&prev, &curr, Window::Session), "still a rollover");
+        let trig = evaluate(&prev, &curr, &NotificationConfig::default());
+        assert!(
+            !trig.contains(&Trigger::ResetBack {
+                window: Window::Session
+            }),
+            "{trig:?}"
+        );
+        let mut state = NotifState {
+            crossings: [(Window::Session, 70)].into_iter().collect(),
+            ..NotifState::default()
+        };
+        dedup_and_apply(&mut state, &prev, &curr, trig);
+        assert!(state.crossings.is_empty(), "the rollover re-arms crossings");
+    }
+
+    #[test]
+    fn now_relative_reset_stamps_do_not_roll_on_every_poll() {
+        // An expired Codex window reports 0 s left: each fetch stamps the
+        // reset at its own "now".
+        let t0 = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+        let tick = |i: i64, pct: f32| {
+            let mut s = snap(Some(pct), None);
+            s.ts = t0 + Duration::minutes(i);
+            s.session_reset = Some(s.ts);
+            s
+        };
+        let cfg = NotificationConfig::default();
+        let mut state = NotifState::default();
+        let (a, b, c) = (tick(0, 60.0), tick(1, 80.0), tick(2, 80.0));
+        let first = dedup_and_apply(&mut state, &a, &b, evaluate(&a, &b, &cfg));
+        assert_eq!(
+            first,
+            vec![Trigger::Threshold {
+                window: Window::Session,
+                pct: 70
+            }]
+        );
+        assert!(!is_reset(&b, &c, Window::Session));
+        let again = dedup_and_apply(&mut state, &b, &c, evaluate(&b, &c, &cfg));
+        assert!(
+            again.is_empty(),
+            "re-fired on a now-relative stamp: {again:?}"
+        );
+    }
+
+    #[test]
+    fn r3_no_pace_alert_on_the_weekly_reset_tick() {
+        // The pace fit still covers last week's samples on the reset tick:
+        // it must not use up the new window's one alert.
+        let now = Utc.with_ymd_and_hms(2026, 9, 1, 0, 1, 0).unwrap();
+        let mut prev = snap(None, Some(95.0));
+        prev.weekly_reset = Some(now - Duration::minutes(1));
+        let mut curr = snap(None, Some(2.0));
+        curr.ts = now;
+        curr.weekly_reset = Some(now + Duration::days(7));
+        let pace = PaceEstimate {
+            slope_pct_per_hour: 0.8,
+            confidence: 0.9,
+            sample_count: 200,
+        };
+        let pt = evaluate_pace(Some(&pace), &curr, &pace_cfg(), now).expect("precondition");
+        let mut state = NotifState {
+            pace_fired_this_window: true,
+            ..NotifState::default()
+        };
+        let kept = dedup_and_apply(&mut state, &prev, &curr, vec![pt]);
+        assert!(kept.is_empty(), "{kept:?}");
+        assert!(
+            !state.pace_fired_this_window,
+            "the new window's alert is unspent"
+        );
     }
 }

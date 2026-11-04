@@ -53,7 +53,7 @@ impl Provider for AmazonQProvider {
         // `auth_kv` row with key `codewhisperer:odic:token`, and parse the
         // JSON `BuilderIdToken` for `access_token` / `refresh_token`. Email
         // is not on disk — an SSO/IdC API call would be needed to attach it.
-        Ok(None)
+        Err(ProviderError::Unsupported)
     }
 
     fn parse_stored_blob(&self, _blob: &str) -> PResult<TokenGrant> {
@@ -84,6 +84,9 @@ mod tests {
 
     #[test]
     fn capture_returns_none_placeholder() {
-        assert!(matches!(AmazonQProvider.capture_current_login(), Ok(None)));
+        assert!(matches!(
+            AmazonQProvider.capture_current_login(),
+            Err(ProviderError::Unsupported)
+        ));
     }
 }

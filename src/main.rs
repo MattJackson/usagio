@@ -55,7 +55,6 @@ use store::{Account, CachedUsage, ProviderAccount, State};
 /// the constant with a per-account lookup keyed on the containing bucket.
 const CLAUDE_SLUG: &str = "claude";
 
-const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 /// App slug used everywhere we ask the platform for a per-app directory
 /// (`~/.config/usagio` on macOS, `$XDG_CONFIG_HOME/usagio` on Linux,
 /// `%APPDATA%\usagio` on Windows). The one-shot rename from `claude-usage`
@@ -149,6 +148,22 @@ fn effective_first_arg<'a>(args: &'a [String], exe: &std::path::Path) -> Option<
         .or_else(|| is_app_bundle_launch(exe).then_some("menubar"))
 }
 
+/// Arguments after the subcommand. Empty (not a panic) when argv was empty,
+/// as in an argv-less `.app` bundle launch where the subcommand is implied.
+fn tail_args(args: &[String]) -> &[String] {
+    args.get(1..).unwrap_or(&[])
+}
+
+/// Save the merged poll state only when it differs from what was loaded, so
+/// idle cycles don't rewrite state.json and rotate the rolling backups.
+fn save_if_changed(st: &State, before: &[u8]) -> Result<bool> {
+    if serde_json::to_vec(st).ok().as_deref() == Some(before) {
+        return Ok(false);
+    }
+    st.save()?;
+    Ok(true)
+}
+
 fn run() -> Result<()> {
     // One-shot rename migration: if `~/.config/claude-usage/` still exists
     // and `~/.config/usagio/` doesn't, atomically move it (with a
@@ -189,9 +204,12 @@ fn run() -> Result<()> {
             // user to re-login. Fire a menu-bar notification AND log loudly.
             // We still proceed (State::default), but the user is at least
             // told and can retry.
+            let log_path = store::config_dir()
+                .map(|d| d.join("usagio.log").display().to_string())
+                .unwrap_or_else(|_| "usagio.log in the config directory".to_string());
             let msg = format!(
                 "usagio: config migration FAILED — accounts may appear missing. \
-                 See ~/.config/usagio/logs; try again or copy the old dir manually. \
+                 See {log_path}; try again or copy the old dir manually. \
                  Details: {e:?}"
             );
             eprintln!("{msg}");
@@ -256,29 +274,29 @@ fn run() -> Result<()> {
     let exe = std::env::current_exe().unwrap_or_default();
     match effective_first_arg(&args, &exe) {
         None => cmd_list(&[]),
-        Some("list") | Some("ls") => cmd_list(&args[1..]),
-        Some("capture") | Some("add") => cmd_capture(&args[1..]),
+        Some("list") | Some("ls") => cmd_list(tail_args(&args)),
+        Some("capture") | Some("add") => cmd_capture(tail_args(&args)),
         Some("switch") | Some("use") => cmd_switch(args.get(1).map(String::as_str), None),
         Some("start") => cmd_switch(args.get(1).map(String::as_str), Some(Launch::Fresh)),
         Some("continue") | Some("cont") | Some("c") => {
             cmd_switch(args.get(1).map(String::as_str), Some(Launch::Continue))
         }
         Some("token") => cmd_token(args.get(1).map(String::as_str)),
-        Some("watch") => cmd_watch(&args[1..]),
+        Some("watch") => cmd_watch(tail_args(&args)),
         Some("menubar") => {
-            menubar::set_theme_override_from_args(&args[1..]);
+            menubar::set_theme_override_from_args(tail_args(&args));
             menubar::run()
         }
-        Some("report") => cmd_report(&args[1..]),
-        Some("context") => cmd_context(&args[1..]),
+        Some("report") => cmd_report(tail_args(&args)),
+        Some("context") => cmd_context(tail_args(&args)),
         Some("install") => cmd_install(),
         Some("uninstall") => cmd_uninstall(),
         Some("rm") | Some("remove") => cmd_rm(args.get(1).map(String::as_str)),
-        Some("renew") | Some("login") => cmd_renew(&args[1..]),
+        Some("renew") | Some("login") => cmd_renew(tail_args(&args)),
         // Internal, undocumented — see `cmd_secrets_selftest` doc comment.
-        Some("__secrets_selftest") => cmd_secrets_selftest(&args[1..]),
+        Some("__secrets_selftest") => cmd_secrets_selftest(tail_args(&args)),
         // Internal, undocumented — headless screenshot renderer (see cmd doc).
-        Some("__render_shot") => cmd_render_shot(&args[1..]),
+        Some("__render_shot") => cmd_render_shot(tail_args(&args)),
         Some("-h") | Some("--help") | Some("help") => {
             print_help();
             Ok(())
@@ -307,11 +325,12 @@ fn print_help() {
          usagio switch [email]    Make <email> the active login (no launch)\n  \
          usagio start [email]     Switch, then launch the selected provider CLI\n  \
          usagio continue [email]  Switch, then resume the selected provider session\n  \
-         usagio token [email]     Print a fresh access token\n  \
-         usagio watch             Auto-swap at 95%, keep working (foreground)\n  \
-         usagio menubar           Run the macOS menu-bar app (usage + auto-swap)\n  \
+         usagio token [email]     Print an access token (the active one: the token Claude Code is using)\n  \
+         usagio watch [OPTS]      Auto-swap at your trigger (default 95%), keep working (foreground)\n  \
+                                        --trigger <pct>  --ceiling <pct>  --interval <secs>\n  \
+         usagio menubar           Run the menu-bar/tray app (usage + auto-swap)\n  \
          usagio menubar --theme <os>  Force an OEM look for a UI audit: windows|macos|gnome|system\n  \
-         usagio install           Run the menu-bar app at every login (via launchd)\n  \
+         usagio install           Run the menu-bar/tray app at every login\n  \
          usagio uninstall         Stop running the menu-bar app at login\n  \
          usagio report            Usage patterns by weekday / hour / account\n  \
          usagio report --pace     Per-account burn-rate forecast (empty-in ETA)\n  \
@@ -320,10 +339,12 @@ fn print_help() {
                                         --project  <path>  scope in-tree instructions to this project\n  \
          usagio login             Sign in to a new account in your browser (adds it)\n  \
          usagio renew <email>     Sign that account in again in your browser (fresh login)\n  \
+                                        --provider <slug>  or use `codex:email`\n  \
          usagio rm <email>        Forget an account\n\n\
          With no [email], switch/start/continue auto-pick the account that has room\n  \
          and whose weekly limit resets soonest (use it before the quota resets).\n  \
-         With an [email], auto-swap stays on it until it's exhausted.\n\n\
+         With an [email], a pick already at/over the trigger holds until it's\n  \
+         exhausted; one under the trigger swaps at the trigger as usual.\n\n\
          Onboarding: log into an account with `claude` as usual, then\n  \
          `usagio capture`. Repeat once per account.\n"
     );
@@ -346,7 +367,11 @@ fn cmd_capture(args: &[String]) -> Result<()> {
     // dedicated `state.accounts` bucket; every other registered provider uses
     // the generic `state.providers[slug]` slot. No arg defaults to Claude
     // (back-compat with the original Claude-only `usagio capture`).
-    let slug = args.first().map(String::as_str).unwrap_or(CLAUDE_SLUG);
+    // Slugs are lowercase; match a `Codex` the way a `Codex:` qualifier is.
+    let slug = args
+        .first()
+        .map_or_else(|| CLAUDE_SLUG.to_string(), |s| s.to_ascii_lowercase());
+    let slug = slug.as_str();
     if slug == CLAUDE_SLUG {
         let (email, existed) = capture_current()?;
         println!(
@@ -389,7 +414,10 @@ pub(crate) fn capture_current() -> Result<(String, bool)> {
         .capture_current_login()
         .map_err(|e| anyhow!("{e}"))?
         .ok_or_else(|| {
-            anyhow!("no claude.ai login found in the keychain — run `claude` and /login first")
+            anyhow!(
+                "no claude.ai login found (keychain / ~/.claude/.credentials.json) — run \
+                 `claude` and /login first"
+            )
         })?;
     // `Account::from_keychain_blob` parses `expires_at` (epoch millis) out of
     // the verbatim blob exactly as before — reusing it here keeps this an
@@ -544,6 +572,19 @@ pub(crate) fn persist_login(
             plan: existing.as_ref().and_then(|a| a.plan.clone()),
         };
         let active = state.provider_accounts_mut(slug).active.as_deref() == Some(key.as_str());
+        // A switch to a DIFFERENT account is already queued: never overwrite
+        // that intent. Stage the renewed tokens only; the queued switch
+        // finishes first.
+        let other_queued = state
+            .provider_accounts(slug)
+            .and_then(|pa| pa.pending_switch.as_ref())
+            .is_some_and(|pending| pending.key != key);
+        if other_queued && active {
+            logging::log(&format!(
+                "event=renewal_handoff_deferred provider={slug} reason=other_switch_pending"
+            ));
+        }
+        let active = active && !other_queued;
         if active {
             let accounts = state.provider_accounts_mut(slug);
             let drain_token = accounts
@@ -552,15 +593,29 @@ pub(crate) fn persist_login(
                 .and_then(|pending| pending.drain_token.clone());
             accounts.pending_switch = Some(store::PendingSwitch {
                 key: key.clone(),
-                manual: true,
+                // A renewal is not a pick: `manual: false` on a switch whose
+                // target is already active marks it so the commit leaves
+                // manual_pick/manual_hold alone.
+                manual: false,
                 from: accounts.active.clone(),
                 drain_token,
                 credentials_written: false,
                 leave_latch: None,
                 renewed_account: Some(acct),
+                renewal: true,
             });
         } else {
             state.upsert_provider_account(slug, acct);
+            // A queued switch TO this account may already have written its old
+            // credentials to the vendor file; make the retry rewrite them.
+            if let Some(pending) = state
+                .provider_accounts_mut(slug)
+                .pending_switch
+                .as_mut()
+                .filter(|pending| pending.key == key)
+            {
+                pending.credentials_written = false;
+            }
         }
         state.save()?;
         Ok(active)
@@ -572,10 +627,10 @@ pub(crate) fn persist_login(
             let status = provider.client_status()?;
             let ready = with_state_lock(|| {
                 let mut state = State::load()?;
-                lifecycle::prepare_handoff(provider, &status, &mut state, &key, true)
+                lifecycle::prepare_handoff(provider, &status, &mut state, &key, false)
             })?;
             if ready {
-                commit_provider_switch(provider, slug, &key, true, true)?;
+                commit_provider_switch(provider, slug, &key, false, false)?;
             }
             Ok(ready)
         })();
@@ -638,9 +693,18 @@ fn persist_claude_login(
         // Inside the lock, so a concurrent switch can't land between the
         // "is it active" check and this write.
         if active {
-            provider
-                .write_active_account(&a.keychain_blob, &identity)
-                .map_err(|e| anyhow!("saved, but making it live failed: {e}"))?;
+            if let Err(e) = provider.write_active_account(&a.keychain_blob, &identity) {
+                // Durable marker so the next poll's CAS republishes this exact
+                // grant instead of adopting the old slot over it.
+                let fp = logging::token_fingerprint(&a.refresh_token);
+                if let Some(a) = state.find_mut(&email) {
+                    a.live_write_pending = Some(fp);
+                }
+                state.save()?;
+                return Err(anyhow!(
+                    "saved, but making it live failed (will be retried on the next poll): {e}"
+                ));
+            }
         }
         Ok((a.keychain_blob.clone(), active))
     })?;
@@ -691,6 +755,27 @@ fn warn_expiring_logins() {
     }
 }
 
+/// A `claude:`/`codex:` qualifier on a renew selector picks the provider (as it
+/// does for switch/start/rm); returns the bare account selector.
+fn strip_renew_qualifier(slug: &mut String, selector: Option<String>) -> Option<String> {
+    let sel = selector?;
+    match sel.split_once(':') {
+        Some((q, account)) => {
+            *slug = q.to_ascii_lowercase();
+            Some(account.to_string())
+        }
+        None => Some(sel),
+    }
+}
+
+/// Resolve a non-Claude renew selector (full key or unique prefix) up front, so
+/// a prefix is never passed through as the expected account.
+fn resolve_provider_renew_key(state: &State, slug: &str, sel: &str) -> Result<String> {
+    resolve_provider_selector(state, &format!("{slug}:{sel}"))
+        .map(|(_, key)| key)
+        .ok_or_else(|| anyhow!("no unique {slug} account matches '{sel}'"))
+}
+
 /// `usagio login|renew [<email>] [--provider <slug>]`: run the provider's own
 /// login in the default browser — renewing `<email>`, or adding whichever
 /// account signs in when none is given (the CLI side of the menu's "Renew
@@ -698,24 +783,20 @@ fn warn_expiring_logins() {
 fn cmd_renew(args: &[String]) -> Result<()> {
     const USAGE: &str = "usage: usagio login|renew [<email>] [--provider <slug>]";
     let mut slug = CLAUDE_SLUG.to_string();
-    let mut selector = None;
+    let mut selector: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--provider" | "-p" => slug = it.next().context(USAGE)?.clone(),
+            "--provider" | "-p" => slug = it.next().context(USAGE)?.to_ascii_lowercase(),
             other => selector = Some(other.to_string()),
         }
     }
+    let selector = strip_renew_qualifier(&mut slug, selector);
     let provider = provider_by_slug(&slug)?;
     let state = State::load()?;
     let target = match selector {
         Some(sel) if slug == CLAUDE_SLUG => login::Target::Renew(state.resolve(&sel)?),
-        Some(sel) => login::Target::Renew(
-            state
-                .find_provider_account(&slug, &sel)
-                .map(|a| a.key.clone())
-                .unwrap_or(sel),
-        ),
+        Some(sel) => login::Target::Renew(resolve_provider_renew_key(&state, &slug, &sel)?),
         // The browser keeps its own session; this store key is never shown
         // in a window, it just marks the account as browser-added.
         None => login::Target::Add {
@@ -792,15 +873,24 @@ fn cmd_list(args: &[String]) -> Result<()> {
     let refresh = args.iter().any(|a| a == "--refresh" || a == "-r");
     // By default read the cache (no network); --refresh does exactly one fetch.
     if refresh {
+        providers::init();
         refresh_usage_cache(true);
         claude_profiles::refresh(usize::MAX, true);
+        let trigger = State::load()
+            .ok()
+            .and_then(|s| s.trigger_pct)
+            .unwrap_or(TRIGGER_PCT);
+        refresh_provider_usage_caches_with(true, trigger, &std::collections::HashSet::new());
     }
     providers::init();
     let state = State::load()?;
     let no_claude = state.accounts.is_empty();
     let no_providers = state.providers.values().all(|p| p.accounts.is_empty());
     if no_claude && no_providers {
-        println!("No accounts yet. Log into one with `claude` (or `codex`), then: usagio capture");
+        println!(
+            "No accounts yet. Log into one with `claude` (or `codex`), then: usagio capture \
+             (or `usagio capture codex`)"
+        );
         return Ok(());
     }
 
@@ -887,11 +977,21 @@ fn cmd_switch(selector: Option<&str>, launch: Option<Launch>) -> Result<()> {
         if let Some(Ok(email)) = &claude {
             return finish_claude_switch(email, launch, true);
         }
+        // An ambiguous Claude prefix is an error, never a reason to switch a
+        // different provider's account (same rule as `rm`).
+        if let Some(Err(e)) = &claude {
+            if store::is_ambiguous_selector(e) {
+                return claude.unwrap().map(|_| ());
+            }
+        }
         if let Some((slug, key)) = resolve_provider_selector(&state, sel) {
             return finish_provider_switch(&slug, &key, launch, true);
         }
-        // Surface Claude's own error ("'dev' is ambiguous — matches: …")
-        // rather than a bare miss.
+        let other = provider_selector_matches(&state, sel);
+        if other.len() > 1 {
+            bail!(ambiguous_provider_selector(sel, &other));
+        }
+        // Surface Claude's own error rather than a bare miss.
         if let Some(Err(e)) = claude {
             return Err(e);
         }
@@ -924,18 +1024,50 @@ fn finish_provider_switch(slug: &str, key: &str, launch: Option<Launch>, hold: b
         bail!("launching {} is not supported", provider.display_name());
     }
     let label = switch_to_provider_account(slug, key, hold)?;
-    if provider_switch_pending(slug, key) {
+    if try_provider_switch_pending(slug, key)? {
         println!("Switch to {label} ({slug}) is queued until the client finishes its work.");
         if launch.is_none() {
             return Ok(());
         }
-        while provider_switch_pending(slug, key) {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            switch_provider_with_intent(slug, key, hold)?;
-        }
+        wait_for_queued_provider_switch(slug, key, hold, |secs| {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+        })?;
+        ensure_switch_landed(slug, key, &label)?;
     }
     println!("Active login is now {label} ({slug}).");
     launch_selected_client(provider, launch)
+}
+
+/// Re-drive the queued switch to `key` until it leaves the queue, calling
+/// `pause(secs)` between attempts. Each re-drive probes the client (a
+/// subprocess for Codex), so back off from 1s to 5s while it is still busy.
+fn wait_for_queued_provider_switch(
+    slug: &str,
+    key: &str,
+    hold: bool,
+    mut pause: impl FnMut(u64),
+) -> Result<()> {
+    let mut wait = 1;
+    while let Some(pending) = queued_provider_switch(slug, key)? {
+        pause(wait);
+        // Compare-and-set on the intent seen before the pause: a newer pick
+        // queued meanwhile wins, and the loop ends on the next check.
+        switch_provider_expecting(slug, key, hold, Some(&pending))?;
+        wait = (wait + 1).min(5);
+    }
+    Ok(())
+}
+
+/// After waiting out a queued switch: bail unless `key` really became active
+/// (the queue may have been superseded or cancelled instead).
+fn ensure_switch_landed(slug: &str, key: &str, label: &str) -> Result<()> {
+    let active = State::load()?
+        .provider_accounts(slug)
+        .and_then(|pa| pa.active.clone());
+    if active.is_some_and(|a| a.eq_ignore_ascii_case(key)) {
+        return Ok(());
+    }
+    bail!("the queued switch to {label} ({slug}) did not complete; it is not the active login")
 }
 
 fn launch_selected_client(provider: &dyn Provider, launch: Option<Launch>) -> Result<()> {
@@ -973,12 +1105,19 @@ fn finish_claude_switch(email: &str, launch: Option<Launch>, hold: bool) -> Resu
 /// slots instead of one flat list, since account keys are only unique within
 /// a single provider (a Codex and a future provider could share an email).
 pub(crate) fn resolve_provider_selector(state: &State, selector: &str) -> Option<(String, String)> {
+    let mut matches = provider_selector_matches(state, selector);
+    (matches.len() == 1).then(|| matches.remove(0))
+}
+
+/// Every non-Claude `(slug, key)` `selector` matches: the exact matches if
+/// any, else the prefix matches. More than one means the selector is ambiguous.
+fn provider_selector_matches(state: &State, selector: &str) -> Vec<(String, String)> {
     let (scope, sel) = selector
         .trim()
         .split_once(':')
         .map_or((None, selector.trim()), |(slug, key)| (Some(slug), key));
     if sel.is_empty() {
-        return None;
+        return Vec::new();
     }
     let sel_lc = sel.to_lowercase();
     let mut exact: Vec<(String, String)> = Vec::new();
@@ -996,13 +1135,11 @@ pub(crate) fn resolve_provider_selector(state: &State, selector: &str) -> Option
             }
         }
     }
-    if exact.len() == 1 {
-        return Some(exact.into_iter().next().unwrap());
+    if exact.is_empty() {
+        prefix
+    } else {
+        exact
     }
-    if exact.is_empty() && prefix.len() == 1 {
-        return Some(prefix.into_iter().next().unwrap());
-    }
-    None
 }
 
 /// Make `key` the active login for the non-Claude provider `slug` (state
@@ -1018,9 +1155,35 @@ pub(crate) fn switch_to_provider_account(slug: &str, key: &str, hold: bool) -> R
 }
 
 fn switch_provider_with_intent(slug: &str, key: &str, manual: bool) -> Result<String> {
+    switch_provider_expecting(slug, key, manual, None)
+}
+
+/// Whether `slug`'s queued switch is still exactly `expected`.
+fn pending_switch_is(state: &State, slug: &str, expected: &store::PendingSwitch) -> bool {
+    state
+        .provider_accounts(slug)
+        .and_then(|pa| pa.pending_switch.as_ref())
+        == Some(expected)
+}
+
+/// `switch_provider_with_intent`, optionally as a retry of the queued switch
+/// `expected` (compare-and-set): if the queue moved on meanwhile (a newer
+/// explicit choice, or it already completed) do nothing rather than replay a
+/// stale intent over it.
+fn switch_provider_expecting(
+    slug: &str,
+    key: &str,
+    manual: bool,
+    expected: Option<&store::PendingSwitch>,
+) -> Result<String> {
     let provider = provider_by_slug(slug)?;
     if !provider.capabilities().supports_switching {
         bail!("switching is not supported for {slug}");
+    }
+    if let Some(exp) = expected {
+        if !pending_switch_is(&State::load()?, slug, exp) {
+            return Ok(key.to_owned());
+        }
     }
     let renewal_pending = State::load()?
         .provider_accounts(slug)
@@ -1033,6 +1196,10 @@ fn switch_provider_with_intent(slug: &str, key: &str, manual: bool) -> Result<St
     let status = provider.client_status()?;
     let ready = with_state_lock(|| {
         let mut state = State::load()?;
+        // Authoritative compare-and-set: same state lock as the queue write.
+        if expected.is_some_and(|exp| !pending_switch_is(&state, slug, exp)) {
+            return Ok(false);
+        }
         lifecycle::prepare_handoff(provider, &status, &mut state, key, manual)
     })?;
     if !ready {
@@ -1041,15 +1208,23 @@ fn switch_provider_with_intent(slug: &str, key: &str, manual: bool) -> Result<St
     commit_provider_switch(provider, slug, key, manual, manual)
 }
 
+/// Whether a switch to `key` is still queued; a state read failure is an error
+/// (not "no longer pending").
+fn try_provider_switch_pending(slug: &str, key: &str) -> Result<bool> {
+    Ok(queued_provider_switch(slug, key)?.is_some())
+}
+
+/// `slug`'s queued switch, if it is the one to `key`.
+fn queued_provider_switch(slug: &str, key: &str) -> Result<Option<store::PendingSwitch>> {
+    let state = State::load()?;
+    Ok(state
+        .provider_accounts(slug)
+        .and_then(|pa| pa.pending_switch.clone())
+        .filter(|pending| pending.key.eq_ignore_ascii_case(key)))
+}
+
 pub(crate) fn provider_switch_pending(slug: &str, key: &str) -> bool {
-    State::load()
-        .ok()
-        .and_then(|state| {
-            state
-                .provider_accounts(slug)
-                .and_then(|pa| pa.pending_switch.clone())
-        })
-        .is_some_and(|pending| pending.key.eq_ignore_ascii_case(key))
+    try_provider_switch_pending(slug, key).unwrap_or(false)
 }
 
 fn complete_pending_switches() {
@@ -1068,7 +1243,9 @@ fn complete_pending_switches() {
             }
             continue;
         }
-        if let Err(error) = switch_provider_with_intent(slug, &pending.key, pending.manual) {
+        if let Err(error) =
+            switch_provider_expecting(slug, &pending.key, pending.manual, Some(pending))
+        {
             logging::log(&format!(
                 "event=pending_switch_retry provider={slug} reason={error}"
             ));
@@ -1109,6 +1286,7 @@ fn recover_obsolete_pending_switch(
             pending.key = active.clone();
             pending.from = Some(active);
             pending.manual = false;
+            pending.renewal = false;
             pending.credentials_written = false;
             pending.leave_latch = None;
             pending.renewed_account = None;
@@ -1149,7 +1327,23 @@ fn commit_provider_switch(
     hold: bool,
     manual: bool,
 ) -> Result<String> {
-    let (acct, identity, drain_token) = with_state_lock(|| {
+    commit_provider_switch_guarded(provider, slug, key, hold, manual, None)?
+        .ok_or_else(|| anyhow!("switch intent changed before commit"))
+}
+
+/// `commit_provider_switch` with an optional auto-swap guard: when
+/// `expect_active` is set, the CAS precondition (that account still active, and
+/// no switch queued for a DIFFERENT key, e.g. a renewal staged meanwhile) is
+/// re-checked in the first locked phase; `Ok(None)` if it no longer holds.
+fn commit_provider_switch_guarded(
+    provider: &dyn Provider,
+    slug: &str,
+    key: &str,
+    hold: bool,
+    manual: bool,
+    expect_active: Option<&str>,
+) -> Result<Option<String>> {
+    let Some((acct, identity, drain_token)) = with_state_lock(|| {
         // Absorb any lagging on-disk rotation for the OUTGOING account BEFORE we
         // overwrite the vendor's credential file — the same guard Claude's
         // `switch_to_guarded` applies (main.rs, `absorb_before_switch`). Without
@@ -1160,6 +1354,18 @@ fn commit_provider_switch(
         // under the reentrant lock, so load AFTER it to pick up the rotation.
         credentials::absorb_before_switch(provider);
         let mut state = State::load()?;
+        if let Some(expect) = expect_active {
+            let pa = state.provider_accounts(slug);
+            let still_active = pa
+                .and_then(|pa| pa.active.as_deref())
+                .is_some_and(|c| c.eq_ignore_ascii_case(expect));
+            let other_queued = pa
+                .and_then(|pa| pa.pending_switch.as_ref())
+                .is_some_and(|p| !p.key.eq_ignore_ascii_case(key));
+            if !still_active || other_queued {
+                return Ok(None);
+            }
+        }
         let renewed_account = state
             .provider_accounts(slug)
             .and_then(|accounts| accounts.pending_switch.as_ref())
@@ -1180,6 +1386,10 @@ fn commit_provider_switch(
             .and_then(|accounts| accounts.pending_switch.as_ref())
             .is_some_and(|pending| pending.key == key && pending.credentials_written)
             && lifecycle::matching_active_blob(provider, &identity)?.is_some();
+        let pending_renewal = state
+            .provider_accounts(slug)
+            .and_then(|accounts| accounts.pending_switch.as_ref())
+            .is_some_and(|pending| pending.key == key && pending.renewal);
         let from = state.provider_accounts_mut(slug).active.clone();
         let leave_latch = state
             .provider_accounts(slug)
@@ -1193,6 +1403,7 @@ fn commit_provider_switch(
             credentials_written,
             leave_latch,
             renewed_account,
+            renewal: pending_renewal && !manual,
         });
         state.save()?;
         if !credentials_written {
@@ -1214,8 +1425,11 @@ fn commit_provider_switch(
                 .renewed_account = None;
             state.save()?;
         }
-        Ok((acct, identity, drain_token))
-    })?;
+        Ok(Some((acct, identity, drain_token)))
+    })?
+    else {
+        return Ok(None);
+    };
     // Starting a daemon can take seconds. Keep state reads, usage persistence,
     // and account management responsive while the refresh lock owns this switch.
     provider
@@ -1240,26 +1454,35 @@ fn commit_provider_switch(
             "account removed during client handoff"
         );
         let leave_latch = pending.leave_latch.clone();
+        let renewal = pending.renewal && !manual;
         accounts.pending_switch = None;
         let prev = state
             .provider_accounts_mut(slug)
             .active
             .replace(acct.key.clone());
-        state.set_manual_pick(slug, hold.then_some(acct.key.as_str()));
-        let tier = pick_tier(&state, slug, &acct.key);
-        state.set_manual_pick_tier(slug, hold.then_some(tier.as_str()));
-        let hold = hold && tier >= autoswap::Tier::Draining;
-        state.set_manual_hold(slug, hold.then_some(acct.key.as_str()));
-        state.note_active_change(
-            slug,
-            prev.as_deref(),
-            &acct.key,
-            if manual {
-                autoswap::memory::ChangeKind::Manual
-            } else {
-                autoswap::memory::ChangeKind::Auto
-            },
-        );
+        // A login renewal (explicit `renewal` marker staged by `persist_login`)
+        // must not touch the user's pick, hold, or the swap memory.
+        let renewal = renewal
+            && prev
+                .as_deref()
+                .is_some_and(|p| p.eq_ignore_ascii_case(&acct.key));
+        if !renewal {
+            state.set_manual_pick(slug, hold.then_some(acct.key.as_str()));
+            let tier = pick_tier(&state, slug, &acct.key);
+            state.set_manual_pick_tier(slug, hold.then_some(tier.as_str()));
+            let hold = hold && tier >= autoswap::Tier::Draining;
+            state.set_manual_hold(slug, hold.then_some(acct.key.as_str()));
+            state.note_active_change(
+                slug,
+                prev.as_deref(),
+                &acct.key,
+                if manual {
+                    autoswap::memory::ChangeKind::Manual
+                } else {
+                    autoswap::memory::ChangeKind::Auto
+                },
+            );
+        }
         if let (Some(from), Some((kind, latch))) = (prev.as_deref(), leave_latch) {
             state
                 .swap_memory
@@ -1283,7 +1506,7 @@ fn commit_provider_switch(
         if let Some(prev) = prev.filter(|p| !p.eq_ignore_ascii_case(&acct.key)) {
             reset_usage_fetch_tracker(&fetch_tracker_key(slug, &prev));
         }
-        Ok(acct.key)
+        Ok(Some(acct.key))
     })
 }
 
@@ -1431,10 +1654,13 @@ fn release_reset_hold(state: &mut State, slug: &str, rows: &[Row], trigger: f64)
 }
 
 /// `settle_manual_pick` for every provider with a pick still waiting on a
-/// post-switch reading, and `release_reset_hold` for every held one.
-fn settle_manual_picks(trigger: f64) {
+/// post-switch reading, and `release_reset_hold` for every held one. Judged
+/// against the saved trigger, the threshold `pick_tier` decided the hold by
+/// (not the cycle's effective one: auto-swap off runs at a 101% sentinel).
+fn settle_manual_picks() {
     let settled = with_state_lock(|| {
         let mut st = State::load()?;
+        let trigger = st.trigger_pct.unwrap_or(TRIGGER_PCT);
         let mut slugs: Vec<String> = st.manual_pick_at.keys().cloned().collect();
         slugs.extend(st.manual_holds.keys().cloned());
         slugs.sort();
@@ -1487,26 +1713,41 @@ fn switch_if_still_active(slug: &str, target: &str, expect_active: &str) -> Resu
     lifecycle::ensure_provider_fresh(provider, target)?;
     let _refresh = lifecycle::refresh_lock()?;
     let status = provider.client_status()?;
-    with_state_lock(|| {
+    switch_provider_if_still_active(provider, &status, target, expect_active)
+}
+
+/// Compare-and-set + handoff preparation under the state lock; the commit (which
+/// runs the seconds-long client handoff) happens AFTER the lock is released so
+/// `commit_provider_switch` can keep state reads responsive during the handoff.
+fn switch_provider_if_still_active(
+    provider: &dyn Provider,
+    status: &providers::ClientStatus,
+    target: &str,
+    expect_active: &str,
+) -> Result<Option<String>> {
+    let slug = provider.provider_id();
+    let ready = with_state_lock(|| {
         let mut state = State::load()?;
         if state
             .provider_accounts(slug)
             .is_some_and(|pa| pa.pending_switch.is_some())
         {
-            return Ok(None);
+            return Ok(false);
         }
         let current = provider_active(&state, slug);
         if !current
             .as_deref()
             .is_some_and(|c| c.eq_ignore_ascii_case(expect_active))
+            || autoswap::shell::pick_diverged_from_armed(slug, &state)
         {
-            return Ok(None);
+            return Ok(false);
         }
-        if !lifecycle::prepare_handoff(provider, &status, &mut state, target, false)? {
-            return Ok(None);
-        }
-        commit_provider_switch(provider, slug, target, false, false).map(Some)
-    })
+        lifecycle::prepare_handoff(provider, status, &mut state, target, false)
+    })?;
+    if !ready {
+        return Ok(None);
+    }
+    commit_provider_switch_guarded(provider, slug, target, false, false, Some(expect_active))
 }
 
 /// `switch_if_still_active`, writing the engine's leave latch for the account
@@ -1724,6 +1965,59 @@ fn ensure_fresh_with_fallback(
     }
 }
 
+/// Get a usable bearer for a reset claim. The ACTIVE account's token belongs
+/// to Claude Code: adopt the slot's current one (never POST /token, like
+/// `cmd_token`/`prepare_switch`); any other account refreshes normally.
+fn claim_refresh_token(
+    provider: &'static dyn Provider,
+    email: &str,
+    acct: &mut Account,
+    is_active: bool,
+) -> std::result::Result<(), String> {
+    if is_active {
+        // `active_refresh_cas` requires the state lock (it may write the slot).
+        let cas = with_state_lock(|| {
+            let mut st = State::load()?;
+            let outcome = st.find_mut(email).map(|a| {
+                let before = serde_json::to_value(&*a).ok();
+                let outcome = active_refresh_cas(provider, a);
+                let changed = serde_json::to_value(&*a).ok() != before;
+                (outcome, a.clone(), changed)
+            });
+            if outcome.as_ref().is_some_and(|(_, _, changed)| *changed) {
+                st.save()?;
+            }
+            Ok(outcome)
+        });
+        match cas {
+            Ok(Some((ActiveRefreshOutcome::Adopted, fresh, _))) => *acct = fresh,
+            Ok(Some((ActiveRefreshOutcome::RefreshFailed, _, _))) | Ok(None) => {
+                logging::log(&format!(
+                    "claim: active account {email} slot unreadable; using stored token"
+                ));
+            }
+            Err(e) => {
+                // Degrade, don't fail: the stored token is what this path
+                // always used before the locked CAS existed.
+                logging::log(&format!(
+                    "claim: reading the active login for {email} failed ({e:#}); using stored token"
+                ));
+            }
+        }
+        return Ok(());
+    }
+    match ensure_fresh_with_fallback(provider, email, acct) {
+        Ok(_) => Ok(()),
+        Err(oauth::RefreshError::InvalidGrant) => {
+            flag_needs_relogin(email);
+            Err(format!(
+                "{email} needs re-login before a reset can be claimed"
+            ))
+        }
+        Err(e) => Err(format!("token refresh for {email} failed: {e}")),
+    }
+}
+
 /// Claim a banked usage-limit reset for the Claude account keyed by `email`.
 /// Refreshes the token (a claim must authenticate), reads the org uuid from the
 /// profile and the grant id from the cached usage the menu was built from, then
@@ -1748,16 +2042,12 @@ pub(crate) fn claim_claude_reset(email: &str) -> std::result::Result<usage::Clai
         .find(|g| g.is_available() && g.usable_now)
         .map(|g| g.id.clone())
         .ok_or("no claimable reset on this account")?;
-    match ensure_fresh_with_fallback(provider, email, &mut acct) {
-        Ok(_) => {}
-        Err(oauth::RefreshError::InvalidGrant) => {
-            flag_needs_relogin(email);
-            return Err(format!(
-                "{email} needs re-login before a reset can be claimed"
-            ));
-        }
-        Err(e) => return Err(format!("token refresh for {email} failed: {e}")),
-    }
+    let is_active = State::load().ok().is_some_and(|st| {
+        st.active
+            .as_deref()
+            .is_some_and(|a| a.eq_ignore_ascii_case(email))
+    });
+    claim_refresh_token(provider, email, &mut acct, is_active)?;
     let profile = usage::fetch_profile(&acct.access_token)
         .ok_or("could not read account profile (for organization id)")?;
     let org =
@@ -1812,7 +2102,9 @@ fn switch_to_guarded(
     let switched = with_state_lock(|| {
         let mut st = State::load()?;
         if let Some(exp) = expect_active {
-            if st.active.as_deref() != Some(exp) {
+            if st.active.as_deref() != Some(exp)
+                || autoswap::shell::pick_diverged_from_armed(CLAUDE_SLUG, &st)
+            {
                 logging::log(&format!(
                     "swap to {label} skipped: active changed to {:?} since the decision",
                     st.active
@@ -1837,6 +2129,11 @@ fn switch_to_guarded(
         // the stale `st`) to later re-push pre-rotation tokens on switch-
         // back. See H_R2_1 in the round-2 codeaudit findings.
         st = State::load()?;
+        // A remove may have landed during the unlocked phase 1; never make a
+        // deleted account live (same rule as the provider path).
+        if st.find(email).is_none() {
+            bail!("{label} was removed before the switch could complete");
+        }
         // Preserve any token rotation the currently-active session picked up
         // and wrote into the keychain (Claude legacy path). This mutates `st`
         // in memory; the final `st.save()` below persists the freshest tokens.
@@ -1853,7 +2150,17 @@ fn switch_to_guarded(
         let from = st.active.clone();
         // ~/.claude.json first, keychain last (the commit point), rollback on fail.
         apply_account(provider, &acct, identity, from.as_deref(), &label)?;
+        // A pending live-write marker is only meaningful while its account
+        // stays active with an unwritten renewal. The account leaving the slot
+        // no longer owns it, and the incoming account's blob was just written
+        // to it, so neither may later rewrite the slot over a vendor rotation.
+        if let Some(prev) = from.as_deref() {
+            if let Some(p) = st.find_mut(prev) {
+                p.live_write_pending = None;
+            }
+        }
         if let Some(a) = st.find_mut(email) {
+            a.live_write_pending = None;
             // Rotations are already saved by `oauth::ensure_fresh`; this
             // records an active-slot adoption from `prepare_switch`.
             a.adopt_tokens_if_newer(&acct);
@@ -1947,7 +2254,11 @@ fn apply_account(
             // If the rollback ALSO fails we're half-applied (~/.claude.json points
             // at the new account, keychain still holds the old) — surface that
             // explicitly rather than silently swallowing the rollback error.
-            if let Err(re) = restore_claude_json_raw(bytes, *mode) {
+            // Re-patch the prior identity into the CURRENT file so Claude Code's
+            // own writes since the snapshot survive the rollback.
+            if let Err(re) = crate::providers::claude::rollback_claude_identity(bytes, *mode)
+                .map_err(|e| anyhow!("{e}"))
+            {
                 logging::log(&format!(
                     "event=switch from={} to={to} identity_written=ok \
                      keychain_written=err:{e:#} rollback=err:{re:#}",
@@ -1977,7 +2288,7 @@ fn apply_account(
     // real recovery on the returning account would be ignored: the first
     // 429 lands on count=1 (which was reset to 0 by us here), and the
     // second bumps to 2, immediately re-escalating on possibly-stale data.
-    if let Some(prev) = from {
+    if let Some(prev) = from.filter(|p| !p.eq_ignore_ascii_case(to)) {
         reset_usage_fetch_tracker(prev);
     }
     Ok(())
@@ -2029,7 +2340,10 @@ fn mirror_inactive_rotation(
     let outcome = with_state_lock(|| {
         let vendor_identity = match provider.read_active_identity() {
             Ok(Some(id)) => id,
-            _ => return Ok(None),
+            Ok(None) => return Ok(None),
+            // Surface the failure (logged as mirror_back=err) instead of
+            // passing it off as a benign identity mismatch.
+            Err(e) => return Ok(Some(Err(e.to_string()))),
         };
         let matches = identity_matches(
             acct.identity_uuid().as_deref(),
@@ -2044,11 +2358,18 @@ fn mirror_inactive_rotation(
         if !matches {
             return Ok(None);
         }
-        Ok(Some(
-            provider
-                .mirror_rotated_token(&acct.keychain_blob)
-                .map_err(|e| e.to_string()),
-        ))
+        let result = provider
+            .mirror_rotated_token(&acct.keychain_blob)
+            .map_err(|e| e.to_string());
+        crate::logging::log(&format!(
+            "event=mirror account={} result={}",
+            acct.key(),
+            match &result {
+                Ok(()) => "ok".to_string(),
+                Err(e) => format!("err:{e}"),
+            }
+        ));
+        Ok(Some(result))
     });
     // On the Ok path, the inner Option is the mirror outcome; if we couldn't
     // even acquire the lock / run the closure this cycle, skip (None) — the
@@ -2180,6 +2501,19 @@ fn sync_active_from_keychain(provider: &'static dyn Provider, state: &mut State)
         ));
         return;
     }
+    // A renewal whose live write failed left a marker naming the stored grant
+    // the slot never received: the slot is older, not fresher (same rule as
+    // `lifecycle::active_refresh_cas`).
+    if acct.live_write_pending.as_deref()
+        == Some(logging::token_fingerprint(&acct.refresh_token).as_str())
+        && acct.refresh_token != fresh.refresh_token
+    {
+        logging::log(&format!(
+            "event=sync_active_from_keychain account={active} outcome=skipped \
+             reason=pending_live_write"
+        ));
+        return;
+    }
     logging::log(&format!(
         "event=sync_active_from_keychain account={active} outcome=adopted \
          at_prefix={} rt_prefix={}",
@@ -2196,9 +2530,77 @@ fn sync_active_from_keychain(provider: &'static dyn Provider, state: &mut State)
 // token
 // ---------------------------------------------------------------------------
 
+/// `usagio token` is Claude-only: accept `claude:<x>`, reject other qualifiers.
+fn token_selector(sel: &str) -> Result<&str> {
+    match sel.split_once(':') {
+        Some((q, rest)) if q.eq_ignore_ascii_case(CLAUDE_SLUG) => Ok(rest),
+        Some((q, _)) => bail!("`usagio token` is Claude-only; '{q}:' accounts are not supported"),
+        None => Ok(sel),
+    }
+}
+
+/// The poll's locked active-account CAS: `(outcome, stored account)`. Saves
+/// only when the CAS changed the account, so idle cycles neither rewrite
+/// state.json nor rotate the rolling backups (as `save_if_changed`).
+fn poll_active_cas(
+    provider: &dyn Provider,
+    email: &str,
+) -> Result<(Option<ActiveRefreshOutcome>, Option<Account>)> {
+    with_state_lock(|| {
+        let mut st = State::load()?;
+        let mut changed = false;
+        let outcome = st.find_mut(email).map(|a| {
+            let before = serde_json::to_value(&*a).ok();
+            let outcome = active_refresh_cas(provider, a);
+            changed = serde_json::to_value(&*a).ok() != before;
+            outcome
+        });
+        if changed {
+            st.save()?;
+        }
+        let fresh = st.find(email).cloned();
+        Ok((outcome, fresh))
+    })
+}
+
+/// `usagio token` for the account it saw active. GUARANTEE: never POST /token
+/// for the ACTIVE account (single-use refresh token would invalidate the live
+/// vendor CLI's copy → forced re-login): ADOPT the vendor slot's current token
+/// instead, so a script gets the same bearer the vendor CLI is using. If the
+/// slot is unreadable the stored token is returned rather than POST. Returns
+/// `None` once the account is no longer active. Runs under the state lock
+/// (`active_refresh_cas` may write the slot), like `claim_refresh_token`.
+fn token_active_cas(
+    provider: &dyn Provider,
+    email: &str,
+) -> Result<Option<(ActiveRefreshOutcome, Account)>> {
+    with_state_lock(|| {
+        let mut st = State::load()?;
+        if !st
+            .active
+            .as_deref()
+            .is_some_and(|a| a.eq_ignore_ascii_case(email))
+        {
+            return Ok(None);
+        }
+        let Some(a) = st.find_mut(email) else {
+            return Ok(None);
+        };
+        let before = serde_json::to_value(&*a).ok();
+        let outcome = active_refresh_cas(provider, a);
+        let changed = serde_json::to_value(&*a).ok() != before;
+        let acct = a.clone();
+        if changed {
+            st.save()
+                .context("recording the adopted token in state.json failed")?;
+        }
+        Ok(Some((outcome, acct)))
+    })
+}
+
 fn cmd_token(selector: Option<&str>) -> Result<()> {
     let state = State::load()?;
-    let email = match selector {
+    let email = match selector.map(token_selector).transpose()? {
         Some(sel) => state.resolve(sel)?,
         None => match state.accounts.as_slice() {
             [only] => only.key().to_string(),
@@ -2206,63 +2608,60 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
             _ => bail!("multiple accounts; specify one by email or prefix"),
         },
     };
-    // Phase 1 (no lock): refresh if near expiry. Network I/O stays OUTSIDE the
-    // cross-process lock so a slow/hung token endpoint can't stall the daemon
-    // poll or a concurrent switch (which all take the same lock).
-    let mut acct = State::load()?
-        .find(&email)
-        .cloned()
-        .with_context(|| format!("no account matches '{email}'"))?;
-    // Reactive path: try the disk fallback before flagging so a rotation the
-    // vendor CLI wrote to ~/.claude/.credentials.json (or that fsnotify missed)
-    // is adopted here instead of tripping needs_relogin on a token that's
-    // already been superseded on disk.
     let provider = providers::get(CLAUDE_SLUG)
         .ok_or_else(|| anyhow!("internal: provider '{CLAUDE_SLUG}' not registered"))?;
-    let adopted = if state.active.as_deref() == Some(email.as_str()) {
-        // GUARANTEE: never POST /token for the ACTIVE account (single-use refresh
-        // token would invalidate the live vendor CLI's copy → forced re-login).
-        // `usagio token` for the active account ADOPTS the vendor slot's current
-        // token instead of minting one; a script gets the same bearer the vendor
-        // CLI is using. If the slot is unreadable we return the stored token
-        // rather than POST. See `active_refresh_cas`'s doc.
-        match active_refresh_cas(provider, &mut acct) {
-            ActiveRefreshOutcome::Adopted => true,
-            ActiveRefreshOutcome::RefreshFailed => {
-                logging::log(&format!(
-                    "token: active account {email} slot unreadable; returning stored \
-                     token (never POST /token for the active account)"
-                ));
-                false
-            }
-        }
+    let active = if state.active.as_deref() == Some(email.as_str()) {
+        token_active_cas(provider, &email)?
     } else {
-        match ensure_fresh_with_fallback(provider, &email, &mut acct) {
-            // `ensure_fresh` saved any rotation itself.
-            Ok(_) => false,
-            Err(oauth::RefreshError::InvalidGrant) => {
-                flag_needs_relogin(&email);
-                bail!(
-                    "account {email} needs re-login (refresh token rejected); run \
-                     `claude /login` for it or click the account row in the menu"
+        None
+    };
+    let acct = match active {
+        Some((ActiveRefreshOutcome::Adopted, fresh)) => {
+            // Never refreshed for the active account (see `token_active_cas`):
+            // say so when Claude Code has left it expired.
+            if fresh.expires_at <= Utc::now().timestamp_millis() {
+                eprintln!(
+                    "warning: {email}'s access token (the one Claude Code is using) has \
+                     expired; run `claude` to renew it — usagio never refreshes the \
+                     active login"
                 );
             }
-            Err(e) => bail!("token refresh for {email} failed: {e}"),
+            fresh
+        }
+        Some((ActiveRefreshOutcome::RefreshFailed, stored)) => {
+            logging::log(&format!(
+                "token: active account {email} slot unreadable; returning stored \
+                 token (never POST /token for the active account)"
+            ));
+            stored
+        }
+        None => {
+            // Network I/O stays OUTSIDE the cross-process lock so a slow/hung
+            // token endpoint can't stall the daemon poll or a concurrent
+            // switch (which all take the same lock).
+            let mut acct = State::load()?
+                .find(&email)
+                .cloned()
+                .with_context(|| format!("no account matches '{email}'"))?;
+            // Reactive path: try the disk fallback before flagging so a
+            // rotation the vendor CLI wrote to ~/.claude/.credentials.json (or
+            // that fsnotify missed) is adopted here instead of tripping
+            // needs_relogin on a token that's already been superseded on disk.
+            match ensure_fresh_with_fallback(provider, &email, &mut acct) {
+                // `ensure_fresh` saved any rotation itself.
+                Ok(_) => acct,
+                Err(oauth::RefreshError::InvalidGrant) => {
+                    flag_needs_relogin(&email);
+                    bail!(
+                        "account {email} needs re-login (refresh token rejected); run \
+                         `claude /login` for it or click the account row in the menu"
+                    );
+                }
+                Err(e) => bail!("token refresh for {email} failed: {e}"),
+            }
         }
     };
     let token = acct.access_token.clone();
-    // Phase 2 (locked): persist the vendor slot's token we just adopted,
-    // without clobbering a fresher one.
-    if adopted {
-        with_state_lock(|| {
-            let mut st = State::load()?;
-            if let Some(a) = st.find_mut(&email) {
-                a.adopt_tokens_if_newer(&acct);
-            }
-            st.save()
-                .context("recording the adopted token in state.json failed")
-        })?;
-    }
     println!("{token}");
     Ok(())
 }
@@ -2271,12 +2670,57 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
 // rm
 // ---------------------------------------------------------------------------
 
+/// Resolve an account selector across providers: `claude:x` / `codex:x`
+/// qualify the provider; an unqualified selector tries Claude first, then the
+/// other providers' accounts. Returns `(slug, key)`.
+fn resolve_account_selector(state: &State, sel: &str) -> Result<(String, String)> {
+    if let Some((slug, account)) = sel.split_once(':') {
+        let slug = slug.to_ascii_lowercase();
+        provider_by_slug(&slug)?;
+        if slug == CLAUDE_SLUG {
+            return Ok((slug, state.resolve(account)?));
+        }
+        return resolve_provider_selector(state, sel)
+            .ok_or_else(|| anyhow!("no unique {slug} account matches '{account}'"));
+    }
+    // Unqualified: fall through to other providers ONLY when Claude has no
+    // match at all. An ambiguous Claude selector stays an error, and a match in
+    // more than one provider must be qualified (this feeds a destructive `rm`).
+    let claude = state.resolve(sel);
+    let mut other = provider_selector_matches(state, sel);
+    match (claude, other.len()) {
+        (Ok(email), 0) => Ok((CLAUDE_SLUG.to_string(), email)),
+        (Ok(email), _) => {
+            let (slug, key) = &other[0];
+            bail!(
+                "'{sel}' matches {CLAUDE_SLUG}:{email} and {slug}:{key}; qualify it with a provider prefix"
+            )
+        }
+        (Err(e), _) if store::is_ambiguous_selector(&e) => Err(e),
+        (Err(_), 1) => Ok(other.remove(0)),
+        (Err(_), 0) => bail!("no account matches '{sel}'"),
+        (Err(_), _) => bail!(ambiguous_provider_selector(sel, &other)),
+    }
+}
+
+fn ambiguous_provider_selector(sel: &str, matches: &[(String, String)]) -> String {
+    let list: Vec<String> = matches.iter().map(|(s, k)| format!("{s}:{k}")).collect();
+    format!(
+        "'{sel}' matches more than one account ({}); be more specific",
+        list.join(", ")
+    )
+}
+
 fn cmd_rm(selector: Option<&str>) -> Result<()> {
     let selector = selector.context("usage: usagio rm <email>")?;
     let state = State::load()?;
-    let email = state.resolve(selector)?;
-    remove_account(&email)?;
-    println!("Removed {email}.");
+    let (slug, key) = resolve_account_selector(&state, selector)?;
+    if slug == CLAUDE_SLUG {
+        remove_account(&key)?;
+    } else {
+        remove_provider_account_generic(&slug, &key)?;
+    }
+    println!("Removed {key}.");
     Ok(())
 }
 
@@ -2374,7 +2818,7 @@ fn row_from_account(a: &Account) -> Row {
             c.opus_pct
                 .map(|p| cell_from_parts(Some(p), c.opus_reset.as_deref()))
         }),
-        error: None,
+        error: last_refresh_error(&fetch_tracker_key(CLAUDE_SLUG, a.key())),
         fetched_at: c.map(|c| c.fetched_at),
         reported: c.map(|c| c.reported.clone()).unwrap_or_default(),
     }
@@ -2409,7 +2853,7 @@ pub(crate) fn row_from_provider_account(slug: &str, a: &ProviderAccount) -> Row 
             c.opus_pct
                 .map(|p| cell_from_parts(Some(p), c.opus_reset.as_deref()))
         }),
-        error: None,
+        error: last_refresh_error(&fetch_tracker_key(slug, &a.key)),
         fetched_at: c.map(|c| c.fetched_at),
         reported: c.map(|c| c.reported.clone()).unwrap_or_default(),
     }
@@ -2513,14 +2957,14 @@ pub(crate) fn optimize_now() -> Result<Option<String>> {
 /// account is already past target (it's all that's left) do we fall back to the
 /// least-consumed still-usable one. Operates entirely on cached rows — callers
 /// must not fetch first.
-/// Rank accounts by runway and reset horizon.
+/// Rank accounts by weekly reset, then runway.
 fn auto_pick_for(_state: &State, rows: &[Row], ceiling: f64, trigger: f64) -> Result<String> {
     auto_pick_v2(rows, ceiling, trigger, Utc::now())
 }
 
-/// Auto-pick by the v2 `rank_key`: the best Ready account by runway (an
-/// account whose weekly reset falls within the rebalance horizon first), then
-/// the Draining one with the most hard runway. Never an account at its limit.
+/// Auto-pick by the v2 `rank_key`: the Ready account whose weekly reset comes
+/// first (then the most runway), then the Draining one with the most hard
+/// runway. Never an account at its limit.
 fn auto_pick_v2(rows: &[Row], ceiling: f64, trigger: f64, now: DateTime<Utc>) -> Result<String> {
     if !rows.iter().any(|r| r.has_data()) {
         bail!(
@@ -2548,7 +2992,7 @@ fn auto_pick_v2(rows: &[Row], ceiling: f64, trigger: f64, now: DateTime<Utc>) ->
             autoswap::assess::assess(&a, false, &ctx)
         })
         .collect();
-    ranked.sort_by(|a, b| autoswap::assess::rank_cmp(a, b, now, None));
+    ranked.sort_by(|a, b| autoswap::assess::rank_cmp(a, b, None));
     let Some(pick) = ranked
         .iter()
         .find(|a| matches!(a.tier, autoswap::Tier::Ready | autoswap::Tier::Draining))
@@ -2584,9 +3028,11 @@ fn auto_pick_v2(rows: &[Row], ceiling: f64, trigger: f64, now: DateTime<Utc>) ->
 }
 
 impl Row {
-    /// True once we have a cached usage sample to reason about.
+    /// True once we have a cached usage sample to reason about. A refresh
+    /// error does not discard it: the engine keeps judging the cached sample
+    /// by its age, and the menu shows the error beside it.
     fn has_data(&self) -> bool {
-        self.error.is_none() && self.fetched_at.is_some()
+        self.fetched_at.is_some()
     }
 
     /// Money the account can still spend on usage credits — see
@@ -2638,6 +3084,9 @@ fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
 // Keychain helpers — delegate to the platform SecretStore
 // ---------------------------------------------------------------------------
 
+// Only the keychain-account unit test uses this now; the live slot logic is
+// `providers::claude::active_slot_{read,write}`.
+#[cfg(test)]
 fn keychain_account() -> String {
     std::env::var("USER").unwrap_or_else(|_| "claude".to_string())
 }
@@ -2651,21 +3100,15 @@ fn keychain_account() -> String {
 // single-user threat model. TODO: switch back to security-framework once we
 // ship a code-signed (Developer ID) build, where "Always Allow" persists.
 fn keychain_read() -> Option<String> {
-    platform()
-        .secrets()
-        .get(KEYCHAIN_SERVICE, &keychain_account())
-        .ok()
-        .flatten()
+    providers::claude::active_slot_read().ok().flatten()
 }
 
 fn keychain_write(blob: &str) -> Result<()> {
-    let result = platform()
-        .secrets()
-        .set(KEYCHAIN_SERVICE, &keychain_account(), blob);
+    let result = providers::claude::active_slot_write(blob).map_err(|e| anyhow!("{e}"));
     // Feed the keychain-write health signal the watchdog watches: a run of
     // consecutive failures is the fingerprint of the fd-exhaustion EMFILE that
-    // silently broke account switching (see `src/watchdog.rs`). A success
-    // resets the counter.
+    // silently broke account switching (see `src/watchdog.rs`). File writes
+    // hit EMFILE the same way. A success resets the counter.
     watchdog::record_keychain_result(result.is_ok());
     result
 }
@@ -2743,8 +3186,8 @@ fn cmd_secrets_selftest(args: &[String]) -> Result<()> {
 }
 
 fn claude_json_path() -> Result<std::path::PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(std::path::PathBuf::from(home).join(".claude.json"))
+    // Same resolution as the Claude provider (honours CLAUDE_CONFIG_DIR).
+    crate::providers::claude::claude_json_path().context("HOME/USERPROFILE is not set")
 }
 
 /// Read the current `oauthAccount` + `userID` from `~/.claude.json`.
@@ -2785,68 +3228,26 @@ fn claude_json_mode(_path: &std::path::Path) -> u32 {
     0o600
 }
 
-/// Restore ~/.claude.json to prior raw bytes (atomic tmp+rename), re-applying the
-/// original mode so the rollback preserves the file's permissions (matching the
-/// documented "rewrites preserve the original file mode" invariant). Cleans up
-/// the temp file on any failure.
-fn restore_claude_json_raw(bytes: &[u8], mode: u32) -> Result<()> {
-    let path = claude_json_path()?;
-    write_bytes_atomic_mode(&path, bytes, mode)
-}
-
-/// Atomically write `bytes` to `path` (tmp + rename) ending at permission
-/// `mode`, cleaning up the temp file on any failure. The temp is created
-/// owner-only from the start (via `store::write_private`, no umask window) since
-/// these files carry OAuth tokens; `mode` is then applied before the rename.
-/// Shared by the `~/.claude.json` identity write and rollback, and unit-tested.
-fn write_bytes_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> Result<()> {
-    let tmp = path.with_extension("json.usagio.tmp");
-    if let Err(e) = store::write_private(&tmp, bytes) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).context("writing temp file");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
-    }
-    #[cfg(not(unix))]
-    let _ = mode;
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).context("renaming file into place");
-    }
-    Ok(())
-}
-
 /// Patch `~/.claude.json` so its active identity is this account: set
 /// `oauthAccount`, set or (when unknown) REMOVE `userID`, and drop the stale
 /// `cachedUsageUtilization`. Atomic, preserves the file mode, cleans the tmp on
 /// failure.
 fn write_claude_identity(oauth_account: &serde_json::Value, user_id: Option<&str>) -> Result<()> {
-    let path = claude_json_path()?;
-    let bytes = std::fs::read(&path).context("reading ~/.claude.json")?;
-    let mut v: serde_json::Value =
-        serde_json::from_slice(&bytes).context("parsing ~/.claude.json")?;
-    let obj = v
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("~/.claude.json is not a JSON object"))?;
-    obj.insert("oauthAccount".into(), oauth_account.clone());
-    match user_id {
-        Some(uid) => {
-            obj.insert("userID".into(), serde_json::Value::String(uid.to_string()));
-        }
-        // Don't leave the previous account's userID paired with a new identity.
-        None => {
-            obj.remove("userID");
-        }
-    }
-    obj.remove("cachedUsageUtilization");
-    let json = serde_json::to_vec_pretty(&v)?;
-    // Preserve the file's existing mode; the shared writer creates the temp
-    // owner-only first, so tokens are never briefly world-readable.
-    let mode = claude_json_mode(&path);
-    write_bytes_atomic_mode(&path, &json, mode).context("replacing ~/.claude.json")
+    write_claude_identity_with(oauth_account, user_id, || {})
+}
+
+/// Read-modify-write `~/.claude.json`. The Claude CLI rewrites this file
+/// continually, so re-read just before committing and redo the patch if the
+/// bytes moved (bounded). `before_commit` is a test seam.
+fn write_claude_identity_with(
+    oauth_account: &serde_json::Value,
+    user_id: Option<&str>,
+    before_commit: impl FnMut(),
+) -> Result<()> {
+    // One implementation (torn-read retry, missing-file message) shared with
+    // the Claude provider.
+    crate::providers::claude::write_claude_identity_with(oauth_account, user_id, before_commit)
+        .map_err(|e| anyhow!("{e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -2854,6 +3255,7 @@ fn write_claude_identity(oauth_account: &serde_json::Value, user_id: Option<&str
 // ---------------------------------------------------------------------------
 
 /// Outcome of a usage refresh.
+#[derive(Default)]
 struct RefreshOutcome {
     /// True if the ACTIVE account got HTTP 429 (caller should back off).
     rate_limited: bool,
@@ -2861,6 +3263,10 @@ struct RefreshOutcome {
     active_fetched: bool,
     /// Any account's usage request 429'd this cycle (v2 storm guard).
     saw_429: bool,
+    /// Accounts whose usage was fetched this cycle.
+    fetched: usize,
+    /// Accounts whose token refresh or usage fetch failed this cycle.
+    failed: usize,
 }
 
 /// The ONE place that calls the usage API. Does all network work (token refresh
@@ -2885,11 +3291,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
         Ok(s) => s,
         Err(e) => {
             logging::log(&format!("poll: state load failed: {e}"));
-            return RefreshOutcome {
-                rate_limited: false,
-                active_fetched: false,
-                saw_429: false,
-            };
+            return RefreshOutcome::default();
         }
     };
     // v1 state is Claude-only; resolve the provider once at the top of the
@@ -2900,11 +3302,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
         Ok(p) => p,
         Err(e) => {
             logging::log(&format!("poll: provider unavailable: {e:#}"));
-            return RefreshOutcome {
-                rate_limited: false,
-                active_fetched: false,
-                saw_429: false,
-            };
+            return RefreshOutcome::default();
         }
     };
     sync_active_from_keychain(provider, &mut state);
@@ -2917,6 +3315,8 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
     // Per-account outcome for the replay rows (§6); "skip" unless fetched.
     let mut outcomes: std::collections::HashMap<String, &'static str> =
         std::collections::HashMap::new();
+    // Token refreshes that failed before any fetch (no replay outcome).
+    let mut refresh_failed = 0usize;
     let mut active_fetched = false;
     let mut saw_429 = false;
 
@@ -3016,37 +3416,25 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
             ));
             continue;
         }
-        // The ACTIVE account gets the compare-and-swap treatment (see the
-        // `active_refresh_cas` doc above): usagio DOES rotate its token, but
-        // the read-refresh-read sequence is run entirely under the state
-        // lock so it can never race a concurrent switch/capture in this
-        // process, and it backs off cleanly the instant it observes Claude
-        // Code touched the same slot. Every other account uses the plain
+        // The ACTIVE account is adopt-only (`lifecycle::active_refresh_cas`):
+        // usagio never POSTs a refresh grant for it, it adopts whatever the
+        // vendor client left in the slot (or republishes a renewal whose live
+        // write failed), all under the state lock so it cannot race a
+        // concurrent switch/capture. Every other account uses the plain
         // network-outside-the-lock refresh below.
-        // H3/gap-4 (v0.5.0 codeaudit + codex-switch-e2e): `supports_active_refresh`
-        // used to be read nowhere outside its own doc comment — this is the
-        // gate that makes it load-bearing. A provider that can't do a
-        // programmatic refresh grant (or, before this change, hasn't
-        // explicitly opted in) falls through to the plain `ensure_fresh`
-        // path below even for its active account, same as an inactive one.
+        // `supports_active_refresh` gates that path. Claude returns true; a
+        // provider returning false would fall through to `ensure_fresh` for
+        // its active account too, which POSTs — so a provider driven through
+        // this loop must opt in.
         let is_active =
             state.active.as_deref() == Some(email.as_str()) && provider.supports_active_refresh();
         if is_active {
-            let email_owned = email.clone();
-            let cas = with_state_lock(|| {
-                let mut st = State::load()?;
-                let outcome = st
-                    .find_mut(&email_owned)
-                    .map(|a| active_refresh_cas(provider, a));
-                if outcome.is_some() {
-                    st.save()?;
-                }
-                let fresh = st.find(&email_owned).cloned();
-                Ok((outcome, fresh))
-            });
+            let cas = poll_active_cas(provider, email);
             match cas {
                 Ok((Some(ActiveRefreshOutcome::RefreshFailed), _)) => {
                     // Keep the existing cache this cycle; retry next tick.
+                    note_refresh_error(email, Some("token refresh failed".to_string()));
+                    refresh_failed += 1;
                     continue;
                 }
                 Ok((Some(_), Some(fresh))) => {
@@ -3062,13 +3450,20 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
                     logging::log(&format!(
                         "poll: active CAS state operation failed for {email}: {e:#}"
                     ));
+                    refresh_failed += 1;
                     continue;
                 }
             }
         } else {
-            match oauth::ensure_fresh(&mut acct, REFRESH_SKEW_SECS) {
+            // Fingerprint BEFORE the refresh replaces the token in place.
+            let old_prefix = logging::token_fingerprint(&acct.access_token);
+            // The refresh token the request will actually send: the refresh
+            // adopts a newer saved rotation from state.json when there is one.
+            let sent_refresh = stored_refresh_token(email, &acct.refresh_token);
+            // Same disk-fallback as the other reactive entry points, so a
+            // rotation that exists only on disk doesn't flag needs_relogin.
+            match ensure_fresh_with_fallback(provider, email, &mut acct) {
                 Ok(true) => {
-                    let old_prefix = logging::token_fingerprint(&acct.access_token);
                     // mirror_back is `skip` (not `ok`/`err`) when the vendor
                     // CLI's own active identity doesn't match this account —
                     // Claude Code's keychain/credentials-file slot is a
@@ -3100,6 +3495,11 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
                         "event=needs_relogin account={email} reason=invalid_grant"
                     ));
                     acct.needs_relogin = true;
+                    // The merge only flags if the stored token is still the
+                    // one that was rejected.
+                    // Re-read: the disk fallback may have adopted (and then had
+                    // rejected) a different token than the one first sent.
+                    acct.refresh_token = stored_refresh_token(email, &sent_refresh);
                     // Fall through to the merge step so the flag is persisted;
                     // skip the usage fetch — a rejected refresh means we don't
                     // have a usable access token to try the usage endpoint with.
@@ -3110,6 +3510,8 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
                     logging::log(&format!(
                         "token refresh failed for {email}: {e} (keeping cache)"
                     ));
+                    note_refresh_error(email, Some(format!("token refresh failed: {e}")));
+                    refresh_failed += 1;
                     continue;
                 }
             }
@@ -3258,6 +3660,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
                     record_inactive_fetch_failure(email, now_ts);
                 }
                 logging::log(&format!("usage 403 for {email}; keeping cache"));
+                note_refresh_error(email, Some("usage request refused (HTTP 403)".to_string()));
                 if let Some(p) = detect_lapsed_plan(provider, email, &acct.access_token, now_ts) {
                     persist_plan(CLAUDE_SLUG, email, &p, None);
                 }
@@ -3291,6 +3694,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
                     record_inactive_fetch_failure(email, now_ts);
                 }
                 logging::log(&format!("usage error for {email}: {e}; keeping cache"));
+                note_refresh_error(email, Some(format!("usage fetch failed: {e}")));
                 None
             }
         };
@@ -3307,9 +3711,14 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
             // path (edge-triggered purely through state, so it runs even on the
             // first poll). Persisted once at the end if anything changed.
             let mut ns = acct.notif_state.clone();
-            for trig in &notifications::reset_grant_triggers(&mut ns, &cu.reported.reset_grants) {
-                if let Err(e) = notifications::fire(trig, &account_key) {
-                    logging::log(&format!("notify: {email}: {e:#}"));
+            for g in &cu.reported.reset_grants {
+                for trig in &notifications::reset_grant_triggers(&mut ns, std::slice::from_ref(g)) {
+                    if let Err(e) = notifications::fire(trig, &account_key) {
+                        logging::log(&format!("notify: {email}: {e:#}"));
+                        // Not delivered: leave the grant un-announced so the
+                        // next poll retries instead of losing it for good.
+                        notifications::release_dedup(&mut ns, trig, Some(&g.id));
+                    }
                 }
             }
             if let Some(prev) = prev_snap {
@@ -3334,6 +3743,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
                 for trig in &kept {
                     if let Err(e) = notifications::fire(trig, &account_key) {
                         logging::log(&format!("notify: {email}: {e:#}"));
+                        notifications::release_dedup(&mut ns, trig, None);
                     }
                 }
             }
@@ -3373,39 +3783,72 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
     // Merge under the lock with a fresh reload so we don't clobber a switch.
     let merged = with_state_lock(|| {
         let mut st = State::load()?;
+        let before = serde_json::to_vec(&st).unwrap_or_default();
         sync_active_claude_identity(&mut st);
         for (email, acct, cu, ns) in &updates {
             if let Some(a) = st.find_mut(email) {
-                // Tokens are already saved: rotations by `oauth::ensure_fresh`,
-                // active-slot adoptions by the CAS above.
-                // Propagate the flag from the phase-1/2 snapshot to the
-                // locked state — but only ever OR it in. A plain overwrite (`a.needs_relogin =
-                // acct.needs_relogin`) could silently clobber `true` back to
-                // `false` if a concurrent path (switch, capture,
-                // `flag_needs_relogin`) set the flag on the locked state
-                // between our phase-1 snapshot and this merge (errors-01,
-                // v0.5.2 codeaudit) — a re-login that genuinely IS needed
-                // would stop being shown.
-                a.needs_relogin = a.needs_relogin || acct.needs_relogin;
-                if let Some(cu) = cu {
-                    a.cached_usage = Some(cu.clone());
-                }
-                if let Some(ns) = ns {
-                    a.notif_state = ns.clone();
-                }
+                merge_poll_update(a, acct, cu.as_ref(), ns.as_ref());
             }
         }
-        st.save()?;
+        save_if_changed(&st, &before)?;
         Ok(())
     });
     if let Err(e) = merged {
         logging::log(&format!("poll: saving refreshed cache failed: {e:#}"));
     }
     logging::log("poll: done");
+    let fetched = outcomes.values().filter(|o| **o == "ok").count();
     RefreshOutcome {
         rate_limited,
         active_fetched,
         saw_429,
+        fetched,
+        failed: outcomes.len() - fetched + refresh_failed,
+    }
+}
+
+/// The refresh token currently saved for `email` (what the next refresh sends),
+/// or `fallback` when none is saved.
+fn stored_refresh_token(email: &str, fallback: &str) -> String {
+    State::load()
+        .ok()
+        .and_then(|st| st.find(email).map(|a| a.refresh_token.clone()))
+        .filter(|stored| !stored.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Fold one poll update (computed from a phase-1 snapshot, `snap`) into the
+/// freshly reloaded account `a`. Tokens are already saved (rotations by
+/// `oauth::ensure_fresh`, active-slot adoptions by the CAS). Everything here
+/// guards against reverting what a concurrent writer saved since the snapshot.
+fn merge_poll_update(
+    a: &mut Account,
+    snap: &Account,
+    cu: Option<&CachedUsage>,
+    ns: Option<&notifications::NotifState>,
+) {
+    // Only ever OR the flag in (a plain overwrite could clear a concurrent
+    // `flag_needs_relogin`), and only when the stored refresh token is still the
+    // one that was rejected: a renewal that landed mid-poll must not be
+    // re-flagged by a failure of the superseded token.
+    if a.refresh_token == snap.refresh_token {
+        a.needs_relogin = a.needs_relogin || snap.needs_relogin;
+    }
+    // An older poll result never replaces a newer reading saved meanwhile.
+    if let Some(cu) = cu {
+        if a.cached_usage.as_ref().is_none_or(|stored| {
+            // A stored stamp from the future (clock was ahead) never pins.
+            stored.fetched_at <= cu.fetched_at
+                || stored.fetched_at > Utc::now().timestamp() + autoswap::memory::FUTURE_SLACK_SECS
+        }) {
+            a.cached_usage = Some(cu.clone());
+        }
+    }
+    // The poll never touches `login_expiry_warned`; keep whatever is stored.
+    if let Some(ns) = ns {
+        let warned = a.notif_state.login_expiry_warned;
+        a.notif_state = ns.clone();
+        a.notif_state.login_expiry_warned = warned;
     }
 }
 
@@ -3602,6 +4045,10 @@ struct ProviderRefresh {
     active_fetched: std::collections::HashSet<String>,
     /// Any account's request 429'd (v2 storm guard).
     saw_429: std::collections::HashSet<String>,
+    /// Accounts whose usage was fetched, per slug.
+    fetched: std::collections::HashMap<String, usize>,
+    /// Accounts whose token refresh or usage fetch failed, per slug.
+    failed: std::collections::HashMap<String, usize>,
 }
 
 #[cfg(test)]
@@ -3630,6 +4077,9 @@ fn refresh_provider_usage_caches_with(
             continue;
         };
         let active_key = pa.active.clone();
+        // A cache taken while the new active was INACTIVE must not be trusted
+        // by the active fetch skip (same bypass as the Claude loop).
+        let active_just_switched = note_polled_provider_active(slug, active_key.as_deref());
         let mut keys: Vec<String> = pa.accounts.iter().map(|a| a.key.clone()).collect();
         // Active first: it gets first claim on the request budget, and a 429
         // on it stops this provider's inactive fetches for the cycle.
@@ -3680,9 +4130,12 @@ fn refresh_provider_usage_caches_with(
             // the Claude path; the reset-boundary wake brings us back). A manual
             // refresh (`force`) never skips, and past MAX_LOCKED_STALENESS we
             // refresh anyway so an early/unexpected reset can't freeze it.
+            // The ACTIVE account is never skipped here (as in the Claude
+            // path): `v2_active_fetch_skip` below decides it.
             if let Some(cu) = &acct.cached_usage {
                 let stale = Utc::now().timestamp() - cu.fetched_at > MAX_LOCKED_STALENESS_SECS;
                 if !force
+                    && !is_active
                     && !recheck_subscription
                     && !stale
                     && countdown::is_locked_until_reset(&cached_to_account_usage(cu), Utc::now())
@@ -3718,7 +4171,7 @@ fn refresh_provider_usage_caches_with(
             if !force && is_active && defer_active.contains(slug) {
                 continue;
             }
-            if !force && is_active {
+            if !force && is_active && !active_just_switched {
                 if let Some(cu) = &acct.cached_usage {
                     {
                         if v2_active_fetch_skip(slug, &key, cu, trigger, now_ts).is_some() {
@@ -3736,6 +4189,11 @@ fn refresh_provider_usage_caches_with(
                         logging::log(&format!(
                             "provider refresh failed for {slug}/{key}: {e}; keeping cache"
                         ));
+                        note_refresh_error(
+                            &tracker_key,
+                            Some(format!("token refresh failed: {e}")),
+                        );
+                        *out.failed.entry(slug.to_string()).or_default() += 1;
                         continue;
                     }
                 }
@@ -3761,6 +4219,7 @@ fn refresh_provider_usage_caches_with(
             let cu = match provider.fetch_usage(&access) {
                 Ok(snap) => {
                     record_usage_fetch_success(&tracker_key);
+                    *out.fetched.entry(slug.to_string()).or_default() += 1;
                     if snap.plan.is_some() {
                         plan = snap.plan.clone();
                     }
@@ -3777,6 +4236,7 @@ fn refresh_provider_usage_caches_with(
                 }
                 Err(e) => {
                     record_fetch_attempt_failed(&tracker_key, now_ts);
+                    *out.failed.entry(slug.to_string()).or_default() += 1;
                     if matches!(e, ProviderError::RateLimited { .. }) {
                         outcomes.insert(key.clone(), "429");
                         out.saw_429.insert(slug.to_string());
@@ -3788,6 +4248,7 @@ fn refresh_provider_usage_caches_with(
                     } else {
                         outcomes.insert(key.clone(), "err");
                         record_usage_fetch_non_429(&tracker_key);
+                        note_refresh_error(&tracker_key, Some(format!("usage fetch failed: {e}")));
                     }
                     if !is_active {
                         record_inactive_fetch_failure(&tracker_key, now_ts);
@@ -3799,7 +4260,10 @@ fn refresh_provider_usage_caches_with(
                         e,
                         ProviderError::RateLimited { .. } | ProviderError::Other(_)
                     ) {
-                        plan = detect_lapsed_plan(provider.as_ref(), &tracker_key, &access, now_ts);
+                        plan = plan_after_failed_fetch(
+                            plan,
+                            detect_lapsed_plan(provider.as_ref(), &tracker_key, &access, now_ts),
+                        );
                     }
                     None
                 }
@@ -3911,18 +4375,38 @@ fn cached_to_account_usage(cu: &CachedUsage) -> countdown::AccountUsage {
     }
 }
 
-fn cmd_watch(args: &[String]) -> Result<()> {
+const WATCH_USAGE: &str =
+    "usage: usagio watch [--interval <secs>] [--trigger <pct>] [--ceiling <pct>]";
+
+/// Parse `watch` flags; a missing or unparsable value is an error, never a
+/// silent fallback to the saved/default setting.
+fn parse_watch_opts(args: &[String]) -> Result<menubar::LoopOpts> {
+    fn value<T: std::str::FromStr>(flag: &str, it: &mut std::slice::Iter<'_, String>) -> Result<T> {
+        let raw = it
+            .next()
+            .with_context(|| format!("{flag} needs a value\n{WATCH_USAGE}"))?;
+        raw.parse()
+            .map_err(|_| anyhow!("invalid value '{raw}' for {flag}\n{WATCH_USAGE}"))
+    }
     let mut opts = menubar::LoopOpts::default();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--interval" => opts.base = it.next().and_then(|s| s.parse().ok()).unwrap_or(opts.base),
-            "--trigger" => opts.trigger = it.next().and_then(|s| s.parse().ok()).or(opts.trigger),
-            "--ceiling" => opts.ceiling = it.next().and_then(|s| s.parse().ok()).or(opts.ceiling),
-            other => bail!("unknown watch option: {other}"),
+            "--interval" => opts.base = value("--interval", &mut it)?,
+            "--trigger" => opts.trigger = Some(value("--trigger", &mut it)?),
+            "--ceiling" => opts.ceiling = Some(value("--ceiling", &mut it)?),
+            other => bail!("unknown watch option: {other}\n{WATCH_USAGE}"),
         }
     }
-    let state = State::load().unwrap_or_default();
+    Ok(opts)
+}
+
+fn cmd_watch(args: &[String]) -> Result<()> {
+    let opts = parse_watch_opts(args)?;
+    let state = State::load().unwrap_or_else(|e| {
+        eprintln!("usagio watch: could not read state.json ({e:#}); the banner below shows defaults, not your saved settings");
+        State::default()
+    });
     let trigger = opts
         .trigger
         .unwrap_or_else(|| state.trigger_pct.unwrap_or(TRIGGER_PCT));
@@ -4267,7 +4751,37 @@ fn with_fetch_trackers<T>(
     f(guard.as_mut().unwrap())
 }
 
+/// The last token-refresh / usage-fetch failure per fetch-tracker key, shown
+/// on the account's menu row until a fetch succeeds. In-memory like the
+/// trackers: the polling process is the one whose menu renders it.
+static LAST_REFRESH_ERRORS: std::sync::Mutex<Option<std::collections::HashMap<String, String>>> =
+    std::sync::Mutex::new(None);
+
+fn note_refresh_error(key: &str, err: Option<String>) {
+    let mut g = LAST_REFRESH_ERRORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(Default::default);
+    match err {
+        Some(e) => {
+            m.insert(key.to_string(), e);
+        }
+        None => {
+            m.remove(key);
+        }
+    }
+}
+
+fn last_refresh_error(key: &str) -> Option<String> {
+    LAST_REFRESH_ERRORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(key).cloned())
+}
+
 fn record_usage_fetch_success(email: &str) {
+    note_refresh_error(email, None);
     with_fetch_trackers(|t| {
         let entry = t.entry(email.to_string()).or_default();
         entry.consecutive_429s = 0;
@@ -4391,6 +4905,16 @@ fn recheck_lapsed_plan(provider: &dyn Provider, tracker_key: &str, access: &str)
     }
 }
 
+/// The plan to persist after a failed usage fetch: a lapse detected now wins,
+/// but a `Restored` plan confirmed earlier this cycle is kept (the throttled
+/// detector returns `None` for an account already checked this cycle).
+fn plan_after_failed_fetch(
+    current: Option<PlanStatus>,
+    detected: Option<PlanStatus>,
+) -> Option<PlanStatus> {
+    detected.or(current)
+}
+
 /// After a 403/429 from the usage endpoint, ask the provider (throttled per
 /// account) whether the plan lapsed. `Some` only for a confirmed lapse.
 fn detect_lapsed_plan(
@@ -4418,6 +4942,7 @@ fn persist_plan(
     let lapsed = !plan.active;
     let res = with_state_lock(|| {
         let mut st = State::load()?;
+        let loaded = serde_json::to_vec(&st).unwrap_or_default();
         let mut changed = false;
         let apply = |no_sub: &mut bool, label: &mut Option<String>| {
             let was = *no_sub;
@@ -4438,7 +4963,7 @@ fn persist_plan(
                 lifecycle::set_provider_tokens(provider, a, at, rt, *exp)?;
             }
         }
-        st.save()?;
+        save_if_changed(&st, &loaded)?;
         Ok(changed)
     });
     match res {
@@ -4470,6 +4995,28 @@ fn note_polled_active(active: Option<&str>) -> bool {
     let mut last = LAST_POLLED_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
     let changed = last.as_deref() != active;
     *last = active.map(str::to_string);
+    changed
+}
+
+/// Per-provider twin of `note_polled_active`: the active key each non-Claude
+/// provider had at its last poll. Returns true when it changed (or is new).
+fn note_polled_provider_active(slug: &str, active: Option<&str>) -> bool {
+    static LAST: std::sync::Mutex<Option<std::collections::HashMap<String, String>>> =
+        std::sync::Mutex::new(None);
+    let mut guard = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(Default::default);
+    // Tests run in parallel threads sharing one process: keep their state apart.
+    #[cfg(test)]
+    let slug = &format!("{slug}#{:?}", std::thread::current().id());
+    let changed = map.get(slug).map(String::as_str) != active;
+    match active {
+        Some(a) => {
+            map.insert(slug.to_string(), a.to_string());
+        }
+        None => {
+            map.remove(slug);
+        }
+    }
     changed
 }
 
@@ -4548,6 +5095,10 @@ pub(crate) struct ProviderCycle {
     pub swapped: Option<(String, String)>,
     /// The active account's usage fetch was rate-limited (HTTP 429).
     pub rate_limited: bool,
+    /// Accounts whose usage was fetched this cycle.
+    pub fetched: usize,
+    /// Accounts whose token refresh or usage fetch failed this cycle.
+    pub failed: usize,
     /// The ACTIVE account's `Row::max_pct()` (session OR weekly, whichever is
     /// tighter), feeding `next_interval`'s cadence ramp. v0.5.13: scoped to the
     /// active account (see `cadence_max_pct`) so an inactive, already-maxed
@@ -4756,7 +5307,7 @@ fn watch_cycle(
         }
     }
     let provider_refresh = refresh_provider_usage_caches_with(force, trigger, &spent);
-    settle_manual_picks(trigger);
+    settle_manual_picks();
 
     let state = State::load()?;
     let now_ts = Utc::now().timestamp();
@@ -4785,6 +5336,14 @@ fn watch_cycle(
                 provider_refresh.rate_limited.contains(slug),
                 provider_refresh.active_fetched.contains(slug),
                 provider_refresh.saw_429.contains(slug),
+            )
+        };
+        let (fetched, failed) = if slug == CLAUDE_SLUG {
+            (claude_refresh.fetched, claude_refresh.failed)
+        } else {
+            (
+                provider_refresh.fetched.get(slug).copied().unwrap_or(0),
+                provider_refresh.failed.get(slug).copied().unwrap_or(0),
             )
         };
         let max_pct = cadence_max_pct(&rows, active.as_deref());
@@ -4834,6 +5393,8 @@ fn watch_cycle(
             active,
             swapped,
             rate_limited,
+            fetched,
+            failed,
             max_pct,
             actionable,
             urgency,
@@ -4898,19 +5459,43 @@ fn history_path() -> Result<std::path::PathBuf> {
 
 fn log_event(v: &serde_json::Value) {
     use std::io::Write;
-    let Ok(path) = history_path() else { return };
+    let path = match history_path() {
+        Ok(p) => p,
+        Err(e) => {
+            log_history_failure(&format!("history path unavailable: {e:#}"));
+            return;
+        }
+    };
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            log_history_failure(&format!("create {} failed: {e}", dir.display()));
+        }
     }
     // Rotate if it has grown too large (keep one previous generation), using the
     // same threshold as the debug log so the policy can't drift.
     logging::rotate_if_large(&path, logging::MAX_BYTES);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(f, "{v}");
+        Ok(mut f) => {
+            if let Err(e) = writeln!(f, "{v}") {
+                log_history_failure(&format!("write {} failed: {e}", path.display()));
+            }
+        }
+        Err(e) => log_history_failure(&format!("open {} failed: {e}", path.display())),
+    }
+}
+
+/// Log a history.jsonl write failure, at most once per process so a
+/// persistent fault doesn't flood the debug log every poll.
+fn log_history_failure(msg: &str) {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        logging::log(&format!(
+            "history: {msg} (further history errors suppressed)"
+        ));
     }
 }
 
@@ -4943,6 +5528,19 @@ struct Sample {
     weekly: Option<f64>,
     #[serde(default)]
     event: Option<String>,
+    /// Provider of a swap event (absent on older Claude-only events).
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+/// Swap events `cmd_report` counts. Its usage samples are Claude-only
+/// (`watch_cycle`), so swaps of other providers stay out of its verdict.
+fn report_swap_count(samples: &[Sample]) -> usize {
+    samples
+        .iter()
+        .filter(|s| s.event.as_deref() == Some("swap"))
+        .filter(|s| s.provider.as_deref().is_none_or(|p| p == CLAUDE_SLUG))
+        .count()
 }
 
 /// Positive session-% deltas between consecutive SAME-account active samples —
@@ -5015,8 +5613,13 @@ fn cmd_report(args: &[String]) -> Result<()> {
     use chrono::{Datelike, Local, TimeZone, Timelike};
 
     let path = history_path()?;
-    let data = std::fs::read_to_string(&path)
-        .context("no history yet — run `usagio watch` (or `install`) to collect it")?;
+    let data = match std::fs::read(&path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!("no history yet — run `usagio watch` (or `install`) to collect it")
+        }
+        Err(e) => return Err(anyhow!(e).context(format!("reading {}", path.display()))),
+    };
     let samples: Vec<Sample> = data
         .lines()
         .filter_map(|l| serde_json::from_str::<Sample>(l).ok())
@@ -5050,10 +5653,7 @@ fn cmd_report(args: &[String]) -> Result<()> {
             }
         }
     }
-    let swaps = samples
-        .iter()
-        .filter(|s| s.event.as_deref() == Some("swap"))
-        .count();
+    let swaps = report_swap_count(&samples);
     let span_start = samples
         .first()
         .and_then(|s| Local.timestamp_opt(s.ts, 0).single());
@@ -5061,7 +5661,7 @@ fn cmd_report(args: &[String]) -> Result<()> {
         .last()
         .and_then(|s| Local.timestamp_opt(s.ts, 0).single());
 
-    println!("\nUsage report");
+    println!("\nUsage report (Claude accounts)");
     if let (Some(a), Some(b)) = (span_start, span_end) {
         println!(
             "  period: {} → {}",
@@ -5105,23 +5705,42 @@ fn cmd_report(args: &[String]) -> Result<()> {
 // Reuses the burn_rate module, so the CLI stays a thin renderer over the same
 // data the menu bar consumes.
 
+/// `(slug, key)` of every captured account `report --pace` covers: Claude's
+/// (those with an email) then every other provider's.
+fn pace_targets(state: &State) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = state
+        .accounts
+        .iter()
+        .filter_map(|a| a.email.clone())
+        .map(|e| (CLAUDE_SLUG.to_string(), e))
+        .collect();
+    for (slug, pa) in &state.providers {
+        if slug != CLAUDE_SLUG {
+            out.extend(pa.accounts.iter().map(|a| (slug.clone(), a.key.clone())));
+        }
+    }
+    out
+}
+
 fn cmd_report_pace() -> Result<()> {
     use crate::providers::trait_def::Window;
     use crate::usage_log::AccountKey;
     let state = State::load()?;
-    if state.accounts.is_empty() {
+    let targets = pace_targets(&state);
+    if targets.is_empty() {
         println!("No accounts captured yet — run `usagio capture` first.");
         return Ok(());
     }
     println!("\nBurn-rate forecast");
     println!("  Projection from recent usage history, not a guarantee.\n");
     let now = Utc::now();
-    for acct in &state.accounts {
-        let Some(email) = acct.email.clone() else {
-            continue;
-        };
-        let key = AccountKey::new(CLAUDE_SLUG, &email);
-        println!("  {email}");
+    for (slug, email) in &targets {
+        let key = AccountKey::new(slug, email);
+        if slug == CLAUDE_SLUG {
+            println!("  {email}");
+        } else {
+            println!("  {slug}:{email}");
+        }
         for window in [Window::Session, Window::Weekly] {
             if let Some(est) = crate::burn_rate::estimate(&key, window, now) {
                 println!("    {}", crate::burn_rate::format_menu_row(&est));
@@ -5179,11 +5798,19 @@ pub(crate) fn stable_exe_path() -> std::path::PathBuf {
 /// 3. Fall back to the bare [`stable_exe_path`] if no bundle is found (a
 ///    from-source install, or a brew formula version predating the bundle).
 pub(crate) fn launch_agent_exe_path() -> std::path::PathBuf {
-    let current = std::env::current_exe().unwrap_or_default();
+    resolve_launch_agent_exe(std::env::current_exe().unwrap_or_default(), stable_exe_path)
+}
+
+/// [`launch_agent_exe_path`] over an injected `current_exe` and stable-path
+/// resolver, so the bundle-preference rules are testable.
+fn resolve_launch_agent_exe(
+    current: std::path::PathBuf,
+    stable: impl FnOnce() -> std::path::PathBuf,
+) -> std::path::PathBuf {
     if current.to_string_lossy().contains(".app/Contents/MacOS/") {
         return current;
     }
-    let stable = stable_exe_path();
+    let stable = stable();
     sibling_app_bundle_exe(&stable).unwrap_or(stable)
 }
 
@@ -5383,7 +6010,7 @@ fn migrate_launchd_if_needed() {
 /// runs meaningfully on macOS — `platform().autostart()` is the thing that's
 /// actually OS-gated, via the `Platform` trait in `src/platform/`). No
 /// `#[cfg(target_os)]` here on purpose: `tests/strict_cfg.rs` restricts that
-/// attribute to `src/platform/*`, and spawning a nonexistent `timeout`/
+/// attribute to `src/platform/*`, and spawning a nonexistent
 /// `osascript` binary on a non-macOS host is already a silent, swallowed
 /// `Err` — `Command::spawn`'s ordinary "not found" failure mode — so the
 /// unconditional call is a no-op there without needing an explicit gate.
@@ -5391,16 +6018,35 @@ fn migrate_launchd_if_needed() {
 /// exiting non-zero in that case is the expected, swallowed outcome.
 fn purge_legacy_login_items() {
     for name in ["usagio", "claude-usage"] {
-        let _ = std::process::Command::new("timeout")
-            .args([
-                "3",
-                "osascript",
-                "-e",
-                &format!("tell application \"System Events\" to delete login item \"{name}\""),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        let mut cmd = std::process::Command::new("/usr/bin/osascript");
+        cmd.args([
+            "-e",
+            &format!("tell application \"System Events\" to delete login item \"{name}\""),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+        let _ = run_with_deadline(cmd, std::time::Duration::from_secs(3));
+    }
+}
+
+/// Run `cmd`, killing it if it outlives `deadline` (no dependency on
+/// `timeout(1)`, which stock macOS does not ship). `Ok(true)` on exit 0.
+fn run_with_deadline(
+    mut cmd: std::process::Command,
+    deadline: std::time::Duration,
+) -> std::io::Result<bool> {
+    let mut child = cmd.spawn()?;
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status.success());
+        }
+        if start.elapsed() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 

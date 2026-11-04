@@ -13,8 +13,8 @@ use chrono::{DateTime, Utc};
 use super::memory::SwapMemory;
 use super::policy::*;
 use super::{
-    assess_all, decide, AccountIn, Action, Decision, Kind, ManualPick, Policy, Reason, Snapshot,
-    Tier, Urgency, WindowIn,
+    assess::Assessed, assess_all, decide, AccountIn, Action, Decision, Kind, ManualPick, Policy,
+    Reason, Snapshot, Tier, Urgency, WindowIn,
 };
 use crate::store::State;
 use crate::{logging, Row};
@@ -305,6 +305,54 @@ impl DecisionLog {
 pub struct ShellState {
     pub budget: Budget,
     pub log: DecisionLog,
+    /// The (target, failure kind) of the last failed auto-switch that was
+    /// already notified; cleared by a successful switch.
+    pub last_failure: Option<(String, &'static str)>,
+}
+
+/// Coarse class of a failed switch, for notification dedup. The target's
+/// key is removed from the text first, so an address like `client.ops@…`
+/// can't steer the class; a login that needs renewing is `auth`.
+pub(crate) fn failure_kind(e: &anyhow::Error, target: &str) -> &'static str {
+    let mut m = format!("{e:#}").to_ascii_lowercase();
+    let key = target.to_ascii_lowercase();
+    if !key.is_empty() {
+        m = m.replace(&key, "");
+    }
+    if m.contains("renew login") {
+        "auth"
+    } else if m.contains("keychain") || m.contains("secret") || m.contains("credential") {
+        "credential-write"
+    } else if m.contains("handoff") || m.contains("client") {
+        "client-handoff"
+    } else if m.contains("refresh") || m.contains("token") || m.contains("auth") {
+        "auth"
+    } else {
+        "other"
+    }
+}
+
+/// A cycle that does not switch ends the failure episode, so a later one
+/// notifies again.
+pub(crate) fn clear_failure_on_stay(last: &mut Option<(String, &'static str)>, action: &Action) {
+    if !matches!(action, Action::Switch { .. }) {
+        *last = None;
+    }
+}
+
+/// Record a failed switch to `to`; true when the user should be told (the
+/// first failure of this (target, kind) since the last success).
+pub(crate) fn should_notify_failure(
+    last: &mut Option<(String, &'static str)>,
+    to: &str,
+    kind: &'static str,
+) -> bool {
+    let cur = (to.to_ascii_lowercase(), kind);
+    if last.as_ref() == Some(&cur) {
+        return false;
+    }
+    *last = Some(cur);
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -489,8 +537,10 @@ fn log_decision_ndjson(
     reads: &[ReadLog],
     budget: &Budget,
     now: DateTime<Utc>,
+    outcome: Option<&str>,
 ) {
     let v = serde_json::json!({
+        "outcome": outcome,
         "ts": now.timestamp(),
         "provider": slug,
         "engine": "v2",
@@ -565,11 +615,14 @@ pub(crate) fn run_cycle(
 
     let mut swapped = None;
     let mut switched_ok = false;
+    let mut switch_outcome: Option<String> = None;
     if let Action::Switch { to, kind } = &d.action {
         let target_row = rows.iter().find(|r| r.email.eq_ignore_ascii_case(to));
+        // A missing reading stays missing ("—" / null), never a fake 0%.
         let (pick_s, pick_w) = target_row
-            .map(|r| (r.session.pct.unwrap_or(0.0), r.weekly.pct.unwrap_or(0.0)))
-            .unwrap_or((0.0, 0.0));
+            .map(|r| (r.session.pct, r.weekly.pct))
+            .unwrap_or((None, None));
+        let (pick_s_txt, pick_w_txt) = (fmt_pct(pick_s), fmt_pct(pick_w));
         let target_pct = row_pct(target_row);
         if *kind != Kind::Rebalance {
             logging::log(&format!(
@@ -579,9 +632,23 @@ pub(crate) fn run_cycle(
             ));
         }
         let latch = leave_latch(*kind, act_assessed.as_ref(), now);
-        match crate::switch_if_still_active_latched(slug, to, active, latch) {
+        // The pick/hold was read at cycle start; the verify reads above took
+        // seconds. A pin set meanwhile wins over this auto move.
+        let moved = if State::load().is_ok_and(|fresh| pick_changed(&state, &fresh, slug)) {
+            logging::log(&format!(
+                "event=swap_skipped provider={slug} target={to} reason=pick_changed v=2"
+            ));
+            switch_outcome = Some("skipped:pick_changed".to_string());
+            Ok(None)
+        } else {
+            let _pick = arm_expected_pick(slug, &state);
+            crate::switch_if_still_active_latched(slug, to, active, latch)
+        };
+        match moved {
             Ok(Some(label)) => {
                 switched_ok = true;
+                switch_outcome = Some("switched".to_string());
+                shell.last_failure = None;
                 let kind = *kind;
                 crate::log_event(&serde_json::json!({
                     "ts": now.timestamp(),
@@ -599,20 +666,35 @@ pub(crate) fn run_cycle(
                         "Prepared {label} for its next reset — usage is still blocked."
                     )),
                     Kind::Rebalance => crate::notify(&format!(
-                        "Flipped back to {label} — {pick_s:.0}% / {pick_w:.0}%"
+                        "Flipped back to {label} — {pick_s_txt} / {pick_w_txt}"
                     )),
                     _ => crate::notify(&format!(
-                        "Switched to {label} — {pick_s:.0}% / {pick_w:.0}%"
+                        "Switched to {label} — {pick_s_txt} / {pick_w_txt}"
                     )),
                 }
                 swapped = Some((active.to_string(), to.clone()));
             }
-            Ok(None) => logging::log(&format!(
-                "event=swap_skipped provider={slug} target={to} reason=active_changed v=2"
-            )),
-            Err(e) => logging::log(&format!("swap to {slug}/{to} failed: {e:#}")),
+            Ok(None) => {
+                switch_outcome.get_or_insert_with(|| "skipped:active_changed".to_string());
+                logging::log(&format!(
+                    "event=swap_skipped provider={slug} target={to} reason=active_changed v=2"
+                ))
+            }
+            Err(e) => {
+                logging::log(&format!("swap to {slug}/{to} failed: {e:#}"));
+                let fk = failure_kind(&e, to);
+                switch_outcome = Some(format!("failed:{fk}"));
+                if should_notify_failure(&mut shell.last_failure, to, fk) {
+                    crate::notify(&format!(
+                        "Auto-swap to {to} failed ({fk}) — staying on {active}. See the log."
+                    ));
+                }
+            }
         }
-    } else if shell.log.should_log(&d) {
+    } else {
+        clear_failure_on_stay(&mut shell.last_failure, &d.action);
+    }
+    if !matches!(d.action, Action::Switch { .. }) && shell.log.should_log(&d) {
         let target = d
             .blocked_target
             .as_deref()
@@ -625,20 +707,16 @@ pub(crate) fn run_cycle(
             d.reason.as_str(),
             d.active_tier.as_str()
         ));
-        log_decision_ndjson(&snap.provider, &d, &reads, &shell.budget, now);
+        log_decision_ndjson(&snap.provider, &d, &reads, &shell.budget, now, None);
     }
-    if switched_ok {
+    if let Some(outcome) = &switch_outcome {
         shell.log.should_log(&d);
-        log_decision_ndjson(slug, &d, &reads, &shell.budget, now);
+        log_decision_ndjson(slug, &d, &reads, &shell.budget, now, Some(outcome));
     }
 
     // Stuck notice + the Draining hysteresis memory, in one locked write.
     if !switched_ok {
-        let soonest = rows
-            .iter()
-            .filter(|r| r.has_data())
-            .filter_map(|r| r.weekly.resets_at)
-            .min()
+        let soonest = soonest_unlock(&assessed, now)
             .map(crate::humanize_until)
             .unwrap_or_else(|| "unknown".to_string());
         let mut fire = false;
@@ -667,6 +745,42 @@ pub(crate) fn run_cycle(
         urgency: d.urgency,
         next_check_at: d.next_check_at,
     })
+}
+
+/// Display a possibly-missing percentage.
+pub(crate) fn fmt_pct(p: Option<f64>) -> String {
+    p.map_or_else(|| "—".to_string(), |p| format!("{p:.0}%"))
+}
+
+/// Whether the manual pick or hold for `slug` differs between two loads of the
+/// state (set, cleared or moved since the cycle began).
+pub(crate) fn pick_changed(before: &State, after: &State, slug: &str) -> bool {
+    before.manual_pick(slug) != after.manual_pick(slug)
+        || before.manual_hold(slug) != after.manual_hold(slug)
+}
+
+/// The soonest moment any switchable account unlocks (earliest `blocked_until`
+/// still in the future), for the stuck notice. Session and weekly blocks both
+/// count; rows that cannot be switched are not assessed at all.
+pub(crate) fn soonest_unlock(assessed: &[Assessed], now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    assessed
+        .iter()
+        .filter_map(|a| a.blocked_until)
+        .filter(|u| *u > now)
+        .min()
+        // Nothing blocked (e.g. a Draining stay): the earliest upcoming reset.
+        // If any account is blocked with no known unlock, stay unknown rather
+        // than name a reset that does not unlock anything.
+        .or_else(|| {
+            if assessed.iter().any(|a| a.blocked) {
+                return None;
+            }
+            assessed
+                .iter()
+                .flat_map(|a| a.windows.iter().filter_map(|w| w.resets_at))
+                .filter(|r| *r > now)
+                .min()
+        })
 }
 
 /// Keep `manual_holds[slug]` ⇔ (pick settled tier ≥ Draining), so a rollback
@@ -701,6 +815,15 @@ pub(crate) fn dual_write_hold(slug: &str) {
 /// 429 streak making the active account Unknown for a while. Returns whether
 /// to send the notice now.
 pub fn stuck_update(m: &mut SwapMemory, d: &Decision, active: &str) -> bool {
+    // The active account changed under this cycle (a concurrent manual
+    // switch already reset the memory for the new one): this decision is
+    // about the old account, so it must not touch the new one's memory.
+    if m.last_seen_active
+        .as_deref()
+        .is_some_and(|a| !a.eq_ignore_ascii_case(active))
+    {
+        return false;
+    }
     let tier = d.active_tier;
     if d.active_real {
         if let Some(prev) = m.real_tier.as_deref().and_then(Tier::parse) {
@@ -764,6 +887,47 @@ pub(crate) fn arm_leave_latch(
         *p.borrow_mut() = latch.map(|(k, l)| (slug.to_string(), from.to_string(), k, l));
     });
     Disarm
+}
+
+type ArmedPick = (String, Option<String>, Option<String>);
+
+thread_local! {
+    /// The manual pick/hold the engine saw at cycle start for the switch in
+    /// progress on this thread; re-checked inside the switch's locked section.
+    static EXPECTED_PICK: std::cell::RefCell<Option<ArmedPick>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arm the cycle-start pick/hold of `slug` (taken from `state`) for the switch
+/// about to run; disarmed when the returned guard drops.
+pub(crate) fn arm_expected_pick(slug: &str, state: &State) -> impl Drop {
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            EXPECTED_PICK.with(|p| *p.borrow_mut() = None);
+        }
+    }
+    EXPECTED_PICK.with(|p| {
+        *p.borrow_mut() = Some((
+            slug.to_string(),
+            state.manual_pick(slug).map(str::to_string),
+            state.manual_hold(slug).map(str::to_string),
+        ));
+    });
+    Disarm
+}
+
+/// Whether `locked` (a state loaded under the state lock) has a different
+/// manual pick/hold for `slug` than the one armed for this switch. Always
+/// false when nothing is armed (manual switches, tests).
+pub(crate) fn pick_diverged_from_armed(slug: &str, locked: &State) -> bool {
+    EXPECTED_PICK.with(|p| {
+        p.borrow().as_ref().is_some_and(|(s, pick, hold)| {
+            s == slug
+                && (locked.manual_pick(slug) != pick.as_deref()
+                    || locked.manual_hold(slug) != hold.as_deref())
+        })
+    })
 }
 
 /// Take the armed leave latch if it is for `slug` leaving `from`.

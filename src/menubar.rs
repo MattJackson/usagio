@@ -521,8 +521,17 @@ fn login_expiring_in(a: &AcctView, now: DateTime<Utc>) -> Option<chrono::Duratio
     (left <= chrono::Duration::seconds(crate::login::RENEW_WINDOW_SECS)).then_some(left)
 }
 
+/// A login whose expiry has already passed (it can't be renewed in place by
+/// a refresh any more; the renew flow is the only way back).
+fn login_expired(left: chrono::Duration) -> bool {
+    left <= chrono::Duration::zero()
+}
+
 /// Coarse "time left" for a login expiry: days, then hours.
 fn login_left_label(left: chrono::Duration) -> String {
+    if login_expired(left) {
+        return "expired".to_string();
+    }
     match (left.num_days(), left.num_hours()) {
         (d, _) if d >= 1 => format!("{d}d"),
         (_, h) if h >= 1 => format!("{h}h"),
@@ -617,6 +626,12 @@ fn trailing_usage_for_account(
     // A login about to die outranks usage: once it's gone the numbers freeze
     // and the account can't be switched to. Full detail is in the submenu.
     if let Some(left) = login_expiring_in(a, now) {
+        // Already past its expiry: the same treatment as a rejected login.
+        if login_expired(left) {
+            let t = "⚠ renew".to_string();
+            let len = u16len(&t);
+            return (t, vec![(0, len, Severity::Red)]);
+        }
         let t = format!("renew · {}", login_left_label(left));
         let len = u16len(&t);
         return (t, vec![(0, len, Severity::Amber)]);
@@ -630,6 +645,17 @@ fn trailing_usage_for_account(
             return (format!("{} credits", left.display_whole()), Vec::new());
         }
     }
+    // A maxed window with unknown reset: the other window's unlock time is
+    // not when the account frees up, so show the percentages, not a countdown.
+    let usage = account_usage_for(a);
+    let display = if countdown::has_indefinite_block(&usage) {
+        DisplayState::Usage {
+            session_pct: usage.session_pct,
+            weekly_pct: usage.weekly_pct,
+        }
+    } else {
+        display
+    };
     match display {
         DisplayState::Locked {
             until,
@@ -809,6 +835,17 @@ fn acct_max_pct(a: &AcctView) -> Option<f64> {
         .fold(None, |acc, p| Some(acc.map_or(p, |m: f64| m.max(p))))
 }
 
+/// Highest of the session/weekly percentages only — the windows
+/// `compute_display` locks on. Unlike [`acct_max_pct`] it ignores scoped
+/// windows (e.g. Opus), which can be maxed while the account stays usable.
+fn blocking_pct(a: &AcctView) -> Option<f64> {
+    let (s, w) = summary_pcts(a);
+    match (s, w) {
+        (Some(s), Some(w)) => Some(s.max(w)),
+        (s, w) => s.or(w),
+    }
+}
+
 /// The account the tray icon/title should reflect, honoring
 /// `State.tray_icon_mode` (carried on the snapshot):
 ///   - `None` — "at risk" (the default): across every provider's ACTIVE
@@ -837,12 +874,35 @@ fn tray_target<'a>(
     // At risk: the active account that blocks soonest (its binding window's
     // time to block at its own pace), falling back to the highest pct.
     let now = now_utc();
-    let actives: Vec<(&ProviderSection, &AcctView)> = snap
+    let all_actives: Vec<(&ProviderSection, &AcctView)> = snap
         .sections
         .iter()
         .filter_map(|sec| Some((sec, sec.accounts.iter().find(|a| a.active)?)))
+        .collect();
+    let actives: Vec<(&ProviderSection, &AcctView)> = all_actives
+        .iter()
+        .copied()
         .filter(|(_, a)| locked_countdown_for(a, now).is_none())
         .collect();
+    if actives.is_empty() {
+        // Every active account is locked: show the one that unlocks soonest
+        // (its lock countdown) rather than a blank "no active account".
+        // A maxed window with no reset time blocks indefinitely: the other
+        // window's unlock time is not a real unlock, so rank it last.
+        let unlock = |a: &AcctView| {
+            let usage = account_usage_for(a);
+            if countdown::has_indefinite_block(&usage) {
+                return None;
+            }
+            match countdown::compute_display(&usage, now) {
+                DisplayState::Locked { until, .. } => Some(until),
+                _ => None,
+            }
+        };
+        return all_actives
+            .into_iter()
+            .min_by_key(|(_, a)| unlock(a).unwrap_or(DateTime::<Utc>::MAX_UTC));
+    }
     let ttb = |a: &AcctView| binding_for(a, now).and_then(|b| b.time_to_block);
     if actives.iter().any(|(_, a)| ttb(a).is_some()) {
         return actives.into_iter().min_by(|(_, a), (_, b)| {
@@ -865,13 +925,38 @@ fn tray_target<'a>(
 }
 
 /// The tray icon bytes for the current [`tray_target`]: the target provider's
-/// 16px brand icon, so the menu bar shows *which* agent the percentage is for.
-/// Falls back to the usagio mark when there's no target or no bundled icon.
+/// 16px brand icon, so the tray shows *which* agent the percentage is for
+/// (Linux/Windows; macOS keeps the usagio mark and names the agent in the
+/// tooltip). Falls back to the usagio mark when there's no target or no bundled icon.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 fn tray_icon_bytes(snap: &Snapshot) -> &'static [u8] {
     tray_target(snap, snap.tray_icon_mode.as_deref())
         .and_then(|(sec, _)| crate::icons::png16_for(sec.provider_id))
         .unwrap_or_else(crate::icons::usagio_tray_icon)
+}
+
+/// The tray icon to push, if the target agent's icon changed since `last`.
+/// Checked every tick (like the title), not only when the menu signature
+/// changes: `tray_target` depends on burn rates the signature leaves out.
+#[allow(dead_code)] // used by the Linux/Windows redraw loop only
+fn tray_icon_update(last: &mut Option<&'static [u8]>, snap: &Snapshot) -> Option<&'static [u8]> {
+    let icon = tray_icon_bytes(snap);
+    if *last == Some(icon) {
+        return None;
+    }
+    *last = Some(icon);
+    Some(icon)
+}
+
+/// The tooltip to push, if it changed since `last` (see [`tray_icon_update`]).
+#[allow(dead_code)] // used by the macOS tick only
+fn tray_tooltip_update(last: &mut String, snap: &Snapshot) -> Option<String> {
+    let tip = tooltip_for(snap);
+    if *last == tip {
+        return None;
+    }
+    last.clone_from(&tip);
+    Some(tip)
 }
 
 /// Entry point dispatched by `usagio menubar` (see `main.rs`). Every platform
@@ -912,7 +997,8 @@ pub fn run() -> Result<()> {
     // frozen muda-compat facade). `spawn` installs the `NSStatusItem` and
     // returns a `Clone` `TrayHandle` without blocking, so usagio keeps driving
     // its own `NSApplication`/`NSTimer` loop below; the status item shows the
-    // agent icon + `%` title side-by-side (muri #58).
+    // fixed usagio mark + the `%` title side-by-side (muri #58); the title and
+    // tooltip, not the icon, say which agent the percentage is for.
     let initial = build_snapshot();
     let mut tray = Tray::new(muri::Icon::from_png(
         crate::icons::usagio_tray_icon().to_vec(),
@@ -957,6 +1043,7 @@ pub fn run() -> Result<()> {
     let menu_rx = MenuEvent::receiver().clone();
     let last_sig = RefCell::new(menu_signature(&initial));
     let last_title = RefCell::new(title_for(&initial));
+    let last_tooltip = RefCell::new(tooltip_for(&initial));
     let tick = RcBlock::new(move |_t: core::ptr::NonNull<NSTimer>| {
         // If `brew upgrade` replaced our binary, relaunch into the new version.
         if let Some(start) = &start_exe {
@@ -977,8 +1064,10 @@ pub fn run() -> Result<()> {
             handle.set_menu(crate::platform::render::render_menu(
                 &cross_platform::menu_tree_from_snapshot(&snap),
             ));
-            handle.set_tooltip(Some(tooltip_for(&snap)));
             *last_sig.borrow_mut() = sig;
+        }
+        if let Some(tip) = tray_tooltip_update(&mut last_tooltip.borrow_mut(), &snap) {
+            handle.set_tooltip(Some(tip));
         }
         let title = title_for(&snap);
         if *last_title.borrow() != title {
@@ -1245,6 +1334,11 @@ pub(crate) fn request_poll_now() {
     cv.notify_all();
 }
 
+/// True while this process is display-only because another usagio process
+/// holds `engine.lock` (design §3.5).
+static ENGINE_DISPLAY_ONLY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Wait up to `timeout` for a [`request_poll_now`]; returns (and clears) the
 /// request flag. Behaves like `thread::sleep(timeout)` when nothing is asked.
 fn wait_for_poll_request(timeout: Duration) -> bool {
@@ -1344,33 +1438,59 @@ pub(crate) fn poll_loop_with(opts: &LoopOpts) {
     }
 }
 
+/// The engine role held by `poll_loop_with`. Dropping it (the loop unwinding
+/// on a panic, before the supervisor's respawn backoff) releases the flock, so
+/// it also marks this process display-only: another process may take the lock
+/// in that window, and a manual refresh here must not run a second engine.
+struct EngineLock {
+    _file: Option<std::fs::File>,
+}
+
+impl Drop for EngineLock {
+    fn drop(&mut self) {
+        ENGINE_DISPLAY_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Take the engine lock (`~/.config/usagio/engine.lock`, a non-blocking
-/// flock), waiting while another process holds it. Returns the open file (the
-/// lock lives as long as it does), or `None` if the lock file can't be used at
-/// all — then this process runs the engine anyway rather than never polling.
-fn acquire_engine_lock() -> Option<std::fs::File> {
+/// flock), waiting while another process holds it. The returned guard holds the
+/// open file (the lock lives as long as it does); it holds no file if the lock
+/// file can't be used at all — then this process runs the engine anyway rather
+/// than never polling.
+fn acquire_engine_lock() -> EngineLock {
     use fs2::FileExt;
     let mut logged = false;
     loop {
-        let file = crate::store::config_dir().ok().and_then(|d| {
-            let _ = std::fs::create_dir_all(&d);
-            std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(d.join("engine.lock"))
-                .ok()
-        });
-        let Some(file) = file else {
-            crate::logging::log("event=engine_lock_unavailable ; running the engine unlocked");
-            return None;
+        let opened = crate::store::config_dir()
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|d| {
+                let _ = std::fs::create_dir_all(&d);
+                let path = d.join("engine.lock");
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(&path)
+                    .map_err(|e| format!("{}: {e}", path.display()))
+            });
+        let file = match opened {
+            Ok(f) => f,
+            Err(why) => {
+                crate::logging::log(&format!(
+                    "event=engine_lock_unavailable error={why} ; running the engine unlocked"
+                ));
+                ENGINE_DISPLAY_ONLY.store(false, std::sync::atomic::Ordering::SeqCst);
+                return EngineLock { _file: None };
+            }
         };
         if file.try_lock_exclusive().is_ok() {
+            ENGINE_DISPLAY_ONLY.store(false, std::sync::atomic::Ordering::SeqCst);
             if logged {
                 crate::logging::log("event=engine_lock_acquired");
             }
-            return Some(file);
+            return EngineLock { _file: Some(file) };
         }
+        ENGINE_DISPLAY_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
         if !logged {
             crate::logging::log(
                 "event=engine_lock_busy ; another usagio process runs auto-swap — display-only",
@@ -1386,12 +1506,46 @@ fn acquire_engine_lock() -> Option<std::fs::File> {
 }
 
 /// Max panic-and-respawn cycles tolerated in `PANIC_LOOP_WINDOW_SECS` before
-/// `poll_loop_supervisor` gives up self-healing and hard-exits (letting
-/// launchd's `KeepAlive`/restart policy bring the whole process back up
-/// clean) — a backstop against a genuine crash-loop rather than a transient
-/// one-off panic.
+/// `poll_loop_supervisor` treats it as a crash-loop (asks launchd for a clean
+/// restart, else respawns slowly) rather than a transient one-off panic.
 const MAX_PANICS_PER_WINDOW: usize = 10;
 const PANIC_LOOP_WINDOW_SECS: u64 = 60;
+/// What the supervisor does once it sees a panic loop.
+#[derive(Debug, PartialEq, Eq)]
+enum PanicLoopResponse {
+    Exit,
+    KeepRespawning,
+}
+
+/// Both LaunchAgent plists ship `KeepAlive=false`, so a bare exit is never
+/// restarted: only exit once a launchd restart was actually issued; otherwise
+/// keep respawning the poller (slowly) so the tray stays alive.
+fn panic_loop_response(restart: &LaunchdRestart) -> PanicLoopResponse {
+    match restart {
+        LaunchdRestart::Issued => PanicLoopResponse::Exit,
+        LaunchdRestart::Failed | LaunchdRestart::NotManaged => PanicLoopResponse::KeepRespawning,
+    }
+}
+
+/// Minimum process uptime before a panic loop may ask launchd for a restart.
+/// A process that was itself just restarted and loops again falls to the slow
+/// respawn path, so a deterministic panic cannot kickstart forever.
+const MIN_UPTIME_FOR_KICKSTART_SECS: u64 = 600;
+
+fn may_kickstart(uptime: Duration) -> bool {
+    uptime.as_secs() >= MIN_UPTIME_FOR_KICKSTART_SECS
+}
+
+/// When this process started (first call wins; the supervisor primes it).
+fn process_uptime() -> Duration {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed()
+}
+
+/// Backoff between respawns once a panic loop was detected and no restart
+/// was possible.
+const PANIC_LOOP_BACKOFF_SECS: u64 = 300;
+
 /// Backoff between a `poll_loop` panic and respawning it.
 const PANIC_RESPAWN_BACKOFF_SECS: u64 = 5;
 
@@ -1417,10 +1571,12 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// the app's lifetime with no user-visible
 /// symptom beyond stale menu numbers. Instead: log the panic, back off, and
 /// respawn — self-healing by default. Only a genuine panic-loop (more than
-/// `MAX_PANICS_PER_WINDOW` in `PANIC_LOOP_WINDOW_SECS`) falls through to a
-/// hard process exit, which launchd's LaunchAgent restarts into a clean
-/// process (see `AUTOSTART_LABEL`/`cmd_install`).
+/// `MAX_PANICS_PER_WINDOW` in `PANIC_LOOP_WINDOW_SECS`) asks launchd for a
+/// clean restart (the `watchdog_self_restart` path) and exits only once that
+/// was issued; the plists ship `KeepAlive=false`, so otherwise it keeps
+/// respawning slowly rather than exiting into a dead tray.
 fn poll_loop_supervisor() {
+    let _ = process_uptime(); // start the uptime clock
     let mut panics: Vec<std::time::Instant> = Vec::new();
     loop {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(poll_loop));
@@ -1442,9 +1598,24 @@ fn poll_loop_supervisor() {
         if panics.len() > MAX_PANICS_PER_WINDOW {
             crate::logging::log(&format!(
                 "event=poll_loop_panic_loop reason=\"more than {MAX_PANICS_PER_WINDOW} panics in \
-                 {PANIC_LOOP_WINDOW_SECS}s\" ; exiting for launchd to restart us clean"
+                 {PANIC_LOOP_WINDOW_SECS}s\" ; asking launchd for a clean restart"
             ));
-            std::process::exit(1);
+            let restart = if may_kickstart(process_uptime()) {
+                relaunch_via_launchd()
+            } else {
+                LaunchdRestart::Failed
+            };
+            if panic_loop_response(&restart) == PanicLoopResponse::Exit {
+                // kickstart -k replaces this process; wait to be replaced.
+                std::thread::sleep(Duration::from_secs(3));
+                std::process::exit(0);
+            }
+            crate::logging::log(
+                "event=poll_loop_panic_loop no launchd restart available (KeepAlive=false); \
+                 staying alive and retrying slowly",
+            );
+            std::thread::sleep(Duration::from_secs(PANIC_LOOP_BACKOFF_SECS));
+            continue;
         }
         std::thread::sleep(Duration::from_secs(PANIC_RESPAWN_BACKOFF_SECS));
     }
@@ -1471,6 +1642,7 @@ fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     static LAST_CHECK: Mutex<Option<Instant>> = Mutex::new(None);
+    static FAILED_TARGET: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
     {
         let mut g = LAST_CHECK.lock().unwrap();
         let should_check = !matches!(*g, Some(t) if t.elapsed() < Duration::from_secs(10));
@@ -1484,7 +1656,8 @@ fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
     let Ok(now) = std::fs::canonicalize(&stable) else {
         return;
     };
-    if now == start {
+    let mut failed = FAILED_TARGET.lock().unwrap_or_else(|e| e.into_inner());
+    if !relaunch_due(start, &now, failed.as_deref()) {
         return;
     }
     crate::logging::log("binary changed on disk (brew upgrade); relaunching");
@@ -1498,7 +1671,10 @@ fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
             // Under launchd but the kickstart didn't take. Staying on the current
             // (old) binary — alive — is far better than exiting into a dead,
             // never-restarted state (KeepAlive=false won't bring us back).
-            crate::logging::log("launchctl kickstart failed; staying on current version");
+            crate::logging::log(
+                "launchctl kickstart failed; staying on current version until the binary changes again",
+            );
+            *failed = Some(now);
         }
         LaunchdRestart::NotManaged => {
             // Bare run (no launchd job): an orphaned child re-parents to
@@ -1506,12 +1682,26 @@ fn maybe_relaunch_after_upgrade(start: &std::path::Path) {
             // actually succeeded, else we'd vanish with no replacement.
             match std::process::Command::new(&stable).arg("menubar").spawn() {
                 Ok(_) => std::process::exit(0),
-                Err(e) => crate::logging::log(&format!(
-                    "relaunch spawn failed: {e}; staying on current version"
-                )),
+                Err(e) => {
+                    crate::logging::log(&format!(
+                        "relaunch spawn failed: {e}; staying on current version until the binary changes again"
+                    ));
+                    *failed = Some(now);
+                }
             }
         }
     }
+}
+
+/// Whether the binary at `now` should be relaunched into: it differs from the
+/// one this process started from, and a relaunch into it hasn't already failed
+/// (a failure isn't retried every 10s; a newer binary is tried again).
+fn relaunch_due(
+    start: &std::path::Path,
+    now: &std::path::Path,
+    failed: Option<&std::path::Path>,
+) -> bool {
+    now != start && failed != Some(now)
 }
 
 /// Outcome of attempting a launchd-driven restart.
@@ -1624,7 +1814,13 @@ fn launchd_managed_from_env(xpc_service_name: Option<&str>) -> bool {
 /// Run one poll+auto-swap cycle with the configured trigger (Settings ▸
 /// Auto-swap, or `opts.trigger`), returning its outcome and the trigger used
 /// so the caller's cadence math matches what `watch_cycle` dispatched on.
-fn run_cycle(guards: &mut SwapGuards, force: bool, opts: &LoopOpts) -> (CycleOutcome, f64) {
+/// [`run_cycle`], keeping the failure (logged either way) so an explicit
+/// Refresh click can say it failed.
+fn run_cycle_checked(
+    guards: &mut SwapGuards,
+    force: bool,
+    opts: &LoopOpts,
+) -> (std::result::Result<CycleOutcome, String>, f64) {
     let st = State::load().unwrap_or_default();
     let autoswap = !st.autoswap_disabled;
     let threshold = opts
@@ -1635,17 +1831,20 @@ fn run_cycle(guards: &mut SwapGuards, force: bool, opts: &LoopOpts) -> (CycleOut
     // The target ceiling follows the trigger (see `Row::eligible_target`).
     let ceiling = opts.ceiling.unwrap_or(trigger).min(trigger);
     match watch_cycle(trigger, ceiling, guards, force) {
-        Ok(o) => (o, trigger),
+        Ok(o) => (Ok(o), trigger),
         Err(e) => {
             crate::logging::log(&format!("poll failed: {e}"));
-            (
-                CycleOutcome {
-                    providers: Vec::new(),
-                },
-                trigger,
-            )
+            (Err(format!("{e}")), trigger)
         }
     }
+}
+
+fn run_cycle(guards: &mut SwapGuards, force: bool, opts: &LoopOpts) -> (CycleOutcome, f64) {
+    let (res, trigger) = run_cycle_checked(guards, force, opts);
+    let outcome = res.unwrap_or(CycleOutcome {
+        providers: Vec::new(),
+    });
+    (outcome, trigger)
 }
 
 /// Whether the provider currently under an env-override that would defeat any
@@ -1982,21 +2181,34 @@ fn probe_installed(_slug: &str) -> bool {
     true
 }
 
-/// Return the parsed state, re-reading state.json only when its mtime changed.
-/// The 0.75s UI tick would otherwise read+parse the file every tick forever.
-/// Only the main thread calls this, but a Mutex keeps it trivially sound.
+/// Identity of one version of state.json: mtime, length and (on unix) inode.
+/// Every save is a tmp+rename, so a new inode tells two saves apart even when
+/// a coarse filesystem clock gives them the same mtime.
+type StateFileKey = Option<(std::time::SystemTime, u64, u64)>;
+
+fn state_file_key(path: &std::path::Path) -> StateFileKey {
+    let m = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(&m);
+    #[cfg(not(unix))]
+    let ino = 0;
+    Some((m.modified().ok()?, m.len(), ino))
+}
+
+/// Return the parsed state, re-reading state.json only when the file changed
+/// (see [`state_file_key`]). The 0.75s UI tick would otherwise read+parse the
+/// file every tick forever. A Mutex keeps the shared cache sound.
 fn cached_state() -> State {
     use std::sync::{Mutex, OnceLock};
-    use std::time::SystemTime;
     struct C {
-        mtime: Option<SystemTime>,
+        key: StateFileKey,
         state: State,
         loaded: bool,
     }
     static CELL: OnceLock<Mutex<C>> = OnceLock::new();
     let cell = CELL.get_or_init(|| {
         Mutex::new(C {
-            mtime: None,
+            key: None,
             state: State::default(),
             loaded: false,
         })
@@ -2004,11 +2216,11 @@ fn cached_state() -> State {
     let path = crate::store::config_dir()
         .map(|d| d.join("state.json"))
         .unwrap_or_default();
-    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    let key = state_file_key(&path);
     let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.loaded || g.mtime != mtime {
+    if !g.loaded || g.key != key {
         g.state = State::load().unwrap_or_default();
-        g.mtime = mtime;
+        g.key = key;
         g.loaded = true;
     }
     g.state.clone()
@@ -2039,9 +2251,45 @@ fn cached_state() -> State {
 /// countdown); a healthy one `<Label> renews in <X>` ("resets in" beside a
 /// lock read as if that window were locked too). `None` for a healthy window
 /// with no known reset — nothing useful to say.
-fn window_status_row(w: &WindowView) -> Option<(String, bool)> {
+/// Whether the window `id` of `a` is `StaleAfterReset`: still at/above the lock
+/// threshold in the cache, but its reset passed and the reading predates it.
+fn window_is_stale_after_reset(a: &AcctView, id: &str, now: DateTime<Utc>) -> bool {
+    let mut u = account_usage_for(a);
+    match id {
+        "session" => {
+            u.weekly_pct = None;
+            u.weekly_reset = None;
+        }
+        "weekly" => {
+            u.session_pct = None;
+            u.session_reset = None;
+        }
+        _ => return false,
+    }
+    matches!(
+        countdown::compute_display(&u, now),
+        DisplayState::StaleAfterReset { .. }
+    )
+}
+
+/// Whether Settings > Tray Icon should check "At risk".
+fn at_risk_checked(snap: &Snapshot) -> bool {
+    // A pin whose provider has no captured account falls back to at-risk
+    // (see `tray_target`), so the menu must show that.
+    match snap.tray_icon_mode.as_deref() {
+        None => true,
+        Some(slug) => !snap.sections.iter().any(|s| s.provider_id == slug),
+    }
+}
+
+/// `stale`: the window's reset already passed and the cached reading predates
+/// it (`DisplayState::StaleAfterReset`), so it is not locked, just unrefreshed.
+fn window_status_row_at(w: &WindowView, stale: bool) -> Option<(String, bool)> {
     let label = stat_display_label(w);
-    let locked = w.pct.is_some_and(|p| p >= 100.0);
+    if stale {
+        return Some((format!("{label} reset · awaiting fresh usage"), false));
+    }
+    let locked = w.pct.is_some_and(|p| p >= countdown::LOCKED_THRESHOLD_PCT);
     match (locked, w.reset.is_empty()) {
         (true, false) => Some((format!("{label} locked · unlocks in {}", w.reset), true)),
         (true, true) => Some((format!("{label} locked"), true)),
@@ -2187,13 +2435,15 @@ fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)
         return rows;
     }
     if let Some(left) = login_expiring_in(a, now_utc()) {
-        rows.push((
+        let row = if login_expired(left) {
+            "⚠ Login expired — Renew login… below".to_string()
+        } else {
             format!(
                 "Login expires in {} — Renew login… below",
                 login_left_label(left)
-            ),
-            true,
-        ));
+            )
+        };
+        rows.push((row, true));
     }
     if let Some(err) = &a.error {
         rows.push((format!("⚠ Refresh error: {err}"), true));
@@ -2208,21 +2458,26 @@ fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)
             // "what's locked / when does it unlock" the header's bare countdown
             // can't convey); otherwise keep window order (session before weekly).
             // Stable sort preserves that order among the non-locked windows.
+            let now = now_utc();
+            // A window whose reset passed before the next refresh is not
+            // locked, whatever its stale cached pct says.
+            let stale = |w: &WindowView| window_is_stale_after_reset(a, &w.id, now);
+            let locked_now = |w: &WindowView| {
+                w.pct.is_some_and(|p| p >= countdown::LOCKED_THRESHOLD_PCT) && !stale(w)
+            };
             let mut ordered: Vec<&WindowView> = a.windows.iter().collect();
-            ordered.sort_by_key(|w| u8::from(!w.pct.is_some_and(|p| p >= 100.0)));
+            ordered.sort_by_key(|w| u8::from(!locked_now(w)));
             // When the WEEKLY window is locked, the account is fully blocked
             // regardless of the session window — so drop the "Session renews in X"
             // line (its countdown is meaningless while the weekly limit blocks all
             // use). The "Weekly locked · unlocks in X" row says everything.
-            let weekly_locked = a
-                .windows
-                .iter()
-                .any(|w| w.id == "weekly" && w.pct.is_some_and(|p| p >= 100.0));
+            let weekly_locked = a.windows.iter().any(|w| w.id == "weekly" && locked_now(w));
+            let before = rows.len();
             for w in ordered {
-                if weekly_locked && !w.pct.is_some_and(|p| p >= 100.0) {
+                if weekly_locked && !locked_now(w) {
                     continue;
                 }
-                if let Some((mut text, locked)) = window_status_row(w) {
+                if let Some((mut text, locked)) = window_status_row_at(w, stale(w)) {
                     if locked && spendable_credits(a).is_some() {
                         text.push_str(" · using credits");
                     }
@@ -2232,8 +2487,10 @@ fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(String, bool)
             // What the provider itself reported beyond the windows (credits,
             // where the week went, per-model limits) — never estimates.
             rows.extend(reported_rows(&a.reported).into_iter().map(|r| (r, false)));
-            if !rows.iter().any(|(r, _)| !r.starts_with("Plan · ")) {
-                rows.push(("no data yet".to_string(), false));
+            // Usage is known (the header shows it); only the reset times are
+            // missing, so say that rather than "no data yet".
+            if rows.len() == before {
+                rows.push(("reset times not reported".to_string(), false));
             }
         } else {
             rows.push(("no data yet".to_string(), false));
@@ -2259,10 +2516,9 @@ fn account_extra_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
         // N% · ~X"). Once the weekly window is already locked (100%),
         // that reads as a redundant "· 100% · ~0m" — skip it; the
         // "Weekly limit reached" status row already conveys the lock.
-        let weekly_locked = a
-            .windows
-            .iter()
-            .any(|w| w.id == "weekly" && w.pct.is_some_and(|p| p >= 100.0));
+        let weekly_locked = a.windows.iter().any(|w| {
+            w.id == "weekly" && w.pct.is_some_and(|p| p >= countdown::LOCKED_THRESHOLD_PCT)
+        });
         if !weekly_locked {
             if let Some(row) = empty_in_row(&account_key, a, Utc::now()) {
                 rows.push(row);
@@ -2417,12 +2673,14 @@ fn menu_signature(snap: &Snapshot) -> String {
             if let Some(left) = login_expiring_in(a, now) {
                 s.push_str(&format!("renew={}|", login_left_label(left)));
             }
-            s.push_str(&format!("rn={}|", a.renewable));
+            s.push_str(&format!("rn={}|err={:?}|", a.renewable, a.error));
             for w in &a.windows {
                 s.push_str(&format!(
                     "{}={}:r={}|",
                     w.id,
-                    w.pct.map(|v| v.round() as i64).unwrap_or(-1),
+                    // The rendered text, so a tie like 2.5 -> "2%" vs 3.0 -> "3%"
+                    // can't hide behind a different rounding rule.
+                    pct(w.pct),
                     w.reset,
                 ));
             }
@@ -2456,7 +2714,17 @@ fn menu_signature(snap: &Snapshot) -> String {
             reg.provider_id, reg.display_name, reg.installed
         ));
     }
-    s.push_str(&format!("as={} th={:.0}", snap.autoswap, snap.threshold));
+    let nc = &snap.notification_config;
+    s.push_str(&format!(
+        "as={} th={:.0} uc={} ti={:?} nt={}{}{}",
+        snap.autoswap,
+        snap.threshold,
+        snap.use_credits,
+        snap.tray_icon_mode,
+        nc.threshold_enabled,
+        nc.reset_back_enabled,
+        nc.pace_enabled,
+    ));
     s
 }
 
@@ -2498,7 +2766,7 @@ fn recovery_status(
         }
     }
     if matches!(state, DisplayState::Usage { .. })
-        && !acct_max_pct(active).is_some_and(|p| p >= 99.5)
+        && !blocking_pct(active).is_some_and(|p| p >= 99.5)
     {
         return None;
     }
@@ -2535,7 +2803,7 @@ fn recovery_status(
             }
             DisplayState::StaleAfterReset { .. } => pending = Some(account),
             DisplayState::Usage { .. } => {
-                if acct_max_pct(account).is_some_and(|p| p < 99.5) {
+                if blocking_pct(account).is_some_and(|p| p < 99.5) {
                     return Some((
                         "Switch".into(),
                         format!("{} · Usage available", account.display),
@@ -2863,14 +3131,19 @@ fn handle_click(id: &str) {
         ("noop", _, _) => {}
         ("autoswap", Some("off"), None) => set_autoswap(false),
         ("autoswap", Some("credits"), None) => toggle_use_credits(),
-        ("autoswap", Some("now"), None) => match optimize_now() {
-            Ok(Some(email)) => {
-                notify(&format!("Switched to {email}"));
-                request_poll_now();
-            }
-            Ok(None) => notify("Already on the best account"),
-            Err(e) => notify(&format!("Optimize failed: {e}")),
-        },
+        // Off the UI thread (a switch can refresh a token over the network)
+        // and ordered against queued Switch clicks by the generation counter.
+        ("autoswap", Some("now"), None) => {
+            spawn_latest_switch(CLAUDE_SLUG, |guard| match optimize_now() {
+                Ok(Some(email)) => {
+                    guard.for_provider(CLAUDE_SLUG).last_swap = Some(std::time::Instant::now());
+                    notify(&format!("Switched to {email}"));
+                    request_poll_now();
+                }
+                Ok(None) => notify("Already on the best account"),
+                Err(e) => notify(&format!("Optimize failed: {e}")),
+            })
+        }
         ("autoswap", Some(t), None) => {
             if let Ok(v) = t.parse::<f64>() {
                 set_autoswap_threshold(v);
@@ -2978,6 +3251,17 @@ fn handle_backup_restore_dialog() {
     handle_backup_restore_dialog_with(crate::platform().file_dialog());
 }
 
+/// True if any string anywhere in `v` is the `"<redacted>"` placeholder that
+/// `store::redact_state_for_dump` writes (such a file holds no usable logins).
+fn json_contains_redacted(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::String(s) => s == "<redacted>",
+        serde_json::Value::Array(a) => a.iter().any(json_contains_redacted),
+        serde_json::Value::Object(o) => o.values().any(json_contains_redacted),
+        _ => false,
+    }
+}
+
 /// Testable core of the Restore… click: takes the `FileDialog` as a
 /// parameter so `#[cfg(test)]` can pass a `platform::MockFileDialog` instead
 /// of popping a real native panel. See `platform::Platform::file_dialog`.
@@ -3012,32 +3296,41 @@ fn handle_backup_restore_dialog_with(dialog: &dyn crate::platform::FileDialog) {
         notify("Restore failed: not a usagio state file (missing 'accounts')");
         return;
     }
+    if json_contains_redacted(&value) {
+        notify(
+            "Restore failed: this is a redacted diagnostic dump (tokens are \"<redacted>\"), \
+             not a working backup",
+        );
+        return;
+    }
     let new_state = State::from_value(&value);
 
+    // Ask OUTSIDE the cross-process state lock: the modal can stay open
+    // indefinitely and would otherwise block every poller/CLI state write.
+    let asked_about = match crate::store::accounts_dropped_by(&new_state) {
+        Ok(d) => d,
+        Err(e) => {
+            notify(&format!("Restore failed: {e}"));
+            return;
+        }
+    };
+    if !asked_about.is_empty() && !confirm(&restore_drop_confirmation(&asked_about)) {
+        return; // user declined; not an error
+    }
+
     let outcome = with_state_lock(|| -> Result<bool> {
+        // Recompute under the lock: if the set of dropped accounts changed
+        // while the dialog was open, the confirmation no longer applies.
         let dropped = crate::store::accounts_dropped_by(&new_state)?;
-        if !dropped.is_empty() && !confirm(&restore_drop_confirmation(&dropped)) {
-            return Ok(false); // user declined; not an error
+        if dropped != asked_about {
+            anyhow::bail!("accounts changed while the confirmation was open; try Restore again");
         }
         let dir = crate::store::config_dir()?;
-        let stash = crate::store::stash_pre_restore(&dir)?;
-        if let Err(e) = crate::store::save_state_restore(new_state.clone()) {
-            // The stash renamed the live state.json aside; a failed write here
-            // would leave state.json MISSING → State::load reads zero accounts
-            // (audit finding 11). Roll the stash back so the pre-restore state
-            // is preserved exactly, then surface the original error.
-            if let Some(stash_path) = stash {
-                if let Err(re) = crate::store::unstash_pre_restore(&stash_path) {
-                    return Err(e.context(format!(
-                        "restore write failed and rollback also failed; your \
-                         previous accounts are preserved at {} — move it back to \
-                         state.json to recover (rollback error: {re})",
-                        stash_path.display()
-                    )));
-                }
-            }
-            return Err(e);
-        }
+        // The stash is a copy and `save_state_restore` writes atomically, so
+        // a failed restore leaves the live state.json untouched; the stash is
+        // kept as an extra pre-restore copy.
+        crate::store::stash_pre_restore(&dir)?;
+        crate::store::save_state_restore(new_state.clone())?;
         Ok(true)
     });
 
@@ -3087,7 +3380,7 @@ fn accounts_needing_relogin() -> Vec<String> {
             st.providers
                 .values()
                 .flat_map(|p| p.accounts.iter())
-                .filter(|a| a.needs_relogin)
+                .filter(|a| a.needs_relogin && !a.no_subscription)
                 .map(|a| a.key.clone()),
         )
         .collect();
@@ -3097,6 +3390,15 @@ fn accounts_needing_relogin() -> Vec<String> {
 }
 
 fn handle_refresh_now() {
+    // Single engine owner (design §3.5): a display-only process runs no poll,
+    // decide or switch, so it must not run a cycle (a second engine with
+    // independent hysteresis). The owner refreshes on its own schedule.
+    if ENGINE_DISPLAY_ONLY.load(std::sync::atomic::Ordering::SeqCst) {
+        notify(
+            "Another usagio process owns refreshing; this menu updates from it on its own schedule",
+        );
+        return;
+    }
     // Shares `poll_loop`'s `SwapGuard`
     // instead of a throwaway `SwapGuard::default()` — see
     // `shared_swap_guard`'s doc for why a manual click and the background
@@ -3118,9 +3420,16 @@ fn handle_refresh_now() {
                 }
             }
             let _reset = InFlightGuard;
-            let (outcome, _trigger) = {
+            let (result, _trigger) = {
                 let mut g = guard.lock().unwrap_or_else(|e| e.into_inner());
-                run_cycle(&mut g, true, &LoopOpts::default())
+                run_cycle_checked(&mut g, true, &LoopOpts::default())
+            };
+            let outcome = match result {
+                Ok(o) => o,
+                Err(e) => {
+                    notify(&format!("Refresh failed: {e}"));
+                    return;
+                }
             };
             let rate_limited = outcome.providers.iter().any(|p| p.rate_limited);
             if rate_limited {
@@ -3129,19 +3438,36 @@ fn handle_refresh_now() {
                 // Surface accounts that can't refresh at all — a dead login is
                 // the reason the numbers won't move, so a bare "Usage refreshed"
                 // would be a quiet lie for those rows.
-                let stuck = accounts_needing_relogin();
-                match stuck.as_slice() {
-                    [] => notify("Usage refreshed"),
-                    [one] => notify(&format!("Usage refreshed — {one} needs re-login")),
-                    many => notify(&format!(
-                        "Usage refreshed — {} accounts need re-login: {}",
-                        many.len(),
-                        many.join(", ")
-                    )),
-                }
+                let fetched = outcome.providers.iter().map(|p| p.fetched).sum();
+                let failed = outcome.providers.iter().map(|p| p.failed).sum();
+                notify(&refresh_summary(
+                    fetched,
+                    failed,
+                    &accounts_needing_relogin(),
+                ));
             }
         });
     })
+}
+
+/// The "Refresh usage now" result toast. Per-account failures are logged and
+/// skipped by the cycle, so they must be counted here, not read off `Ok`.
+fn refresh_summary(fetched: usize, failed: usize, stuck: &[String]) -> String {
+    let head = match (fetched, failed) {
+        (0, f) if f > 0 => "Refresh failed — no account could be refreshed".to_string(),
+        (_, 0) => "Usage refreshed".to_string(),
+        (_, 1) => "Usage refreshed — 1 account could not be refreshed".to_string(),
+        (_, f) => format!("Usage refreshed — {f} accounts could not be refreshed"),
+    };
+    match stuck {
+        [] => head,
+        [one] => format!("{head} — {one} needs re-login"),
+        many => format!(
+            "{head} — {} accounts need re-login: {}",
+            many.len(),
+            many.join(", ")
+        ),
+    }
 }
 
 /// CAS `REFRESH_IN_FLIGHT` from `false` to `true`; if it was already `true`
@@ -3166,6 +3492,48 @@ fn try_start_refresh(spawn: impl FnOnce()) {
 /// provider, dispatch through the trait — the result is only surfaced via
 /// notification since v1 state has no bucket to persist non-Claude accounts.
 fn handle_capture(slug: &str) {
+    if slug != CLAUDE_SLUG && providers::get(slug).is_none() {
+        notify(&format!(
+            "Capture failed: provider '{slug}' is not registered"
+        ));
+        return;
+    }
+    // Capture makes the login active and may hit the network, so it runs like
+    // a switch: off the UI thread, ordered against queued switch clicks.
+    // A capture is never dropped by a later click: it is queued, bumps the
+    // generation so OLDER switches yield, and whichever worker gets the swap
+    // guard next (this one or a later switch) runs it first.
+    PENDING_CAPTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .entry(slug.to_string())
+        .and_modify(|n| *n += 1)
+        .or_insert(1);
+    let owned = slug.to_string();
+    spawn_latest_switch(slug, move |_| run_pending_captures(&owned));
+}
+
+/// Captures clicked but not yet run, per provider.
+static PENDING_CAPTURES: std::sync::Mutex<Option<std::collections::HashMap<String, usize>>> =
+    std::sync::Mutex::new(None);
+
+/// Run every queued capture for `slug`. Called with the swap guard held, by
+/// the capture's own worker and by every switch worker before its gen check,
+/// so a Switch clicked after a Capture always sees the captured account.
+fn run_pending_captures(slug: &str) {
+    let n = PENDING_CAPTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|m| m.remove(slug))
+        .unwrap_or(0);
+    for _ in 0..n {
+        capture_serialized(slug);
+    }
+}
+
+fn capture_serialized(slug: &str) {
     if slug == CLAUDE_SLUG {
         match capture_current() {
             Ok((email, existed)) => {
@@ -3181,20 +3549,21 @@ fn handle_capture(slug: &str) {
         return;
     }
     let Some(provider) = providers::get(slug) else {
-        notify(&format!(
-            "Capture failed: provider '{slug}' is not registered"
-        ));
         return;
     };
     // State v2 (codex-switch-e2e): every non-Claude provider now has a real
     // multi-account slot (`State::providers[slug]`) to persist into, closing
     // the gap this used to leave as "persistence lands in a later phase".
     match capture_current_generic(slug) {
-        Ok((key, existed)) => notify(&format!(
-            "{} {} {key}",
-            if existed { "Refreshed" } else { "Captured" },
-            provider.display_name()
-        )),
+        Ok((key, existed)) => {
+            notify(&format!(
+                "{} {} {key}",
+                if existed { "Refreshed" } else { "Captured" },
+                provider.display_name()
+            ));
+            // Capture makes this login the provider's active account.
+            request_poll_now();
+        }
         Err(e) => notify(&format!("Capture failed: {e}")),
     }
 }
@@ -3202,13 +3571,36 @@ fn handle_capture(slug: &str) {
 /// "Renew login…": run the provider's own login in usagio's sign-in window —
 /// the default browser where no window can be shown — and save the result
 /// (see `crate::login`). Runs on the UI thread; the wait happens off it.
+/// Sign-in window store for a renew. `State::find` searches Claude accounts
+/// only, so its `login_store` applies only to a Claude renew; any other
+/// provider keys its store by the account key.
+fn renew_login_store(st: &State, slug: &str, key: &str) -> String {
+    if slug == CLAUDE_SLUG {
+        if let Some(store) = st.find(key).and_then(|a| a.login_store.clone()) {
+            return store;
+        }
+    }
+    key.to_string()
+}
+
 fn handle_renew(slug: &str, key: &str) {
+    if providers::get(slug).is_none() {
+        return;
+    }
+    let (slug, key) = (slug.to_string(), key.to_string());
+    let s = slug.clone();
+    begin_login_after_superseding(&s, move |browser_only| {
+        begin_renew(&slug, &key, browser_only)
+    });
+}
+
+fn begin_renew(slug: &str, key: &str, browser_only: bool) {
     let Some(provider) = providers::get(slug) else {
         return;
     };
     let store = State::load()
         .ok()
-        .and_then(|st| st.find(key).and_then(|a| a.login_store.clone()))
+        .map(|st| renew_login_store(&st, slug, key))
         .unwrap_or_else(|| key.to_string());
     let target = crate::login::Target::Renew(key.to_string());
     let started = crate::login::start(provider, target, |result| match result {
@@ -3219,7 +3611,13 @@ fn handle_renew(slug: &str, key: &str) {
         Err(e) => notify(&format!("Renew failed: {e:#}")),
     });
     match started {
-        Ok(s) => show_sign_in(&format!("Renew {key} — usagio"), slug, &store, &s),
+        Ok(s) => show_sign_in(
+            &format!("Renew {key} — usagio"),
+            slug,
+            &store,
+            &s,
+            browser_only,
+        ),
         Err(e) => notify(&format!("Renew failed: {e:#}")),
     }
 }
@@ -3273,6 +3671,16 @@ fn spawn_claim(key: String) {
 /// fresh sign-in window store, adding whichever account signs in (never
 /// switching to it). The account remembers that store for its renewals.
 fn handle_sign_in(slug: &str) {
+    if providers::get(slug).is_none() {
+        return;
+    }
+    let owned = slug.to_string();
+    begin_login_after_superseding(slug, move |browser_only| {
+        begin_sign_in(&owned, browser_only)
+    });
+}
+
+fn begin_sign_in(slug: &str, browser_only: bool) {
     let Some(provider) = providers::get(slug) else {
         return;
     };
@@ -3293,6 +3701,7 @@ fn handle_sign_in(slug: &str) {
             slug,
             &store,
             &s,
+            browser_only,
         ),
         Err(e) => notify(&format!("Sign-in failed: {e:#}")),
     }
@@ -3300,9 +3709,16 @@ fn handle_sign_in(slug: &str) {
 
 /// Show a started login in the sign-in window, or the default browser where
 /// no window can be shown here.
-fn show_sign_in(title: &str, slug: &str, store: &str, started: &crate::login::Started) {
+fn show_sign_in(
+    title: &str,
+    slug: &str,
+    store: &str,
+    started: &crate::login::Started,
+    browser_only: bool,
+) {
     let platform = crate::platform();
-    let in_window = platform.sign_in_window_available()
+    let in_window = !browser_only
+        && platform.sign_in_window_available()
         && match platform.open_sign_in_window(
             title,
             &started.url,
@@ -3317,9 +3733,12 @@ fn show_sign_in(title: &str, slug: &str, store: &str, started: &crate::login::St
             }
         };
     if !in_window {
-        if let Err(e) = platform.open_url(&started.url) {
-            started.progress.cancel();
-            notify(&format!("Sign-in failed: {e:#}"));
+        match platform.open_url(&started.url) {
+            Ok(()) => track_browser_login(slug, std::sync::Arc::clone(&started.progress)),
+            Err(e) => {
+                started.progress.cancel();
+                notify(&format!("Sign-in failed: {e:#}"));
+            }
         }
     }
 }
@@ -3347,11 +3766,154 @@ fn login_message(mut msg: String, r: &crate::login::Renewed) -> String {
     msg
 }
 
+/// The in-flight browser-fallback login per provider. Nothing else can stop
+/// its loopback listener (Codex's fixed port 1455 included) once the tab is
+/// closed, so a newer sign-in for the same provider supersedes it first.
+static BROWSER_LOGINS: std::sync::Mutex<
+    Option<std::collections::HashMap<String, std::sync::Arc<crate::login::Progress>>>,
+> = std::sync::Mutex::new(None);
+
+fn track_browser_login(slug: &str, progress: std::sync::Arc<crate::login::Progress>) {
+    let replaced = BROWSER_LOGINS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(slug.to_string(), std::sync::Arc::clone(&progress));
+    // A flow replaced here would otherwise keep its listener, untracked.
+    if let Some(old) = replaced.filter(|old| !std::sync::Arc::ptr_eq(old, &progress)) {
+        old.supersede();
+    }
+}
+
+/// Supersede the previous browser login for `slug`, if any. Never blocks; the
+/// caller waits for the listener to be released ([`wait_released`]) off the UI
+/// thread before binding the same port again.
+fn supersede_previous_login(slug: &str) -> Option<std::sync::Arc<crate::login::Progress>> {
+    let prev = BROWSER_LOGINS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|m| m.remove(slug))?;
+    // A finished flow holds no listener: nothing to wait for, so the new
+    // sign-in runs inline and may use the sign-in window.
+    if prev.is_finished() {
+        return None;
+    }
+    prev.supersede();
+    Some(prev)
+}
+
+/// Wait (briefly) until a superseded flow's worker has released its listener.
+fn wait_released(prev: &crate::login::Progress) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !prev.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Latest sign-in click per provider, so a worker still waiting for an old
+/// listener never starts (and then supersedes) a flow begun by a newer click.
+static LOGIN_GEN: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
+
+fn login_gen(slug: &str, bump: bool) -> u64 {
+    let mut m = LOGIN_GEN.lock().unwrap_or_else(|e| e.into_inner());
+    let g = m
+        .get_or_insert_with(Default::default)
+        .entry(slug.to_string())
+        .or_insert(0);
+    if bump {
+        *g += 1;
+    }
+    *g
+}
+
+/// Run `begin(browser_only)` for a new sign-in on `slug`. With nothing to
+/// supersede it runs inline (the UI thread, window allowed). Otherwise the
+/// wait for the old listener happens on a worker, and since no window can be
+/// opened off the main thread, the new flow uses the browser. A newer click
+/// made during that wait wins: the worker then starts nothing.
+fn begin_login_after_superseding(slug: &str, begin: impl FnOnce(bool) + Send + 'static) {
+    let gen = login_gen(slug, true);
+    match supersede_previous_login(slug) {
+        None => begin(false),
+        Some(prev) => {
+            let slug = slug.to_string();
+            #[cfg(test)]
+            let home = crate::store::home_override();
+            std::thread::spawn(move || {
+                #[cfg(test)]
+                crate::store::set_home_override(home);
+                wait_released(&prev);
+                if login_gen(&slug, false) == gen {
+                    begin(true);
+                } else {
+                    crate::logging::log(&format!(
+                        "event=login_superseded_while_waiting provider={slug}"
+                    ));
+                }
+            });
+        }
+    }
+}
+
+/// Run `work` on a worker thread while holding the shared swap guard. The
+/// poller holds that guard for a whole `run_cycle` (network fetches, token
+/// refreshes), so taking it on the UI thread would freeze the tray; the
+/// worker waits instead, keeping the serialization with the poller.
+fn spawn_serialized_with_poller(work: impl FnOnce(&mut SwapGuards) + Send + 'static) {
+    let shared = shared_swap_guard();
+    // Unit tests scope the config dir per thread; carry it to the worker.
+    #[cfg(test)]
+    let home = crate::store::home_override();
+    std::thread::spawn(move || {
+        #[cfg(test)]
+        crate::store::set_home_override(home);
+        let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+        work(&mut guard);
+    });
+}
+
 fn handle_switch(slug: &str, key: &str) {
     // Explicit user choice may select an exhausted account. Serialize with the
-    // poller so it cannot immediately undo the choice with an older decision.
-    let shared = shared_swap_guard();
-    let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+    // poller so it cannot immediately undo the choice with an older decision;
+    // off the UI thread, since the guard can be held across network fetches.
+    let (slug, key) = (slug.to_string(), key.to_string());
+    let provider = slug.clone();
+    spawn_latest_switch(&provider, move |guard| {
+        switch_serialized(guard, &slug, &key)
+    });
+}
+
+/// Latest requested switch per provider. `std::sync::Mutex` is not FIFO, so
+/// workers queued behind the poller can wake in any order; each carries the
+/// generation it was requested at and skips if a newer click superseded it.
+static SWITCH_GEN: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
+
+fn spawn_latest_switch(slug: &str, work: impl FnOnce(&mut SwapGuards) + Send + 'static) {
+    let gen = {
+        let mut m = SWITCH_GEN.lock().unwrap_or_else(|e| e.into_inner());
+        let n = m.get_or_insert_with(Default::default);
+        let g = n.entry(slug.to_string()).or_insert(0);
+        *g += 1;
+        *g
+    };
+    let slug = slug.to_string();
+    spawn_serialized_with_poller(move |guard| {
+        run_pending_captures(&slug);
+        let current = SWITCH_GEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|m| m.get(&slug).copied());
+        if current == Some(gen) {
+            work(guard);
+        }
+    });
+}
+
+fn switch_serialized(guard: &mut SwapGuards, slug: &str, key: &str) {
     // State v2 (codex-switch-e2e): dispatch by provider slug instead of
     // hard-gating on Claude — `capabilities().supports_switching` already
     // keeps the "Switch to this account" row from being built for a
@@ -3530,6 +4092,15 @@ fn confirm(question: &str) -> bool {
     confirm_with_button(question, "Remove")
 }
 
+/// What the user answered: `Some(true)` for `button`, `Some(false)` for any
+/// other button, `None` when the dialog produced no button at all.
+fn confirm_answer(result: rfd::MessageDialogResult, button: &str) -> Option<bool> {
+    match result {
+        rfd::MessageDialogResult::Custom(label) => Some(label == button),
+        _ => None,
+    }
+}
+
 fn confirm_with_button(question: &str, button: &str) -> bool {
     let result = rfd::MessageDialog::new()
         .set_title("usagio")
@@ -3540,7 +4111,20 @@ fn confirm_with_button(question: &str, button: &str) -> bool {
             "Cancel".to_string(),
         ))
         .show();
-    matches!(result, rfd::MessageDialogResult::Custom(label) if label == button)
+    // Both buttons are custom, so a non-button result means the dialog was
+    // dismissed without one (Esc or close on Windows) or could not be shown at
+    // all (Linux without zenity). Still fail closed, and say nothing changed
+    // without claiming either cause.
+    confirm_answer(result, button).unwrap_or_else(|| {
+        crate::logging::log(&format!(
+            "event=confirm_dialog_no_answer button={button:?} ; nothing changed"
+        ));
+        notify(
+            "Nothing was changed — the confirmation closed without a choice \
+             (if no dialog appeared on Linux, install zenity)",
+        );
+        false
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3859,7 +4443,7 @@ mod cross_platform {
             "trayicon:at-risk",
             "At risk (closest to limit)",
             true,
-            cur_mode.is_none(),
+            at_risk_checked(snap),
         )];
         for sec in &snap.sections {
             trayicon_items.push(checkbox(
@@ -3918,6 +4502,7 @@ mod cross_platform {
     fn redraw_loop(handle: Box<dyn MenuHandle>, initial: Snapshot) {
         let mut last_sig = menu_signature(&initial);
         let mut last_title = title_for(&initial);
+        let mut last_icon = Some(initial_icon_bytes(&initial));
         let start_exe = std::fs::canonicalize(crate::stable_exe_path()).ok();
         loop {
             std::thread::sleep(Duration::from_millis(750));
@@ -3930,13 +4515,21 @@ mod cross_platform {
                 if let Err(e) = handle.set_menu(menu_tree_from_snapshot(&snap)) {
                     crate::logging::log(&format!("menubar: set_menu failed: {e:#}"));
                 }
-                let _ = handle.set_icon(initial_icon_bytes(&snap));
                 last_sig = sig;
+            }
+            if let Some(icon) = tray_icon_update(&mut last_icon, &snap) {
+                if let Err(e) = handle.set_icon(icon) {
+                    crate::logging::log(&format!("menubar: set_icon failed: {e:#}"));
+                }
             }
             let title = title_for(&snap);
             if title != last_title {
-                let _ = handle.set_title(&title);
-                last_title = title;
+                match handle.set_title(&title) {
+                    Ok(()) => last_title = title,
+                    Err(e) => {
+                        crate::logging::log(&format!("menubar: set_title failed: {e:#}"));
+                    }
+                }
             }
         }
     }
@@ -4270,6 +4863,47 @@ mod tests {
     }
 
     #[test]
+    fn only_the_latest_queued_switch_runs() {
+        let shared = shared_swap_guard();
+        let held = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        for name in ["A", "B"] {
+            let tx = tx.clone();
+            spawn_latest_switch("latest-test", move |_| {
+                let _ = tx.send(name);
+            });
+        }
+        drop(held);
+        // Wait generously for the surviving switch (other tests hold the
+        // process-global guard), then briefly confirm nothing else arrives.
+        let mut ran = Vec::new();
+        if let Ok(n) = rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            ran.push(n);
+        }
+        while let Ok(n) = rx.recv_timeout(std::time::Duration::from_millis(300)) {
+            ran.push(n);
+        }
+        assert_eq!(ran, ["B"], "superseded switch must not run");
+    }
+
+    #[test]
+    fn serialized_work_does_not_block_the_caller_while_poller_holds_guard() {
+        let shared = shared_swap_guard();
+        let held = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_serialized_with_poller(move |_| {
+            let _ = tx.send(());
+        });
+        // We got here without blocking; the work must not run until released.
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("work runs once the guard is free");
+    }
+
+    #[test]
     fn shared_swap_guard_returns_the_same_arc_every_call() {
         // `poll_loop` and
         // `handle_refresh_now` must reason about anti-thrash cooldown/
@@ -4337,8 +4971,12 @@ mod tests {
         let initial = State::load().unwrap().notification_config.threshold_enabled;
 
         const ITERATIONS: usize = 100;
-        let handles: Vec<_> = (0..2)
-            .map(|_| {
+        // Two threads toggle; a third bumps a counter field under the same
+        // lock. A toggle that skips the lock reads a stale counter and writes
+        // it back, so lost updates show up as an exact count shortfall instead
+        // of only (maybe) flipping the parity of the bool.
+        let handles: Vec<_> = (0..3)
+            .map(|worker| {
                 let home = home.clone();
                 std::thread::spawn(move || {
                     // HOME_OVERRIDE is thread-local (see store::ScopedConfigDir);
@@ -4346,7 +4984,16 @@ mod tests {
                     // the parent test set up.
                     crate::store::set_home_override(Some(home));
                     for _ in 0..ITERATIONS {
-                        toggle_notification_trigger("threshold");
+                        if worker == 2 {
+                            with_state_lock(|| {
+                                let mut st = State::load()?;
+                                st.trigger_pct = Some(st.trigger_pct.unwrap_or(0.0) + 1.0);
+                                st.save()
+                            })
+                            .unwrap();
+                        } else {
+                            toggle_notification_trigger("threshold");
+                        }
                     }
                 })
             })
@@ -4356,6 +5003,11 @@ mod tests {
         }
 
         let total_toggles = 2 * ITERATIONS;
+        assert_eq!(
+            State::load().unwrap().trigger_pct,
+            Some(ITERATIONS as f64),
+            "every locked counter bump must survive the concurrent toggles"
+        );
         let expected = if total_toggles % 2 == 1 {
             !initial
         } else {
@@ -4619,6 +5271,21 @@ mod tests {
         assert_eq!(trailing_for_account(&a, bands(), now).0, "⚠ renew");
         let rows = submenu_info_rows(&claude_section(), &a);
         assert_eq!(rows, vec!["⚠ Login expired — Renew login… below"]);
+    }
+
+    #[test]
+    fn a_lapsed_renewable_login_reads_expired_not_under_an_hour() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        with_now(now, || {
+            let mut a = acct("dev@example.com", Some(10.0), Some(20.0), false);
+            a.renewable = true;
+            a.login_expires_at = Some(now - chrono::Duration::hours(3));
+            let (t, colors) = trailing_for_account(&a, bands(), now);
+            assert_eq!(t, "⚠ renew");
+            assert_eq!(colors[0].2, Severity::Red);
+            let rows = submenu_info_rows(&claude_section(), &a);
+            assert_eq!(rows[0], "⚠ Login expired — Renew login… below", "{rows:?}");
+        });
     }
 
     #[test]
@@ -5303,6 +5970,44 @@ mod tests {
     }
 
     #[test]
+    fn menu_signature_folds_settings_and_account_error() {
+        let base = one_section_snap(acct("you@work.com", Some(50.0), Some(60.0), true));
+        let sig = menu_signature(&base);
+        let mut m = one_section_snap(acct("you@work.com", Some(50.0), Some(60.0), true));
+        m.tray_icon_mode = Some("codex".into());
+        assert_ne!(sig, menu_signature(&m), "tray_icon_mode");
+        let mut m = one_section_snap(acct("you@work.com", Some(50.0), Some(60.0), true));
+        m.use_credits = !m.use_credits;
+        assert_ne!(sig, menu_signature(&m), "use_credits");
+        for i in 0..3 {
+            let mut m = one_section_snap(acct("you@work.com", Some(50.0), Some(60.0), true));
+            let c = &mut m.notification_config;
+            match i {
+                0 => c.threshold_enabled = !c.threshold_enabled,
+                1 => c.reset_back_enabled = !c.reset_back_enabled,
+                _ => c.pace_enabled = !c.pace_enabled,
+            }
+            assert_ne!(sig, menu_signature(&m), "notification flag {i}");
+        }
+        let mut m = one_section_snap(acct("you@work.com", Some(50.0), Some(60.0), true));
+        m.sections[0].accounts[0].error = Some("boom".into());
+        assert_ne!(sig, menu_signature(&m), "account error");
+    }
+
+    #[test]
+    fn window_status_row_locks_at_the_countdown_threshold() {
+        let w = WindowView {
+            id: "weekly".into(),
+            label: "7d".into(),
+            pct: Some(99.7),
+            reset: "3d".into(),
+        };
+        let (text, locked) = window_status_row_at(&w, false).unwrap();
+        assert!(locked, "99.7% is locked per countdown threshold: {text}");
+        assert!(text.contains("unlocks in"), "{text}");
+    }
+
+    #[test]
     fn menu_signature_folds_provider_id() {
         // Same account, same numbers, different provider slug → different
         // signature. Guards against a cross-provider menu change being
@@ -5970,7 +6675,7 @@ mod tests {
     }
 
     #[test]
-    fn flat_account_order_tie_breaks_by_headroom_then_email() {
+    fn flat_account_order_tie_breaks_by_headroom() {
         let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
         // Same reset instant: more headroom (lower max_pct) sorts first.
         let reset = Some(now + chrono::Duration::days(1));
@@ -5987,6 +6692,25 @@ mod tests {
             .map(|&(si, ai)| sections[si].accounts[ai].key.as_str())
             .collect();
         assert_eq!(keys, vec!["b@x.com", "a@x.com"]);
+    }
+
+    #[test]
+    fn flat_account_order_ties_break_by_key_not_input_order() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let reset = Some(now + chrono::Duration::days(1));
+        let mk = |k: &str| acct_with_resets(k, Some(10.0), Some(10.0), false, None, reset);
+        // Identical usage and reset, stored in reverse key order.
+        let sections = vec![section_with(
+            CLAUDE_SLUG,
+            "Claude",
+            vec![mk("c@x.com"), mk("a@x.com"), mk("b@x.com")],
+        )];
+        let order = flat_account_order(&sections, now);
+        let keys: Vec<&str> = order
+            .iter()
+            .map(|&(si, ai)| sections[si].accounts[ai].key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["a@x.com", "b@x.com", "c@x.com"]);
     }
 
     #[test]
@@ -6051,8 +6775,10 @@ mod tests {
         // Sections registered in reverse-alpha order — grouped_order must
         // still return Claude before Codex.
         let sections = vec![
-            section_with("codex", "Codex", vec![c1, c2]),
-            section_with(CLAUDE_SLUG, "Claude", vec![a1, a2]),
+            // Accounts are stored latest-reset first so the expected
+            // soonest-first order differs from storage order.
+            section_with("codex", "Codex", vec![c2, c1]),
+            section_with(CLAUDE_SLUG, "Claude", vec![a2, a1]),
         ];
         let account_order = flat_account_order(&sections, now);
         let snap = Snapshot {
@@ -6072,22 +6798,8 @@ mod tests {
         assert_eq!(snap.sections[groups[0].0].display_name, "Claude");
         assert_eq!(snap.sections[groups[1].0].display_name, "Codex");
         // Within-provider account order preserved.
-        assert_eq!(groups[0].1.len(), 2);
-        assert_eq!(groups[1].1.len(), 2);
-    }
-
-    #[test]
-    fn build_snapshot_omits_sections_for_providers_with_zero_accounts() {
-        // No captured accounts → no section (the "no header, no rows" rule).
-        // Uses the pure `partition_capture_providers` sibling to prove the
-        // filter logic without touching state.json. `build_snapshot`'s own
-        // gate is the `if provider_rows.is_empty() { continue; }` branch —
-        // this test locks in the *behavior* the gate exists to enforce.
-        let snap = Snapshot::default();
-        assert!(
-            snap.sections.is_empty(),
-            "empty snapshot has no sections — a provider with zero rows must never emit one",
-        );
+        assert_eq!(groups[0].1, vec![1, 0], "Claude: soonest reset first");
+        assert_eq!(groups[1].1, vec![1, 0], "Codex: soonest reset first");
     }
 
     // -----------------------------------------------------------------------
@@ -6319,6 +7031,29 @@ mod tests {
     }
 
     #[test]
+    fn restore_rejects_redacted_dump_and_keeps_live_tokens() {
+        let _g = crate::store::ScopedConfigDir::new();
+        let mut live = crate::store::State::default();
+        live.accounts.push(restore_test_acct("a@e.com"));
+        live.save().unwrap();
+        let redacted = crate::store::redact_state_for_dump(&crate::store::State::load().unwrap());
+        let path = crate::store::config_dir()
+            .unwrap()
+            .join("redacted-dump.json");
+        std::fs::write(&path, serde_json::to_vec(&redacted).unwrap()).unwrap();
+
+        let dialog = crate::platform::MockFileDialog::default();
+        *dialog.pick_file_returns.borrow_mut() = Some(path);
+        handle_backup_restore_dialog_with(&dialog);
+
+        let after = crate::store::State::load().unwrap();
+        assert_eq!(
+            after.accounts[0].access_token, "at",
+            "restoring a redacted dump must not overwrite live tokens"
+        );
+    }
+
+    #[test]
     fn backup_restore_click_calls_file_dialog_pick_file_once() {
         let _g = crate::store::ScopedConfigDir::new();
         let dialog = crate::platform::MockFileDialog::default();
@@ -6356,6 +7091,22 @@ mod tests {
         let mut a = crate::store::Account::from_keychain_blob(&blob).unwrap();
         a.email = Some(email.to_string());
         a
+    }
+
+    #[test]
+    fn restore_dropped_list_is_stable_across_calls_with_several_provider_slugs() {
+        use crate::store::{accounts_dropped_by, ScopedConfigDir, State};
+        let _g = ScopedConfigDir::new();
+        let mut current = State::default();
+        for slug in ["codex", "zed", "alpha", "mid"] {
+            current.upsert_provider_account(slug, codex_state_acct("k@x.com"));
+        }
+        current.save().unwrap();
+        let first = accounts_dropped_by(&State::default()).unwrap();
+        assert_eq!(first.len(), 4, "{first:?}");
+        for _ in 0..40 {
+            assert_eq!(accounts_dropped_by(&State::default()).unwrap(), first);
+        }
     }
 
     #[test]
@@ -6712,6 +7463,37 @@ mod tests {
         let mut a = acct("a@x.com", None, Some(40.0), true);
         a.windows[0].reset.clear();
         assert_eq!(submenu_info_rows(&sec, &a), ["Weekly renews in 2d"]);
+
+        // Usage known but no reset times reported: the header shows the
+        // percentages, so the submenu must not claim there is no data.
+        let mut a = acct("a@x.com", Some(40.0), Some(20.0), true);
+        for w in &mut a.windows {
+            w.reset.clear();
+        }
+        a.plan = Some("Max".into());
+        assert_eq!(
+            submenu_info_rows(&sec, &a),
+            ["Plan · Max", "reset times not reported"]
+        );
+    }
+
+    #[test]
+    fn an_expiring_login_row_does_not_hide_the_usage_fallback() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        with_now(now, || {
+            let mut a = acct("a@x.com", Some(40.0), Some(20.0), true);
+            for w in &mut a.windows {
+                w.reset.clear();
+            }
+            a.renewable = true;
+            a.login_expires_at = Some(now + chrono::Duration::days(2));
+            let rows = submenu_info_rows(&claude_section(), &a);
+            assert_eq!(
+                rows.last().map(String::as_str),
+                Some("reset times not reported"),
+                "{rows:?}"
+            );
+        });
     }
 
     #[test]
@@ -6753,10 +7535,14 @@ mod tests {
         }
         // The usage-log reader is mtime-cached process-wide; drop entries other
         // tests (or the empty read above) left behind so ours is parsed fresh.
-        crate::usage_log::invalidate_cache();
+        crate::usage_log::evict_recent_months();
         let rows = account_extra_info_rows(&sec, &a);
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows[0].starts_with("Weekly · "), "{rows:?}");
+        assert_ne!(
+            rows[0], "Weekly · 60% · —",
+            "a real pace, not the no-history fallback"
+        );
         assert_eq!(rows[1], "updated 1m ago");
 
         // Weekly already locked → the burn forecast is redundant and skipped.
@@ -6790,6 +7576,41 @@ mod tests {
         let mut sec = claude_section();
         sec.accounts = vec![locked_for("active@x.com", now, true), alt];
         recovery_status(&sec, &active, now)
+    }
+
+    #[test]
+    fn recovery_ignores_a_maxed_opus_only_window() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let mk = || {
+            let mut a = acct("solo@x.com", Some(10.0), Some(30.0), true);
+            a.windows.push(WindowView {
+                id: "opus".into(),
+                label: "Opus 7d".into(),
+                pct: Some(100.0),
+                reset: "2d".into(),
+            });
+            a
+        };
+        let a = mk();
+        let mut sec = claude_section();
+        sec.accounts = vec![mk()];
+        assert_eq!(
+            recovery_status(&sec, &a, now),
+            None,
+            "session/weekly have headroom: the account is usable"
+        );
+    }
+
+    #[test]
+    fn at_risk_tray_falls_back_to_locked_active_when_nothing_else_is_active() {
+        let mut a = acct("solo@x.com", Some(10.0), Some(100.0), true);
+        a.weekly_reset_at = Some(now_utc() + chrono::Duration::days(2));
+        let snap = one_section_snap(a);
+        assert!(
+            tray_target(&snap, None).is_some(),
+            "a locked sole active account must still be the tray target"
+        );
+        assert_ne!(title_for(&snap), "—");
     }
 
     #[test]
@@ -7104,15 +7925,71 @@ mod tests {
             "changed mtime reloads"
         );
 
-        // New content but the SAME mtime → the cache is trusted (no re-parse
-        // every 0.75s tick).
-        st.trigger_pct = Some(70.0);
-        save_state_with_mtime(&st, tag2);
+        // The same file rewritten in place (same inode, length and mtime) → the
+        // cache is trusted (no re-parse every 0.75s tick).
+        let path = crate::store::config_dir().unwrap().join("state.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("80.0", "70.0");
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut &f, text.as_bytes()).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000 + tag2))
+            .unwrap();
+        drop(f);
         assert_eq!(
             cached_state().trigger_pct,
             Some(80.0),
             "unchanged mtime hits the cache"
         );
+    }
+
+    // The inode in the cache key is unix-only; elsewhere two same-length
+    // saves at one mtime are indistinguishable.
+    #[cfg(unix)]
+    #[test]
+    fn cached_state_reloads_a_save_that_lands_on_the_same_mtime() {
+        let _l = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::store::ScopedConfigDir::new();
+        let tag = next_mtime_tag();
+        let mut st = State {
+            trigger_pct: Some(90.0),
+            ..State::default()
+        };
+        save_state_with_mtime(&st, tag);
+        assert_eq!(cached_state().trigger_pct, Some(90.0));
+        // A second atomic save within one coarse timestamp tick.
+        st.trigger_pct = Some(85.5);
+        save_state_with_mtime(&st, tag);
+        assert_eq!(
+            cached_state().trigger_pct,
+            Some(85.5),
+            "a new save must not be hidden behind an equal mtime"
+        );
+    }
+
+    #[test]
+    fn build_snapshot_omits_sections_for_providers_with_zero_accounts() {
+        // Only Claude has accounts: every other registered provider (stubs
+        // included) must not get a section, or Settings > Tray Icon lists them
+        // all and the empty-state rows never show.
+        let _l = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::store::ScopedConfigDir::new();
+        let mut st = State::default();
+        st.accounts.push(restore_test_acct("only@x.com"));
+        st.active = Some("only@x.com".to_string());
+        save_state_with_mtime(&st, next_mtime_tag());
+
+        let snap = build_snapshot();
+        let ids: Vec<String> = snap
+            .sections
+            .iter()
+            .map(|s| s.provider_id.to_string())
+            .collect();
+        assert_eq!(ids, [CLAUDE_SLUG]);
     }
 
     #[test]
@@ -7222,6 +8099,17 @@ mod tests {
     }
 
     #[test]
+    fn renew_login_store_only_uses_claude_store_for_claude() {
+        let _g = crate::store::ScopedConfigDir::new();
+        let mut st = State::default();
+        let mut a = restore_test_acct("me@x.com");
+        a.login_store = Some("s-abc".into());
+        st.accounts.push(a);
+        assert_eq!(renew_login_store(&st, CLAUDE_SLUG, "me@x.com"), "s-abc");
+        assert_eq!(renew_login_store(&st, "codex", "me@x.com"), "me@x.com");
+    }
+
+    #[test]
     fn accounts_needing_relogin_lists_claude_and_provider_accounts_sorted() {
         let _g = crate::store::ScopedConfigDir::new();
         let mut st = State::default();
@@ -7233,6 +8121,14 @@ mod tests {
         c.needs_relogin = true;
         st.upsert_provider_account("codex", c);
         st.upsert_provider_account("codex", codex_state_acct("ok@x.com"));
+        st.save().unwrap();
+        assert_eq!(accounts_needing_relogin(), ["c@x.com", "z@x.com"]);
+
+        // A lapsed (Free) provider account renders its plan, not "re-login".
+        let mut lapsed = codex_state_acct("free@x.com");
+        lapsed.needs_relogin = true;
+        lapsed.no_subscription = true;
+        st.upsert_provider_account("codex", lapsed);
         st.save().unwrap();
         assert_eq!(accounts_needing_relogin(), ["c@x.com", "z@x.com"]);
 
@@ -7420,7 +8316,17 @@ mod tests {
             let blob_b = codex_auth_json("b@example.com");
             for blob in [&blob_a, &blob_b] {
                 std::fs::write(dir.path().join("auth.json"), blob).unwrap();
+                let _ = wait_for_poll_request(Duration::ZERO);
                 handle_click("capture:codex");
+                // Capture runs on a worker; it requests a poll once saved.
+                let mut done = false;
+                for _ in 0..200 {
+                    if wait_for_poll_request(Duration::from_millis(50)) {
+                        done = true;
+                        break;
+                    }
+                }
+                assert!(done, "capture never completed");
             }
             let st = State::load().unwrap();
             assert!(st.find_provider_account("codex", "a@example.com").is_some());
@@ -7432,6 +8338,15 @@ mod tests {
             );
 
             handle_click("switch:codex:a@example.com");
+            // The switch runs on a worker thread; wait for it to land.
+            for _ in 0..500 {
+                let st = State::load().unwrap();
+                if st.provider_accounts("codex").unwrap().active.as_deref() == Some("a@example.com")
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
             let st = State::load().unwrap();
             assert_eq!(
                 st.provider_accounts("codex").unwrap().active.as_deref(),
@@ -7442,7 +8357,8 @@ mod tests {
                 blob_a
             );
         });
-        let _ = wait_for_poll_request(Duration::ZERO); // the switch asked for a poll
+        // The worker asks for a poll after switching; consume it.
+        let _ = wait_for_poll_request(Duration::from_secs(5));
     }
 
     #[test]
@@ -7640,5 +8556,395 @@ mod tests {
             Some(0.47),
         );
         assert!(account_header_row(&sec, &b).bold_spans.is_empty());
+    }
+
+    // --- round-2 B2 regressions ---------------------------------------------
+
+    fn switch_gen(slug: &str) -> u64 {
+        SWITCH_GEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|m| m.get(slug).copied())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn optimize_now_click_runs_on_a_worker_and_bumps_the_switch_generation() {
+        let _l = POLL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::store::ScopedConfigDir::new();
+        let before = switch_gen(CLAUDE_SLUG);
+        handle_click("autoswap:now");
+        assert_eq!(
+            switch_gen(CLAUDE_SLUG),
+            before + 1,
+            "an Optimize click must supersede older queued switches"
+        );
+    }
+
+    #[test]
+    fn refresh_now_in_a_display_only_process_does_not_run_the_engine() {
+        use std::sync::atomic::Ordering;
+        let _l = REFRESH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::store::ScopedConfigDir::new();
+        REFRESH_IN_FLIGHT.store(false, Ordering::SeqCst);
+        ENGINE_DISPLAY_ONLY.store(true, Ordering::SeqCst);
+        let shared = shared_swap_guard();
+        let held = shared.lock().unwrap_or_else(|e| e.into_inner());
+        handle_refresh_now();
+        let started = REFRESH_IN_FLIGHT.load(Ordering::SeqCst);
+        ENGINE_DISPLAY_ONLY.store(false, Ordering::SeqCst);
+        drop(held);
+        REFRESH_IN_FLIGHT.store(false, Ordering::SeqCst);
+        assert!(!started, "a display-only process must not run a cycle");
+    }
+
+    #[test]
+    fn dropping_the_engine_lock_makes_the_process_display_only() {
+        use std::sync::atomic::Ordering;
+        let _l = REFRESH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::store::ScopedConfigDir::new();
+        ENGINE_DISPLAY_ONLY.store(true, Ordering::SeqCst);
+        let lock = acquire_engine_lock();
+        let owner = !ENGINE_DISPLAY_ONLY.load(Ordering::SeqCst);
+        // A poll_loop panic unwinds and drops the lock before the respawn
+        // backoff; another process may take it then.
+        drop(lock);
+        let after_drop = ENGINE_DISPLAY_ONLY.load(Ordering::SeqCst);
+        ENGINE_DISPLAY_ONLY.store(false, Ordering::SeqCst);
+        assert!(owner, "holding engine.lock makes this process the owner");
+        assert!(
+            after_drop,
+            "a released engine.lock must not leave Refresh-now running an engine"
+        );
+    }
+
+    #[test]
+    fn panic_loop_exits_only_when_a_restart_was_issued() {
+        assert_eq!(
+            panic_loop_response(&LaunchdRestart::Issued),
+            PanicLoopResponse::Exit
+        );
+        for r in [LaunchdRestart::Failed, LaunchdRestart::NotManaged] {
+            assert_eq!(
+                panic_loop_response(&r),
+                PanicLoopResponse::KeepRespawning,
+                "KeepAlive=false means a bare exit is never restarted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_finished_browser_login_is_not_superseded_and_leaves_the_registry() {
+        let done = std::sync::Arc::new(crate::login::Progress::default());
+        track_browser_login("t-login-done", done.clone());
+        done.mark_finished();
+        assert!(
+            supersede_previous_login("t-login-done").is_none(),
+            "a finished flow holds no listener: the next sign-in may use the window"
+        );
+        assert!(supersede_previous_login("t-login-done").is_none());
+    }
+
+    #[test]
+    fn tracking_a_new_browser_login_supersedes_the_one_it_replaces() {
+        let old = std::sync::Arc::new(crate::login::Progress::default());
+        let new = std::sync::Arc::new(crate::login::Progress::default());
+        track_browser_login("t-login-replace", old.clone());
+        track_browser_login("t-login-replace", new.clone());
+        assert!(
+            old.is_superseded(),
+            "a replaced flow must not keep its listener untracked"
+        );
+        assert!(!new.is_cancelled());
+        let prev = supersede_previous_login("t-login-replace").expect("tracked");
+        assert!(std::sync::Arc::ptr_eq(&prev, &new));
+    }
+
+    #[test]
+    fn a_failed_relaunch_is_not_retried_until_the_binary_changes_again() {
+        use std::path::Path;
+        let (a, b, c) = (
+            Path::new("/v1/usagio"),
+            Path::new("/v2/usagio"),
+            Path::new("/v3/usagio"),
+        );
+        assert!(!relaunch_due(a, a, None), "unchanged binary");
+        assert!(relaunch_due(a, b, None), "first sight of a new binary");
+        assert!(
+            !relaunch_due(a, b, Some(b)),
+            "a relaunch into this binary already failed"
+        );
+        assert!(relaunch_due(a, c, Some(b)), "a newer binary retries");
+    }
+
+    #[test]
+    fn confirm_tells_a_dialog_failure_from_a_cancel() {
+        use rfd::MessageDialogResult as R;
+        assert_eq!(
+            confirm_answer(R::Custom("Remove".into()), "Remove"),
+            Some(true)
+        );
+        assert_eq!(
+            confirm_answer(R::Custom("Cancel".into()), "Remove"),
+            Some(false)
+        );
+        assert_eq!(
+            confirm_answer(R::Cancel, "Remove"),
+            None,
+            "a non-button result means the dialog could not be shown"
+        );
+    }
+
+    #[test]
+    fn refresh_now_reports_failed_fetches_instead_of_success() {
+        assert_eq!(
+            refresh_summary(0, 3, &[]),
+            "Refresh failed — no account could be refreshed"
+        );
+        assert_eq!(
+            refresh_summary(2, 1, &[]),
+            "Usage refreshed — 1 account could not be refreshed"
+        );
+        assert_eq!(
+            refresh_summary(2, 2, &[]),
+            "Usage refreshed — 2 accounts could not be refreshed"
+        );
+        assert_eq!(refresh_summary(2, 0, &[]), "Usage refreshed");
+        // Nothing was due (all skipped as fresh): not a failure.
+        assert_eq!(refresh_summary(0, 0, &[]), "Usage refreshed");
+        assert_eq!(
+            refresh_summary(1, 0, &["a@x.io".to_string()]),
+            "Usage refreshed — a@x.io needs re-login"
+        );
+    }
+
+    #[test]
+    fn a_newer_sign_in_click_wins_over_a_worker_still_waiting() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let wait_for = |flag: &AtomicBool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !flag.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            flag.load(Ordering::SeqCst)
+        };
+        // Click 2 supersedes A and waits on a worker; click 3 finds nothing
+        // tracked and starts inline. The waiting worker must not start B.
+        let a = Arc::new(crate::login::Progress::default());
+        track_browser_login("t-login-gen", a.clone());
+        let started_b = Arc::new(AtomicBool::new(false));
+        let b = Arc::clone(&started_b);
+        begin_login_after_superseding("t-login-gen", move |_| b.store(true, Ordering::SeqCst));
+        let started_c = Arc::new(AtomicBool::new(false));
+        let c = Arc::clone(&started_c);
+        begin_login_after_superseding("t-login-gen", move |browser_only| {
+            assert!(!browser_only, "nothing to supersede: runs inline");
+            c.store(true, Ordering::SeqCst);
+        });
+        assert!(started_c.load(Ordering::SeqCst));
+        a.mark_finished();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !started_b.load(Ordering::SeqCst),
+            "an older click's worker started after a newer click"
+        );
+        // Control: with no newer click the worker does start its flow.
+        let d = Arc::new(crate::login::Progress::default());
+        track_browser_login("t-login-gen", d.clone());
+        let started_e = Arc::new(AtomicBool::new(false));
+        let e = Arc::clone(&started_e);
+        begin_login_after_superseding("t-login-gen", move |browser_only| {
+            assert!(browser_only);
+            e.store(true, Ordering::SeqCst);
+        });
+        d.mark_finished();
+        assert!(wait_for(&started_e), "the only waiting click never started");
+        supersede_previous_login("t-login-gen");
+    }
+
+    #[test]
+    fn a_new_browser_login_cancels_the_previous_one_for_that_provider() {
+        let old = std::sync::Arc::new(crate::login::Progress::default());
+        let other = std::sync::Arc::new(crate::login::Progress::default());
+        track_browser_login("t-login-a", old.clone());
+        track_browser_login("t-login-b", other.clone());
+        let prev = supersede_previous_login("t-login-a").expect("tracked");
+        assert!(std::sync::Arc::ptr_eq(&prev, &old));
+        assert!(
+            old.is_cancelled() && old.is_superseded(),
+            "previous flow ends quietly"
+        );
+        assert!(!other.is_cancelled(), "other providers are untouched");
+    }
+
+    #[test]
+    fn tray_icon_and_tooltip_follow_the_target_without_a_menu_change() {
+        let mut snap =
+            two_section_snap(acct("c@x", Some(10.0), Some(10.0), true), Some(99.0), None);
+        let mut icon = None;
+        let mut tip = String::new();
+        assert!(tray_icon_update(&mut icon, &snap).is_some(), "first push");
+        assert!(tray_tooltip_update(&mut tip, &snap).is_some(), "first push");
+        assert!(tray_icon_update(&mut icon, &snap).is_none(), "unchanged");
+        assert!(tray_tooltip_update(&mut tip, &snap).is_none(), "unchanged");
+        snap.tray_icon_mode = Some(CLAUDE_SLUG.to_string());
+        assert!(tray_icon_update(&mut icon, &snap).is_some(), "target moved");
+        assert!(
+            tray_tooltip_update(&mut tip, &snap).is_some(),
+            "target moved"
+        );
+    }
+
+    #[test]
+    fn all_locked_fallback_skips_an_indefinitely_blocked_account() {
+        let mut claude = acct("c@x", Some(100.0), Some(100.0), true);
+        claude.session_reset_at = None; // maxed, reset unknown: indefinite
+        claude.weekly_reset_at = Some(now_utc() + chrono::Duration::hours(1));
+        let mut snap = two_section_snap(claude, Some(10.0), None);
+        let codex = &mut snap.sections[1].accounts[0];
+        codex.windows[1].pct = Some(100.0);
+        codex.weekly_reset_at = Some(now_utc() + chrono::Duration::hours(3));
+        let (sec, _) = tray_target(&snap, None).unwrap();
+        assert_eq!(sec.provider_id, "codex", "Claude never really unlocks");
+    }
+
+    #[test]
+    fn stale_after_reset_window_is_not_shown_as_locked() {
+        let w = WindowView {
+            id: "weekly".into(),
+            label: "7d".into(),
+            pct: Some(100.0),
+            reset: "<1m".into(),
+        };
+        let (text, locked) = window_status_row_at(&w, true).unwrap();
+        assert!(!locked && !text.contains("locked"), "{text}");
+        assert!(text.contains("awaiting"), "{text}");
+    }
+
+    #[test]
+    fn at_risk_is_checked_when_the_pinned_provider_has_no_section() {
+        let mut snap = two_section_snap(acct("c@x", Some(1.0), None, true), None, None);
+        assert!(at_risk_checked(&snap));
+        snap.tray_icon_mode = Some("codex".into());
+        assert!(!at_risk_checked(&snap), "pinned and present");
+        snap.tray_icon_mode = Some("gemini-cli".into());
+        assert!(
+            at_risk_checked(&snap),
+            "pinned but gone: behaves as at-risk"
+        );
+    }
+
+    #[test]
+    fn menu_signature_tracks_the_rendered_percentage_on_ties() {
+        let a = menu_signature(&one_section_snap(acct("a@x", Some(2.5), Some(1.0), true)));
+        let b = menu_signature(&one_section_snap(acct("a@x", Some(3.0), Some(1.0), true)));
+        assert_ne!(a, b, "2.5 renders 2% and 3.0 renders 3%");
+    }
+
+    #[test]
+    fn generic_capture_requests_a_poll() {
+        let _l = POLL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::store::ScopedConfigDir::new();
+        let dir = tempfile::tempdir().unwrap();
+        crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+            std::fs::write(
+                dir.path().join("auth.json"),
+                codex_auth_json("a@example.com"),
+            )
+            .unwrap();
+            let _ = wait_for_poll_request(Duration::ZERO);
+            handle_click("capture:codex");
+            let mut polled = false;
+            for _ in 0..100 {
+                if wait_for_poll_request(Duration::from_millis(50)) {
+                    polled = true;
+                    break;
+                }
+            }
+            assert!(polled, "capture makes the login active; refresh it now");
+        });
+    }
+
+    #[test]
+    fn a_failed_cycle_is_reported_as_an_error() {
+        let _g = crate::store::ScopedConfigDir::new();
+        let dir = crate::store::config_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("state.json"), b"{ not json").unwrap();
+        let shared = shared_swap_guard();
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let (res, _) = run_cycle_checked(&mut g, true, &LoopOpts::default());
+        assert!(res.is_err(), "an aborted cycle must not look like success");
+    }
+
+    #[test]
+    fn launchd_restart_is_allowed_once_per_incident() {
+        assert!(!may_kickstart(Duration::from_secs(60)), "fresh restart");
+        assert!(!may_kickstart(Duration::from_secs(599)));
+        assert!(may_kickstart(Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn a_queued_capture_is_never_dropped_by_a_later_switch() {
+        let _l = POLL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::store::ScopedConfigDir::new();
+        let dir = tempfile::tempdir().unwrap();
+        crate::env_lock::scoped_env_var("CODEX_HOME", Some(dir.path().to_str().unwrap()), || {
+            let auth = dir.path().join("auth.json");
+            std::fs::write(&auth, codex_auth_json("a@example.com")).unwrap();
+            let _ = wait_for_poll_request(Duration::ZERO);
+            handle_click("capture:codex");
+            for _ in 0..200 {
+                if wait_for_poll_request(Duration::from_millis(50)) {
+                    break;
+                }
+            }
+            std::fs::write(&auth, codex_auth_json("b@example.com")).unwrap();
+            let shared = shared_swap_guard();
+            let held = shared.lock().unwrap_or_else(|e| e.into_inner());
+            handle_click("capture:codex");
+            handle_click("switch:codex:a@example.com");
+            drop(held);
+            let mut ok = false;
+            for _ in 0..200 {
+                let st = State::load().unwrap();
+                let pa = st.provider_accounts("codex").unwrap();
+                if st.find_provider_account("codex", "b@example.com").is_some()
+                    && pa.active.as_deref() == Some("a@example.com")
+                {
+                    ok = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(ok, "capture must run first, then the switch to a@");
+        });
+    }
+
+    #[test]
+    fn a_weekly_lock_whose_reset_passed_is_not_shown_locked_in_the_submenu() {
+        let now = now_utc();
+        let mut a = acct("stale@x.com", Some(20.0), Some(100.0), false);
+        a.weekly_reset_at = Some(now - chrono::Duration::minutes(1));
+        a.fetched_at = Some(now - chrono::Duration::minutes(10));
+        let items = submenu_info_items(&claude_section(), &a);
+        assert!(
+            !items
+                .iter()
+                .any(|(r, locked)| *locked || r.contains("locked")),
+            "a stale 100% weekly was shown locked: {items:?}"
+        );
+        assert!(
+            items.iter().any(|(r, _)| r.contains("awaiting")),
+            "{items:?}"
+        );
+        assert!(
+            items.contains(&("Session renews in 3h".to_string(), false)),
+            "the session row was dropped: {items:?}"
+        );
+        // The stale weekly does not lead: the session row keeps its place.
+        assert!(items[0].0.starts_with("Session"), "{items:?}");
     }
 }

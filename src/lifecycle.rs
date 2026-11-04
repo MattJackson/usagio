@@ -104,10 +104,25 @@ fn prepare_provider_refresh(
     })?;
     // Saved selection can lag a vendor login. A credential currently owned by
     // the client must never be refreshed by us, even if state calls it inactive.
-    if let Some(blob) = matching_active_blob(provider, &snapshot.identity_snapshot())
-        .ok()
-        .flatten()
-    {
+    // A read error fails closed for the REFRESH decision only: we cannot prove
+    // the client does not own it, so skip our own refresh request and hand back
+    // the saved credential so switches and polls keep working. An API-key-only
+    // vendor blob proves the vendor holds no OAuth login, i.e. no match.
+    let matched = match matching_active_blob(provider, &snapshot.identity_snapshot()) {
+        Ok(m) => m,
+        Err(e) if format!("{e:#}").contains("API-key-only") => None,
+        Err(e) => {
+            logging::log(&format!(
+                "event=refresh_skipped provider={slug} account={key} reason=vendor_slot_unreadable:{e:#}"
+            ));
+            return Ok(PreparedRefresh {
+                expires_at_ms: snapshot.expires_at.saturating_mul(1000),
+                owned: true,
+                value: snapshot,
+            });
+        }
+    };
+    if let Some(blob) = matched {
         let grant = provider.parse_stored_blob(&blob)?;
         let adopted = crate::credentials::with_state_lock(|| {
             let mut state = crate::store::State::load()?;
@@ -117,7 +132,9 @@ fn prepare_provider_refresh(
             if account.secret_blob == snapshot.secret_blob {
                 account.secret_blob = blob;
                 account.access_token = grant.access;
-                account.refresh_token = grant.refresh.unwrap_or_default();
+                if let Some(refresh) = grant.refresh {
+                    account.refresh_token = refresh;
+                }
                 account.expires_at = chrono::Utc::now()
                     .timestamp()
                     .saturating_add(grant.expires_in_secs);
@@ -189,7 +206,9 @@ pub fn identity_fields_match(
         (Some(a), Some(b)) => a == b,
         _ => match (expected_email, actual_email) {
             (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-            (None, _) => true,
+            // No expected email: only an expected record with no uuid either
+            // has nothing to contradict; a uuid-only record needs a uuid match.
+            (None, _) => expected_uuid.is_none(),
             _ => false,
         },
     }
@@ -270,8 +289,9 @@ pub(crate) enum ActiveRefreshOutcome {
     /// whatever it currently holds (whether it had drifted or was already in
     /// sync). No token was minted.
     Adopted,
-    /// The slot was unreadable/unparseable; `acct` is left untouched and the
-    /// caller keeps the existing cache for this cycle.
+    /// The slot was unreadable/unparseable, empty, or held a different login;
+    /// `acct` is left untouched and the caller keeps the existing cache for
+    /// this cycle.
     RefreshFailed,
 }
 
@@ -293,13 +313,13 @@ pub(crate) fn active_refresh_cas(
         Ok(Some(b)) => b,
         Ok(None) => {
             logging::log(&format!(
-                "event=active_refresh_adopt_failed account={email} reason=slot_empty"
+                "event=active_refresh_adopt_failed account={email} reason=no_matching_active_login (slot empty or identity mismatch)"
             ));
             return ActiveRefreshOutcome::RefreshFailed;
         }
         Err(e) => {
             logging::log(&format!(
-                "event=active_refresh_adopt_failed account={email} reason=read:{e}"
+                "event=active_refresh_adopt_failed account={email} reason=read:{e:#}"
             ));
             return ActiveRefreshOutcome::RefreshFailed;
         }
@@ -314,6 +334,41 @@ pub(crate) fn active_refresh_cas(
         }
     };
 
+    // A renewal whose live write failed (`persist_claude_login`) left a marker
+    // naming the refresh token it could not publish. Only while that marker
+    // matches the stored token do we rewrite the slot; otherwise the slot is
+    // the truth and is adopted below (expiry is never compared: clocks and
+    // server-chosen lifetimes are not provenance).
+    if acct.live_write_pending.as_deref()
+        == Some(logging::token_fingerprint(&acct.refresh_token).as_str())
+        && acct.refresh_token != cc_acct.refresh_token
+    {
+        let identity = providers::IdentitySnapshot {
+            email: acct.email.clone(),
+            uuid: acct.identity_uuid(),
+            display_name: None,
+            native_blob: serde_json::json!({
+                "oauthAccount": acct.oauth_account.clone().unwrap_or(serde_json::Value::Null),
+                "userID": acct.user_id,
+            }),
+        };
+        return match provider.write_active_account(&acct.keychain_blob, &identity) {
+            Ok(()) => {
+                acct.live_write_pending = None;
+                logging::log(&format!(
+                    "event=active_refresh_rewrote_slot account={email} reason=pending_live_write"
+                ));
+                ActiveRefreshOutcome::Adopted
+            }
+            Err(e) => {
+                logging::log(&format!(
+                    "event=active_refresh_adopt_failed account={email} reason=slot_rewrite:{e}"
+                ));
+                ActiveRefreshOutcome::RefreshFailed
+            }
+        };
+    }
+    acct.live_write_pending = None;
     let drifted = cc_acct.access_token != acct.access_token;
     let cc_prefix = logging::token_fingerprint(&cc_acct.access_token);
     acct.set_tokens(
@@ -364,7 +419,7 @@ pub(crate) fn refresh_provider_active_account(slug: &str) {
                     if let Some(r) = grant.refresh.clone() {
                         a.refresh_token = r;
                     }
-                    a.expires_at = Utc::now().timestamp() + grant.expires_in_secs;
+                    a.expires_at = Utc::now().timestamp().saturating_add(grant.expires_in_secs);
                     a.needs_relogin = false;
                 }
                 state.save()?;
@@ -405,13 +460,18 @@ fn provider_active_refresh(slug: &str, acct: &ProviderAccount) -> ProviderRefres
         Ok(Some(blob)) if blob != acct.secret_blob || acct.needs_relogin => {
             match provider.parse_stored_blob(&blob) {
                 Ok(grant) => ProviderRefreshOutcome::Refreshed(blob, grant),
-                Err(_) => ProviderRefreshOutcome::Failed,
+                Err(e) => {
+                    logging::log(&format!(
+                        "event=active_adopt_failed provider={slug} reason=parse:{e:#}"
+                    ));
+                    ProviderRefreshOutcome::Failed
+                }
             }
         }
         Ok(_) => ProviderRefreshOutcome::Nothing,
         Err(e) => {
             logging::log(&format!(
-                "event=active_adopt_failed provider={slug} reason={e}"
+                "event=active_adopt_failed provider={slug} reason={e:#}"
             ));
             ProviderRefreshOutcome::Failed
         }
@@ -434,7 +494,8 @@ pub(crate) fn ensure_claude_fresh(
         skew_secs,
         || {
             let mut current = initial.clone();
-            let (_, active) = adopt_saved_rotation(&mut current);
+            let (_, active) = adopt_saved_rotation(&mut current)
+                .map_err(|e| RefreshError::Transient(format!("reading saved state: {e:#}")))?;
             Ok(PreparedRefresh {
                 expires_at_ms: current.expires_at,
                 owned: active,
@@ -463,18 +524,18 @@ pub(crate) fn ensure_claude_fresh(
 
 /// Adopt the saved tokens if another refresher already rotated this grant.
 /// Returns (adopted, account is now the active one).
-fn adopt_saved_rotation(acct: &mut Account) -> (bool, bool) {
-    let Ok(st) = crate::store::State::load() else {
-        return (false, false);
-    };
-    let active = st.active.as_deref() == Some(acct.key());
+/// A state load failure is an error (fail closed): we cannot tell whether the
+/// account is the vendor-owned active one.
+fn adopt_saved_rotation(acct: &mut Account) -> Result<(bool, bool)> {
+    let st = crate::store::State::load()?;
+    let active = crate::credentials::is_active_key(acct.key(), st.active.as_deref());
     let adopted = match st.find(acct.key()) {
         Some(saved) if saved.refresh_token != acct.refresh_token => {
             acct.adopt_tokens_if_newer(saved)
         }
         _ => false,
     };
-    (adopted, active)
+    Ok((adopted, active))
 }
 
 /// Save a rotation of the grant `sent`. Skipped (not an error) when the slot
@@ -483,7 +544,7 @@ fn adopt_saved_rotation(acct: &mut Account) -> (bool, bool) {
 fn save_rotation(acct: &Account, sent: &str) -> anyhow::Result<()> {
     crate::credentials::with_state_lock(|| {
         let mut st = crate::store::State::load()?;
-        if st.active.as_deref() == Some(acct.key()) {
+        if crate::credentials::is_active_key(acct.key(), st.active.as_deref()) {
             return Ok(());
         }
         if let Some(a) = st.find_mut(acct.key()) {
@@ -514,6 +575,10 @@ pub(crate) fn prepare_handoff(
         .provider_accounts(slug)
         .and_then(|accounts| accounts.pending_switch.as_ref())
         .and_then(|pending| pending.renewed_account.clone());
+    let was_renewal = state
+        .provider_accounts(slug)
+        .and_then(|accounts| accounts.pending_switch.as_ref())
+        .is_some_and(|pending| pending.renewal && pending.key == key);
     if let Some(renewed) = &renewed_account {
         anyhow::ensure!(
             renewed.key == key,
@@ -543,6 +608,7 @@ pub(crate) fn prepare_handoff(
                     drain_token: None,
                     credentials_written: true,
                     renewed_account: None,
+                    renewal: false,
                     leave_latch: None,
                 });
                 state.save()?;
@@ -599,7 +665,7 @@ pub(crate) fn prepare_handoff(
                     .and_then(|pending| pending.leave_latch.clone())
             })
     };
-    accounts.pending_switch = Some(crate::store::PendingSwitch {
+    let queued = crate::store::PendingSwitch {
         key: key.to_owned(),
         manual,
         from: accounts.active.clone(),
@@ -607,8 +673,17 @@ pub(crate) fn prepare_handoff(
         credentials_written: false,
         leave_latch,
         renewed_account,
-    });
-    state.save()?;
+        // A renewal stays a renewal across drain retries, unless the user now
+        // explicitly picks the account (manual).
+        renewal: !manual && was_renewal,
+    };
+    // A retry that changes nothing must not rewrite state.json (each save
+    // rotates a rolling backup).
+    let changed = accounts.pending_switch.as_ref() != Some(&queued);
+    accounts.pending_switch = Some(queued);
+    if changed {
+        state.save()?;
+    }
     if !already_requested || provider.handoff_request_is_idempotent() {
         provider.begin_handoff(token)?;
         logging::log(&format!(

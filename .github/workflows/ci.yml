@@ -117,6 +117,11 @@ jobs:
               Invoke-WebRequest -UseBasicParsing `
                 "https://github.com/lucasg/Dependencies/releases/download/v1.11.1/Dependencies_x64_Release.zip" `
                 -OutFile $depZip
+              # Pinned SHA-256 of the v1.11.1 asset (release assets are mutable,
+              # so the tag alone does not pin the content).
+              $expected = "7d22dc00f1c09fd4415d48ad74d1cf801893e83b9a39944b0fce6dea7ceaea99"
+              $actual = (Get-FileHash -Algorithm SHA256 $depZip).Hash.ToLower()
+              if ($actual -ne $expected) { throw "Dependencies zip SHA-256 mismatch: $actual" }
               Expand-Archive -Force $depZip $depDir
               $dep = Join-Path $depDir "Dependencies.exe"
               & $dep -depth 8 -chain $exe 2>&1 |
@@ -149,9 +154,9 @@ jobs:
         # test binary depends on tray-icon / muda's runtime DLLs (menubar
         # cross-OS refactor), which fail to resolve at bootstrap on
         # windows-latest (STATUS_ENTRYPOINT_NOT_FOUND). The release binary
-        # builds fine (`cargo build --release` above), and Windows-specific
-        # behavior is still exercised via the `--ignored` step below scoped
-        # to `platform::windows`. TODO(v0.5.1): investigate hermetic Windows
+        # builds fine (`cargo build --release` above). Windows-specific
+        # side-effect tests are currently NOT run in CI either: the
+        # `--ignored` step below is disabled (`if: false`). TODO(v0.5.1): investigate hermetic Windows
         # unit-test runtime for menubar-dependent code paths.
         if: env.FULL == 'true' && (matrix.os != 'windows-latest')
         run: cargo test --tests --all-features -- --test-threads=1
@@ -207,8 +212,10 @@ jobs:
         run: |
           dbus-run-session -- bash -c '
             set -euo pipefail
-            echo -n "" | gnome-keyring-daemon --unlock --components=secrets
-            eval "$(echo -n "" | gnome-keyring-daemon --start --components=secrets)"
+            # The unlock password must be a newline: `echo -n ""` sends no
+            # password, no `login` collection is created, and every keyring
+            # call falls back to the file (the test asserts it did not).
+            eval "$(printf "\n" | gnome-keyring-daemon --unlock --components=secrets)"
             export GNOME_KEYRING_CONTROL
             cargo test --test integration_linux_secrets --all-features -- --ignored --test-threads=1
           '
