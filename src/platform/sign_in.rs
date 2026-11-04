@@ -47,6 +47,21 @@ pub(super) fn open_url(url: &str) -> Result<()> {
     // reap it in the background instead of blocking the tray loop.
     #[cfg(target_os = "linux")]
     {
+        // Still catch a fast failure (no handler / no browser: xdg-open exits
+        // 3/4 within milliseconds) so the caller can report it.
+        let grace = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if !status.success() => {
+                    bail!("opening the browser failed ({status})")
+                }
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) if std::time::Instant::now() < grace => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
         std::thread::spawn(move || {
             let _ = child.wait();
         });
@@ -263,7 +278,9 @@ mod imp {
         let store = match crate::login::store_dir(slug, key) {
             Ok(store) => store,
             Err(e) => {
-                window.close();
+                // SAFETY: the window was never shown or handed out; nothing
+                // else holds a use of it after this early return.
+                unsafe { window.destroy() };
                 return Err(e);
             }
         };
@@ -275,7 +292,8 @@ mod imp {
         {
             Ok(webview) => webview,
             Err(e) => {
-                window.close();
+                // SAFETY: as above.
+                unsafe { window.destroy() };
                 return Err(e);
             }
         };

@@ -531,7 +531,7 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
                 stderr.trim(),
             );
         }
-        let out = run_security(&[
+        let out = match run_security(&[
             "add-generic-password",
             "-s",
             service,
@@ -539,8 +539,14 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
             account,
             "-w",
             secret,
-        ])
-        .context("running `security add-generic-password`")?;
+        ]) {
+            Ok(out) => out,
+            Err(e) => {
+                // Spawn / wait failure after the delete already succeeded.
+                restore_prior_secret(service, account, prior.as_deref());
+                return Err(e.context("running `security add-generic-password`"));
+            }
+        };
         if out.timed_out || !out.success() {
             restore_prior_secret(service, account, prior.as_deref());
         }

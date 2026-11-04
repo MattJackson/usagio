@@ -471,15 +471,60 @@ fn fallback_set(dir: &Path, service: &str, account: &str, secret: &str) -> Resul
         fallback_key(service, account),
         Value::String(secret.to_string()),
     );
+    fallback_set_pending(&mut map, &fallback_key(service, account), true);
     fallback_write(dir, &map)
 }
 
 fn fallback_delete(dir: &Path, service: &str, account: &str) -> Result<()> {
     let mut map = fallback_load(dir)?;
-    if map.remove(&fallback_key(service, account)).is_some() {
+    let removed = map.remove(&fallback_key(service, account)).is_some();
+    let unmarked = fallback_set_pending(&mut map, &fallback_key(service, account), false);
+    if removed || unmarked {
         fallback_write(dir, &map)?;
     }
     Ok(())
+}
+
+/// Top-level key (not matching any `service\u{1}` prefix, so `fallback_list`
+/// ignores it) holding the set of entries written by `fallback_set`, i.e.
+/// while the keyring was unreachable. Only those are known to be newer than
+/// the keyring copy.
+const PENDING_KEY: &str = "\u{2}pending";
+
+/// Mark/unmark `key` as pending. Returns true if the map changed.
+fn fallback_set_pending(map: &mut Map<String, Value>, key: &str, pending: bool) -> bool {
+    let mut set = map
+        .get(PENDING_KEY)
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    let changed = if pending {
+        set.insert(key.to_string(), Value::Bool(true)).is_none()
+    } else {
+        set.remove(key).is_some()
+    };
+    if changed {
+        if set.is_empty() {
+            map.remove(PENDING_KEY);
+        } else {
+            map.insert(PENDING_KEY.to_string(), Value::Object(set));
+        }
+    }
+    changed
+}
+
+/// Like `fallback_get`, but only for entries marked pending.
+fn fallback_get_pending(dir: &Path, service: &str, account: &str) -> Result<Option<String>> {
+    let map = fallback_load(dir)?;
+    let key = fallback_key(service, account);
+    let pending = map
+        .get(PENDING_KEY)
+        .and_then(|v| v.get(&key))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !pending {
+        return Ok(None);
+    }
+    Ok(map.get(&key).and_then(|v| v.as_str()).map(String::from))
 }
 
 fn fallback_list(dir: &Path, service: &str) -> Result<Vec<String>> {
@@ -501,11 +546,12 @@ fn get_impl(
     service: &str,
     account: &str,
 ) -> Result<Option<String>> {
-    // The file fallback only ever holds writes made while the keyring was
-    // unreachable, so it is newer than any keyring copy: prefer it. (A
-    // successful keyring `set` clears it.) An unreadable fallback file just
-    // defers to the keyring.
-    if let Ok(Some(v)) = fallback_get(dir, service, account) {
+    // An entry the file fallback marked as written while the keyring was
+    // unreachable is newer than any keyring copy: prefer it. (A successful
+    // keyring `set` clears it.) Legacy unmarked entries (older versions never
+    // cleared them) keep the old keyring-first order, and an unreadable
+    // fallback file just defers to the keyring.
+    if let Ok(Some(v)) = fallback_get_pending(dir, service, account) {
         return Ok(Some(v));
     }
     match keyring_get() {
@@ -527,7 +573,11 @@ fn set_impl(
         // Drop any older fallback copy so `get` can't return it over this
         // newer keyring value. Best-effort: the keyring write succeeded.
         Ok(()) => {
-            let _ = fallback_delete(dir, service, account);
+            if let Err(e) = fallback_delete(dir, service, account) {
+                crate::logging::log(&format!(
+                    "event=secrets_fallback_cleanup svc={service} acct={account} result=err:{e:#}"
+                ));
+            }
             Ok(())
         }
         Err(e) if is_daemon_unavailable(&e) => fallback_set(dir, service, account, secret),
@@ -642,7 +692,7 @@ pub struct LinuxMenu {
     /// discarded (there's no `glib::MainLoop` yet to call `.quit()` on).
     /// `run_event_loop` checks this on entry and returns immediately if set,
     /// so a quit requested during startup is still honored.
-    should_quit_early: std::sync::atomic::AtomicBool,
+    should_quit_early: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LinuxMenu {
@@ -651,7 +701,7 @@ impl LinuxMenu {
             click_cb: Arc::new(Mutex::new(None)),
             main_loop: Arc::new(Mutex::new(None)),
             gtk_init: OnceLock::new(),
-            should_quit_early: std::sync::atomic::AtomicBool::new(false),
+            should_quit_early: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -789,7 +839,15 @@ impl MenuBackend for LinuxMenu {
         }
 
         let click_cb = Arc::clone(&self.click_cb);
+        let quit_flag = Arc::clone(&self.should_quit_early);
+        let loop_for_quit = main_loop.clone();
         gtk::glib::source::timeout_add_local(std::time::Duration::from_millis(100), move || {
+            // A `request_quit` that landed after the loop was published but
+            // before `run()` started is wiped by `g_main_loop_run`; the flag
+            // is re-checked here, from inside the running loop, so it sticks.
+            if quit_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                loop_for_quit.quit();
+            }
             // Menu-item clicks arrive on tray-icon's own global channel.
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 if let Some(cb) = click_cb.lock().unwrap().as_ref() {
@@ -810,19 +868,22 @@ impl MenuBackend for LinuxMenu {
         });
 
         main_loop.run();
+        // Consume the flag so a quit that was also delivered directly doesn't
+        // make a future `run_event_loop` return immediately.
+        self.should_quit_early
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
     fn request_quit(&self) {
         let slot = self.main_loop.lock().unwrap();
+        // Always record the request: if the loop is published but not yet
+        // inside `run()`, `ml.quit()` is lost and the loop's own poll honors
+        // the flag instead. `run_event_loop` clears it after `run()` returns.
+        self.should_quit_early
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(ml) = slot.as_ref() {
             ml.quit();
-        } else {
-            // run_event_loop hasn't populated main_loop yet — remember the
-            // request so run_event_loop can honor it on entry instead of
-            // this call being a silent no-op.
-            self.should_quit_early
-                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
@@ -1009,14 +1070,30 @@ mod tests {
 
     #[test]
     fn xdg_relative_values_are_ignored() {
-        crate::env_lock::scoped_env_var("HOME", Some("/tmp/xdg-home"), || {
-            crate::env_lock::scoped_env_var("XDG_CONFIG_HOME", Some("cfg"), || {
-                assert_eq!(xdg_config_home(), PathBuf::from("/tmp/xdg-home/.config"));
-            });
-            crate::env_lock::scoped_env_var("XDG_CACHE_HOME", Some("cache"), || {
-                assert_eq!(xdg_cache_home(), PathBuf::from("/tmp/xdg-home/.cache"));
-            });
+        // Not nested: `scoped_env_var` is not reentrant. The relative value
+        // must be ignored in favor of the HOME-derived default.
+        crate::env_lock::scoped_env_var("XDG_CONFIG_HOME", Some("cfg"), || {
+            assert_eq!(xdg_config_home(), home_dir().join(".config"));
+            assert!(xdg_config_home().is_absolute());
         });
+        crate::env_lock::scoped_env_var("XDG_CACHE_HOME", Some("cache"), || {
+            assert_eq!(xdg_cache_home(), home_dir().join(".cache"));
+            assert!(xdg_cache_home().is_absolute());
+        });
+    }
+
+    /// A legacy (unmarked) file entry must NOT beat the keyring.
+    #[test]
+    fn linux_secrets_legacy_unmarked_file_entry_loses_to_keyring() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut map = Map::new();
+        map.insert(
+            fallback_key("svc", "acct"),
+            Value::String("stale".to_string()),
+        );
+        fallback_write(tmp.path(), &map).unwrap();
+        let got = get_impl(|| Ok("fresh".to_string()), tmp.path(), "svc", "acct").unwrap();
+        assert_eq!(got.as_deref(), Some("fresh"));
     }
 
     // --- Secrets: split store ----------------------------------------------
