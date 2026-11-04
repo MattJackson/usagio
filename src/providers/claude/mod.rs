@@ -1539,6 +1539,28 @@ mod tests {
     }
 
     #[test]
+    fn write_active_account_rolls_claude_json_back_when_the_slot_write_fails() {
+        let cfg = crate::store::ScopedConfigDir::new();
+        let home = cfg.home();
+        crate::env_lock::scoped_env_var("HOME", Some(home.to_str().unwrap()), || {
+            let claude_json = home.join(".claude.json");
+            let prior = r#"{"oauthAccount":{"emailAddress":"old@example.com"},"other":"keep"}"#;
+            std::fs::write(&claude_json, prior).unwrap();
+            // Fails the one slot write (keychain on macOS, file elsewhere).
+            crate::platform::arm_keychain_set_failure();
+            let identity = identity_with(serde_json::json!({
+                "oauthAccount": { "emailAddress": "new@example.com" }
+            }));
+            let res = ClaudeProvider.write_active_account(&blob_with("at", 1), &identity);
+            assert!(res.is_err(), "a failed slot write must fail the switch");
+            let after: Value =
+                serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
+            let prior: Value = serde_json::from_str(prior).unwrap();
+            assert_eq!(after, prior, "~/.claude.json was left on the new account");
+        });
+    }
+
+    #[test]
     fn mirror_rotated_token_logs_where_it_wrote() {
         if crate::platform::current().os_display_name() == "macOS" {
             return; // would hit the real keychain
