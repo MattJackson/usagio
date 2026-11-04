@@ -4262,6 +4262,30 @@ fn capturing_the_claude_login_stores_it_as_the_active_account() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "reads or writes the OS secret store, which is only hermetic (in-memory) on macOS"
+)]
+fn capture_refuses_a_token_whose_profile_email_differs_from_claude_json() {
+    with_claude_home("json@e.com", |_| {
+        let blob = claude_account("json@e.com", 3_600_000).keychain_blob;
+        prime_active_slot(&blob);
+        let (url, _) = crate::tests::spawn_mock_usage_server(
+            200,
+            r#"{"account":{"email":"someone-else@e.com"}}"#.into(),
+        );
+        crate::providers::claude::usage::set_profile_url_override(Some(&format!(
+            "{url}/api/oauth/profile"
+        )));
+        let res = capture_current();
+        crate::providers::claude::usage::set_profile_url_override(None);
+        let err = res.expect_err("mismatched identity must not be captured");
+        assert!(format!("{err:#}").contains("someone-else@e.com"), "{err:#}");
+        assert!(State::load().unwrap().accounts.is_empty());
+    });
+}
+
+#[test]
 fn the_capture_command_routes_other_providers_to_their_own_slot() {
     let _cfg = crate::store::ScopedConfigDir::new();
     let dir = tempfile::tempdir().unwrap();
