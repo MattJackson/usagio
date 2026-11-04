@@ -1751,6 +1751,72 @@ fn refresh_provider_active_account_codex_adopts_cli_rotation_without_posting() {
     });
 }
 
+fn with_inactive_codex_account<R>(exp: i64, f: impl FnOnce(&std::path::Path, &str) -> R) -> R {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().to_str().unwrap().to_string();
+    crate::env_lock::scoped_env_var("CODEX_HOME", Some(&home), || {
+        let blob = codex_auth_json("user@example.com", exp, "at", "rt");
+        std::fs::write(dir.path().join("auth.json"), &blob).unwrap();
+        capture_current_generic("codex").unwrap();
+        // State lags the vendor login: the account reads as inactive.
+        let mut st = State::load().unwrap();
+        st.provider_accounts_mut("codex").active = None;
+        st.save().unwrap();
+        f(dir.path(), &blob)
+    })
+}
+
+#[test]
+fn vendor_slot_read_error_never_triggers_our_own_refresh() {
+    let soon = Utc::now().timestamp() + 10;
+    with_inactive_codex_account(soon, |dir, _| {
+        // The vendor file is mid-rewrite / unreadable.
+        std::fs::write(dir.join("auth.json"), "{not json").unwrap();
+        let (base_url, hits) = spawn_mock_token_server();
+        #[allow(clippy::disallowed_methods)]
+        std::env::set_var(
+            "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+            format!("{base_url}/v1/oauth/token"),
+        );
+        let res = crate::lifecycle::ensure_provider_fresh(
+            crate::providers::get("codex").unwrap(),
+            "user@example.com",
+        );
+        #[allow(clippy::disallowed_methods)]
+        std::env::remove_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "must not POST a refresh for a credential we could not prove we own: {res:?}"
+        );
+    });
+}
+
+#[test]
+fn adopting_a_vendor_blob_without_a_refresh_token_keeps_the_saved_one() {
+    with_inactive_codex_account(4_000_000_000, |dir, _| {
+        let blob = serde_json::json!({
+            "tokens": {
+                "id_token": codex_id_token("user@example.com", 4_000_000_000),
+                "access_token": "vendor-at",
+            }
+        })
+        .to_string();
+        std::fs::write(dir.join("auth.json"), &blob).unwrap();
+        let _ = crate::lifecycle::ensure_provider_fresh(
+            crate::providers::get("codex").unwrap(),
+            "user@example.com",
+        );
+        let st = State::load().unwrap();
+        let acct = st
+            .find_provider_account("codex", "user@example.com")
+            .unwrap();
+        assert_eq!(acct.access_token, "vendor-at", "adopted");
+        assert_eq!(acct.refresh_token, "rt", "saved refresh token kept");
+    });
+}
+
 // usagio must NEVER mint a token for the active account — Anthropic's refresh
 // tokens are single-use, so a usagio POST would rotate the family server-side
 // and invalidate the copy Claude Code holds (→ /login). The active-account
@@ -5301,7 +5367,7 @@ fn cadence_wakes_at_the_v2_next_check_time() {
 }
 
 #[test]
-fn auto_pick_v2_ranks_by_runway_then_expiring_room() {
+fn auto_pick_v2_ranks_ready_by_earliest_weekly_reset() {
     let now = Utc::now();
     let far = now + Duration::days(5);
     // v1 picked the soonest reset (dev4, 3 points to the trigger); v2 picks
@@ -5311,6 +5377,16 @@ fn auto_pick_v2_ranks_by_runway_then_expiring_room() {
         row_full("dev8@e.com", 40.0, 90.0, far),
     ];
     assert_eq!(auto_pick_v2(&rows, 95.0, 95.0, now).unwrap(), "dev8@e.com");
+    // Among Ready accounts the earliest weekly reset goes first, at any
+    // distance (not only inside the 6 h rebalance horizon).
+    let rows = vec![
+        row_full("later@e.com", 10.0, 10.0, far),
+        row_full("sooner@e.com", 10.0, 50.0, now + Duration::days(1)),
+    ];
+    assert_eq!(
+        auto_pick_v2(&rows, 95.0, 95.0, now).unwrap(),
+        "sooner@e.com"
+    );
     // A Ready account whose weekly resets inside the 6 h horizon goes first.
     let rows = vec![
         row_full("roomy@e.com", 10.0, 10.0, far),
@@ -6102,6 +6178,45 @@ fn failed_refresh_lock_never_sends_a_single_use_refresh_grant() {
     assert!(matches!(result, Err(oauth::RefreshError::Transient(_))));
     assert_eq!(hit_count(&hits), 0);
     assert_eq!(account.refresh_token, "single-use");
+}
+
+#[test]
+fn unreadable_state_never_sends_a_single_use_refresh_grant() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    std::fs::create_dir_all(store::config_dir().unwrap()).unwrap();
+    std::fs::write(store::config_dir().unwrap().join("state.json"), "{corrupt").unwrap();
+    let (url, hits) = spawn_mock_usage_server(500, "{}".into());
+    oauth::set_token_url_override(Some(&url));
+    let mut account =
+        Account::from_keychain_blob(&mock_claude_blob("expired", "single-use", 1)).unwrap();
+    let result = lifecycle::ensure_claude_fresh(&mut account, 60);
+    oauth::set_token_url_override(None);
+    assert!(matches!(result, Err(oauth::RefreshError::Transient(_))));
+    assert_eq!(hit_count(&hits), 0);
+}
+
+#[test]
+fn a_uuid_only_record_does_not_match_a_uuidless_identity() {
+    // Expected: uuid, no email. Actual: no uuid, some other email.
+    assert!(!lifecycle::identity_fields_match(
+        Some("u-1"),
+        None,
+        None,
+        Some("other@example.com")
+    ));
+    // No uuid on either side and no expected email: nothing to contradict.
+    assert!(lifecycle::identity_fields_match(
+        None,
+        None,
+        None,
+        Some("a@example.com")
+    ));
+    assert!(lifecycle::identity_fields_match(
+        Some("u-1"),
+        Some("a@example.com"),
+        None,
+        Some("A@example.com")
+    ));
 }
 
 #[test]

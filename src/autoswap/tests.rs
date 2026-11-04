@@ -208,9 +208,47 @@ fn t4_today_session_vs_weekly_ranking() {
         .into_iter()
         .filter(|a| !a.is_active)
         .collect();
-    c.sort_by(|a, b| rank_cmp(a, b, now, None));
+    c.sort_by(|a, b| rank_cmp(a, b, None));
     assert_eq!(c[0].key, "dev8", "40/90 ranks above 16/92");
     assert_eq!(c[1].key, "dev4");
+}
+
+/// 2026-11-04 00:08: dev3 hit a real 100%. matthew (86%, weekly reset Nov 10
+/// 17:00) and dev5 (0%, reset Nov 10 23:00) were both Ready; v2 served dev5
+/// on runway and matthew's room would have expired first. Earliest reset wins.
+#[test]
+fn ready_serve_spends_the_earliest_weekly_reset_first() {
+    let now = ymd(11, 4, 0, 8, 52);
+    let acct_w = |key: &str, w: f64, reset| {
+        let mut a = acct(key, 0.0, w, now).wreset(Some(reset));
+        a.session = None;
+        a
+    };
+    let s = snap(
+        now,
+        "dev3",
+        vec![
+            acct_w("dev3", 100.0, ymd(11, 13, 0, 0, 0)),
+            acct_w("dev5", 0.0, ymd(11, 10, 23, 0, 0)),
+            acct_w("matthew", 86.0, ymd(11, 10, 17, 0, 0)),
+        ],
+    );
+    let d = decide(&s);
+    assert_eq!(switched(&d), Some(("matthew", Kind::Serve)), "{d:?}");
+
+    // D2 still holds: an earlier reset without MIN_LANDING runway is not Ready
+    // and loses to a roomy account.
+    let s = snap(
+        now,
+        "dev3",
+        vec![
+            acct_w("dev3", 100.0, ymd(11, 13, 0, 0, 0)),
+            acct_w("dev5", 0.0, ymd(11, 10, 23, 0, 0)),
+            acct_w("matthew", 93.0, ymd(11, 10, 17, 0, 0)),
+        ],
+    );
+    let d = decide(&s);
+    assert_eq!(switched(&d), Some(("dev5", Kind::Serve)), "{d:?}");
 }
 
 #[test]
@@ -1667,4 +1705,125 @@ fn blocked_manual_pick_prepares_earlier_session_reset_after_cooldown() {
             "never prepare to a later reset"
         );
     }
+}
+
+#[test]
+fn stuck_notice_names_the_soonest_unlock_not_the_soonest_weekly_reset() {
+    let now = at(12, 0, 0);
+    // Both session-blocked, weekly has room and resets days out.
+    let s = snap(
+        now,
+        "a",
+        vec![
+            acct("a", 100.0, 40.0, now).sreset(Some(now + Duration::hours(1))),
+            acct("b", 100.0, 70.0, now).sreset(Some(now + Duration::hours(3))),
+        ],
+    );
+    let soonest = super::shell::soonest_unlock(&assess_all(&s), now);
+    assert_eq!(soonest, Some(now + Duration::hours(1)));
+    // A block whose reset already passed is not "soonest".
+    assert_eq!(
+        super::shell::soonest_unlock(&assess_all(&s), now + Duration::hours(2)),
+        Some(now + Duration::hours(3))
+    );
+}
+
+#[test]
+fn stale_stuck_decision_never_touches_the_new_actives_memory() {
+    use super::shell::stuck_update;
+    let now = at(12, 0, 0);
+    let s = snap(
+        now,
+        "a",
+        vec![
+            acct("a", 100.0, 100.0, now).sreset(Some(now + Duration::hours(1))),
+            acct("b", 100.0, 100.0, now).sreset(Some(now + Duration::hours(2))),
+        ],
+    );
+    let d = decide(&s);
+    assert!(d.stuck, "{d:?}");
+    // A concurrent manual switch moved the memory on to "b".
+    let mut m = SwapMemory {
+        last_seen_active: Some("b".to_string()),
+        ..Default::default()
+    };
+    assert!(!stuck_update(&mut m, &d, "a"));
+    assert!(!m.stuck_notified && m.real_tier.is_none() && m.draining.is_none());
+    // The matching active still arms and fires as before.
+    m.last_seen_active = Some("a".to_string());
+    assert!(stuck_update(&mut m, &d, "a"));
+}
+
+#[test]
+fn a_pick_set_after_the_cycle_began_is_detected() {
+    use crate::store::State;
+    let before = State {
+        active: Some("a@x.io".to_string()),
+        ..Default::default()
+    };
+    let mut after = before.clone();
+    assert!(!super::shell::pick_changed(&before, &after, "claude"));
+    after.set_manual_pick("claude", Some("a@x.io"));
+    assert!(super::shell::pick_changed(&before, &after, "claude"));
+}
+
+#[test]
+fn a_missing_pct_is_shown_as_a_dash_not_zero() {
+    assert_eq!(super::shell::fmt_pct(None), "—");
+    assert_eq!(super::shell::fmt_pct(Some(41.6)), "42%");
+}
+
+#[test]
+fn credits_in_different_non_dominant_units_are_not_ranked_by_raw_minor_units() {
+    let now = at(12, 0, 0);
+    let s = snap(
+        now,
+        "x",
+        vec![
+            acct("x", 100.0, 100.0, now),
+            acct("b", 100.0, 100.0, now),
+            acct("c", 100.0, 100.0, now),
+        ],
+    );
+    let mut v = assess_all(&s);
+    for a in v.iter_mut() {
+        a.tier = Tier::Credits;
+    }
+    v[1].credits = Money::new(5_000, 2, "EUR");
+    v[2].credits = Money::new(100_000, 0, "JPY");
+    // Neither is the dominant unit ("USD"): group by unit, not raw amount.
+    let order = |a: &Assessed, b: &Assessed| rank_cmp(a, b, Some("USD"));
+    // EUR sorts before JPY by unit name regardless of the raw minor amounts.
+    assert_eq!(order(&v[1], &v[2]), std::cmp::Ordering::Less);
+    assert_eq!(order(&v[2], &v[1]), std::cmp::Ordering::Greater);
+}
+
+#[test]
+fn blind_projection_only_applies_to_windows_that_were_in_the_band() {
+    let read = at(12, 0, 0);
+    let now = read + Duration::minutes(4);
+    // Weekly 94 (in band, binding is irrelevant); session 85 is outside the
+    // band and must not get a projection that could cross the limit.
+    let s = snap(now, "act", vec![acct("act", 85.0, 94.0, read).backoff()]);
+    let act = assess_all(&s).into_iter().find(|a| a.is_active).unwrap();
+    let sess = act
+        .windows
+        .iter()
+        .find(|w| w.id == WindowId::Session)
+        .unwrap();
+    assert!(sess.proj.is_none(), "{sess:?}");
+}
+
+#[test]
+fn an_absurd_negative_pct_does_not_panic_the_next_check() {
+    let now = at(12, 0, 0);
+    let s = snap(
+        now,
+        "act",
+        vec![
+            acct("act", 20.0, -1.0e300, now).rate(1.0, 1.0).wreset(None),
+            acct("b", 10.0, 10.0, now),
+        ],
+    );
+    let _ = decide(&s);
 }

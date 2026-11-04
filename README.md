@@ -235,36 +235,40 @@ The daemon's goal is to **exhaust each account's weekly quota in order of soones
 reset** — spend what's about to expire before it evaporates — without ever letting
 your active session hit the wall. It does this two ways:
 
-- **Reactive.** When the active account's session **or** weekly usage crosses your
+- **Reactive.** When the active account's session **or** weekly usage reaches your
   threshold (default **95%**, set from the menu), it switches to another account with
   room, so a long session keeps going instead of blocking. If the usage endpoint
-  rate-limits (HTTP 429) the active account while it's within 5 points of the
-  threshold, that counts as crossing it: usagio can't see the real number, so it
-  moves rather than letting you run out blind.
-- **Proactive flip-back.** The usual reason you leave an account is that its **5h
-  session** filled — its weekly still has room. When that session resets, the daemon
-  **returns to the account** to keep draining its weekly, as long as it's still the
-  best one to be on (soonest weekly reset). Over a week this rides each account down
-  to nearly-spent, in order, instead of stranding quota you left behind.
+  rate-limits (HTTP 429) and the active account was within 5 points of the threshold
+  when last read, usagio projects its usage forward from the last reading at a
+  conservative burn rate and moves once that projection reaches the threshold,
+  rather than running out blind. A projection only ever moves you onto an account
+  whose usage was freshly verified.
+- **Proactive rebalance.** The usual reason you leave an account is that its **5h
+  session** filled — its weekly still has room. When an account's weekly resets
+  within the next 6 hours and it has usable room, the daemon moves to it to spend
+  that quota before it evaporates. Accounts whose weekly reset is further away
+  are not rebalanced to; they are chosen by soonest weekly reset when a switch is
+  needed.
 
 Hysteresis keeps it from thrashing:
 
-- only swap **to** an account whose session and weekly are both more than 5 points
-  under your threshold (inside that band a single 429 would force it straight back
-  out), and whose reading is fresh — a target is re-checked right before the
-  swap if its last reading is more than two minutes old;
-- a **swap cooldown** on optional swaps (flip-backs) so it can't flip rapidly —
-  moving off an account that has hit the threshold is never delayed;
-- **no bounce-back** to an account it just left within a short window, and not
-  until it has a fresh reading taken after it was left; and
-- on a proactive flip-back between two accounts that reset at the same time, a
-  headroom margin so near-equal accounts don't ping-pong.
+- a target must be **ready**: after the move it must have at least 15 minutes of
+  runway before it would reach your threshold, at its recent burn rate (or a
+  default rate when there is no history), in both session and weekly. A target's
+  reading must also be fresh — it is re-checked right before the swap if its last
+  reading is more than two minutes old;
+- a **swap cooldown** (5 minutes) on optional moves such as rebalancing — moving
+  off an account that has hit the threshold is never delayed;
+- **no bounce-back** to an account it just left until it has a fresh reading taken
+  after it was left; and
+- when no account is ready, a fallback move to a non-ready account happens only if
+  it buys at least 5 more minutes of runway than staying.
+
+Among ready accounts the one whose weekly resets soonest is used first.
 
 Every account that can be switched — Claude and Codex alike — goes through the same
-rules, each provider with its own cooldown and backoff. If every other account is
-past your threshold too, it moves to the one with the most room left (when that's
-at least 5 points more than the active one). If no account has room it doesn't
-swap — it notifies you of the soonest reset. It runs inside the menu-bar app (so
+rules, each provider with its own cooldown and backoff. If no account has room it
+doesn't swap — it notifies you of the soonest reset. It runs inside the menu-bar app (so
 `usagio install` keeps it on), or headless via `usagio watch` on a machine with no
 menu bar; both run the same loop and use the threshold and auto-swap setting from
 the menu (`usagio watch --trigger` overrides the threshold).

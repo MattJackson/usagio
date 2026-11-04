@@ -155,6 +155,9 @@ pub fn evaluate(prev: &Snapshot, curr: &Snapshot, cfg: &NotificationConfig) -> V
     if cfg.threshold_enabled {
         for (w, p, c) in pairs {
             let (Some(p), Some(c)) = (p, c) else { continue };
+            // A pair spanning a reset: the new window started from ~0, so
+            // judge crossings against that, not the pre-reset level.
+            let p = if is_window_reset(p, c) { 0.0 } else { p };
             for pct in THRESHOLDS {
                 let t = pct as f32;
                 if p < t && c >= t {
@@ -177,9 +180,10 @@ pub fn evaluate(prev: &Snapshot, curr: &Snapshot, cfg: &NotificationConfig) -> V
 /// True iff the (prev, curr) percentages for one window describe a reset:
 /// utilization dropped from a non-trivial prior level. The 50-percent floor
 /// keeps normal noise (small fluctuations near zero) from being mistaken for
-/// a reset — a genuine reset lands a high percentage back at (near-)zero.
+/// a reset — a genuine reset lands a high percentage back at (near-)zero, so
+/// the drop must also be substantial (>= 20 points) or land under 10%.
 fn is_window_reset(prev_pct: f32, curr_pct: f32) -> bool {
-    curr_pct < prev_pct && prev_pct > 50.0
+    prev_pct > 50.0 && curr_pct < prev_pct && (prev_pct - curr_pct >= 20.0 || curr_pct < 10.0)
 }
 
 /// True iff `curr` shows a reset for `w` relative to `prev`. Public so the
@@ -275,7 +279,29 @@ pub fn evaluate_pace(
     // seconds — the printed body ends up wrong by up to 59s otherwise.
     let millis = (hours_to_100 * 3_600_000.0) as i64;
     let hit = now.checked_add_signed(Duration::milliseconds(millis))?;
+    // The window resets before the projection lands: nothing to warn about.
+    if curr.weekly_reset.is_some_and(|r| hit >= r) {
+        return None;
+    }
     Some(Trigger::WeeklyPace { hit_time: hit })
+}
+
+/// Undo the dedup bit a state-driven trigger set, after its delivery failed,
+/// so the next tick retries it. `grant_id` is the grant a reset-grant trigger
+/// was raised for. Threshold/reset crossings are edge-triggered on the
+/// (prev, curr) pair, which advances regardless, so they are not retried
+/// (fire is documented best-effort).
+pub fn release_dedup(state: &mut NotifState, trigger: &Trigger, grant_id: Option<&str>) {
+    match (trigger, grant_id) {
+        (Trigger::WeeklyPace { .. }, _) => state.pace_fired_this_window = false,
+        (Trigger::ResetGrantAvailable { .. }, Some(id)) => {
+            state.reset_grants_seen.remove(id);
+        }
+        (Trigger::ResetUsableNow { .. }, Some(id)) => {
+            state.reset_grants_usable_fired.remove(id);
+        }
+        _ => {}
+    }
 }
 
 /// Reset-grant notifications for this tick, deduped in place against `state`.
@@ -997,5 +1023,70 @@ mod tests {
             sample_count: 12,
         };
         assert!(evaluate_pace(Some(&pace), &snap(None, Some(50.0)), &pace_cfg(), now).is_none());
+    }
+
+    #[test]
+    fn pace_alert_is_suppressed_when_the_window_resets_first() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+        let pace = PaceEstimate {
+            slope_pct_per_hour: 10.0,
+            confidence: 0.9,
+            sample_count: 12,
+        };
+        let mut curr = snap(None, Some(50.0));
+        curr.weekly_reset = Some(now + Duration::hours(2));
+        assert!(evaluate_pace(Some(&pace), &curr, &pace_cfg(), now).is_none());
+        curr.weekly_reset = Some(now + Duration::hours(6));
+        assert!(evaluate_pace(Some(&pace), &curr, &pace_cfg(), now).is_some());
+    }
+
+    #[test]
+    fn a_small_decrease_is_not_a_window_reset() {
+        assert!(!is_window_reset(91.0, 89.0));
+        assert!(!is_window_reset(80.0, 79.0));
+        assert!(is_window_reset(95.0, 5.0));
+        assert!(is_window_reset(95.0, 60.0));
+    }
+
+    #[test]
+    fn a_crossing_in_the_same_pair_as_a_reset_still_fires() {
+        let prev = snap(None, Some(95.0));
+        let curr = snap(None, Some(75.0));
+        let cfg = NotificationConfig::default();
+        let trig = evaluate(&prev, &curr, &cfg);
+        assert!(
+            trig.contains(&Trigger::Threshold {
+                window: Window::Weekly,
+                pct: 70
+            }),
+            "{trig:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_delivery_releases_the_dedup_bit_for_retry() {
+        let mut st = NotifState::default();
+        let g = ResetGrant {
+            id: "g1".into(),
+            label: "L".into(),
+            resets_left: 1,
+            usable_now: true,
+            ..Default::default()
+        };
+        let trigs = reset_grant_triggers(&mut st, std::slice::from_ref(&g));
+        assert_eq!(trigs.len(), 2);
+        for t in &trigs {
+            release_dedup(&mut st, t, Some("g1"));
+        }
+        assert_eq!(reset_grant_triggers(&mut st, &[g]).len(), 2, "retried");
+        st.pace_fired_this_window = true;
+        release_dedup(
+            &mut st,
+            &Trigger::WeeklyPace {
+                hit_time: Utc::now(),
+            },
+            None,
+        );
+        assert!(!st.pace_fired_this_window);
     }
 }

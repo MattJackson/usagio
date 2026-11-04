@@ -336,11 +336,15 @@ impl WatchdogEffects for RealEffects {
                 "event=fd_watchdog action=watcher_respawn result=no_watcher_installed",
             );
         }
-        // A respawn also resets the keychain-failure counter: if the respawn
+        // A real respawn also resets the keychain-failure counter: if it
         // released the descriptors, the next keychain write should succeed, and
         // we don't want a stale pre-respawn failure count to escalate us to a
-        // restart before that next write gets a chance.
-        KEYCHAIN_CONSEC_FAILURES.store(0, Ordering::Relaxed);
+        // restart before that next write gets a chance. With no watcher there
+        // was nothing to remediate, so keep the count and let a persisting
+        // failure escalate.
+        if respawned {
+            KEYCHAIN_CONSEC_FAILURES.store(0, Ordering::Relaxed);
+        }
         let after = count_open_fds();
         (before, after)
     }
@@ -686,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn real_effects_respawn_reports_fd_counts_and_resets_keychain_counter() {
+    fn real_effects_respawn_reports_fd_counts_and_keeps_keychain_counter_without_a_watcher() {
         let _cfg = crate::store::ScopedConfigDir::new();
         let _kc = KC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         record_keychain_result(false);
@@ -705,9 +709,10 @@ mod tests {
 
         assert_eq!(
             keychain_consecutive_failures(),
-            0,
-            "respawn must reset the stale failure count"
+            2,
+            "nothing was remediated, so the failure count must survive to escalate"
         );
+        record_keychain_result(true);
         // No watcher is installed under test, so the miss is logged.
         let path = crate::store::config_dir().unwrap().join("usagio.log");
         let contents = std::fs::read_to_string(path).unwrap();

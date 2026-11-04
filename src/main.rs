@@ -2625,14 +2625,14 @@ pub(crate) fn optimize_now() -> Result<Option<String>> {
 /// account is already past target (it's all that's left) do we fall back to the
 /// least-consumed still-usable one. Operates entirely on cached rows — callers
 /// must not fetch first.
-/// Rank accounts by runway and reset horizon.
+/// Rank accounts by weekly reset, then runway.
 fn auto_pick_for(_state: &State, rows: &[Row], ceiling: f64, trigger: f64) -> Result<String> {
     auto_pick_v2(rows, ceiling, trigger, Utc::now())
 }
 
-/// Auto-pick by the v2 `rank_key`: the best Ready account by runway (an
-/// account whose weekly reset falls within the rebalance horizon first), then
-/// the Draining one with the most hard runway. Never an account at its limit.
+/// Auto-pick by the v2 `rank_key`: the Ready account whose weekly reset comes
+/// first (then the most runway), then the Draining one with the most hard
+/// runway. Never an account at its limit.
 fn auto_pick_v2(rows: &[Row], ceiling: f64, trigger: f64, now: DateTime<Utc>) -> Result<String> {
     if !rows.iter().any(|r| r.has_data()) {
         bail!(
@@ -2660,7 +2660,7 @@ fn auto_pick_v2(rows: &[Row], ceiling: f64, trigger: f64, now: DateTime<Utc>) ->
             autoswap::assess::assess(&a, false, &ctx)
         })
         .collect();
-    ranked.sort_by(|a, b| autoswap::assess::rank_cmp(a, b, now, None));
+    ranked.sort_by(|a, b| autoswap::assess::rank_cmp(a, b, None));
     let Some(pick) = ranked
         .iter()
         .find(|a| matches!(a.tier, autoswap::Tier::Ready | autoswap::Tier::Draining))
@@ -3449,9 +3449,14 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
             // path (edge-triggered purely through state, so it runs even on the
             // first poll). Persisted once at the end if anything changed.
             let mut ns = acct.notif_state.clone();
-            for trig in &notifications::reset_grant_triggers(&mut ns, &cu.reported.reset_grants) {
-                if let Err(e) = notifications::fire(trig, &account_key) {
-                    logging::log(&format!("notify: {email}: {e:#}"));
+            for g in &cu.reported.reset_grants {
+                for trig in &notifications::reset_grant_triggers(&mut ns, std::slice::from_ref(g)) {
+                    if let Err(e) = notifications::fire(trig, &account_key) {
+                        logging::log(&format!("notify: {email}: {e:#}"));
+                        // Not delivered: leave the grant un-announced so the
+                        // next poll retries instead of losing it for good.
+                        notifications::release_dedup(&mut ns, trig, Some(&g.id));
+                    }
                 }
             }
             if let Some(prev) = prev_snap {
@@ -3476,6 +3481,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
                 for trig in &kept {
                     if let Err(e) = notifications::fire(trig, &account_key) {
                         logging::log(&format!("notify: {email}: {e:#}"));
+                        notifications::release_dedup(&mut ns, trig, None);
                     }
                 }
             }

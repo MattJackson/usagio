@@ -151,11 +151,17 @@ pub fn append(snap: &Snapshot) -> Result<()> {
     let mut guard = appender_slot().lock().unwrap();
     let reopen = guard.as_ref().map(|a| a.path != path).unwrap_or(true);
     if reopen {
+        // A new month file: prune expired ones now too, so a long-lived
+        // daemon enforces the retention bound without a restart.
+        let _ = rotate_files(&dir, Utc::now());
         // Dropping the old appender flushes any un-fsynced rows.
         *guard = None;
         *guard = Some(Appender::open(&path)?);
     }
-    guard.as_mut().unwrap().write_snap(snap)
+    let before = file_stamp(&path);
+    let written = guard.as_mut().unwrap().write_snap(snap)?;
+    cache_note_append(&path, snap, before, written);
+    Ok(())
 }
 
 /// Explicit rotation entry point: prune history files older than
@@ -204,7 +210,7 @@ pub fn last_n_days(account: &AccountKey, days: u32) -> Vec<Snapshot> {
 /// O(accounts × month_rows) per poll tick (last_snapshot + pace, per account)
 /// plus two more full scans per account per menu redraw. Indexing by
 /// `AccountKey` once at parse time makes each read O(that account's rows).
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct MonthIndex {
     by_account: HashMap<AccountKey, Vec<Snapshot>>,
 }
@@ -227,7 +233,31 @@ impl MonthIndex {
 /// have opened anyway are cached — no proactive scan.
 /// Value: (mtime at parse time, the account-indexed snapshots). The index is
 /// wrapped in `Arc` so a cache hit is a refcount bump, not a clone.
-type MonthCacheEntry = (SystemTime, Arc<MonthIndex>);
+type MonthCacheEntry = (FileStamp, Arc<MonthIndex>);
+
+/// Cache validity key: mtime alone misses an append inside one coarse mtime
+/// tick, so the length is part of the stamp.
+type FileStamp = (SystemTime, u64);
+
+fn file_stamp(path: &Path) -> FileStamp {
+    match std::fs::metadata(path) {
+        Ok(m) => (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len()),
+        Err(_) => (SystemTime::UNIX_EPOCH, 0),
+    }
+}
+
+/// Months a reader can ask for (35 days back) plus slack; older cache entries
+/// are dropped on insert so a long-lived daemon doesn't keep every month.
+const CACHE_KEEP_MONTHS: i32 = 4;
+
+fn month_ordinal(year: i32, month: u32) -> i32 {
+    year * 12 + month as i32
+}
+
+#[cfg(test)]
+thread_local! {
+    static PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Default)]
 struct MonthCache {
@@ -280,32 +310,64 @@ fn read_range_cached(
     out
 }
 
-/// Return all snapshots in month file `path`, using the cached copy when its
-/// mtime matches. Missing file yields an empty vec (cached as UNIX_EPOCH so
-/// a later create-and-write invalidates it).
+/// Return all snapshots in month file `path`, using the cached copy while its
+/// stamp (mtime + length) matches. Missing file yields an empty index (stamped
+/// as UNIX_EPOCH/0 so a later create-and-write invalidates it). The parse runs
+/// outside the cache lock so other readers never wait on it.
 fn load_month_cached(path: &Path, year: i32, month: u32) -> Arc<MonthIndex> {
-    let mtime = std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let stamp = file_stamp(path);
 
-    if let Ok(mut cache) = month_cache().lock() {
-        if let Some((stamp, index)) = cache.months.get(&(year, month)) {
-            if *stamp == mtime {
+    if let Ok(cache) = month_cache().lock() {
+        if let Some((cached, index)) = cache.months.get(&(year, month)) {
+            if *cached == stamp {
                 return Arc::clone(index);
             }
         }
-        // Cache miss / stale — parse, index by account, and store.
-        let index = Arc::new(MonthIndex::build(parse_month(path)));
+    }
+    // Cache miss / stale — parse (unlocked), index by account, and store.
+    let index = Arc::new(MonthIndex::build(parse_month(path)));
+    if let Ok(mut cache) = month_cache().lock() {
         cache
             .months
-            .insert((year, month), (mtime, Arc::clone(&index)));
-        return index;
+            .insert((year, month), (stamp, Arc::clone(&index)));
+        let now = Utc::now();
+        let floor = month_ordinal(now.year(), now.month()) - CACHE_KEEP_MONTHS;
+        cache
+            .months
+            .retain(|(y, m), _| month_ordinal(*y, *m) >= floor);
     }
-    // Fallback if lock is poisoned: skip cache.
-    Arc::new(MonthIndex::build(parse_month(path)))
+    index
+}
+
+/// After `append` wrote `line_len` bytes to `path`: patch the cached month in
+/// place when nothing else touched the file (so the next read does not re-parse
+/// the whole month), otherwise drop the entry.
+fn cache_note_append(path: &Path, snap: &Snapshot, before: FileStamp, line_len: u64) {
+    let after = file_stamp(path);
+    let (year, month) = (snap.ts.year(), snap.ts.month());
+    let Ok(mut cache) = month_cache().lock() else {
+        return;
+    };
+    let patched = match cache.months.get_mut(&(year, month)) {
+        Some((stamp, index)) if *stamp == before && after.1 == before.1 + line_len => {
+            Arc::make_mut(index)
+                .by_account
+                .entry(AccountKey::new(snap.provider.clone(), snap.account.clone()))
+                .or_default()
+                .push(snap.clone());
+            *stamp = after;
+            true
+        }
+        _ => false,
+    };
+    if !patched {
+        cache.months.remove(&(year, month));
+    }
 }
 
 fn parse_month(path: &Path) -> Vec<Snapshot> {
+    #[cfg(test)]
+    PARSE_COUNT.with(|c| c.set(c.get() + 1));
     let mut out = Vec::new();
     let Ok(f) = File::open(path) else {
         return out;
@@ -348,8 +410,34 @@ pub fn last_snapshot(account: &AccountKey) -> Option<Snapshot> {
     // R2-PERF-01: use the mtime-gated cache; called per account per poll
     // from the notifications eval branch, so an uncached scan of ~35 days
     // of NDJSON per tick is wasteful.
-    let snaps = read_range_cached(&dir, account, now - Duration::days(35), now);
-    snaps.into_iter().rev().find(Snapshot::is_reading)
+    let (from, to) = (now - Duration::days(35), now);
+    // Scan the cached per-account rows for the newest reading; clone only it.
+    let (mut y, mut m) = (from.year(), from.month());
+    let mut best: Option<Snapshot> = None;
+    loop {
+        let index = load_month_cached(&month_path_ym(&dir, y, m), y, m);
+        if let Some(rows) = index.by_account.get(account) {
+            let newest = rows
+                .iter()
+                .filter(|s| s.ts >= from && s.ts <= to && s.is_reading())
+                .max_by_key(|s| s.ts);
+            if let Some(n) = newest {
+                if best.as_ref().is_none_or(|b| n.ts >= b.ts) {
+                    best = Some(n.clone());
+                }
+            }
+        }
+        if (y, m) == (to.year(), to.month()) {
+            break;
+        }
+        if m == 12 {
+            y += 1;
+            m = 1;
+        } else {
+            m += 1;
+        }
+    }
+    best
 }
 
 /// Seven-character sparkline of the last seven local days' peak weekly usage
@@ -381,8 +469,8 @@ fn decisions_path(dir: &Path, ts: DateTime<Utc>) -> PathBuf {
 
 /// Append one auto-swap decision line to this month's
 /// `decisions.YYYY-MM.ndjson` (same directory, rotation and retention as the
-/// history log). One small `writeln!` with O_APPEND, so concurrent writers
-/// never interleave a line. Rare (one line per decision change), so no
+/// history log). One `write_all` of the whole line with O_APPEND, so
+/// concurrent writers never interleave a line. Rare (one line per decision change), so no
 /// batching.
 pub fn append_decision(v: &serde_json::Value) -> Result<()> {
     let dir = log_dir()?;
@@ -399,7 +487,7 @@ pub fn append_decision(v: &serde_json::Value) -> Result<()> {
         opts.mode(0o600);
     }
     let mut f = opts.open(&path).context("opening decisions log")?;
-    writeln!(f, "{v}").context("writing decisions log")?;
+    write_line(&mut f, &v.to_string()).context("writing decisions log")?;
     Ok(())
 }
 
@@ -460,16 +548,28 @@ impl Appender {
         })
     }
 
-    fn write_snap(&mut self, snap: &Snapshot) -> Result<()> {
+    /// Returns the bytes written (the line plus its newline).
+    fn write_snap(&mut self, snap: &Snapshot) -> Result<u64> {
         let line = serde_json::to_string(snap).context("serializing snapshot")?;
-        writeln!(self.file, "{line}").context("appending history line")?;
+        let n = write_line(&mut self.file, &line).context("appending history line")?;
         self.rows_since_fsync += 1;
         if self.rows_since_fsync >= FSYNC_BATCH {
             let _ = self.file.sync_data();
             self.rows_since_fsync = 0;
         }
-        Ok(())
+        Ok(n)
     }
+}
+
+/// Write `line` plus a newline with ONE `write_all`, so an O_APPEND file gets
+/// the whole record in a single write and concurrent writers cannot interleave
+/// inside it (`writeln!` issues one write per formatted fragment).
+fn write_line<W: Write>(w: &mut W, line: &str) -> std::io::Result<u64> {
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
+    w.write_all(buf.as_bytes())?;
+    Ok(buf.len() as u64)
 }
 
 impl Drop for Appender {
@@ -1374,18 +1474,129 @@ mod tests {
     }
 
     #[test]
-    fn append_prunes_only_on_first_append_per_process() {
+    fn append_prunes_on_first_append_and_again_when_the_month_file_changes() {
         let _l = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _cfg = store::ScopedConfigDir::new();
+        // Rotation has already happened in this process.
+        BOOT_ROTATED.store(true, Ordering::SeqCst);
+        append(&snap("claude", "a@x.io", utc(2049, 9, 5, 5), Some(1.0))).unwrap();
         let stale = cfg_dir().join("history.2020-01.ndjson");
         touch_with_mtime(
             &stale,
             SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_700_000_000),
         );
-        // Rotation has already happened in this process: no prune now.
-        BOOT_ROTATED.store(true, Ordering::SeqCst);
-        append(&snap("claude", "a@x.io", utc(2049, 9, 5, 5), Some(1.0))).unwrap();
-        assert!(stale.exists(), "later appends must not re-run the prune");
+        // A long-lived daemon rolling into a new month prunes without a restart.
+        append(&snap("claude", "a@x.io", utc(2049, 10, 1, 5), Some(1.0))).unwrap();
+        assert!(!stale.exists(), "month change must prune expired files");
+    }
+
+    #[test]
+    fn write_line_is_a_single_write() {
+        struct Counting(usize, Vec<u8>);
+        impl Write for Counting {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0 += 1;
+                self.1.extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut w = Counting(0, Vec::new());
+        let v = serde_json::json!({"ts": 1, "a": [1, 2, 3], "b": "x"});
+        let n = write_line(&mut w, &v.to_string()).unwrap();
+        assert_eq!(w.0, 1, "one write per record");
+        assert_eq!(n as usize, w.1.len());
+        assert!(w.1.ends_with(b"}\n"));
+    }
+
+    #[test]
+    fn cache_sees_an_append_that_leaves_the_mtime_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = AccountKey::new("claude", "a@x.io");
+        let path = month_path_ym(dir.path(), 2044, 3);
+        let line = |d: u32, pct: f32| {
+            format!(
+                "{}\n",
+                serde_json::to_string(&snap("claude", "a@x.io", utc(2044, 3, d, 0), Some(pct)))
+                    .unwrap()
+            )
+        };
+        let read = || {
+            weeklies(&read_range_cached(
+                dir.path(),
+                &key,
+                utc(2044, 3, 1, 0),
+                utc(2044, 3, 30, 0),
+            ))
+        };
+        std::fs::write(&path, line(1, 1.0)).unwrap();
+        let stamp = SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_800_000_000);
+        let set_mtime = || {
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(stamp)
+                .unwrap();
+        };
+        set_mtime();
+        assert_eq!(read(), vec![1.0]);
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(line(2, 2.0).as_bytes()).unwrap();
+        drop(f);
+        set_mtime(); // same mtime tick, longer file
+        assert_eq!(read(), vec![1.0, 2.0], "a longer file must re-parse");
+    }
+
+    #[test]
+    fn append_patches_the_cached_month_instead_of_reparsing_it() {
+        let _l = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cfg = store::ScopedConfigDir::new();
+        let key = AccountKey::new("claude", "a@x.io");
+        let t1 = utc(2043, 2, 3, 0);
+        let t2 = utc(2043, 2, 4, 0);
+        let read = || {
+            weeklies(&read_range_cached(
+                &cfg_dir(),
+                &key,
+                utc(2043, 2, 1, 0),
+                utc(2043, 2, 28, 0),
+            ))
+        };
+        append(&snap("claude", "a@x.io", t1, Some(1.0))).unwrap();
+        assert_eq!(read(), vec![1.0]);
+        let parses = PARSE_COUNT.with(|c| c.get());
+        append(&snap("claude", "a@x.io", t2, Some(2.0))).unwrap();
+        assert_eq!(read(), vec![1.0, 2.0], "the new row is visible");
+        assert_eq!(
+            PARSE_COUNT.with(|c| c.get()),
+            parses,
+            "an append must not force a whole-month re-parse"
+        );
+    }
+
+    #[test]
+    fn month_cache_drops_months_no_reader_can_ask_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = utc(2019, 1, 15, 0);
+        std::fs::write(month_path(dir.path(), old), "").unwrap();
+        let _ = load_month_cached(&month_path_ym(dir.path(), 2019, 1), 2019, 1);
+        let now = Utc::now();
+        let _ = load_month_cached(
+            &month_path_ym(dir.path(), now.year(), now.month()),
+            now.year(),
+            now.month(),
+        );
+        assert!(
+            !month_cache()
+                .lock()
+                .unwrap()
+                .months
+                .contains_key(&(2019, 1)),
+            "a month older than any reader's lookback is evicted"
+        );
     }
 
     #[test]

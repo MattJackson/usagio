@@ -13,8 +13,8 @@ use chrono::{DateTime, Utc};
 use super::memory::SwapMemory;
 use super::policy::*;
 use super::{
-    assess_all, decide, AccountIn, Action, Decision, Kind, ManualPick, Policy, Reason, Snapshot,
-    Tier, Urgency, WindowIn,
+    assess::Assessed, assess_all, decide, AccountIn, Action, Decision, Kind, ManualPick, Policy,
+    Reason, Snapshot, Tier, Urgency, WindowIn,
 };
 use crate::store::State;
 use crate::{logging, Row};
@@ -567,9 +567,11 @@ pub(crate) fn run_cycle(
     let mut switched_ok = false;
     if let Action::Switch { to, kind } = &d.action {
         let target_row = rows.iter().find(|r| r.email.eq_ignore_ascii_case(to));
+        // A missing reading stays missing ("—" / null), never a fake 0%.
         let (pick_s, pick_w) = target_row
-            .map(|r| (r.session.pct.unwrap_or(0.0), r.weekly.pct.unwrap_or(0.0)))
-            .unwrap_or((0.0, 0.0));
+            .map(|r| (r.session.pct, r.weekly.pct))
+            .unwrap_or((None, None));
+        let (pick_s_txt, pick_w_txt) = (fmt_pct(pick_s), fmt_pct(pick_w));
         let target_pct = row_pct(target_row);
         if *kind != Kind::Rebalance {
             logging::log(&format!(
@@ -579,7 +581,17 @@ pub(crate) fn run_cycle(
             ));
         }
         let latch = leave_latch(*kind, act_assessed.as_ref(), now);
-        match crate::switch_if_still_active_latched(slug, to, active, latch) {
+        // The pick/hold was read at cycle start; the verify reads above took
+        // seconds. A pin set meanwhile wins over this auto move.
+        let moved = if State::load().is_ok_and(|fresh| pick_changed(&state, &fresh, slug)) {
+            logging::log(&format!(
+                "event=swap_skipped provider={slug} target={to} reason=pick_changed v=2"
+            ));
+            Ok(None)
+        } else {
+            crate::switch_if_still_active_latched(slug, to, active, latch)
+        };
+        match moved {
             Ok(Some(label)) => {
                 switched_ok = true;
                 let kind = *kind;
@@ -599,10 +611,10 @@ pub(crate) fn run_cycle(
                         "Prepared {label} for its next reset — usage is still blocked."
                     )),
                     Kind::Rebalance => crate::notify(&format!(
-                        "Flipped back to {label} — {pick_s:.0}% / {pick_w:.0}%"
+                        "Flipped back to {label} — {pick_s_txt} / {pick_w_txt}"
                     )),
                     _ => crate::notify(&format!(
-                        "Switched to {label} — {pick_s:.0}% / {pick_w:.0}%"
+                        "Switched to {label} — {pick_s_txt} / {pick_w_txt}"
                     )),
                 }
                 swapped = Some((active.to_string(), to.clone()));
@@ -634,11 +646,7 @@ pub(crate) fn run_cycle(
 
     // Stuck notice + the Draining hysteresis memory, in one locked write.
     if !switched_ok {
-        let soonest = rows
-            .iter()
-            .filter(|r| r.has_data())
-            .filter_map(|r| r.weekly.resets_at)
-            .min()
+        let soonest = soonest_unlock(&assessed, now)
             .map(crate::humanize_until)
             .unwrap_or_else(|| "unknown".to_string());
         let mut fire = false;
@@ -667,6 +675,29 @@ pub(crate) fn run_cycle(
         urgency: d.urgency,
         next_check_at: d.next_check_at,
     })
+}
+
+/// Display a possibly-missing percentage.
+pub(crate) fn fmt_pct(p: Option<f64>) -> String {
+    p.map_or_else(|| "—".to_string(), |p| format!("{p:.0}%"))
+}
+
+/// Whether the manual pick or hold for `slug` differs between two loads of the
+/// state (set, cleared or moved since the cycle began).
+pub(crate) fn pick_changed(before: &State, after: &State, slug: &str) -> bool {
+    before.manual_pick(slug) != after.manual_pick(slug)
+        || before.manual_hold(slug) != after.manual_hold(slug)
+}
+
+/// The soonest moment any switchable account unlocks (earliest `blocked_until`
+/// still in the future), for the stuck notice. Session and weekly blocks both
+/// count; rows that cannot be switched are not assessed at all.
+pub(crate) fn soonest_unlock(assessed: &[Assessed], now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    assessed
+        .iter()
+        .filter_map(|a| a.blocked_until)
+        .filter(|u| *u > now)
+        .min()
 }
 
 /// Keep `manual_holds[slug]` ⇔ (pick settled tier ≥ Draining), so a rollback
@@ -701,6 +732,15 @@ pub(crate) fn dual_write_hold(slug: &str) {
 /// 429 streak making the active account Unknown for a while. Returns whether
 /// to send the notice now.
 pub fn stuck_update(m: &mut SwapMemory, d: &Decision, active: &str) -> bool {
+    // The active account changed under this cycle (a concurrent manual
+    // switch already reset the memory for the new one): this decision is
+    // about the old account, so it must not touch the new one's memory.
+    if m.last_seen_active
+        .as_deref()
+        .is_some_and(|a| !a.eq_ignore_ascii_case(active))
+    {
+        return false;
+    }
     let tier = d.active_tier;
     if d.active_real {
         if let Some(prev) = m.real_tier.as_deref().and_then(Tier::parse) {

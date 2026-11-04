@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Windows: resolve the home directory from `HOME`, else `USERPROFILE` (empty `HOME` counts as unset) for `~/.claude.json`, Claude credential watching and the Codex `auth.json`.
 - Linux/Windows: Claude account switch and capture now use `~/.claude/.credentials.json`, the file Claude Code reads, instead of the OS secret store. A stale "Claude Code-credentials" secret-store entry from earlier versions is orphaned and harmless.
+- Auto-swap now moves to the ready account whose weekly limit resets soonest, so remaining quota is spent before it expires. Previously it chose the account with the most runway unless a reset was within 6 hours, which picked a fresh account over one 6 hours from losing its room. Accounts without 15 minutes of runway are still skipped. The engine now matches the menu order.
+- The stuck-swap notice now names the soonest time any account unlocks (session or weekly), not the soonest weekly reset. A pin set while a swap was being verified is respected, and a missing target reading shows as a dash rather than 0%.
+- Burn-rate forecasts keep sub-hour precision, ignore samples from before the last reset, and show "lasts to reset" when the window resets first.
+- Pace alerts no longer fire for a projection that lands after the weekly reset. A window reset now needs a real drop, and a threshold crossed in the same reading as a reset still alerts.
+- Refreshing a vendor-owned login now fails closed if the vendor slot or saved state cannot be read, keeps the saved refresh token when the vendor copy has none, and no longer matches a uuid-only saved account to an unrelated identity.
+- History and decision log lines are written in a single write; the month cache notices appends that keep the same modified time, is patched on append instead of re-parsed, no longer holds its lock while parsing, drops months no reader needs, and expired history is pruned when a long-running daemon moves to a new month.
+- Credits in different non-dominant currencies are no longer ranked by raw amounts, the blind projection applies only to windows that were near the threshold, an out-of-range usage value can no longer crash scheduling, and a failed watcher respawn no longer clears the keychain failure count.
 
 ## [1.0.8] - 2026-10-31
 

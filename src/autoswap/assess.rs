@@ -263,7 +263,11 @@ pub fn assess(a: &AccountIn, is_active: bool, ctx: &Ctx) -> Assessed {
             .any(|w| !w.pending && !w.blocked && w.lb >= w.limit - BLIND_BAND);
     if blind_in_band {
         let bm = blind_age_min.unwrap_or(0.0);
-        for w in windows.iter_mut().filter(|w| !w.pending) {
+        // Per window (§3.3): only a window whose last reading was in the band.
+        for w in windows
+            .iter_mut()
+            .filter(|w| !w.pending && w.lb >= w.limit - BLIND_BAND)
+        {
             let blind_rate = match w.id {
                 WindowId::Session => BLIND_RATE_SESSION,
                 WindowId::Weekly => BLIND_RATE_WEEKLY,
@@ -451,18 +455,18 @@ pub fn dominant_unit(accounts: &[Assessed]) -> Option<String> {
 /// `rank_key` (§3.3) as a comparator: better first. Also used by `auto_pick`,
 /// `optimize_now` and `switch` with no selector. Uses `total_cmp` throughout,
 /// so it is a total order and never NaN-poisoned.
-pub fn rank_cmp(a: &Assessed, b: &Assessed, now: DateTime<Utc>, unit: Option<&str>) -> Ordering {
+///
+/// Ready accounts go earliest weekly reset first: room left at a reset is
+/// lost, so the room that expires soonest is spent first. Every Ready account
+/// already clears `MIN_LANDING_MIN`, so this never lands on an account about
+/// to block (D2). Matches the menu order (`account_order::Priority`).
+pub fn rank_cmp(a: &Assessed, b: &Assessed, unit: Option<&str>) -> Ordering {
     let (ta, tb) = (rank_tier(a), rank_tier(b));
     ta.cmp(&tb).then_with(|| match ta {
         Tier::Ready => {
-            let horizon = now + Duration::hours(REBALANCE_HORIZON_H);
-            let expiring = |x: &Assessed| {
-                x.weekly_reset
-                    .filter(|r| *r < horizon)
-                    .unwrap_or(DateTime::<Utc>::MAX_UTC)
-            };
-            expiring(a)
-                .cmp(&expiring(b))
+            let reset = |x: &Assessed| x.weekly_reset.unwrap_or(DateTime::<Utc>::MAX_UTC);
+            reset(a)
+                .cmp(&reset(b))
                 .then(b.soft_runway.total_cmp(&a.soft_runway))
                 .then_with(|| a.key.cmp(&b.key))
         }
@@ -474,7 +478,14 @@ pub fn rank_cmp(a: &Assessed, b: &Assessed, now: DateTime<Utc>, unit: Option<&st
             let k = |x: &Assessed| {
                 let m = x.credits.as_ref();
                 let other_unit = m.is_some_and(|m| Some(m.unit.as_str()) != unit);
-                (other_unit, -m.map_or(0, |m| m.amount_minor))
+                // Amounts compare only within one unit: other units group by
+                // unit name first (§3.3 B11).
+                let group = if other_unit {
+                    m.map_or_else(String::new, |m| m.unit.clone())
+                } else {
+                    String::new()
+                };
+                (other_unit, group, -m.map_or(0, |m| m.amount_minor))
             };
             k(a).cmp(&k(b)).then_with(|| a.key.cmp(&b.key))
         }
