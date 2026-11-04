@@ -511,14 +511,12 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
     let result = (|| -> Result<()> {
         // Remember the current value so a failed add (after the delete has
         // already succeeded) can put it back instead of leaving no credential.
-        let prior = run_security(&["find-generic-password", "-s", service, "-a", account, "-w"])
-            .ok()
-            .filter(|r| r.success())
-            .map(|r| {
-                String::from_utf8_lossy(&r.stdout)
-                    .trim_end_matches('\n')
-                    .to_string()
-            });
+        let backup_run =
+            run_security(&["find-generic-password", "-s", service, "-a", account, "-w"]);
+        if matches!(&backup_run, Ok(r) if r.timed_out) {
+            timed_out = true;
+        }
+        let prior = backup_prior(backup_run, service, account)?;
         let del = run_security(&["delete-generic-password", "-s", service, "-a", account])
             .context("running `security delete-generic-password` (pre-set)")?;
         if del.timed_out {
@@ -589,6 +587,28 @@ fn real_set(service: &str, account: &str, secret: &str) -> Result<()> {
         }
     ));
     result
+}
+
+/// Map the pre-delete backup read to the prior secret. Exit 44 (no item) is
+/// `Ok(None)`; any other failure (spawn error, timeout, denied) is an error so
+/// `real_set` aborts BEFORE the destructive delete rather than losing the
+/// credential with no way to restore it.
+fn backup_prior(out: Result<SecurityRun>, service: &str, account: &str) -> Result<Option<String>> {
+    let out = out.with_context(|| {
+        format!(
+            "running `security find-generic-password` to back up the existing item \
+             (service={service} account={account})"
+        )
+    })?;
+    if out.success() {
+        return Ok(Some(
+            String::from_utf8_lossy(&out.stdout)
+                .trim_end_matches('\n')
+                .to_string(),
+        ));
+    }
+    interpret_get(&out, service, account)
+        .context("backing up the existing keychain item before replacing it")
 }
 
 /// Best-effort: re-add the secret that `real_set` deleted when the following
@@ -785,6 +805,9 @@ pub struct MacOsAutostart;
 impl MacOsAutostart {
     fn plist_path(label: &str) -> Result<PathBuf> {
         let home = std::env::var_os("HOME").context("HOME is not set")?;
+        if !Path::new(&home).is_absolute() {
+            bail!("HOME must be an absolute path (got {home:?})");
+        }
         Ok(PathBuf::from(home)
             .join("Library")
             .join("LaunchAgents")
@@ -1084,9 +1107,13 @@ impl Autostart for MacOsAutostart {
                 // Also drop any legacy `load`-registered entry before removing
                 // the file, so a switch from an older usagio that used the
                 // legacy form doesn't leave a stale live job behind.
-                let _ = Command::new("launchctl")
-                    .args(["unload", &path.to_string_lossy()])
-                    .status();
+                // Skip it once bootout removed the job: a legacy `unload` of a
+                // not-loaded plist prints "Unload failed: 5" to the terminal.
+                if is_agent_loaded(uid, label) {
+                    let _ = Command::new("launchctl")
+                        .args(["unload", &path.to_string_lossy()])
+                        .status();
+                }
                 if is_agent_loaded(uid, label) {
                     crate::logging::log(&format!(
                         "event=launchd_uninstall label={label} result=err:agent still loaded \
@@ -1184,6 +1211,39 @@ mod tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: b"boom".to_vec(),
         }
+    }
+
+    #[test]
+    fn backup_prior_fails_unless_success_or_not_found() {
+        assert_eq!(
+            backup_prior(Ok(run(Some(0), false, "tok\n")), "s", "a")
+                .unwrap()
+                .as_deref(),
+            Some("tok")
+        );
+        assert_eq!(
+            backup_prior(Ok(run(Some(44), false, "")), "s", "a").unwrap(),
+            None
+        );
+        assert!(backup_prior(Ok(run(Some(1), false, "")), "s", "a").is_err());
+        assert!(backup_prior(Ok(run(None, true, "")), "s", "a").is_err());
+        assert!(backup_prior(Err(anyhow::anyhow!("spawn")), "s", "a").is_err());
+    }
+
+    #[test]
+    fn plist_path_rejects_empty_or_relative_home() {
+        crate::env_lock::scoped_env_var("HOME", Some(""), || {
+            assert!(MacOsAutostart::plist_path("x").is_err());
+        });
+        crate::env_lock::scoped_env_var("HOME", Some("rel/home"), || {
+            assert!(MacOsAutostart::plist_path("x").is_err());
+        });
+        crate::env_lock::scoped_env_var("HOME", Some("/Users/t"), || {
+            assert_eq!(
+                MacOsAutostart::plist_path("x").unwrap(),
+                PathBuf::from("/Users/t/Library/LaunchAgents/x.plist")
+            );
+        });
     }
 
     #[test]
@@ -1497,6 +1557,8 @@ mod tests {
     #[test]
     #[ignore = "touches the real login keychain; run with --ignored"]
     fn macos_secrets_set_after_existing_item_created_by_another_process() {
+        // real_set logs via store::config_dir(); needs a HOME_OVERRIDE.
+        let _g = crate::store::ScopedConfigDir::new();
         let service = format!("usagio-platform-test-foreign-{}", std::process::id());
         let account = "foreign-owner";
         let _ = Command::new("security")
