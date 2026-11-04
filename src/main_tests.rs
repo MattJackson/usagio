@@ -6406,3 +6406,55 @@ fn renew_selector_qualifier_picks_the_provider() {
         ("claude", Some("dev@example.com"))
     );
 }
+
+#[test]
+fn renewing_active_account_keeps_a_queued_switch_to_another_account() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let provider = MockActiveSlotProvider::new("outgoing");
+    let slug = provider.provider_id();
+    let k = "active@example.com";
+    let mut state = State::default();
+    state
+        .provider_accounts_mut(slug)
+        .accounts
+        .push(codex_account(k, None));
+    state
+        .provider_accounts_mut(slug)
+        .accounts
+        .push(codex_account("other@example.com", None));
+    state.provider_accounts_mut(slug).active = Some(k.into());
+    state.provider_accounts_mut(slug).pending_switch = Some(store::PendingSwitch {
+        key: "other@example.com".into(),
+        manual: true,
+        from: Some(k.into()),
+        drain_token: Some("drain".into()),
+        credentials_written: false,
+        renewed_account: None,
+        leave_latch: None,
+    });
+    state.save().unwrap();
+    let captured = providers::trait_def::CapturedAccount {
+        identity: providers::IdentitySnapshot {
+            email: Some(k.into()),
+            uuid: None,
+            display_name: None,
+            native_blob: serde_json::Value::Null,
+        },
+        secret_blob: "renewed".into(),
+        tokens: providers::trait_def::TokenGrant {
+            access: "renewed-at".into(),
+            refresh: Some("renewed-rt".into()),
+            expires_in_secs: 3600,
+        },
+    };
+    let r = persist_login(&provider, captured, None).unwrap();
+    assert!(!r.made_live);
+    let state = State::load().unwrap();
+    let pa = state.provider_accounts(slug).unwrap();
+    let pending = pa.pending_switch.as_ref().expect("queued switch dropped");
+    assert_eq!(pending.key, "other@example.com");
+    assert_eq!(
+        state.find_provider_account(slug, k).unwrap().access_token,
+        "renewed-at"
+    );
+}

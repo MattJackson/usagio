@@ -544,6 +544,19 @@ pub(crate) fn persist_login(
             plan: existing.as_ref().and_then(|a| a.plan.clone()),
         };
         let active = state.provider_accounts_mut(slug).active.as_deref() == Some(key.as_str());
+        // A switch to a DIFFERENT account is already queued: never overwrite
+        // that intent. Stage the renewed tokens only; the queued switch
+        // finishes first.
+        let other_queued = state
+            .provider_accounts(slug)
+            .and_then(|pa| pa.pending_switch.as_ref())
+            .is_some_and(|pending| pending.key != key);
+        if other_queued && active {
+            logging::log(&format!(
+                "event=renewal_handoff_deferred provider={slug} reason=other_switch_pending"
+            ));
+        }
+        let active = active && !other_queued;
         if active {
             let accounts = state.provider_accounts_mut(slug);
             let drain_token = accounts
