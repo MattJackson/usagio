@@ -6325,20 +6325,6 @@ mod tests {
         assert_eq!(groups[1].1, vec![1, 0], "Codex: soonest reset first");
     }
 
-    #[test]
-    fn build_snapshot_omits_sections_for_providers_with_zero_accounts() {
-        // No captured accounts → no section (the "no header, no rows" rule).
-        // Uses the pure `partition_capture_providers` sibling to prove the
-        // filter logic without touching state.json. `build_snapshot`'s own
-        // gate is the `if provider_rows.is_empty() { continue; }` branch —
-        // this test locks in the *behavior* the gate exists to enforce.
-        let snap = Snapshot::default();
-        assert!(
-            snap.sections.is_empty(),
-            "empty snapshot has no sections — a provider with zero rows must never emit one",
-        );
-    }
-
     // -----------------------------------------------------------------------
     // Capability-gated menu rows. `supports_switching`
     // gates the "Switch to this account" row and `supports_remove` the
@@ -7436,6 +7422,27 @@ mod tests {
             Some(80.0),
             "unchanged mtime hits the cache"
         );
+    }
+
+    #[test]
+    fn build_snapshot_omits_sections_for_providers_with_zero_accounts() {
+        // Only Claude has accounts: every other registered provider (stubs
+        // included) must not get a section, or Settings > Tray Icon lists them
+        // all and the empty-state rows never show.
+        let _l = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::store::ScopedConfigDir::new();
+        let mut st = State::default();
+        st.accounts.push(restore_test_acct("only@x.com"));
+        st.active = Some("only@x.com".to_string());
+        save_state_with_mtime(&st, next_mtime_tag());
+
+        let snap = build_snapshot();
+        let ids: Vec<String> = snap
+            .sections
+            .iter()
+            .map(|s| s.provider_id.to_string())
+            .collect();
+        assert_eq!(ids, [CLAUDE_SLUG]);
     }
 
     #[test]
