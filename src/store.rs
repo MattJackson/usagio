@@ -891,7 +891,10 @@ impl State {
                         .get("needs_relogin")
                         .and_then(|x| x.as_bool())
                         .unwrap_or(false),
-                    live_write_pending: None,
+                    live_write_pending: obj
+                        .get("live_write_pending")
+                        .and_then(|x| x.as_str())
+                        .map(String::from),
                     no_subscription: obj
                         .get("no_subscription")
                         .and_then(|x| x.as_bool())

@@ -2977,6 +2977,42 @@ fn guarded_switch_commits_only_while_the_expected_account_is_active() {
     });
 }
 
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "reads or writes the OS secret store, which is only hermetic (in-memory) on macOS"
+)]
+fn pending_live_write_marker_does_not_survive_a_switch_away_and_back() {
+    with_claude_home("a@e.com", |_home| {
+        let mut a = claude_account_with_identity("a@e.com", 3_600_000);
+        // A renewal whose live write failed left this marker on A.
+        a.live_write_pending = Some(crate::logging::token_fingerprint(&a.refresh_token));
+        seed_claude_state(
+            vec![a, claude_account_with_identity("b@e.com", 3_600_000)],
+            Some("a@e.com"),
+        );
+        let provider = providers::get(CLAUDE_SLUG).unwrap();
+        let go = |email: &str| {
+            let acct = State::load().unwrap().find(email).cloned().unwrap();
+            let identity = acct.oauth_account.clone().unwrap();
+            switch_to_guarded(provider, email, &acct, &identity, false, None, false).unwrap();
+        };
+        go("b@e.com");
+        go("a@e.com");
+        // The vendor CLI rotates the slot; no watcher absorbed it first.
+        prime_active_slot(&mock_claude_blob("v-at", "v-rt", 9_999_999_999_999));
+        let mut a = State::load().unwrap().find("a@e.com").cloned().unwrap();
+        let outcome = lifecycle::active_refresh_cas(provider, &mut a);
+        assert!(
+            matches!(outcome, ActiveRefreshOutcome::Adopted),
+            "{outcome:?}"
+        );
+        assert_eq!(a.refresh_token, "v-rt", "vendor rotation was overwritten");
+        let slot = Account::from_keychain_blob(&keychain_read().unwrap()).unwrap();
+        assert_eq!(slot.refresh_token, "v-rt");
+    });
+}
+
 /// Seed A (active) and B, then run a real guarded switch A -> B and return
 /// A's stored account afterwards. `before` runs after seeding, to plant a
 /// rotation for the outgoing account A somewhere other than state.json.

@@ -2098,7 +2098,17 @@ fn switch_to_guarded(
         let from = st.active.clone();
         // ~/.claude.json first, keychain last (the commit point), rollback on fail.
         apply_account(provider, &acct, identity, from.as_deref(), &label)?;
+        // A pending live-write marker is only meaningful while its account
+        // stays active with an unwritten renewal. The account leaving the slot
+        // no longer owns it, and the incoming account's blob was just written
+        // to it, so neither may later rewrite the slot over a vendor rotation.
+        if let Some(prev) = from.as_deref() {
+            if let Some(p) = st.find_mut(prev) {
+                p.live_write_pending = None;
+            }
+        }
         if let Some(a) = st.find_mut(email) {
+            a.live_write_pending = None;
             // Rotations are already saved by `oauth::ensure_fresh`; this
             // records an active-slot adoption from `prepare_switch`.
             a.adopt_tokens_if_newer(&acct);
