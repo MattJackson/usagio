@@ -7740,3 +7740,24 @@ fn report_counts_only_claude_swaps() {
         "codex swaps entered the Claude report"
     );
 }
+
+#[test]
+fn an_in_sync_active_cas_does_not_rewrite_state() {
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let blob = mock_claude_blob("live-at", "live-rt", 9_999_999_999_999);
+    let provider = MockActiveSlotProvider::new(&blob);
+    let mut a = Account::from_keychain_blob(&blob).unwrap();
+    a.email = Some(provider.email.clone());
+    seed_claude_state(vec![a], Some(&provider.email.clone()));
+    let backups = || {
+        std::fs::read_dir(crate::store::config_dir().unwrap().join("backups"))
+            .map(|d| d.count())
+            .unwrap_or(0)
+    };
+    // First pass may normalise; an idle repeat must not rotate a backup.
+    let _ = poll_active_cas(&provider, &provider.email.clone()).unwrap();
+    let before = backups();
+    let (outcome, _) = poll_active_cas(&provider, &provider.email.clone()).unwrap();
+    assert!(matches!(outcome, Some(ActiveRefreshOutcome::Adopted)));
+    assert_eq!(backups(), before, "an idle CAS rewrote state.json");
+}

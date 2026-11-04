@@ -2535,6 +2535,30 @@ fn token_selector(sel: &str) -> Result<&str> {
     }
 }
 
+/// The poll's locked active-account CAS: `(outcome, stored account)`. Saves
+/// only when the CAS changed the account, so idle cycles neither rewrite
+/// state.json nor rotate the rolling backups (as `save_if_changed`).
+fn poll_active_cas(
+    provider: &dyn Provider,
+    email: &str,
+) -> Result<(Option<ActiveRefreshOutcome>, Option<Account>)> {
+    with_state_lock(|| {
+        let mut st = State::load()?;
+        let mut changed = false;
+        let outcome = st.find_mut(email).map(|a| {
+            let before = serde_json::to_value(&*a).ok();
+            let outcome = active_refresh_cas(provider, a);
+            changed = serde_json::to_value(&*a).ok() != before;
+            outcome
+        });
+        if changed {
+            st.save()?;
+        }
+        let fresh = st.find(email).cloned();
+        Ok((outcome, fresh))
+    })
+}
+
 /// `usagio token` for the account it saw active. GUARANTEE: never POST /token
 /// for the ACTIVE account (single-use refresh token would invalidate the live
 /// vendor CLI's copy → forced re-login): ADOPT the vendor slot's current token
@@ -3400,18 +3424,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
         let is_active =
             state.active.as_deref() == Some(email.as_str()) && provider.supports_active_refresh();
         if is_active {
-            let email_owned = email.clone();
-            let cas = with_state_lock(|| {
-                let mut st = State::load()?;
-                let outcome = st
-                    .find_mut(&email_owned)
-                    .map(|a| active_refresh_cas(provider, a));
-                if outcome.is_some() {
-                    st.save()?;
-                }
-                let fresh = st.find(&email_owned).cloned();
-                Ok((outcome, fresh))
-            });
+            let cas = poll_active_cas(provider, email);
             match cas {
                 Ok((Some(ActiveRefreshOutcome::RefreshFailed), _)) => {
                     // Keep the existing cache this cycle; retry next tick.
