@@ -3242,7 +3242,11 @@ fn keychain_rotation_is_adopted_only_for_the_matching_identity() {
     with_claude_home("a@e.com", |_| {
         prime_active_slot(&rotated_blob.keychain_blob);
         let mut st = make_state();
+        let reads = CLAUDE_IDENTITY_READS.with(std::cell::Cell::get);
         sync_active_from_keychain(provider, &mut st);
+        // One parse of ~/.claude.json serves both the metadata refresh and
+        // the rotation identity check.
+        assert_eq!(CLAUDE_IDENTITY_READS.with(std::cell::Cell::get) - reads, 1);
         let a = st.find("a@e.com").unwrap();
         assert_eq!(a.access_token, "at-rotated");
         assert_eq!(a.expires_at, 9_999);

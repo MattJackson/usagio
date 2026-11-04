@@ -2380,7 +2380,13 @@ fn mirror_inactive_rotation(
 /// Refresh metadata independently of token rotation. Called again under the
 /// state lock at poll commit so skipped usage fetches still persist the name.
 fn sync_active_claude_identity(state: &mut State) {
-    let (Some(active), (Some(identity), _)) = (state.active.clone(), read_claude_identity()) else {
+    sync_active_claude_identity_from(state, read_claude_identity().0.as_ref());
+}
+
+/// [`sync_active_claude_identity`] against an `oauthAccount` the caller has
+/// already read from `~/.claude.json` (one parse shared across a poll cycle).
+fn sync_active_claude_identity_from(state: &mut State, identity: Option<&serde_json::Value>) {
+    let (Some(active), Some(identity)) = (state.active.clone(), identity) else {
         return;
     };
     let Some(account) = state.find_mut(&active) else {
@@ -2402,7 +2408,7 @@ fn sync_active_claude_identity(state: &mut State) {
         identity.get("accountUuid").and_then(|v| v.as_str()),
         identity.get("emailAddress").and_then(|v| v.as_str()),
     ) {
-        update_claude_identity(account, &identity);
+        update_claude_identity(account, identity);
     }
 }
 
@@ -2463,7 +2469,17 @@ fn update_claude_identity(account: &mut Account, identity: &serde_json::Value) {
 /// we must NOT overwrite its stored tokens. In-place rotation keeps the same
 /// account uuid/email, so legitimate rotation is still captured.
 fn sync_active_from_keychain(provider: &'static dyn Provider, state: &mut State) {
-    sync_active_claude_identity(state);
+    sync_active_from_keychain_with(provider, state, read_claude_identity().0.as_ref());
+}
+
+/// [`sync_active_from_keychain`] against an `oauthAccount` already read from
+/// `~/.claude.json`, so a caller can parse that file once and share it.
+fn sync_active_from_keychain_with(
+    provider: &'static dyn Provider,
+    state: &mut State,
+    json_oauth: Option<&serde_json::Value>,
+) {
+    sync_active_claude_identity_from(state, json_oauth);
     let _ = provider;
     let Some(active) = state.active.clone() else {
         return;
@@ -2472,14 +2488,11 @@ fn sync_active_from_keychain(provider: &'static dyn Provider, state: &mut State)
     let Ok(fresh) = Account::from_keychain_blob(&blob) else {
         return;
     };
-    let (json_oauth, _) = read_claude_identity();
     let json_uuid = json_oauth
-        .as_ref()
         .and_then(|o| o.get("accountUuid"))
         .and_then(|x| x.as_str())
         .map(String::from);
     let json_email = json_oauth
-        .as_ref()
         .and_then(|o| o.get("emailAddress"))
         .and_then(|x| x.as_str())
         .map(str::to_ascii_lowercase);
@@ -3190,8 +3203,17 @@ fn claude_json_path() -> Result<std::path::PathBuf> {
     crate::providers::claude::claude_json_path().context("HOME/USERPROFILE is not set")
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Calls to [`read_claude_identity`] on this thread (each one parses the
+    /// whole of `~/.claude.json`), so tests can pin "parse once".
+    static CLAUDE_IDENTITY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Read the current `oauthAccount` + `userID` from `~/.claude.json`.
 fn read_claude_identity() -> (Option<serde_json::Value>, Option<String>) {
+    #[cfg(test)]
+    CLAUDE_IDENTITY_READS.with(|n| n.set(n.get() + 1));
     let Ok(path) = claude_json_path() else {
         return (None, None);
     };
@@ -3305,7 +3327,10 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
             return RefreshOutcome::default();
         }
     };
-    sync_active_from_keychain(provider, &mut state);
+    // Parse ~/.claude.json once for the whole cycle: the keychain sync and
+    // the commit-time metadata refresh below share this reading.
+    let claude_identity = read_claude_identity().0;
+    sync_active_from_keychain_with(provider, &mut state, claude_identity.as_ref());
     logging::log("poll: refreshing usage cache");
 
     // Per-account fetch floor uses the same tier ramp as `next_interval`; read
@@ -3784,7 +3809,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
     let merged = with_state_lock(|| {
         let mut st = State::load()?;
         let before = serde_json::to_vec(&st).unwrap_or_default();
-        sync_active_claude_identity(&mut st);
+        sync_active_claude_identity_from(&mut st, claude_identity.as_ref());
         for (email, acct, cu, ns) in &updates {
             if let Some(a) = st.find_mut(email) {
                 merge_poll_update(a, acct, cu.as_ref(), ns.as_ref());
