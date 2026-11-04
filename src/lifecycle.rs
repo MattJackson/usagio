@@ -104,10 +104,8 @@ fn prepare_provider_refresh(
     })?;
     // Saved selection can lag a vendor login. A credential currently owned by
     // the client must never be refreshed by us, even if state calls it inactive.
-    if let Some(blob) = matching_active_blob(provider, &snapshot.identity_snapshot())
-        .ok()
-        .flatten()
-    {
+    // A read error fails closed: we cannot prove the client does not own it.
+    if let Some(blob) = matching_active_blob(provider, &snapshot.identity_snapshot())? {
         let grant = provider.parse_stored_blob(&blob)?;
         let adopted = crate::credentials::with_state_lock(|| {
             let mut state = crate::store::State::load()?;
@@ -117,7 +115,9 @@ fn prepare_provider_refresh(
             if account.secret_blob == snapshot.secret_blob {
                 account.secret_blob = blob;
                 account.access_token = grant.access;
-                account.refresh_token = grant.refresh.unwrap_or_default();
+                if let Some(refresh) = grant.refresh {
+                    account.refresh_token = refresh;
+                }
                 account.expires_at = chrono::Utc::now()
                     .timestamp()
                     .saturating_add(grant.expires_in_secs);
@@ -189,7 +189,9 @@ pub fn identity_fields_match(
         (Some(a), Some(b)) => a == b,
         _ => match (expected_email, actual_email) {
             (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-            (None, _) => true,
+            // No expected email: only an expected record with no uuid either
+            // has nothing to contradict; a uuid-only record needs a uuid match.
+            (None, _) => expected_uuid.is_none(),
             _ => false,
         },
     }
@@ -270,8 +272,9 @@ pub(crate) enum ActiveRefreshOutcome {
     /// whatever it currently holds (whether it had drifted or was already in
     /// sync). No token was minted.
     Adopted,
-    /// The slot was unreadable/unparseable; `acct` is left untouched and the
-    /// caller keeps the existing cache for this cycle.
+    /// The slot was unreadable/unparseable, empty, or held a different login;
+    /// `acct` is left untouched and the caller keeps the existing cache for
+    /// this cycle.
     RefreshFailed,
 }
 
@@ -293,13 +296,13 @@ pub(crate) fn active_refresh_cas(
         Ok(Some(b)) => b,
         Ok(None) => {
             logging::log(&format!(
-                "event=active_refresh_adopt_failed account={email} reason=slot_empty"
+                "event=active_refresh_adopt_failed account={email} reason=no_matching_active_login (slot empty or identity mismatch)"
             ));
             return ActiveRefreshOutcome::RefreshFailed;
         }
         Err(e) => {
             logging::log(&format!(
-                "event=active_refresh_adopt_failed account={email} reason=read:{e}"
+                "event=active_refresh_adopt_failed account={email} reason=read:{e:#}"
             ));
             return ActiveRefreshOutcome::RefreshFailed;
         }
@@ -405,13 +408,18 @@ fn provider_active_refresh(slug: &str, acct: &ProviderAccount) -> ProviderRefres
         Ok(Some(blob)) if blob != acct.secret_blob || acct.needs_relogin => {
             match provider.parse_stored_blob(&blob) {
                 Ok(grant) => ProviderRefreshOutcome::Refreshed(blob, grant),
-                Err(_) => ProviderRefreshOutcome::Failed,
+                Err(e) => {
+                    logging::log(&format!(
+                        "event=active_adopt_failed provider={slug} reason=parse:{e:#}"
+                    ));
+                    ProviderRefreshOutcome::Failed
+                }
             }
         }
         Ok(_) => ProviderRefreshOutcome::Nothing,
         Err(e) => {
             logging::log(&format!(
-                "event=active_adopt_failed provider={slug} reason={e}"
+                "event=active_adopt_failed provider={slug} reason={e:#}"
             ));
             ProviderRefreshOutcome::Failed
         }
@@ -434,7 +442,8 @@ pub(crate) fn ensure_claude_fresh(
         skew_secs,
         || {
             let mut current = initial.clone();
-            let (_, active) = adopt_saved_rotation(&mut current);
+            let (_, active) = adopt_saved_rotation(&mut current)
+                .map_err(|e| RefreshError::Transient(format!("reading saved state: {e:#}")))?;
             Ok(PreparedRefresh {
                 expires_at_ms: current.expires_at,
                 owned: active,
@@ -463,10 +472,10 @@ pub(crate) fn ensure_claude_fresh(
 
 /// Adopt the saved tokens if another refresher already rotated this grant.
 /// Returns (adopted, account is now the active one).
-fn adopt_saved_rotation(acct: &mut Account) -> (bool, bool) {
-    let Ok(st) = crate::store::State::load() else {
-        return (false, false);
-    };
+/// A state load failure is an error (fail closed): we cannot tell whether the
+/// account is the vendor-owned active one.
+fn adopt_saved_rotation(acct: &mut Account) -> Result<(bool, bool)> {
+    let st = crate::store::State::load()?;
     let active = st.active.as_deref() == Some(acct.key());
     let adopted = match st.find(acct.key()) {
         Some(saved) if saved.refresh_token != acct.refresh_token => {
@@ -474,7 +483,7 @@ fn adopt_saved_rotation(acct: &mut Account) -> (bool, bool) {
         }
         _ => false,
     };
-    (adopted, active)
+    Ok((adopted, active))
 }
 
 /// Save a rotation of the grant `sent`. Skipped (not an error) when the slot
