@@ -1155,10 +1155,8 @@ mod tests {
         // path + args, `desktop_exec_split` must parse back into the exact
         // (bin, args) pair `restart()` needs.
         let mut exec = desktop_exec_quote("/home/user/My Apps/usagio");
-        for a in ["menubar"] {
-            exec.push(' ');
-            exec.push_str(&desktop_exec_quote(a));
-        }
+        exec.push(' ');
+        exec.push_str(&desktop_exec_quote("menubar"));
         let mut tokens = desktop_exec_split(&exec).unwrap().into_iter();
         let bin = tokens.next().unwrap();
         let rest: Vec<String> = tokens.collect();
