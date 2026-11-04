@@ -264,6 +264,13 @@ impl Money {
     }
 
     fn render(&self, whole_only: bool) -> String {
+        // `Deserialize` bypasses `new`'s exponent check; a corrupt cached value
+        // must not overflow `pow` (panic) or wrap it to 0 (divide by zero).
+        if self.exponent > Self::MAX_EXPONENT {
+            return format!("{}e-{} {}", self.amount_minor, self.exponent, self.unit)
+                .trim_end()
+                .to_string();
+        }
         let scale = 10i128.pow(self.exponent);
         let abs = i128::from(self.amount_minor).abs();
         let whole = group_thousands(abs / scale);
@@ -896,6 +903,18 @@ fn short_hash(v: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deserialized_money_with_huge_exponent_renders_without_panic() {
+        for exp in [39u32, 200] {
+            let m: Money = serde_json::from_str(&format!(
+                r#"{{"amount_minor":5,"exponent":{exp},"unit":"USD"}}"#
+            ))
+            .unwrap();
+            assert!(m.display().contains('5'));
+            assert!(m.display_whole().contains('5'));
+        }
+    }
+
     use super::*;
     use serde_json::json;
 
