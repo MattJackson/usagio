@@ -2147,21 +2147,34 @@ fn probe_installed(_slug: &str) -> bool {
     true
 }
 
-/// Return the parsed state, re-reading state.json only when its mtime changed.
-/// The 0.75s UI tick would otherwise read+parse the file every tick forever.
-/// Only the main thread calls this, but a Mutex keeps it trivially sound.
+/// Identity of one version of state.json: mtime, length and (on unix) inode.
+/// Every save is a tmp+rename, so a new inode tells two saves apart even when
+/// a coarse filesystem clock gives them the same mtime.
+type StateFileKey = Option<(std::time::SystemTime, u64, u64)>;
+
+fn state_file_key(path: &std::path::Path) -> StateFileKey {
+    let m = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(&m);
+    #[cfg(not(unix))]
+    let ino = 0;
+    Some((m.modified().ok()?, m.len(), ino))
+}
+
+/// Return the parsed state, re-reading state.json only when the file changed
+/// (see [`state_file_key`]). The 0.75s UI tick would otherwise read+parse the
+/// file every tick forever. A Mutex keeps the shared cache sound.
 fn cached_state() -> State {
     use std::sync::{Mutex, OnceLock};
-    use std::time::SystemTime;
     struct C {
-        mtime: Option<SystemTime>,
+        key: StateFileKey,
         state: State,
         loaded: bool,
     }
     static CELL: OnceLock<Mutex<C>> = OnceLock::new();
     let cell = CELL.get_or_init(|| {
         Mutex::new(C {
-            mtime: None,
+            key: None,
             state: State::default(),
             loaded: false,
         })
@@ -2169,11 +2182,11 @@ fn cached_state() -> State {
     let path = crate::store::config_dir()
         .map(|d| d.join("state.json"))
         .unwrap_or_default();
-    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    let key = state_file_key(&path);
     let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.loaded || g.mtime != mtime {
+    if !g.loaded || g.key != key {
         g.state = State::load().unwrap_or_default();
-        g.mtime = mtime;
+        g.key = key;
         g.loaded = true;
     }
     g.state.clone()
@@ -7753,14 +7766,46 @@ mod tests {
             "changed mtime reloads"
         );
 
-        // New content but the SAME mtime → the cache is trusted (no re-parse
-        // every 0.75s tick).
-        st.trigger_pct = Some(70.0);
-        save_state_with_mtime(&st, tag2);
+        // The same file rewritten in place (same inode, length and mtime) → the
+        // cache is trusted (no re-parse every 0.75s tick).
+        let path = crate::store::config_dir().unwrap().join("state.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("80.0", "70.0");
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut &f, text.as_bytes()).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000 + tag2))
+            .unwrap();
+        drop(f);
         assert_eq!(
             cached_state().trigger_pct,
             Some(80.0),
             "unchanged mtime hits the cache"
+        );
+    }
+
+    #[test]
+    fn cached_state_reloads_a_save_that_lands_on_the_same_mtime() {
+        let _l = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::store::ScopedConfigDir::new();
+        let tag = next_mtime_tag();
+        let mut st = State {
+            trigger_pct: Some(90.0),
+            ..State::default()
+        };
+        save_state_with_mtime(&st, tag);
+        assert_eq!(cached_state().trigger_pct, Some(90.0));
+        // A second atomic save within one coarse timestamp tick.
+        st.trigger_pct = Some(85.5);
+        save_state_with_mtime(&st, tag);
+        assert_eq!(
+            cached_state().trigger_pct,
+            Some(85.5),
+            "a new save must not be hidden behind an equal mtime"
         );
     }
 
