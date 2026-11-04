@@ -334,6 +334,34 @@ pub(crate) fn active_refresh_cas(
         }
     };
 
+    // A stored grant that is NEWER than the slot's is a renewal whose live
+    // write failed (`persist_claude_login`): adopting the slot here would undo
+    // it. Retry the write instead of adopting.
+    if acct.expires_at > cc_acct.expires_at && acct.refresh_token != cc_acct.refresh_token {
+        let identity = providers::IdentitySnapshot {
+            email: acct.email.clone(),
+            uuid: acct.identity_uuid(),
+            display_name: None,
+            native_blob: serde_json::json!({
+                "oauthAccount": acct.oauth_account.clone().unwrap_or(serde_json::Value::Null),
+                "userID": acct.user_id,
+            }),
+        };
+        return match provider.write_active_account(&acct.keychain_blob, &identity) {
+            Ok(()) => {
+                logging::log(&format!(
+                    "event=active_refresh_rewrote_slot account={email} reason=stored_grant_newer_than_slot"
+                ));
+                ActiveRefreshOutcome::Adopted
+            }
+            Err(e) => {
+                logging::log(&format!(
+                    "event=active_refresh_adopt_failed account={email} reason=slot_rewrite:{e}"
+                ));
+                ActiveRefreshOutcome::RefreshFailed
+            }
+        };
+    }
     let drifted = cc_acct.access_token != acct.access_token;
     let cc_prefix = logging::token_fingerprint(&cc_acct.access_token);
     acct.set_tokens(

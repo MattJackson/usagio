@@ -687,7 +687,11 @@ fn persist_claude_login(
         if active {
             provider
                 .write_active_account(&a.keychain_blob, &identity)
-                .map_err(|e| anyhow!("saved, but making it live failed: {e}"))?;
+                .map_err(|e| {
+                    anyhow!(
+                        "saved, but making it live failed (will be retried on the next poll): {e}"
+                    )
+                })?;
         }
         Ok((a.keychain_blob.clone(), active))
     })?;
@@ -1870,6 +1874,38 @@ fn ensure_fresh_with_fallback(
     }
 }
 
+/// Get a usable bearer for a reset claim. The ACTIVE account's token belongs
+/// to Claude Code: adopt the slot's current one (never POST /token, like
+/// `cmd_token`/`prepare_switch`); any other account refreshes normally.
+fn claim_refresh_token(
+    provider: &'static dyn Provider,
+    email: &str,
+    acct: &mut Account,
+    is_active: bool,
+) -> std::result::Result<(), String> {
+    if is_active {
+        if matches!(
+            active_refresh_cas(provider, acct),
+            ActiveRefreshOutcome::RefreshFailed
+        ) {
+            logging::log(&format!(
+                "claim: active account {email} slot unreadable; using stored token"
+            ));
+        }
+        return Ok(());
+    }
+    match ensure_fresh_with_fallback(provider, email, acct) {
+        Ok(_) => Ok(()),
+        Err(oauth::RefreshError::InvalidGrant) => {
+            flag_needs_relogin(email);
+            Err(format!(
+                "{email} needs re-login before a reset can be claimed"
+            ))
+        }
+        Err(e) => Err(format!("token refresh for {email} failed: {e}")),
+    }
+}
+
 /// Claim a banked usage-limit reset for the Claude account keyed by `email`.
 /// Refreshes the token (a claim must authenticate), reads the org uuid from the
 /// profile and the grant id from the cached usage the menu was built from, then
@@ -1894,16 +1930,12 @@ pub(crate) fn claim_claude_reset(email: &str) -> std::result::Result<usage::Clai
         .find(|g| g.is_available() && g.usable_now)
         .map(|g| g.id.clone())
         .ok_or("no claimable reset on this account")?;
-    match ensure_fresh_with_fallback(provider, email, &mut acct) {
-        Ok(_) => {}
-        Err(oauth::RefreshError::InvalidGrant) => {
-            flag_needs_relogin(email);
-            return Err(format!(
-                "{email} needs re-login before a reset can be claimed"
-            ));
-        }
-        Err(e) => return Err(format!("token refresh for {email} failed: {e}")),
-    }
+    let is_active = State::load().ok().is_some_and(|st| {
+        st.active
+            .as_deref()
+            .is_some_and(|a| a.eq_ignore_ascii_case(email))
+    });
+    claim_refresh_token(provider, email, &mut acct, is_active)?;
     let profile = usage::fetch_profile(&acct.access_token)
         .ok_or("could not read account profile (for organization id)")?;
     let org =
@@ -3278,11 +3310,7 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
             let old_prefix = logging::token_fingerprint(&acct.access_token);
             // The refresh token the request will actually send: the refresh
             // adopts a newer saved rotation from state.json when there is one.
-            let sent_refresh = State::load()
-                .ok()
-                .and_then(|st| st.find(email).map(|a| a.refresh_token.clone()))
-                .filter(|stored| !stored.is_empty())
-                .unwrap_or_else(|| acct.refresh_token.clone());
+            let sent_refresh = stored_refresh_token(email, &acct.refresh_token);
             // Same disk-fallback as the other reactive entry points, so a
             // rotation that exists only on disk doesn't flag needs_relogin.
             match ensure_fresh_with_fallback(provider, email, &mut acct) {
@@ -3320,7 +3348,9 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
                     acct.needs_relogin = true;
                     // The merge only flags if the stored token is still the
                     // one that was rejected.
-                    acct.refresh_token = sent_refresh;
+                    // Re-read: the disk fallback may have adopted (and then had
+                    // rejected) a different token than the one first sent.
+                    acct.refresh_token = stored_refresh_token(email, &sent_refresh);
                     // Fall through to the merge step so the flag is persisted;
                     // skip the usage fetch — a rejected refresh means we don't
                     // have a usable access token to try the usage endpoint with.
@@ -3621,6 +3651,16 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
     }
 }
 
+/// The refresh token currently saved for `email` (what the next refresh sends),
+/// or `fallback` when none is saved.
+fn stored_refresh_token(email: &str, fallback: &str) -> String {
+    State::load()
+        .ok()
+        .and_then(|st| st.find(email).map(|a| a.refresh_token.clone()))
+        .filter(|stored| !stored.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 /// Fold one poll update (computed from a phase-1 snapshot, `snap`) into the
 /// freshly reloaded account `a`. Tokens are already saved (rotations by
 /// `oauth::ensure_fresh`, active-slot adoptions by the CAS). Everything here
@@ -3876,6 +3916,9 @@ fn refresh_provider_usage_caches_with(
             continue;
         };
         let active_key = pa.active.clone();
+        // A cache taken while the new active was INACTIVE must not be trusted
+        // by the active fetch skip (same bypass as the Claude loop).
+        let active_just_switched = note_polled_provider_active(slug, active_key.as_deref());
         let mut keys: Vec<String> = pa.accounts.iter().map(|a| a.key.clone()).collect();
         // Active first: it gets first claim on the request budget, and a 429
         // on it stops this provider's inactive fetches for the cycle.
@@ -3964,7 +4007,7 @@ fn refresh_provider_usage_caches_with(
             if !force && is_active && defer_active.contains(slug) {
                 continue;
             }
-            if !force && is_active {
+            if !force && is_active && !active_just_switched {
                 if let Some(cu) = &acct.cached_usage {
                     {
                         if v2_active_fetch_skip(slug, &key, cu, trigger, now_ts).is_some() {
@@ -4749,6 +4792,28 @@ fn note_polled_active(active: Option<&str>) -> bool {
     let mut last = LAST_POLLED_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
     let changed = last.as_deref() != active;
     *last = active.map(str::to_string);
+    changed
+}
+
+/// Per-provider twin of `note_polled_active`: the active key each non-Claude
+/// provider had at its last poll. Returns true when it changed (or is new).
+fn note_polled_provider_active(slug: &str, active: Option<&str>) -> bool {
+    static LAST: std::sync::Mutex<Option<std::collections::HashMap<String, String>>> =
+        std::sync::Mutex::new(None);
+    let mut guard = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(Default::default);
+    // Tests run in parallel threads sharing one process: keep their state apart.
+    #[cfg(test)]
+    let slug = &format!("{slug}#{:?}", std::thread::current().id());
+    let changed = map.get(slug).map(String::as_str) != active;
+    match active {
+        Some(a) => {
+            map.insert(slug.to_string(), a.to_string());
+        }
+        None => {
+            map.remove(slug);
+        }
+    }
     changed
 }
 

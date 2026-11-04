@@ -3798,6 +3798,8 @@ fn codex_active_account_follows_its_tier() {
     let k = uniq("codex-active");
     let one = |c: CachedUsage, force: bool| {
         reset_usage_fetch_tracker(&fetch_tracker_key("codex", &k));
+        // Not a freshly switched account: the v2 skip applies.
+        note_polled_provider_active("codex", Some(&k));
         codex_one(&k, c, true, force)
     };
     assert_eq!(one(cu(93.0, 10.0, 300), false), 1, "93% polls every 30s");
@@ -6988,4 +6990,86 @@ fn renewing_a_queued_switch_target_forces_the_credential_rewrite() {
         !pending.credentials_written,
         "renewed grant would never be written"
     );
+}
+
+#[test]
+fn active_cas_keeps_a_newer_stored_renewal_and_rewrites_the_slot() {
+    let _g = crate::store::ScopedConfigDir::new();
+    // The slot still holds the old (dead) grant; state holds the renewed one
+    // whose live write failed. The CAS must not revert state to the slot.
+    let old_blob = mock_claude_blob("old-at", "old-rt", 1_000);
+    let new_blob = mock_claude_blob("new-at", "new-rt", 9_999_999_999_999);
+    let provider = MockActiveSlotProvider::new(&old_blob);
+    let mut acct = Account::from_keychain_blob(&new_blob).unwrap();
+    acct.email = Some("active@example.com".into());
+    let outcome = active_refresh_cas(&provider, &mut acct);
+    assert!(
+        matches!(outcome, ActiveRefreshOutcome::Adopted),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        acct.refresh_token, "new-rt",
+        "renewal was reverted to the slot"
+    );
+    assert_eq!(provider.writes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let slot =
+        Account::from_keychain_blob(&provider.slot.lock().unwrap().clone().unwrap()).unwrap();
+    assert_eq!(slot.refresh_token, "new-rt");
+}
+
+#[test]
+fn claim_for_the_active_account_uses_the_slot_token_without_posting() {
+    let _g = crate::store::ScopedConfigDir::new();
+    let (base_url, hits) = spawn_mock_token_server();
+    crate::providers::claude::oauth::set_token_url_override(Some(&format!(
+        "{base_url}/v1/oauth/token"
+    )));
+    let cc_blob = mock_claude_blob("cc-at", "cc-rt", 9_999_999_999_999);
+    let provider: &'static MockActiveSlotProvider =
+        Box::leak(Box::new(MockActiveSlotProvider::new(&cc_blob)));
+    let mut acct =
+        Account::from_keychain_blob(&mock_claude_blob("stale-at", "stale-rt", 1_000)).unwrap();
+    acct.email = Some("active@example.com".into());
+    claim_refresh_token(provider, "active@example.com", &mut acct, true).unwrap();
+    crate::providers::claude::oauth::set_token_url_override(None);
+    assert_eq!(
+        acct.access_token, "cc-at",
+        "claim used the stale stored token"
+    );
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn stored_refresh_token_tracks_a_fallback_adoption() {
+    let _g = crate::store::ScopedConfigDir::new();
+    let mut st = State::default();
+    let mut a = acct_with_cache(None);
+    a.email = Some("rt@e.com".into());
+    a.refresh_token = "T2".into();
+    st.upsert(a);
+    st.save().unwrap();
+    assert_eq!(stored_refresh_token("rt@e.com", "T1"), "T2");
+    assert_eq!(stored_refresh_token("nobody@e.com", "T1"), "T1");
+}
+
+#[test]
+fn note_polled_provider_active_reports_only_a_change_per_slug() {
+    let slug = "polled-active-test";
+    assert!(note_polled_provider_active(slug, Some("a")));
+    assert!(!note_polled_provider_active(slug, Some("a")));
+    assert!(note_polled_provider_active(slug, Some("b")));
+    assert!(!note_polled_provider_active("other-slug-test", None));
+    assert!(note_polled_provider_active(slug, None));
+}
+
+#[test]
+fn freshly_switched_provider_active_bypasses_the_fresh_cache_skip() {
+    let k = uniq("codex-just-switched");
+    reset_usage_fetch_tracker(&fetch_tracker_key("codex", &k));
+    // First poll with this active key: the cache (taken while inactive) is
+    // fresh, yet must be re-fetched.
+    note_polled_provider_active("codex", Some("someone-else"));
+    assert_eq!(codex_one(&k, cu(10.0, 10.0, 10), true, false), 1);
+    // Next poll, same active: the normal skip applies again.
+    assert_eq!(codex_one(&k, cu(10.0, 10.0, 10), true, false), 0);
 }
