@@ -417,6 +417,12 @@ pub struct ProviderAccounts {
 /// entry only costs that entry (kept raw in `unparsed_accounts`), not the
 /// provider's whole slot. Every skipped piece is logged.
 fn parse_provider_accounts(slug: &str, val: &serde_json::Value) -> Option<ProviderAccounts> {
+    let mut pa = parse_provider_accounts_raw(slug, val)?;
+    pa.promote_unparsed(slug);
+    Some(pa)
+}
+
+fn parse_provider_accounts_raw(slug: &str, val: &serde_json::Value) -> Option<ProviderAccounts> {
     let whole_err = match serde_json::from_value::<ProviderAccounts>(val.clone()) {
         Ok(pa) => return Some(pa),
         Err(e) => e,
@@ -502,6 +508,41 @@ fn raw_provider_account_keys(v: &serde_json::Value) -> Vec<(String, String)> {
 }
 
 impl ProviderAccounts {
+    /// Re-attempt every preserved raw entry: those that now parse (hand
+    /// repaired, or written by a newer build) become real accounts unless that
+    /// key is already present; the rest stay raw.
+    fn promote_unparsed(&mut self, slug: &str) {
+        if self.unparsed_accounts.is_empty() {
+            return;
+        }
+        let raw = std::mem::take(&mut self.unparsed_accounts);
+        for entry in raw {
+            match serde_json::from_value::<ProviderAccount>(entry.clone()) {
+                Ok(a) => {
+                    if self.find(&a.key).is_none() {
+                        crate::logging::log(&format!(
+                            "providers.{slug}: preserved entry {} now parses; restored",
+                            a.key
+                        ));
+                        self.accounts.push(a);
+                    }
+                }
+                Err(_) => self.unparsed_accounts.push(entry),
+            }
+        }
+    }
+
+    /// Drop any preserved raw entry whose `key` matches `key`.
+    fn drop_unparsed(&mut self, key: &str) -> bool {
+        let before = self.unparsed_accounts.len();
+        self.unparsed_accounts.retain(|e| {
+            !e.get("key")
+                .and_then(|k| k.as_str())
+                .is_some_and(|k| k.eq_ignore_ascii_case(key))
+        });
+        self.unparsed_accounts.len() != before
+    }
+
     pub fn find(&self, key: &str) -> Option<&ProviderAccount> {
         self.accounts
             .iter()
@@ -515,6 +556,8 @@ impl ProviderAccounts {
     }
 
     pub fn upsert(&mut self, acct: ProviderAccount) {
+        // A fresh capture supersedes a stale unparseable copy of the same key.
+        self.drop_unparsed(&acct.key);
         if let Some(existing) = self.find_mut(&acct.key) {
             *existing = acct;
         } else {
@@ -1185,7 +1228,8 @@ impl State {
         };
         let before = pa.accounts.len();
         pa.accounts.retain(|a| !a.key.eq_ignore_ascii_case(key));
-        let changed = pa.accounts.len() != before;
+        let dropped_raw = pa.drop_unparsed(key);
+        let changed = pa.accounts.len() != before || dropped_raw;
         if changed {
             if pa
                 .active

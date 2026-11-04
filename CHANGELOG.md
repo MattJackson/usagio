@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A malformed provider account entry in `state.json` no longer drops the provider's other accounts; it is preserved as `unparsed_accounts` and re-parsed on each load. Downgrading to an older build that does not know `unparsed_accounts` will discard those preserved entries on its next save (a rolling backup under `backups/` still holds them).
+
 ## [1.0.8] - 2026-10-31
 
 ### Fixed

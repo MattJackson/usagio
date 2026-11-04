@@ -1582,3 +1582,35 @@ fn pre_restore_stashes_are_pruned_to_a_small_cap() {
         .count();
     assert!(n <= 5, "pre-restore stashes must be capped, found {n}");
 }
+
+#[test]
+fn unparsed_entry_that_now_parses_is_promoted_on_load() {
+    let _g = ScopedConfigDir::new();
+    let good = serde_json::to_value(provider_account("fixed@e.com")).unwrap();
+    let raw = serde_json::json!({
+        "schema_version": 2, "accounts": [],
+        "providers": { "codex": { "accounts": [], "unparsed_accounts": [good] } }
+    });
+    std::fs::write(config_dir().unwrap().join("state.json"), raw.to_string()).unwrap();
+    let st = State::load().unwrap();
+    let pa = &st.providers["codex"];
+    assert_eq!(pa.accounts.len(), 1);
+    assert!(pa.unparsed_accounts.is_empty());
+}
+
+#[test]
+fn upsert_and_remove_drop_the_stale_raw_entry() {
+    let _g = ScopedConfigDir::new();
+    seed_state_with_bad_codex_entry();
+    let mut st = State::load().unwrap();
+    st.upsert_provider_account("codex", provider_account("bad@e.com"));
+    assert!(st.providers["codex"].unparsed_accounts.is_empty());
+    st.save().unwrap();
+
+    seed_state_with_bad_codex_entry();
+    let mut st = State::load().unwrap();
+    assert!(st.remove_provider_account("codex", "bad@e.com"));
+    st.save().expect("authorised removal of a raw entry must save");
+    let on_disk = std::fs::read_to_string(config_dir().unwrap().join("state.json")).unwrap();
+    assert!(!on_disk.contains("bad@e.com"), "{on_disk}");
+}
