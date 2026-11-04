@@ -571,6 +571,12 @@ pub(crate) fn persist_login(
             no_subscription: existing.as_ref().is_some_and(|a| a.no_subscription),
             plan: existing.as_ref().and_then(|a| a.plan.clone()),
         };
+        if let Some(store) = new_store {
+            state
+                .provider_accounts_mut(slug)
+                .login_stores
+                .insert(key.to_lowercase(), store.to_string());
+        }
         let active = state.provider_accounts_mut(slug).active.as_deref() == Some(key.as_str());
         // A switch to a DIFFERENT account is already queued: never overwrite
         // that intent. Stage the renewed tokens only; the queued switch

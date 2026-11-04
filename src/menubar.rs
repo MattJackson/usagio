@@ -3595,16 +3595,18 @@ fn capture_serialized(slug: &str) {
 /// "Renew login…": run the provider's own login in usagio's sign-in window —
 /// the default browser where no window can be shown — and save the result
 /// (see `crate::login`). Runs on the UI thread; the wait happens off it.
-/// Sign-in window store for a renew. `State::find` searches Claude accounts
-/// only, so its `login_store` applies only to a Claude renew; any other
-/// provider keys its store by the account key.
-fn renew_login_store(st: &State, slug: &str, key: &str) -> String {
-    if slug == CLAUDE_SLUG {
-        if let Some(store) = st.find(key).and_then(|a| a.login_store.clone()) {
-            return store;
-        }
-    }
-    key.to_string()
+/// Sign-in window store for a renew: the store the account was added with
+/// (Claude: `Account::login_store`; any other provider: its slot's
+/// `login_stores`), else one keyed by the account key.
+pub(crate) fn renew_login_store(st: &State, slug: &str, key: &str) -> String {
+    let added = if slug == CLAUDE_SLUG {
+        st.find(key).and_then(|a| a.login_store.clone())
+    } else {
+        st.provider_accounts(slug)
+            .and_then(|pa| pa.login_store(key))
+            .map(String::from)
+    };
+    added.unwrap_or_else(|| key.to_string())
 }
 
 fn handle_renew(slug: &str, key: &str) {
@@ -3793,7 +3795,7 @@ fn track_flow_store(store: [u8; 16], progress: std::sync::Arc<crate::login::Prog
 
 /// Every sign-in store still wanted: each saved account's (the one its
 /// "Renew login…" opens, [`renew_login_store`]) plus those of running flows.
-fn sign_in_stores_to_keep(st: &State) -> std::collections::HashSet<[u8; 16]> {
+pub(crate) fn sign_in_stores_to_keep(st: &State) -> std::collections::HashSet<[u8; 16]> {
     let claude = st
         .accounts
         .iter()

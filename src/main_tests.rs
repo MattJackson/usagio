@@ -8105,3 +8105,49 @@ fn a_refresh_failure_reaches_the_row_until_a_fetch_succeeds() {
     assert_eq!(row_from_account(&a).error, None);
     assert_eq!(row_from_provider_account("codex", &p).error, None);
 }
+
+#[test]
+fn a_provider_account_added_by_sign_in_keeps_its_store_through_a_sweep() {
+    // "Sign in to a new Codex account…" used a fresh store; its renewals must
+    // reopen that session, so the store sweep must keep it.
+    let _cfg = crate::store::ScopedConfigDir::new();
+    let provider = MockActiveSlotProvider::new("outgoing");
+    let slug = provider.provider_id();
+    let k = "added@example.com";
+    let captured = providers::trait_def::CapturedAccount {
+        identity: providers::IdentitySnapshot {
+            email: Some(k.into()),
+            uuid: None,
+            display_name: None,
+            native_blob: serde_json::Value::Null,
+        },
+        secret_blob: "added".into(),
+        tokens: providers::trait_def::TokenGrant {
+            access: "added-at".into(),
+            refresh: Some("added-rt".into()),
+            expires_in_secs: 3600,
+        },
+    };
+    persist_login(&provider, captured, Some("new:fresh")).unwrap();
+    let state = State::load().unwrap();
+    assert_eq!(
+        crate::menubar::renew_login_store(&state, slug, k),
+        "new:fresh",
+        "a renew must reopen the store the account signed in with"
+    );
+    let keep = crate::menubar::sign_in_stores_to_keep(&state);
+    assert!(
+        keep.contains(&login::store_id(slug, "new:fresh")),
+        "the sweep would delete the account's working sign-in session"
+    );
+    // Removing the account forgets the store, so the sweep reclaims it.
+    remove_provider_account_generic(slug, k).unwrap();
+    let state = State::load().unwrap();
+    assert!(state
+        .provider_accounts(slug)
+        .unwrap()
+        .login_stores
+        .is_empty());
+    assert!(!crate::menubar::sign_in_stores_to_keep(&state)
+        .contains(&login::store_id(slug, "new:fresh")));
+}

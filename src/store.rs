@@ -444,6 +444,21 @@ pub struct ProviderAccounts {
     /// silently erased by the next save (and the overwrite guard counts them).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unparsed_accounts: Vec<serde_json::Value>,
+    /// Sign-in window store an account was added with ("Sign in to a new
+    /// account…"), keyed by lowercased account key, so its renewals reopen
+    /// that session (see `login::new_store_key`). Claude keeps this on
+    /// `Account::login_store` instead.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub login_stores: std::collections::HashMap<String, String>,
+}
+
+impl ProviderAccounts {
+    /// The sign-in store `key` was added with, if remembered.
+    pub fn login_store(&self, key: &str) -> Option<&str> {
+        self.login_stores
+            .get(&key.to_lowercase())
+            .map(String::as_str)
+    }
 }
 
 /// Parse one `providers.<slug>` value. Fast path is a whole-struct parse; when
@@ -477,6 +492,14 @@ fn parse_provider_accounts_raw(slug: &str, val: &serde_json::Value) -> Option<Pr
         }
     }
     pa.active = obj.get("active").and_then(|x| x.as_str()).map(String::from);
+    if let Some(stores) = obj.get("login_stores") {
+        match serde_json::from_value(stores.clone()) {
+            Ok(m) => pa.login_stores = m,
+            Err(e) => crate::logging::log(&format!(
+                "warn: failed to parse providers.{slug}.login_stores, dropping it: {e}"
+            )),
+        }
+    }
     for (field, is_raw) in [("accounts", false), ("unparsed_accounts", true)] {
         let Some(arr) = obj.get(field).and_then(|x| x.as_array()) else {
             continue;
@@ -1269,6 +1292,7 @@ impl State {
         let dropped_raw = pa.drop_unparsed(key);
         let changed = pa.accounts.len() != before || dropped_raw;
         if changed {
+            pa.login_stores.remove(&key.to_lowercase());
             if pa
                 .active
                 .as_deref()
