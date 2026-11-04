@@ -1916,7 +1916,7 @@ fn prepare_switch(
         match ensure_fresh_with_fallback(provider, email, &mut acct) {
             Ok(_) => {}
             Err(oauth::RefreshError::InvalidGrant) => {
-                flag_needs_relogin(email);
+                flag_needs_relogin(email, &acct.refresh_token);
                 bail!(
                     "account {email} needs re-login (refresh token rejected); run \
                      `claude /login` for it or click the account row in the menu"
@@ -2009,7 +2009,7 @@ fn claim_refresh_token(
     match ensure_fresh_with_fallback(provider, email, acct) {
         Ok(_) => Ok(()),
         Err(oauth::RefreshError::InvalidGrant) => {
-            flag_needs_relogin(email);
+            flag_needs_relogin(email, &acct.refresh_token);
             Err(format!(
                 "{email} needs re-login before a reset can be claimed"
             ))
@@ -2055,11 +2055,13 @@ pub(crate) fn claim_claude_reset(email: &str) -> std::result::Result<usage::Clai
     usage::claim_reset(&acct.access_token, &org, &grant_id).map_err(|e| e.to_string())
 }
 
-/// Best-effort: mark an account `needs_relogin=true` in state.json. If the
-/// state lock is held or the save fails, the next `refresh_usage_cache` tick
-/// re-observes the invalid_grant and sets it again — callers that need
+/// Best-effort: mark an account `needs_relogin=true` in state.json, but only
+/// while it still holds `rejected_refresh_token` (the grant `ensure_fresh`
+/// reports it sent): a rotation or renewal saved meanwhile is not flagged. If
+/// the state lock is held or the save fails, the next `refresh_usage_cache`
+/// tick re-observes the invalid_grant and sets it again — callers that need
 /// certainty already surface a distinct error to the user.
-fn flag_needs_relogin(email: &str) {
+fn flag_needs_relogin(email: &str, rejected_refresh_token: &str) {
     // L7 (round-1 codeaudit): the previous `let _ =` swallowed save errors
     // silently, so a persistent state.json write failure would never be
     // visible in the log. The next `refresh_usage_cache` tick re-sets the
@@ -2068,14 +2070,13 @@ fn flag_needs_relogin(email: &str) {
     logging::log(&format!(
         "event=needs_relogin account={email} reason=invalid_grant"
     ));
-    if let Err(e) = with_state_lock(|| {
-        let mut st = State::load()?;
-        if let Some(a) = st.find_mut(email) {
-            a.needs_relogin = true;
-        }
-        st.save()
-    }) {
-        logging::log(&format!("flag_needs_relogin({email}): save failed: {e:#}"));
+    match credentials::flag_needs_relogin_if_unchanged(email, rejected_refresh_token) {
+        Ok(credentials::FlagOutcome::Rotated) => logging::log(&format!(
+            "flag_needs_relogin({email}): refresh token changed since the \
+             invalid_grant; not flagging"
+        )),
+        Ok(_) => {}
+        Err(e) => logging::log(&format!("flag_needs_relogin({email}): save failed: {e:#}")),
     }
 }
 
@@ -2651,7 +2652,7 @@ fn cmd_token(selector: Option<&str>) -> Result<()> {
                 // `ensure_fresh` saved any rotation itself.
                 Ok(_) => acct,
                 Err(oauth::RefreshError::InvalidGrant) => {
-                    flag_needs_relogin(&email);
+                    flag_needs_relogin(&email, &acct.refresh_token);
                     bail!(
                         "account {email} needs re-login (refresh token rejected); run \
                          `claude /login` for it or click the account row in the menu"
@@ -3457,9 +3458,6 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
         } else {
             // Fingerprint BEFORE the refresh replaces the token in place.
             let old_prefix = logging::token_fingerprint(&acct.access_token);
-            // The refresh token the request will actually send: the refresh
-            // adopts a newer saved rotation from state.json when there is one.
-            let sent_refresh = stored_refresh_token(email, &acct.refresh_token);
             // Same disk-fallback as the other reactive entry points, so a
             // rotation that exists only on disk doesn't flag needs_relogin.
             match ensure_fresh_with_fallback(provider, email, &mut acct) {
@@ -3496,10 +3494,9 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
                     ));
                     acct.needs_relogin = true;
                     // The merge only flags if the stored token is still the
-                    // one that was rejected.
-                    // Re-read: the disk fallback may have adopted (and then had
-                    // rejected) a different token than the one first sent.
-                    acct.refresh_token = stored_refresh_token(email, &sent_refresh);
+                    // one that was rejected: `ensure_fresh` left `acct`
+                    // holding the grant it actually sent (a saved rotation or
+                    // the disk fallback's may differ from the snapshot's).
                     // Fall through to the merge step so the flag is persisted;
                     // skip the usage fetch — a rejected refresh means we don't
                     // have a usable access token to try the usage endpoint with.
@@ -3805,16 +3802,6 @@ fn refresh_usage_cache_with(force: bool, defer_active: bool) -> RefreshOutcome {
         fetched,
         failed: outcomes.len() - fetched + refresh_failed,
     }
-}
-
-/// The refresh token currently saved for `email` (what the next refresh sends),
-/// or `fallback` when none is saved.
-fn stored_refresh_token(email: &str, fallback: &str) -> String {
-    State::load()
-        .ok()
-        .and_then(|st| st.find(email).map(|a| a.refresh_token.clone()))
-        .filter(|stored| !stored.is_empty())
-        .unwrap_or_else(|| fallback.to_string())
 }
 
 /// Fold one poll update (computed from a phase-1 snapshot, `snap`) into the

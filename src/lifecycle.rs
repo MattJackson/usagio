@@ -490,6 +490,9 @@ pub(crate) fn ensure_claude_fresh(
         return Ok(false);
     }
     let initial = acct.clone();
+    // The account whose grant was actually POSTed: `prepare` may have adopted
+    // a newer saved rotation, so on failure the caller's copy is stale.
+    let sent = std::cell::RefCell::new(None::<Account>);
     let refreshed = refresh_transaction::<_, RefreshError>(
         skew_secs,
         || {
@@ -508,7 +511,9 @@ pub(crate) fn ensure_claude_fresh(
             Ok(candidate)
         },
         |snapshot, response| {
-            let candidate = response?;
+            let candidate = response.inspect_err(|_| {
+                *sent.borrow_mut() = Some(snapshot.clone());
+            })?;
             save_rotation(&candidate, &snapshot.refresh_token).map_err(|error| {
                 RefreshError::Transient(format!(
                     "refreshed, but saving the new token failed: {error:#}"
@@ -516,7 +521,19 @@ pub(crate) fn ensure_claude_fresh(
             })?;
             Ok(candidate)
         },
-    )?;
+    );
+    let refreshed = match refreshed {
+        Ok(r) => r,
+        Err(e) => {
+            // Hand back the grant that was rejected, so a re-login flag CAS
+            // (`flag_needs_relogin_if_unchanged`, the poll merge) compares
+            // against the token actually sent rather than the caller's copy.
+            if let Some(sent) = sent.into_inner() {
+                *acct = sent;
+            }
+            return Err(e);
+        }
+    };
     let changed = refreshed.keychain_blob != initial.keychain_blob;
     *acct = refreshed;
     Ok(changed)

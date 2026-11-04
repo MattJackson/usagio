@@ -2587,10 +2587,21 @@ fn flag_needs_relogin_marks_only_that_account() {
         ],
         None,
     );
-    flag_needs_relogin("dead@e.com");
+    flag_needs_relogin("dead@e.com", "rt-dead@e.com");
     let st = State::load().unwrap();
     assert!(st.find("dead@e.com").unwrap().needs_relogin);
     assert!(!st.find("fine@e.com").unwrap().needs_relogin);
+}
+
+#[test]
+fn flag_needs_relogin_spares_an_account_whose_grant_was_replaced() {
+    // The rejected grant is not the one saved now (a renewal or rotation
+    // landed meanwhile): the saved login is healthy and must stay unflagged.
+    let _g = crate::store::ScopedConfigDir::new();
+    seed_claude_state(vec![claude_account("renewed@e.com", 3_600_000)], None);
+    flag_needs_relogin("renewed@e.com", "an-older-rt");
+    let st = State::load().unwrap();
+    assert!(!st.find("renewed@e.com").unwrap().needs_relogin);
 }
 
 #[test]
@@ -7390,19 +7401,6 @@ fn claim_for_the_active_account_uses_the_slot_token_without_posting() {
         "claim used the stale stored token"
     );
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
-}
-
-#[test]
-fn stored_refresh_token_tracks_a_fallback_adoption() {
-    let _g = crate::store::ScopedConfigDir::new();
-    let mut st = State::default();
-    let mut a = acct_with_cache(None);
-    a.email = Some("rt@e.com".into());
-    a.refresh_token = "T2".into();
-    st.upsert(a);
-    st.save().unwrap();
-    assert_eq!(stored_refresh_token("rt@e.com", "T1"), "T2");
-    assert_eq!(stored_refresh_token("nobody@e.com", "T1"), "T1");
 }
 
 #[test]

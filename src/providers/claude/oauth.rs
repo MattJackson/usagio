@@ -111,6 +111,10 @@ pub(crate) fn refresh(acct: &mut Account) -> Result<bool, RefreshError> {
 /// account for re-login. So under a cross-process lock we first adopt any
 /// rotation someone else already saved, and only POST if that's still stale —
 /// then save before releasing the lock, so the next refresher sees it.
+///
+/// On a failed request `acct` is left holding the grant that was actually
+/// sent (which may be a newer saved rotation than the one passed in), so a
+/// re-login flag can compare against the token that was rejected.
 pub fn ensure_fresh(acct: &mut Account, skew_secs: i64) -> Result<bool, RefreshError> {
     crate::lifecycle::ensure_claude_fresh(acct, skew_secs)
 }

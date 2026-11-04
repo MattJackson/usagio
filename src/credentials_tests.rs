@@ -1148,6 +1148,35 @@ fn ensure_fresh_adopts_a_rotation_already_saved_instead_of_reposting() {
 }
 
 #[test]
+fn ensure_fresh_reports_the_grant_it_sent_when_that_grant_is_rejected() {
+    // The caller's copy holds an older grant; ensure_fresh adopts the newer
+    // saved (still expired) rotation and sends that. On invalid_grant the
+    // caller must see the token that was rejected, or its re-login CAS
+    // compares against the wrong one and skips flagging a dead account.
+    with_isolated_home(|| {
+        let mut saved = expired_account("sent@example.com");
+        saved.set_tokens("rotated-at".into(), "rotated-rt".into(), 1);
+        seed_state(vec![saved], None);
+        let (url, hits) = spawn_token_server(400, || {});
+        let _u = TokenUrlGuard::set(&url);
+
+        let mut stale = expired_account("sent@example.com");
+        let err = crate::providers::claude::oauth::ensure_fresh(&mut stale, 900).unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::providers::claude::oauth::RefreshError::InvalidGrant
+        ));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(stale.refresh_token, "rotated-rt", "the grant actually sent");
+        assert_eq!(
+            flag_needs_relogin_if_unchanged("sent@example.com", &stale.refresh_token).unwrap(),
+            FlagOutcome::Flagged
+        );
+    });
+}
+
+#[test]
 fn a_refresh_in_flight_never_overwrites_a_renewed_login() {
     // "Renew login…" saved a brand-new login while a poll's refresh of the
     // old grant was on the wire; the older family must not win on expiry.
