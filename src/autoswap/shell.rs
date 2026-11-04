@@ -324,6 +324,14 @@ pub(crate) fn failure_kind(e: &anyhow::Error) -> &'static str {
     }
 }
 
+/// A cycle that does not switch ends the failure episode, so a later one
+/// notifies again.
+pub(crate) fn clear_failure_on_stay(last: &mut Option<(String, &'static str)>, action: &Action) {
+    if !matches!(action, Action::Switch { .. }) {
+        *last = None;
+    }
+}
+
 /// Record a failed switch to `to`; true when the user should be told (the
 /// first failure of this (target, kind) since the last success).
 pub(crate) fn should_notify_failure(
@@ -675,7 +683,10 @@ pub(crate) fn run_cycle(
                 }
             }
         }
-    } else if shell.log.should_log(&d) {
+    } else {
+        clear_failure_on_stay(&mut shell.last_failure, &d.action);
+    }
+    if !matches!(d.action, Action::Switch { .. }) && shell.log.should_log(&d) {
         let target = d
             .blocked_target
             .as_deref()

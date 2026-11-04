@@ -1215,10 +1215,7 @@ fn commit_provider_switch_guarded(
             let other_queued = pa
                 .and_then(|pa| pa.pending_switch.as_ref())
                 .is_some_and(|p| !p.key.eq_ignore_ascii_case(key));
-            if !still_active
-                || other_queued
-                || autoswap::shell::pick_diverged_from_armed(slug, &state)
-            {
+            if !still_active || other_queued {
                 return Ok(None);
             }
         }

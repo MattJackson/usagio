@@ -1902,6 +1902,27 @@ fn failed_switch_notifies_once_per_target_and_kind() {
 }
 
 #[test]
+fn stay_cycle_ends_the_failure_episode() {
+    use super::shell::{clear_failure_on_stay, should_notify_failure as notify};
+    let mut last = None;
+    assert!(notify(&mut last, "b@e.com", "auth"));
+    let sw = Action::Switch {
+        to: "b@e.com".into(),
+        kind: Kind::Trigger,
+    };
+    clear_failure_on_stay(&mut last, &sw);
+    assert!(
+        !notify(&mut last, "b@e.com", "auth"),
+        "still the same episode"
+    );
+    clear_failure_on_stay(&mut last, &Action::Stay);
+    assert!(
+        notify(&mut last, "b@e.com", "auth"),
+        "a new episode notifies"
+    );
+}
+
+#[test]
 fn failure_kind_classifies_causes() {
     let k = |s: &str| super::shell::failure_kind(&anyhow::anyhow!("{s}"));
     assert_eq!(k("keychain write denied"), "credential-write");
