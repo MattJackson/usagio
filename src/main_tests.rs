@@ -356,15 +356,18 @@ fn row_from_account_tags_provider_id_claude() {
 #[test]
 fn env_override_active_reads_shared_slug_map() {
     // The hook drives both the menu (via menubar::env_override_for) and the
-    // swap filter — one source of truth for the whole app.
-    assert!(!env_override_active(CLAUDE_SLUG));
-    with_env_override_hook(&[CLAUDE_SLUG], || {
-        assert!(env_override_active(CLAUDE_SLUG));
-        // Unknown / non-Claude slugs are unaffected by the Claude env var.
-        assert!(!env_override_active("codex"));
+    // swap filter — one source of truth for the whole app. The un-hooked
+    // answer falls through to the real env var, so pin it unset first.
+    crate::env_lock::scoped_env_var(CLAUDE_ENV_OVERRIDE_VAR, None, || {
+        assert!(!env_override_active(CLAUDE_SLUG));
+        with_env_override_hook(&[CLAUDE_SLUG], || {
+            assert!(env_override_active(CLAUDE_SLUG));
+            // Unknown / non-Claude slugs are unaffected by the Claude env var.
+            assert!(!env_override_active("codex"));
+        });
+        // Restored on exit.
+        assert!(!env_override_active(CLAUDE_SLUG));
     });
-    // Restored on exit.
-    assert!(!env_override_active(CLAUDE_SLUG));
 }
 
 // --- next_interval (backoff + adaptive cadence) ---
