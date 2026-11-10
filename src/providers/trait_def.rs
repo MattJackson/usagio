@@ -184,12 +184,58 @@ pub(crate) struct ResetGrant {
     /// When the grant expires and can no longer be claimed, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) expires_at: Option<DateTime<Utc>>,
+    /// The limits a claim would clear, each with its current usage %, as the
+    /// provider reports them (Claude: `clears` + `percent_used`, keyed
+    /// `five_hour`, `seven_day`, `seven_day_overage_included`, …). Empty when
+    /// the provider doesn't say (Codex).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) clears: Vec<ClearedLimit>,
 }
+
+/// One limit a reset grant clears, and how full it is right now.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ClearedLimit {
+    pub(crate) key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pct: Option<f64>,
+}
+
+impl Eq for ClearedLimit {}
+
+/// Provider keys for the 5-hour session and the weekly window.
+pub(crate) const SESSION_LIMIT_KEY: &str = "five_hour";
+pub(crate) const WEEKLY_LIMIT_KEY: &str = "seven_day";
 
 impl ResetGrant {
     /// A grant worth surfacing: it still has a reset left to spend.
     pub(crate) fn is_available(&self) -> bool {
         self.resets_left >= 1
+    }
+
+    fn clears_key(&self, key: &str) -> bool {
+        self.clears.iter().any(|c| c.key == key)
+    }
+
+    /// Clears the 5-hour session limit.
+    pub(crate) fn clears_session(&self) -> bool {
+        self.clears_key(SESSION_LIMIT_KEY)
+    }
+
+    /// Clears the weekly limit.
+    pub(crate) fn clears_weekly(&self) -> bool {
+        self.clears_key(WEEKLY_LIMIT_KEY)
+    }
+
+    /// Claiming now would give something back: the provider allows it and at
+    /// least one limit it clears has usage on it. A grant whose only target is
+    /// an empty bucket (e.g. a weekly-capped Claude account, where it clears
+    /// just the unused extra-usage bucket) is spent for nothing — not ready.
+    /// When the provider doesn't list what it clears, trust `usable_now`.
+    pub(crate) fn is_ready(&self) -> bool {
+        self.is_available()
+            && self.usable_now
+            && (self.clears.is_empty()
+                || self.clears.iter().any(|c| c.pct.is_some_and(|p| p > 0.0)))
     }
 }
 

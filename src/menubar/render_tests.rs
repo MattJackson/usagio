@@ -8,7 +8,7 @@ use crate::menubar::test_support::{
     SNAPSHOT_LOCK,
 };
 use crate::providers::trait_def::{
-    Credits, Money, ReportedUsage, ResetGrant, UsageShare, UsageWindow,
+    ClearedLimit, Credits, Money, ReportedUsage, ResetGrant, UsageShare, UsageWindow,
 };
 use crate::providers::CLAUDE_SLUG;
 use crate::store::State;
@@ -326,7 +326,7 @@ fn credits_row_shows_available_amount_under_the_spending_cap() {
     c.balance = usd(1200);
     assert_eq!(credits_row(&c).as_deref(), Some("Credits · $12.00"));
     c.used = usd(10000);
-    assert_eq!(credits_row(&c).as_deref(), Some("Credits · 0"));
+    assert_eq!(credits_row(&c), None, "nothing left to spend → no row");
     c.balance = Money::new(63649, 2, Money::CREDITS);
     c.limit = None;
     c.used = None;
@@ -354,7 +354,7 @@ fn credits_row_reports_none_for_disabled_empty_or_capped_accounts() {
             ..Credits::default()
         },
     ] {
-        assert_eq!(credits_row(&c).as_deref(), Some("Credits · 0"));
+        assert_eq!(credits_row(&c), None, "{c:?}");
     }
 }
 
@@ -422,7 +422,10 @@ fn reset_gift_tracks_inactive_accounts_across_providers() {
     );
     let base = title_for(&snap);
     snap.sections[1].accounts[0].active = false;
+    // A saved (not claimable now) reset gets no 🎁 — only a ready one does.
     snap.sections[1].accounts[0].reported.reset_grants = vec![reset_fixture(false)];
+    assert_eq!(title_for(&snap), base);
+    snap.sections[1].accounts[0].reported.reset_grants = vec![reset_fixture(true)];
     assert_eq!(title_for(&snap), format!("{base} 🎁"));
     let a = &snap.sections[1].accounts[0];
     assert!(account_header_row(&snap.sections[1], a)
@@ -445,43 +448,86 @@ fn reset_gift_tracks_inactive_accounts_across_providers() {
     );
 }
 
-#[test]
-fn reset_grant_row_text_by_state() {
-    let mk = |resets_left: u32, usable_now: bool| ResetGrant {
-        id: "g1".into(),
-        label: "Opus launch".into(),
-        resets_left,
+fn cleared(key: &str, pct: f64) -> ClearedLimit {
+    ClearedLimit {
+        key: key.into(),
+        pct: Some(pct),
+    }
+}
+
+fn grant_with(id: &str, usable_now: bool, clears: Vec<ClearedLimit>) -> ResetGrant {
+    ResetGrant {
+        id: id.into(),
+        label: "Fable launch".into(),
+        resets_left: 1,
         usable_now,
-        expires_at: None,
-    };
+        expires_at: Some(Utc::now() + chrono::Duration::days(119)),
+        clears,
+    }
+}
+
+#[test]
+fn reset_rows_say_session_or_weekly_and_merge_duplicates() {
+    // Session-capped account (live shape: clears five_hour at 99%).
+    let session = grant_with(
+        "a",
+        true,
+        vec![
+            cleared("five_hour", 99.0),
+            cleared("seven_day_overage_included", 0.0),
+        ],
+    );
+    assert_eq!(
+        reset_grant_rows(std::slice::from_ref(&session)),
+        vec![("🎁 Session reset ready".to_string(), true)]
+    );
+    // Weekly-capped account: server says usable, but the only thing it
+    // clears is an empty bucket — claiming would waste it (dev7).
+    let wasted = |id: &str| grant_with(id, true, vec![cleared("seven_day_overage_included", 0.0)]);
+    assert_eq!(
+        reset_grant_rows(&[wasted("a")]),
+        vec![("🎁 Reset saved · won't clear weekly".to_string(), false)]
+    );
+    // Three identical grants collapse into one counted row (matthew@pq).
+    assert_eq!(
+        reset_grant_rows(&[wasted("a"), wasted("b"), wasted("c")]),
+        vec![("🎁 3 resets saved · won't clear weekly".to_string(), false)]
+    );
+    // A weekly reset says so.
+    let weekly = grant_with("w", true, vec![cleared("seven_day", 100.0)]);
+    assert_eq!(
+        reset_grant_rows(&[weekly]),
+        vec![("🎁 Weekly reset ready".to_string(), true)]
+    );
     // Spent → no row.
-    assert_eq!(reset_grant_row(&mk(0, true)), None);
-    // Usable now → ready.
-    assert_eq!(
-        reset_grant_row(&mk(1, true)).as_deref(),
-        Some("🎁 1 reset ready")
-    );
-    // Banked but not usable → banked.
-    assert_eq!(
-        reset_grant_row(&mk(1, false)).as_deref(),
-        Some("🎁 1 reset banked")
-    );
-    // Expiry is appended when known.
-    let mut g = mk(1, true);
+    let mut spent = session.clone();
+    spent.resets_left = 0;
+    assert!(reset_grant_rows(&[spent]).is_empty());
+}
+
+#[test]
+fn reset_rows_without_clears_trust_the_provider_flag() {
+    // Codex doesn't say what a reset clears.
+    let mk = |n: u32, usable_now: bool| ResetGrant {
+        id: "c".into(),
+        resets_left: n,
+        usable_now,
+        ..ResetGrant::default()
+    };
+    assert_eq!(reset_grant_rows(&[mk(1, true)])[0].0, "🎁 Reset ready");
+    assert_eq!(reset_grant_rows(&[mk(2, false)])[0].0, "🎁 2 resets saved");
+}
+
+#[test]
+fn reset_expiry_shows_only_when_close() {
+    let mut g = grant_with("a", true, vec![cleared("five_hour", 99.0)]);
+    assert!(!reset_grant_rows(std::slice::from_ref(&g))[0]
+        .0
+        .contains("expires"));
     g.expires_at = Some(Utc::now() + chrono::Duration::days(3));
-    assert!(reset_grant_row(&g)
-        .unwrap()
-        .starts_with("🎁 1 reset ready · expires in "));
-    let mut multiple = mk(2, false);
-    assert_eq!(
-        reset_grant_row(&multiple).as_deref(),
-        Some("🎁 2 resets banked")
-    );
-    multiple.usable_now = true;
-    assert_eq!(
-        reset_grant_row(&multiple).as_deref(),
-        Some("🎁 2 resets ready")
-    );
+    assert!(reset_grant_rows(&[g])[0]
+        .0
+        .starts_with("🎁 Session reset ready · expires in "));
 }
 
 #[test]
@@ -494,10 +540,11 @@ fn reset_grant_rows_lead_reported_rows() {
             resets_left: 1,
             usable_now: true,
             expires_at: None,
+            clears: Vec::new(),
         }],
         ..ReportedUsage::default()
     });
-    assert_eq!(rows[0], "🎁 1 reset ready", "{rows:?}");
+    assert_eq!(rows[0], "🎁 Reset ready", "{rows:?}");
 }
 
 #[test]
@@ -1239,11 +1286,8 @@ fn account_extra_info_rows_footer_and_burn_rate() {
     };
     let a = mk();
 
-    // Keep the same layout without inventing a pace when history is absent.
-    assert_eq!(
-        account_extra_info_rows(&sec, &a),
-        ["Weekly · 60% · —", "updated 1m ago"]
-    );
+    // No pace yet → no forecast row (the % is already on the account row).
+    assert_eq!(account_extra_info_rows(&sec, &a), ["updated 1m ago"]);
     let mut inactive = mk();
     inactive.active = false;
     assert_eq!(
@@ -1270,10 +1314,9 @@ fn account_extra_info_rows_footer_and_burn_rate() {
     crate::usage_log::evict_recent_months();
     let rows = with_now(now, || account_extra_info_rows(&sec, &a));
     assert_eq!(rows.len(), 2, "{rows:?}");
-    assert!(rows[0].starts_with("Weekly · "), "{rows:?}");
-    assert_ne!(
-        rows[0], "Weekly · 60% · —",
-        "a real pace, not the no-history fallback"
+    assert!(
+        rows[0].starts_with("Weekly runs out in ~") || rows[0] == "Weekly lasts to reset",
+        "a forecast without the repeated %: {rows:?}"
     );
     assert_eq!(rows[1], "updated 1m ago");
 

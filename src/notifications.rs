@@ -367,7 +367,7 @@ pub(crate) fn reset_grant_triggers(state: &mut NotifState, grants: &[ResetGrant]
                 label: g.label.clone(),
             });
         }
-        if g.usable_now && state.reset_grants_usable_fired.insert(g.id.clone()) {
+        if g.is_ready() && state.reset_grants_usable_fired.insert(g.id.clone()) {
             out.push(Trigger::ResetUsableNow {
                 label: g.label.clone(),
             });
@@ -901,6 +901,7 @@ mod tests {
             resets_left,
             usable_now,
             expires_at: None,
+            clears: Vec::new(),
         }
     }
 
