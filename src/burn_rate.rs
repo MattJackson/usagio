@@ -122,17 +122,45 @@ fn estimate_from(
 /// doesn't (or the pace is flat), "Weekly · 61% · pace flat" with no reset.
 /// The reset time itself is on the "renews in" row, so it isn't repeated.
 pub(crate) fn format_menu_row(est: &BurnRateEstimate) -> String {
-    let name = match est.window {
+    let tail = match outlook(est) {
+        Outlook::LastsToReset => "lasts to reset".to_string(),
+        Outlook::Flat => "pace flat".to_string(),
+        Outlook::EmptyIn(d) => format!("~{d}"),
+    };
+    format!("{} · {:.0}% · {tail}", window_name(est), est.current_pct)
+}
+
+/// The forecast alone, for a place that already shows the %: "Weekly runs out
+/// in ~6h 5m" / "Weekly lasts to reset". `None` for a flat pace (nothing to say).
+pub(crate) fn format_forecast(est: &BurnRateEstimate) -> Option<String> {
+    let name = window_name(est);
+    match outlook(est) {
+        Outlook::LastsToReset => Some(format!("{name} lasts to reset")),
+        Outlook::Flat => None,
+        Outlook::EmptyIn(d) => Some(format!("{name} runs out in ~{d}")),
+    }
+}
+
+enum Outlook {
+    LastsToReset,
+    Flat,
+    EmptyIn(String),
+}
+
+fn window_name(est: &BurnRateEstimate) -> &'static str {
+    match est.window {
         Window::Session => "Session",
         Window::Weekly => "Weekly",
-    };
+    }
+}
+
+fn outlook(est: &BurnRateEstimate) -> Outlook {
     let flat = est.rate_pct_per_hour <= FLAT_SLOPE_THRESHOLD_PCT_PER_HOUR;
-    let tail = match est.reset_at {
-        Some(reset) if flat || est.empty_at >= reset => "lasts to reset".to_string(),
-        _ if flat => "pace flat".to_string(),
-        _ => format!("~{}", format_short_duration(est.empty_at - Utc::now())),
-    };
-    format!("{name} · {:.0}% · {tail}", est.current_pct)
+    match est.reset_at {
+        Some(reset) if flat || est.empty_at >= reset => Outlook::LastsToReset,
+        _ if flat => Outlook::Flat,
+        _ => Outlook::EmptyIn(format_short_duration(est.empty_at - Utc::now())),
+    }
 }
 
 fn pct_for(s: &Snapshot, w: Window) -> Option<f32> {

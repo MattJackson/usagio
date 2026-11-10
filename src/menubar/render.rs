@@ -277,8 +277,10 @@ pub(super) fn trailing_for_account(
     (text, colors)
 }
 
+/// 🎁 on the account row only for a reset worth claiming now; saved ones are
+/// listed in the submenu.
 fn has_reset(a: &AcctView) -> bool {
-    a.reported.reset_grants.iter().any(ResetGrant::is_available)
+    a.reported.reset_grants.iter().any(ResetGrant::is_ready)
 }
 
 fn trailing_usage_for_account(
@@ -531,15 +533,16 @@ fn window_status_row_at(w: &WindowView, stale: bool) -> Option<(String, bool)> {
 }
 
 /// Show only what can be used now, never historical spending or a spend cap.
+/// Nothing to spend → no row (a "Credits · 0" line is just clutter).
 fn credits_row(c: &Credits) -> Option<String> {
     let status = if !c.enabled && !c.unlimited || c.limit_reached {
-        "0".to_string()
+        return None;
     } else if c.unlimited {
         "unlimited".to_string()
-    } else if let Some(left) = c.spendable() {
+    } else if let Some(left) = c.spendable().filter(|m| m.amount_minor > 0) {
         left.display()
     } else if c.balance.is_some() || c.limit.is_some() {
-        "0".to_string()
+        return None;
     } else {
         "—".to_string()
     };
@@ -590,31 +593,92 @@ fn claims_resets(provider_id: &str) -> bool {
     provider_id == "claude"
 }
 
-pub(super) fn reset_grant_row(g: &ResetGrant) -> Option<String> {
-    if !g.is_available() {
-        return None;
+/// Expiry is only worth a word once it's close; months away is noise.
+const RESET_EXPIRY_SHOWN_WITHIN_DAYS: i64 = 14;
+
+/// What a grant resets, as the menu names it: "session", "weekly", both, or
+/// unknown (`None`) when the provider lists neither.
+fn reset_kind(g: &ResetGrant) -> Option<&'static str> {
+    match (g.clears_session(), g.clears_weekly()) {
+        (true, true) => Some("session + weekly"),
+        (true, false) => Some("session"),
+        (false, true) => Some("weekly"),
+        (false, false) => None,
     }
-    let noun = if g.resets_left == 1 {
-        "reset"
-    } else {
-        "resets"
-    };
-    let state = if g.usable_now { "ready" } else { "banked" };
-    let mut row = format!("🎁 {} {noun} {state}", g.resets_left);
-    if let Some(exp) = g.expires_at {
-        row.push_str(&format!(
-            " · expires in {}",
-            crate::display::humanize_until(exp)
-        ));
+}
+
+/// The reset-grant rows for an account, identical grants merged into one row
+/// with a count, each paired with whether it's ready to claim. Ready means a
+/// claim would clear something in use (see [`ResetGrant::is_ready`]).
+///
+/// * `🎁 Session reset ready` — claim clears the 5-hour limit.
+/// * `🎁 2 resets saved · won't clear weekly` — the provider lists what it
+///   clears and the weekly limit isn't in it (a weekly-capped account).
+/// * `🎁 Reset saved` — the provider doesn't say what it clears (Codex).
+pub(super) fn reset_grant_rows(grants: &[ResetGrant]) -> Vec<(String, bool)> {
+    // (kind, ready, won't-clear-weekly) → (count, earliest expiry), in first-seen order.
+    type Key = (Option<&'static str>, bool, bool);
+    let mut groups: Vec<(Key, u32, Option<DateTime<Utc>>)> = Vec::new();
+    for g in grants.iter().filter(|g| g.is_available()) {
+        let ready = g.is_ready();
+        let not_weekly = !ready && !g.clears.is_empty() && !g.clears_weekly();
+        let key = (reset_kind(g), ready, not_weekly);
+        match groups.iter_mut().find(|(k, _, _)| *k == key) {
+            Some((_, n, exp)) => {
+                *n += g.resets_left;
+                *exp = match (*exp, g.expires_at) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+            }
+            None => groups.push((key, g.resets_left, g.expires_at)),
+        }
     }
-    Some(row)
+    // Same clock as `humanize_until`, which renders the expiry.
+    let now = Utc::now();
+    groups
+        .into_iter()
+        .map(|((kind, ready, not_weekly), n, exp)| {
+            let noun = if n == 1 { "reset" } else { "resets" };
+            let what = match (kind, n) {
+                (Some(k), 1) => capitalize(&format!("{k} {noun}")),
+                (Some(k), _) => format!("{n} {k} {noun}"),
+                (None, 1) => "Reset".to_string(),
+                (None, _) => format!("{n} {noun}"),
+            };
+            let state = if ready { "ready" } else { "saved" };
+            let mut row = format!("🎁 {what} {state}");
+            if not_weekly {
+                row.push_str(" · won't clear weekly");
+            }
+            if let Some(exp) =
+                exp.filter(|e| *e - now < chrono::Duration::days(RESET_EXPIRY_SHOWN_WITHIN_DAYS))
+            {
+                row.push_str(&format!(
+                    " · expires in {}",
+                    crate::display::humanize_until(exp)
+                ));
+            }
+            (row, ready)
+        })
+        .collect()
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
 }
 
 /// Every provider-reported row for an account, in render order: reset grants
 /// (good news up top), scoped limits, where the week went, then credits. Pure;
 /// provider-agnostic.
 fn reported_rows(r: &ReportedUsage) -> Vec<String> {
-    let mut rows: Vec<String> = r.reset_grants.iter().filter_map(reset_grant_row).collect();
+    let mut rows: Vec<String> = reset_grant_rows(&r.reset_grants)
+        .into_iter()
+        .map(|(row, _)| row)
+        .collect();
     rows.extend(r.scoped_limits.iter().filter_map(scoped_limit_row));
     rows.extend(breakdown_row(&r.breakdown));
     rows.extend(r.credits.as_ref().and_then(credits_row));
@@ -776,11 +840,8 @@ fn empty_in_row(
 ) -> Option<String> {
     use crate::autoswap::{rates::rates_for, runway::time_to, WindowId};
     let pct = a.windows.iter().find(|w| w.id == "weekly")?.pct?;
-    let Some(rate) =
-        rates_for(&account_key.provider, &account_key.account, now).own(WindowId::Weekly)
-    else {
-        return Some(format!("Weekly · {} · —", self::pct(Some(pct))));
-    };
+    // No pace yet → nothing to forecast; the weekly % is already on the row.
+    let rate = rates_for(&account_key.provider, &account_key.account, now).own(WindowId::Weekly)?;
     let mins = time_to(pct, 100.0, rate);
     let empty_at = if mins.is_finite() {
         now + chrono::Duration::seconds((mins * 60.0).min(1.0e8) as i64)
@@ -794,7 +855,7 @@ fn empty_in_row(
         empty_at,
         reset_at: a.weekly_reset_at,
     };
-    Some(crate::burn_rate::format_menu_row(&est))
+    crate::burn_rate::format_forecast(&est)
 }
 
 /// Which optional rows `build_account_submenu_item` should append for `sec`'s
@@ -821,13 +882,10 @@ pub(super) fn account_submenu_rows(sec: &ProviderSection, a: &AcctView) -> Accou
         switch_row: sec.supports_switching && !a.active && !a.no_subscription,
         renew_row: a.renewable,
         remove_row: sec.supports_remove,
-        // Only offer the claim when a grant can actually be spent now — a
-        // banked-but-not-usable grant would just return `not_limited`.
+        // Only offer the claim when spending a grant would clear something in
+        // use — otherwise the reset is used up for nothing.
         claim_reset_row: claims_resets(sec.provider_id)
-            && a.reported
-                .reset_grants
-                .iter()
-                .any(|g| g.is_available() && g.usable_now),
+            && a.reported.reset_grants.iter().any(ResetGrant::is_ready),
     }
 }
 

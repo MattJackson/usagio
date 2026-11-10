@@ -408,6 +408,40 @@ fn cedar_ember_banked_grant_is_reported_not_usable() {
 }
 
 #[test]
+fn cedar_ember_grant_records_what_it_clears() {
+    // The Opus 5.5 grant cleared both windows → a session + weekly reset.
+    let g = &reported_usage(&parse(cedar_ember_json(1, true))).reset_grants[0];
+    assert!(g.clears_session() && g.clears_weekly());
+    assert_eq!(g.clears[0].pct, Some(52.0));
+    assert_eq!(g.clears[2].pct, None, "no percent_used entry");
+    assert!(g.is_ready());
+}
+
+#[test]
+fn weekly_capped_fable_grant_is_not_ready() {
+    // Live shape (2026-11-10) on a weekly-capped account: the server says
+    // usable_now, but the grant only clears the empty extra-usage bucket, so a
+    // claim is spent for nothing.
+    let u = parse(serde_json::json!({
+        "cedar_ember": {
+            "eligible": true,
+            "grants": [{
+                "id": "launch-2610-fable",
+                "resets_left": 1,
+                "clears": ["seven_day_overage_included"],
+                "usable_now": true,
+                "percent_used": { "seven_day_overage_included": 0 },
+                "unavailable_reason": null
+            }]
+        }
+    }));
+    let g = &reported_usage(&u).reset_grants[0];
+    assert!(g.usable_now && g.is_available());
+    assert!(!g.clears_session() && !g.clears_weekly());
+    assert!(!g.is_ready());
+}
+
+#[test]
 fn cedar_ember_spent_grant_is_dropped() {
     // resets_left == 0 (already claimed) → not surfaced at all.
     let u = parse(cedar_ember_json(0, false));

@@ -163,10 +163,10 @@ fn reset_claim_requires_confirmation_and_never_claims_codex() {
         handle_claim_with(
             provider,
             "gift@example.com",
+            &[],
             |question| {
                 asked.set(true);
                 assert!(question.contains("gift@example.com"));
-                assert!(question.contains("one banked reset"));
                 approved
             },
             |key| {
@@ -177,6 +177,38 @@ fn reset_claim_requires_confirmation_and_never_claims_codex() {
         assert_eq!(asked.get(), provider == "claude");
         assert_eq!(claimed.get(), expected);
     }
+}
+
+#[test]
+fn claim_question_says_what_clears_and_what_does_not() {
+    use crate::providers::trait_def::{ClearedLimit, ResetGrant};
+    let g = |id: &str| ResetGrant {
+        id: id.into(),
+        resets_left: 1,
+        usable_now: true,
+        clears: vec![
+            ClearedLimit {
+                key: "five_hour".into(),
+                pct: Some(99.0),
+            },
+            ClearedLimit {
+                key: "seven_day_overage_included".into(),
+                pct: Some(0.0),
+            },
+        ],
+        ..ResetGrant::default()
+    };
+    assert_eq!(
+        claim_question("dev4@example.com", &[g("a")]),
+        "Use a session reset on dev4@example.com?\n\n\
+         Clears the 5-hour session limit (now 99%).\n\
+         Your weekly limit is not reset.\n\n\
+         This is the last reset on this account."
+    );
+    let q = claim_question("dev4@example.com", &[g("a"), g("b"), g("c")]);
+    assert!(q.ends_with("2 resets will be left on this account."), "{q}");
+    // The empty side bucket isn't mentioned.
+    assert!(!q.contains("extra-usage"), "{q}");
 }
 
 #[test]
