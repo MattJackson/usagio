@@ -134,6 +134,16 @@ impl SwapMemory {
         }
     }
 
+    /// The user claimed a reset on `key`: a lower reading now is that reset,
+    /// not post-leave lag or the epoch we left it in, so forget the leave
+    /// (settle timer and latches) and let the next read serve it at once.
+    pub(crate) fn note_reset_claimed(&mut self, key: &str) {
+        let k = lc(key);
+        self.left_at.remove(&k);
+        self.trigger_left.remove(&k);
+        self.drained.remove(&k);
+    }
+
     pub(crate) fn left_at(&self, key: &str) -> Option<i64> {
         self.left_at.get(&lc(key)).copied()
     }

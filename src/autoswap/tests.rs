@@ -2195,3 +2195,26 @@ fn latch_epoch_tolerates_relative_reset_jitter() {
     );
     assert!(!assessed(&s, "A").trigger_latched, "a new epoch voids it");
 }
+
+#[test]
+fn claimed_reset_on_a_just_left_account_serves_it_at_once() {
+    let now = at(4, 26, 46);
+    let left = now - Duration::seconds(17);
+    let mut s = snap(
+        now,
+        "dev4",
+        vec![
+            acct("dev4", 100.0, 62.0, now - Duration::seconds(10)),
+            // Read 17 s after we left it (inside the settle window), cleared.
+            acct("dev8", 0.0, 53.0, now - Duration::seconds(1)),
+        ],
+    );
+    s.memory
+        .left_at
+        .insert("dev8".to_string(), left.timestamp());
+    assert!(!assessed(&s, "dev8").servable, "unsettled before the claim");
+    s.memory.note_reset_claimed("DEV8");
+    assert!(assessed(&s, "dev8").servable);
+    let d = decide(&s);
+    assert_eq!(switched(&d).map(|(to, _)| to), Some("dev8"), "{d:?}");
+}
