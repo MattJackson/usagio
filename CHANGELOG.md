@@ -5,6 +5,18 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.3] - 2026-11-10
+
+### Fixed
+
+- A reset grant only counts as ready to claim when a limit it clears has usage on it. Claude reports `usable_now` for weekly-capped accounts whose grant clears only the empty extra-usage allowance; claiming one spent it for nothing. The claimed account's cache is now expired so the next poll re-checks it, and every claim outcome is logged (`event=reset_claim`).
+
+### Changed
+
+- Reset rows name the reset ("Session reset ready", "Weekly reset ready", "Reset saved · won't clear weekly"), merge identical grants into one counted row, and show expiry only within 14 days. 🎁 on the account row and title marks ready resets only.
+- The claim confirmation lists what the reset clears with current usage, says when the weekly limit is not reset, and how many resets remain.
+- Account submenus hide "Credits · 0" and show the weekly forecast without repeating the % ("Weekly runs out in ~6h 5m"); no row when there's no pace yet.
+
 ## [1.1.2] - 2026-11-04
 
 ### Fixed

@@ -10,6 +10,7 @@ use crate::notifications::notify;
 use crate::picking::optimize_now;
 use crate::providers;
 use crate::providers::require;
+use crate::providers::trait_def::{ResetGrant, SESSION_LIMIT_KEY, WEEKLY_LIMIT_KEY};
 use crate::providers::CLAUDE_SLUG;
 use crate::state_ops::{remove_account, remove_provider_account_generic, with_state_lock};
 use crate::store::State;
@@ -313,10 +314,17 @@ fn capture_serialized(slug: &str) {
 /// cleared windows show up right away. This SPENDS a one-shot reset, so it only
 /// ever runs from this explicit click, never automatically.
 fn handle_claim(slug: &str, key: &str) {
+    let grants = State::load()
+        .ok()
+        .and_then(|st| st.find(key).cloned())
+        .and_then(|a| a.cached_usage)
+        .map(|c| c.reported.reset_grants)
+        .unwrap_or_default();
     handle_claim_with(
         slug,
         key,
-        |question| confirm_with_button(question, "Claim reset"),
+        &grants,
+        |question| confirm_with_button(question, "Use reset"),
         |key| {
             spawn_claim(key);
         },
@@ -326,23 +334,84 @@ fn handle_claim(slug: &str, key: &str) {
 fn handle_claim_with(
     slug: &str,
     key: &str,
+    grants: &[ResetGrant],
     ask: impl FnOnce(&str) -> bool,
     claim: impl FnOnce(String),
 ) {
-    if slug == CLAUDE_SLUG
-        && ask(&format!(
-            "Claim this reset for {key}?\n\nThis uses one banked reset."
-        ))
-    {
+    if slug == CLAUDE_SLUG && ask(&claim_question(key, grants)) {
         claim(key.to_string());
     }
 }
 
+/// Plain name for a limit key a reset clears.
+fn limit_name(key: &str) -> String {
+    match key {
+        SESSION_LIMIT_KEY => "5-hour session limit".to_string(),
+        WEEKLY_LIMIT_KEY => "weekly limit".to_string(),
+        "seven_day_overage_included" => "extra-usage allowance".to_string(),
+        other => other.replace('_', " "),
+    }
+}
+
+/// The confirmation text: what the reset clears (with current usage), what it
+/// leaves alone, and how many resets the account has left afterwards.
+pub(super) fn claim_question(key: &str, grants: &[ResetGrant]) -> String {
+    let Some(g) = grants.iter().find(|g| g.is_ready()) else {
+        return format!("Use a reset on {key}?");
+    };
+    let kind = match (g.clears_session(), g.clears_weekly()) {
+        (true, true) => "a session + weekly reset",
+        (true, false) => "a session reset",
+        (false, true) => "a weekly reset",
+        (false, false) => "a reset",
+    };
+    let mut lines = vec![format!("Use {kind} on {key}?"), String::new()];
+    // Skip empty side buckets (0%): clearing them changes nothing.
+    for c in g.clears.iter().filter(|c| {
+        c.key == SESSION_LIMIT_KEY || c.key == WEEKLY_LIMIT_KEY || c.pct.is_some_and(|p| p > 0.0)
+    }) {
+        let now = c
+            .pct
+            .map(|p| format!(" (now {}%)", p.round() as i64))
+            .unwrap_or_default();
+        lines.push(format!("Clears the {}{now}.", limit_name(&c.key)));
+    }
+    if !g.clears.is_empty() && !g.clears_weekly() {
+        lines.push("Your weekly limit is not reset.".to_string());
+    }
+    let left: u32 = grants
+        .iter()
+        .filter(|g| g.is_available())
+        .map(|g| g.resets_left)
+        .sum();
+    lines.push(String::new());
+    lines.push(match left.saturating_sub(1) {
+        0 => "This is the last reset on this account.".to_string(),
+        1 => "1 reset will be left on this account.".to_string(),
+        n => format!("{n} resets will be left on this account."),
+    });
+    lines.join("\n")
+}
+
 fn spawn_claim(key: String) {
-    std::thread::spawn(
-        move || match crate::switching::claude::claim_claude_reset(&key) {
+    std::thread::spawn(move || {
+        let res = crate::switching::claude::claim_claude_reset(&key);
+        crate::logging::log(&format!(
+            "event=reset_claim provider=claude account={key} outcome={}",
+            match &res {
+                Ok(crate::providers::claude::usage::ClaimOutcome::Reset) => "reset".to_string(),
+                Ok(crate::providers::claude::usage::ClaimOutcome::NoChange(s)) => s.clone(),
+                Err(e) => format!("error:{e}"),
+            }
+        ));
+        // A capped account's cache is normally trusted until its reset time;
+        // expire it so the next poll shows what the claim actually changed.
+        if res.is_ok() {
+            expire_cached_usage(&key);
+        }
+        match res {
             Ok(crate::providers::claude::usage::ClaimOutcome::Reset) => {
-                notify(&format!("Reset claimed for {key} — limits cleared"));
+                notify(&format!("Reset used on {key} — limit cleared"));
                 request_poll_now();
             }
             Ok(crate::providers::claude::usage::ClaimOutcome::NoChange(status)) => {
@@ -350,8 +419,22 @@ fn spawn_claim(key: String) {
                 request_poll_now();
             }
             Err(e) => notify(&format!("Claim failed for {key}: {e}")),
-        },
-    );
+        }
+    });
+}
+
+/// Mark `key`'s cached usage as old so the next poll refetches it even if it
+/// reads as locked until reset.
+fn expire_cached_usage(key: &str) {
+    let res = crate::credentials::with_state_lock_absorb(|st| {
+        if let Some(c) = st.find_mut(key).and_then(|a| a.cached_usage.as_mut()) {
+            c.fetched_at = 0;
+        }
+        Ok(())
+    });
+    if let Err(e) = res {
+        crate::logging::log(&format!("expire_cached_usage({key}): {e}"));
+    }
 }
 
 type UiTask = Box<dyn FnOnce() + Send>;

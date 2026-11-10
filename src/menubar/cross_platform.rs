@@ -13,7 +13,7 @@ use super::model::{
 };
 use super::render::{
     account_extra_info_rows, account_header_row, account_submenu_rows, provider_group_header_row,
-    quit_row_plain, reset_grant_row, submenu_info_items, u16len, RowStyle,
+    quit_row_plain, reset_grant_rows, submenu_info_items, u16len, RowStyle,
 };
 use crate::platform::{MenuItem as PMenuItem, MenuTree, ValueColor};
 use crate::providers;
@@ -133,11 +133,9 @@ fn build_account_submenu_item(sec: &ProviderSection, a: &AcctView) -> PMenuItem 
     let rows = account_submenu_rows(sec, a);
     for (row, locked) in submenu_info_items(sec, a) {
         let ready_reset = rows.claim_reset_row
-            && a.reported.reset_grants.iter().any(|g| {
-                g.is_available()
-                    && g.usable_now
-                    && reset_grant_row(g).as_deref() == Some(row.as_str())
-            });
+            && reset_grant_rows(&a.reported.reset_grants)
+                .iter()
+                .any(|(text, ready)| *ready && *text == row);
         if ready_reset {
             items.push(action(
                 format!("claim:{}:{}", sec.provider_id, a.key),

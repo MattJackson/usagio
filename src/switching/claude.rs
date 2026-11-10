@@ -205,14 +205,14 @@ pub(crate) fn claim_claude_reset(email: &str) -> std::result::Result<usage::Clai
         .cloned()
         .ok_or_else(|| format!("account {email} not found"))?;
     // Pick the grant from the cache the menu row was built from — the one the
-    // user saw as claimable. First available + usable-now wins.
+    // user saw as claimable. First ready grant wins (see `ResetGrant::is_ready`).
     let grant_id = acct
         .cached_usage
         .as_ref()
         .map(|c| &c.reported.reset_grants)
         .into_iter()
         .flatten()
-        .find(|g| g.is_available() && g.usable_now)
+        .find(|g| g.is_ready())
         .map(|g| g.id.clone())
         .ok_or("no claimable reset on this account")?;
     let is_active = State::load().ok().is_some_and(|st| {
