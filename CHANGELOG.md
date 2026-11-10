@@ -5,6 +5,12 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.4] - 2026-11-10
+
+### Fixed
+
+- Claiming a reset on an account auto-swap had just left now switches back to it on the next poll. The claim forgets auto-swap's leave memory for that account (the 60 s post-leave settle and leave latches), which had kept the freshly cleared account unservable and left you on a blocked one until you swapped by hand.
+
 ## [1.1.3] - 2026-11-10
 
 ### Fixed
