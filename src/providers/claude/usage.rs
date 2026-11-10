@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 use super::config;
 use crate::providers::trait_def::{
-    Credits, Money, ReportedUsage, ResetGrant, UsageShare, UsageWindow,
+    ClearedLimit, Credits, Money, ReportedUsage, ResetGrant, UsageShare, UsageWindow,
 };
 
 /// Why a usage fetch failed. Lets callers keep the last-known cache on transient
@@ -211,9 +211,10 @@ fn scoped_limits(u: &Usage) -> Vec<UsageWindow> {
 
 /// The `cedar_ember` reset grants on this account, read leniently. A grant is
 /// kept only when it still has a reset left to spend (`resets_left >= 1`), so a
-/// spent or empty grant never surfaces. `usable_now` reflects the block's own
-/// flag AND that the account is at a limit — a reset banked for later reads as
-/// not-usable until you're actually blocked.
+/// spent or empty grant never surfaces. `usable_now` is the block's own flag;
+/// `clears` records which limits a claim would clear and how full each is, so
+/// the menu can tell a session reset from a weekly one (see
+/// `ResetGrant::is_ready`).
 fn reset_grants(u: &Usage) -> Vec<ResetGrant> {
     let block = u.cedar_ember.as_ref().and_then(|v| v.as_object());
     let Some(block) = block else {
@@ -247,12 +248,25 @@ fn reset_grants(u: &Usage) -> Vec<ResetGrant> {
                 .and_then(|x| x.as_str())
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|d| d.with_timezone(&chrono::Utc));
+            let pct_used = g.get("percent_used").and_then(|x| x.as_object());
+            let clears = g
+                .get("clears")
+                .and_then(|x| x.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|k| k.as_str())
+                .map(|key| ClearedLimit {
+                    key: key.to_string(),
+                    pct: pct_used.and_then(|m| m.get(key)).and_then(|x| x.as_f64()),
+                })
+                .collect();
             Some(ResetGrant {
                 id: id.to_string(),
                 label,
                 resets_left,
                 usable_now,
                 expires_at,
+                clears,
             })
         })
         .collect()

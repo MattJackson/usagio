@@ -367,6 +367,7 @@ fn parse_reset_credits(body: &Value) -> Vec<ResetGrant> {
         resets_left: available,
         usable_now: count("applicable_available_count") > 0,
         expires_at: None,
+        clears: Vec::new(),
     }]
 }
 
