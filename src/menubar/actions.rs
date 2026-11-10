@@ -424,11 +424,16 @@ fn spawn_claim(key: String) {
 }
 
 /// Mark `key`'s cached usage as old so the next poll refetches it even if it
-/// reads as locked until reset.
+/// reads as locked until reset, and drop auto-swap's leave memory for it.
 fn expire_cached_usage(key: &str) {
     let res = crate::credentials::with_state_lock_absorb(|st| {
         if let Some(c) = st.find_mut(key).and_then(|a| a.cached_usage.as_mut()) {
             c.fetched_at = 0;
+        }
+        // Without this, an account auto-swap just left stays unservable for
+        // the post-leave settle window even though its limit was cleared.
+        if let Some(m) = st.swap_memory.get_mut(CLAUDE_SLUG) {
+            m.note_reset_claimed(key);
         }
         Ok(())
     });
