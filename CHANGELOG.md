@@ -5,6 +5,13 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.6] - 2026-11-18
+
+### Changed
+
+- Resets are one short row each, named by what they clear: `🎁 Session`, `🎁 Session + Weekly`, `🎁 Weekly`, `🎁 Extra usage`. Two resets are two rows. Click one to use it; the confirmation has the details. Rows that wouldn't clear anything now are shown but not clickable. Replaces the 1.1.5 header and "→ Use … · clears …" rows, which didn't fit the menu.
+- A launch reset on a weekly-capped account (it clears only the extra-usage allowance) is named "Extra usage" in the menu, dialog and notification instead of a bare "reset".
+
 ## [1.1.5] - 2026-11-17
 
 ### Fixed

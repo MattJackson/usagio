@@ -361,15 +361,20 @@ pub(super) fn chosen_grant<'a>(
     }
 }
 
-/// "session reset", "session + weekly reset", "weekly reset" or "reset".
+/// "session reset", "session + weekly reset", "weekly reset", "extra-usage
+/// reset" or "reset" — the same names the menu rows use.
 fn reset_name(g: &ResetGrant) -> &'static str {
     match (g.clears_session(), g.clears_weekly()) {
         (true, true) => "session + weekly reset",
         (true, false) => "session reset",
         (false, true) => "weekly reset",
+        (false, false) if g.clears.iter().any(|c| c.key == EXTRA_USAGE_KEY) => "extra-usage reset",
         (false, false) => "reset",
     }
 }
+
+/// The extra-usage allowance a Claude reset can clear.
+const EXTRA_USAGE_KEY: &str = "seven_day_overage_included";
 
 fn handle_claim_with(
     slug: &str,
@@ -412,11 +417,13 @@ pub(super) fn claim_question(key: &str, grants: &[ResetGrant], grant_id: Option<
         format!("Use the {} on {key}?", reset_name(g)),
         String::new(),
     ];
-    // Only the session and weekly limits; side buckets are noise here.
+    // The session and weekly limits; a side bucket (extra usage) only when
+    // it's all this reset clears.
+    let main_limits = g.clears_session() || g.clears_weekly();
     for c in g
         .clears
         .iter()
-        .filter(|c| c.key == SESSION_LIMIT_KEY || c.key == WEEKLY_LIMIT_KEY)
+        .filter(|c| c.key == SESSION_LIMIT_KEY || c.key == WEEKLY_LIMIT_KEY || !main_limits)
     {
         let now = c
             .pct
@@ -489,6 +496,9 @@ fn cleared_phrase(cleared: &[String]) -> String {
         .map(|k| limit_name(k))
         .collect();
     match names.len() {
+        0 if cleared.iter().any(|k| k == EXTRA_USAGE_KEY) => {
+            "extra-usage allowance cleared".to_string()
+        }
         0 => "limit cleared".to_string(),
         1 => format!("{} cleared", names[0]),
         _ => format!("{} cleared", names.join(" and ")),

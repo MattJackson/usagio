@@ -11,10 +11,7 @@ use super::theme::{theme_from_name, tray_options};
 use super::tray::tray_target;
 use crate::countdown;
 use crate::countdown::{BlockingWindow, DisplayState};
-use crate::providers::trait_def::{
-    Credits, ReportedUsage, ResetGrant, UsageShare, UsageWindow, SESSION_LIMIT_KEY,
-    WEEKLY_LIMIT_KEY,
-};
+use crate::providers::trait_def::{Credits, ReportedUsage, ResetGrant, UsageShare, UsageWindow};
 use crate::providers::SeverityBands;
 use chrono::{DateTime, Utc};
 
@@ -599,16 +596,25 @@ fn claims_resets(provider_id: &str) -> bool {
 /// Expiry is only worth a word once it's close; months away is noise.
 const RESET_EXPIRY_SHOWN_WITHIN_DAYS: i64 = 14;
 
-/// What a grant resets, as the menu names it: "session", "weekly", both, or
-/// unknown (`None`) when the provider lists neither.
+/// A grant holding more resets than this still shows only this many rows.
+const MAX_ROWS_PER_GRANT: u32 = 5;
+
+/// What a grant resets, as the menu names it: "Session", "Weekly",
+/// "Session + Weekly", "Extra usage" (it lists only the extra-usage
+/// allowance — what a launch reset clears on a weekly-capped Claude account),
+/// or `None` when the provider doesn't say.
 pub(super) fn reset_kind(g: &ResetGrant) -> Option<&'static str> {
     match (g.clears_session(), g.clears_weekly()) {
-        (true, true) => Some("session + weekly"),
-        (true, false) => Some("session"),
-        (false, true) => Some("weekly"),
+        (true, true) => Some("Session + Weekly"),
+        (true, false) => Some("Session"),
+        (false, true) => Some("Weekly"),
+        (false, false) if g.clears.iter().any(|c| c.key == EXTRA_USAGE_KEY) => Some("Extra usage"),
         (false, false) => None,
     }
 }
+
+/// The extra-usage allowance a Claude reset can clear.
+const EXTRA_USAGE_KEY: &str = "seven_day_overage_included";
 
 /// The reset-grant rows for an account, each paired with whether it's ready
 /// to claim. See [`reset_grant_row_items`] for the layout.
@@ -619,119 +625,43 @@ pub(super) fn reset_grant_rows(grants: &[ResetGrant]) -> Vec<(String, bool)> {
         .collect()
 }
 
-/// Short name of a limit key, for "clears 5-hour 100%, weekly 27%".
-fn limit_short_name(key: &str) -> Option<&'static str> {
-    match key {
-        SESSION_LIMIT_KEY => Some("5-hour"),
-        WEEKLY_LIMIT_KEY => Some("weekly"),
-        _ => None,
-    }
-}
-
-/// The reset-grant section for an account: a header saying how many resets
-/// there are and how to use one, then one row per kind of reset (identical
-/// grants merged with a count). Ready rows carry the id of the grant a click
-/// on them claims; everything else is `None`. Ready means a claim would clear
-/// something in use (see [`ResetGrant::is_ready`]).
+/// One row per banked reset, named by what it clears. Ready rows carry the id
+/// of the grant a click claims (the confirmation spells out the details);
+/// rows that wouldn't clear anything in use now are plain text. Ready means a
+/// claim would clear something in use (see [`ResetGrant::is_ready`]).
 ///
 /// ```text
-/// 🎁 2 resets available · click one to use it
-/// → Use session reset · clears 5-hour 100%
-/// → Use session + weekly reset · clears 5-hour 100%, weekly 27%
+/// 🎁 Session
+/// 🎁 Session + Weekly
 /// ```
 ///
-/// Ready rows that leave the weekly limit alone come first, so the cheaper
-/// reset leads. With nothing ready the header says so and the rows read
-/// `Session reset · won't clear weekly` / `Reset · not usable yet`.
+/// Ready before saved, and session-only before the rest, so the cheaper reset
+/// leads.
 pub(super) fn reset_grant_row_items(grants: &[ResetGrant]) -> Vec<(String, Option<String>)> {
-    // (kind, ready, won't-clear-weekly) → (count, earliest expiry, first grant),
-    // in first-seen order.
-    type Key = (Option<&'static str>, bool, bool);
-    let mut groups: Vec<(Key, u32, Option<DateTime<Utc>>, &ResetGrant)> = Vec::new();
-    for g in grants.iter().filter(|g| g.is_available()) {
-        let ready = g.is_ready();
-        let not_weekly = !ready && !g.clears.is_empty() && !g.clears_weekly();
-        let key = (reset_kind(g), ready, not_weekly);
-        match groups.iter_mut().find(|(k, _, _, _)| *k == key) {
-            Some((_, n, exp, _)) => {
-                *n += g.resets_left;
-                *exp = match (*exp, g.expires_at) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (a, b) => a.or(b),
-                };
-            }
-            None => groups.push((key, g.resets_left, g.expires_at, g)),
-        }
-    }
-    if groups.is_empty() {
-        return Vec::new();
-    }
-    // Stable: ready before saved; among ready, session-only before the rest.
-    groups.sort_by_key(|((kind, ready, _), _, _, _)| {
-        (!*ready, matches!(*kind, Some(k) if k != "session"))
-    });
-    let total: u32 = groups.iter().map(|(_, n, _, _)| *n).sum();
-    let any_ready = groups.iter().any(|((_, ready, _), _, _, _)| *ready);
-    let noun = if total == 1 { "reset" } else { "resets" };
-    let header = match (any_ready, total) {
-        (true, 1) => "🎁 1 reset available · click it to use it".to_string(),
-        (true, _) => format!("🎁 {total} resets available · click one to use it"),
-        (false, _) => format!("🎁 {total} {noun} saved · none would help right now"),
-    };
-    let mut out = vec![(header, None)];
+    let mut rows: Vec<(bool, bool, String, Option<String>)> = Vec::new();
     // Same clock as `humanize_until`, which renders the expiry.
     let now = Utc::now();
-    for ((kind, ready, not_weekly), n, exp, g) in groups {
-        let what = match kind {
-            Some(k) => format!("{k} reset"),
-            None => "reset".to_string(),
-        };
-        let mut row = if ready {
-            format!("→ Use {what}")
-        } else {
-            capitalize(&what)
-        };
-        if n > 1 {
-            row.push_str(&format!(" ({n}×)"));
-        }
-        if ready {
-            let clears: Vec<String> = g
-                .clears
-                .iter()
-                .filter_map(|c| {
-                    let name = limit_short_name(&c.key)?;
-                    Some(match c.pct {
-                        Some(p) => format!("{name} {}%", p.round() as i64),
-                        None => name.to_string(),
-                    })
-                })
-                .collect();
-            if !clears.is_empty() {
-                row.push_str(&format!(" · clears {}", clears.join(", ")));
-            }
-        } else if not_weekly {
-            row.push_str(" · won't clear weekly");
-        } else {
-            row.push_str(" · not usable yet");
-        }
-        if let Some(exp) =
-            exp.filter(|e| *e - now < chrono::Duration::days(RESET_EXPIRY_SHOWN_WITHIN_DAYS))
+    for g in grants.iter().filter(|g| g.is_available()) {
+        let ready = g.is_ready();
+        let kind = reset_kind(g);
+        let mut row = format!("🎁 {}", kind.unwrap_or("Reset"));
+        if let Some(exp) = g
+            .expires_at
+            .filter(|e| *e - now < chrono::Duration::days(RESET_EXPIRY_SHOWN_WITHIN_DAYS))
         {
             row.push_str(&format!(
                 " · expires in {}",
                 crate::display::humanize_until(exp)
             ));
         }
-        out.push((row, ready.then(|| g.id.clone())));
+        let id = ready.then(|| g.id.clone());
+        // A grant with several resets left is several resets: one row each.
+        for _ in 0..g.resets_left.min(MAX_ROWS_PER_GRANT) {
+            rows.push((!ready, kind != Some("Session"), row.clone(), id.clone()));
+        }
     }
-    out
-}
-
-fn capitalize(s: &str) -> String {
-    let mut c = s.chars();
-    c.next()
-        .map(|f| f.to_uppercase().chain(c).collect())
-        .unwrap_or_default()
+    rows.sort_by_key(|(saved, not_session, _, _)| (*saved, *not_session));
+    rows.into_iter().map(|(_, _, row, id)| (row, id)).collect()
 }
 
 /// Every provider-reported row for an account, in render order: reset grants

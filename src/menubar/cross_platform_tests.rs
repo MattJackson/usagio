@@ -31,7 +31,7 @@ fn reset_ready_row_is_clickable_only_for_claude() {
             assert_eq!(claim_rows.len(), usize::from(provider == "claude" && ready));
             if let Some((id, label, enabled)) = claim_rows.first() {
                 assert_eq!(id.as_str(), "claim:claude:gift@example.com:gift");
-                assert_eq!(label.as_str(), "→ Use reset");
+                assert_eq!(label.as_str(), "🎁 Reset");
                 assert!(**enabled);
             }
             assert!(!items.iter().any(
