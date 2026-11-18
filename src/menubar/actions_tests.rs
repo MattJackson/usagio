@@ -152,32 +152,36 @@ fn toggle_notification_trigger_read_modify_write_is_atomic_under_contention() {
 
 #[test]
 fn reset_claim_requires_confirmation_and_never_claims_codex() {
-    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     for (provider, approved, expected) in [
         ("claude", false, false),
         ("claude", true, true),
         ("codex", true, false),
     ] {
-        let asked = Cell::new(false);
-        let claimed = Cell::new(false);
+        let asked = StdCell::new(false);
+        let claimed = Arc::new(AtomicBool::new(false));
+        let c = claimed.clone();
         handle_claim_with(
             provider,
             "gift@example.com",
             &[],
             Some("g1"),
-            |question| {
+            |question, on_yes| {
                 asked.set(true);
                 assert!(question.contains("gift@example.com"));
-                approved
+                if approved {
+                    on_yes();
+                }
             },
-            |key, grant| {
+            move |key, grant| {
                 assert_eq!(key, "gift@example.com");
                 assert_eq!(grant.as_deref(), Some("g1"));
-                claimed.set(true);
+                c.store(true, Ordering::SeqCst);
             },
         );
         assert_eq!(asked.get(), provider == "claude");
-        assert_eq!(claimed.get(), expected);
+        assert_eq!(claimed.load(Ordering::SeqCst), expected);
     }
 }
 
@@ -257,16 +261,20 @@ fn claim_spends_the_grant_that_was_clicked_not_the_first_ready_one() {
     );
     // A named grant that's gone or not ready is never swapped for another.
     assert!(chosen_grant(&grants, Some("gone")).is_none());
-    let claimed = std::cell::RefCell::new(None);
+    let claimed = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let c = claimed.clone();
     handle_claim_with(
         "claude",
         "dev2@example.com",
         &grants,
         Some("launch-2610-fable"),
-        |_| true,
-        |_, grant| *claimed.borrow_mut() = grant,
+        |_, on_yes| on_yes(),
+        move |_, grant| *c.lock().unwrap() = grant,
     );
-    assert_eq!(claimed.into_inner().as_deref(), Some("launch-2610-fable"));
+    assert_eq!(
+        claimed.lock().unwrap().as_deref(),
+        Some("launch-2610-fable")
+    );
 }
 
 #[test]
@@ -610,4 +618,125 @@ fn refresh_now_reports_failed_fetches_instead_of_success() {
         refresh_summary(1, 0, &["a@x.io".to_string()]),
         "Usage refreshed — a@x.io needs re-login"
     );
+}
+
+/// Drain the UI queue on this (the "UI") thread until `flag` is set.
+fn drain_ui_until(flag: &std::sync::atomic::AtomicBool) -> bool {
+    use std::sync::atomic::Ordering;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !flag.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        run_ui_tasks();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    flag.load(Ordering::SeqCst)
+}
+
+/// Regression: the confirm dialog was asked on the UI thread, so on macOS the
+/// run loop stopped while it was open and none of its buttons (Cancel
+/// included) worked. The ask must return at once, run the dialog elsewhere,
+/// and run the confirmed action back on the UI thread.
+#[test]
+fn confirm_does_not_block_the_ui_thread_and_acts_there_on_yes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc, Mutex};
+    let _ui = UI_TASKS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let ui_thread = std::thread::current().id();
+    let (answer_tx, answer_rx) = mpsc::channel::<bool>();
+    let ask_thread = Arc::new(Mutex::new(None));
+    let did = Arc::new(AtomicBool::new(false));
+    let yes_thread = Arc::new(Mutex::new(None));
+    let (at, d, yt) = (ask_thread.clone(), did.clone(), yes_thread.clone());
+    confirm_then_with(
+        "Use the reset?".into(),
+        "Use reset".into(),
+        move |q, b| {
+            assert_eq!((q, b), ("Use the reset?", "Use reset"));
+            *at.lock().unwrap() = Some(std::thread::current().id());
+            // The user hasn't answered yet: the dialog is still open.
+            answer_rx.recv().unwrap()
+        },
+        move || {
+            *yt.lock().unwrap() = Some(std::thread::current().id());
+            d.store(true, Ordering::SeqCst);
+        },
+    );
+    // Returned while the dialog is still open, and the UI loop keeps running.
+    run_ui_tasks();
+    assert!(
+        !did.load(Ordering::SeqCst),
+        "acted before the user answered"
+    );
+    answer_tx.send(true).unwrap();
+    assert!(drain_ui_until(&did), "the confirmed action never ran");
+    let asked_on = ask_thread.lock().unwrap().expect("dialog was asked");
+    assert_ne!(
+        asked_on, ui_thread,
+        "the dialog must not run on the UI thread"
+    );
+    assert_eq!(*yes_thread.lock().unwrap(), Some(ui_thread));
+}
+
+#[test]
+fn confirm_cancel_or_no_answer_does_nothing() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    let _ui = UI_TASKS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let did = Arc::new(AtomicBool::new(false));
+    let (asked_tx, asked_rx) = mpsc::channel();
+    let d = did.clone();
+    confirm_then_with(
+        "Remove account?".into(),
+        "Remove".into(),
+        move |_, _| {
+            asked_tx.send(()).unwrap();
+            false
+        },
+        move || d.store(true, Ordering::SeqCst),
+    );
+    asked_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("dialog was asked");
+    // Give a (wrongly) queued action every chance to run.
+    for _ in 0..10 {
+        run_ui_tasks();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !did.load(Ordering::SeqCst),
+        "Cancel must not run the action"
+    );
+}
+
+#[test]
+fn block_on_waits_for_a_future_completed_by_another_thread() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Waker};
+    type Slot = Arc<Mutex<(Option<u32>, Option<Waker>)>>;
+    struct Answer(Slot);
+    impl Future for Answer {
+        type Output = u32;
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
+            let mut s = self.0.lock().unwrap();
+            match s.0.take() {
+                Some(v) => Poll::Ready(v),
+                None => {
+                    s.1 = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+        }
+    }
+    let slot: Slot = Arc::new(Mutex::new((None, None)));
+    let s = slot.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(30));
+        let mut g = s.lock().unwrap();
+        g.0 = Some(7);
+        if let Some(w) = g.1.take() {
+            w.wake();
+        }
+    });
+    assert_eq!(block_on(Answer(slot)), 7);
 }

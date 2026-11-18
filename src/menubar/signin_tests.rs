@@ -43,8 +43,7 @@ fn tracking_a_new_browser_login_supersedes_the_one_it_replaces() {
     assert!(std::sync::Arc::ptr_eq(&prev, &new));
 }
 
-/// Serializes the tests that drain the shared UI task queue.
-static UI_TASKS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+use crate::menubar::actions::UI_TASKS_TEST_LOCK;
 
 /// Drain the UI queue on this (the "UI") thread until `flag` is set.
 fn drain_until(flag: &std::sync::atomic::AtomicBool) -> bool {
