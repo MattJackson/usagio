@@ -164,13 +164,15 @@ fn reset_claim_requires_confirmation_and_never_claims_codex() {
             provider,
             "gift@example.com",
             &[],
+            Some("g1"),
             |question| {
                 asked.set(true);
                 assert!(question.contains("gift@example.com"));
                 approved
             },
-            |key| {
+            |key, grant| {
                 assert_eq!(key, "gift@example.com");
+                assert_eq!(grant.as_deref(), Some("g1"));
                 claimed.set(true);
             },
         );
@@ -179,36 +181,152 @@ fn reset_claim_requires_confirmation_and_never_claims_codex() {
     }
 }
 
-#[test]
-fn claim_question_says_what_clears_and_what_does_not() {
-    use crate::providers::trait_def::{ClearedLimit, ResetGrant};
-    let g = |id: &str| ResetGrant {
+fn cleared(key: &str, pct: f64) -> crate::providers::trait_def::ClearedLimit {
+    crate::providers::trait_def::ClearedLimit {
+        key: key.into(),
+        pct: Some(pct),
+    }
+}
+
+fn ready_grant(
+    id: &str,
+    clears: Vec<crate::providers::trait_def::ClearedLimit>,
+) -> crate::providers::trait_def::ResetGrant {
+    crate::providers::trait_def::ResetGrant {
         id: id.into(),
         resets_left: 1,
         usable_now: true,
-        clears: vec![
-            ClearedLimit {
-                key: "five_hour".into(),
-                pct: Some(99.0),
-            },
-            ClearedLimit {
-                key: "seven_day_overage_included".into(),
-                pct: Some(0.0),
-            },
-        ],
-        ..ResetGrant::default()
+        clears,
+        ..Default::default()
+    }
+}
+
+/// dev2's live shape: a full (session + weekly) reset listed first, then a
+/// session-only launch reset.
+fn dev2_grants() -> Vec<crate::providers::trait_def::ResetGrant> {
+    vec![
+        ready_grant(
+            "full-reset-2611",
+            vec![
+                cleared("five_hour", 100.0),
+                cleared("seven_day", 27.0),
+                cleared("seven_day_overage_included", 7.0),
+            ],
+        ),
+        ready_grant(
+            "launch-2610-fable",
+            vec![
+                cleared("five_hour", 100.0),
+                cleared("seven_day_overage_included", 7.0),
+            ],
+        ),
+    ]
+}
+
+#[test]
+fn claim_target_splits_account_and_grant() {
+    assert_eq!(
+        split_claim_target("dev2@example.com:launch-2610-fable"),
+        ("dev2@example.com", Some("launch-2610-fable"))
+    );
+    // A grant id may itself contain ':'.
+    assert_eq!(
+        split_claim_target("dev2@example.com:a:b"),
+        ("dev2@example.com", Some("a:b"))
+    );
+    // Old click ids carry only the account.
+    assert_eq!(
+        split_claim_target("dev2@example.com"),
+        ("dev2@example.com", None)
+    );
+    let c = parse_click_id("claim:claude:dev2@example.com:launch-2610-fable");
+    assert_eq!(c.key, Some("dev2@example.com:launch-2610-fable"));
+}
+
+#[test]
+fn claim_spends_the_grant_that_was_clicked_not_the_first_ready_one() {
+    let grants = dev2_grants();
+    assert_eq!(
+        chosen_grant(&grants, Some("launch-2610-fable")).map(|g| g.id.as_str()),
+        Some("launch-2610-fable")
+    );
+    // No grant named (old menu): first ready one, as before.
+    assert_eq!(
+        chosen_grant(&grants, None).map(|g| g.id.as_str()),
+        Some("full-reset-2611")
+    );
+    // A named grant that's gone or not ready is never swapped for another.
+    assert!(chosen_grant(&grants, Some("gone")).is_none());
+    let claimed = std::cell::RefCell::new(None);
+    handle_claim_with(
+        "claude",
+        "dev2@example.com",
+        &grants,
+        Some("launch-2610-fable"),
+        |_| true,
+        |_, grant| *claimed.borrow_mut() = grant,
+    );
+    assert_eq!(claimed.into_inner().as_deref(), Some("launch-2610-fable"));
+}
+
+#[test]
+fn claim_question_names_the_reset_and_what_stays_banked() {
+    let grants = dev2_grants();
+    assert_eq!(
+        claim_question("dev2@example.com", &grants, Some("launch-2610-fable")),
+        "Use the session reset on dev2@example.com?\n\n\
+         Clears the 5-hour session limit (now 100%).\n\
+         Your weekly limit (now 27%) is not reset.\n\n\
+         Still banked after this: 1 session + weekly reset."
+    );
+    assert_eq!(
+        claim_question("dev2@example.com", &grants, Some("full-reset-2611")),
+        "Use the session + weekly reset on dev2@example.com?\n\n\
+         Clears the 5-hour session limit (now 100%).\n\
+         Clears the weekly limit (now 27%).\n\n\
+         Only need the session cleared? Use the session reset\n\
+         instead and keep this one for the weekly limit.\n\n\
+         Still banked after this: 1 session reset."
+    );
+}
+
+#[test]
+fn claim_question_counts_the_last_and_remaining_resets() {
+    let g = |id: &str| {
+        ready_grant(
+            id,
+            vec![
+                cleared("five_hour", 99.0),
+                cleared("seven_day_overage_included", 0.0),
+            ],
+        )
     };
     assert_eq!(
-        claim_question("dev4@example.com", &[g("a")]),
-        "Use a session reset on dev4@example.com?\n\n\
+        claim_question("dev4@example.com", &[g("a")], Some("a")),
+        "Use the session reset on dev4@example.com?\n\n\
          Clears the 5-hour session limit (now 99%).\n\
          Your weekly limit is not reset.\n\n\
          This is the last reset on this account."
     );
-    let q = claim_question("dev4@example.com", &[g("a"), g("b"), g("c")]);
-    assert!(q.ends_with("2 resets will be left on this account."), "{q}");
-    // The empty side bucket isn't mentioned.
+    let q = claim_question("dev4@example.com", &[g("a"), g("b"), g("c")], Some("b"));
+    assert!(
+        q.ends_with("Still banked after this: 2 session resets."),
+        "{q}"
+    );
     assert!(!q.contains("extra-usage"), "{q}");
+}
+
+#[test]
+fn claim_notification_says_what_was_cleared() {
+    assert_eq!(
+        cleared_phrase(&["five_hour".into(), "seven_day_overage_included".into()]),
+        "5-hour session limit cleared"
+    );
+    assert_eq!(
+        cleared_phrase(&["five_hour".into(), "seven_day".into()]),
+        "5-hour session limit and weekly limit cleared"
+    );
+    assert_eq!(cleared_phrase(&[]), "limit cleared");
 }
 
 #[test]

@@ -5,6 +5,18 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.5] - 2026-11-17
+
+### Fixed
+
+- Clicking a reset now spends the reset you clicked. With a session reset and a session + weekly reset both banked, usagio always spent whichever the server listed first (often the full one), so the weekly reset was used when only the session needed clearing.
+- A successful claim is reported as applied. The claim endpoint names its outcome `result`; usagio only read `status`/`outcome`, so a reset that worked showed "No reset applied: unknown".
+
+### Changed
+
+- The reset section of an account submenu says how many resets you have and how to use one ("🎁 2 resets available · click one to use it"), then one clickable row per kind with what it clears ("→ Use session reset · clears 5-hour 100%"). Session-only resets are listed first.
+- The claim confirmation names the reset, shows the weekly % it leaves alone, points to the session reset when you picked the full one while both are banked, and lists what stays banked. The extra-usage line is gone. The success notification says which limit was cleared.
+
 ## [1.1.4] - 2026-11-10
 
 ### Fixed

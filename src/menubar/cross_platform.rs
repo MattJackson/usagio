@@ -13,7 +13,7 @@ use super::model::{
 };
 use super::render::{
     account_extra_info_rows, account_header_row, account_submenu_rows, provider_group_header_row,
-    quit_row_plain, reset_grant_rows, submenu_info_items, u16len, RowStyle,
+    quit_row_plain, reset_grant_row_items, submenu_info_items, u16len, RowStyle,
 };
 use crate::platform::{MenuItem as PMenuItem, MenuTree, ValueColor};
 use crate::providers;
@@ -132,13 +132,17 @@ fn build_account_submenu_item(sec: &ProviderSection, a: &AcctView) -> PMenuItem 
     let mut items = Vec::new();
     let rows = account_submenu_rows(sec, a);
     for (row, locked) in submenu_info_items(sec, a) {
-        let ready_reset = rows.claim_reset_row
-            && reset_grant_rows(&a.reported.reset_grants)
-                .iter()
-                .any(|(text, ready)| *ready && *text == row);
-        if ready_reset {
+        // A ready reset row claims exactly the grant it names.
+        let ready_grant = if rows.claim_reset_row {
+            reset_grant_row_items(&a.reported.reset_grants)
+                .into_iter()
+                .find_map(|(text, id)| id.filter(|_| text == row))
+        } else {
+            None
+        };
+        if let Some(grant_id) = ready_grant {
             items.push(action(
-                format!("claim:{}:{}", sec.provider_id, a.key),
+                format!("claim:{}:{}:{grant_id}", sec.provider_id, a.key),
                 row,
                 true,
             ));
