@@ -1,6 +1,6 @@
 //! Advanced ▸ Backups: save and restore of state.json.
 
-use super::actions::confirm;
+use super::actions::confirm_then;
 use crate::notifications::notify;
 use crate::state_ops::with_state_lock;
 use crate::store::State;
@@ -150,14 +150,25 @@ fn handle_backup_restore_dialog_with(dialog: &dyn crate::platform::FileDialog) {
             return;
         }
     };
-    if !asked_about.is_empty() && !confirm(&restore_drop_confirmation(&asked_about)) {
-        return; // user declined; not an error
+    if asked_about.is_empty() {
+        apply_restore(&new_state, &asked_about, &path);
+    } else {
+        // Applied only if the user confirms; declining is a no-op, not an error.
+        confirm_then(
+            restore_drop_confirmation(&asked_about),
+            "Remove",
+            move || apply_restore(&new_state, &asked_about, &path),
+        );
     }
+}
 
-    let outcome = with_state_lock(|lock| -> Result<bool> {
+/// Write `new_state` over state.json, unless the accounts it drops are no
+/// longer exactly `asked_about` (what the user was asked to confirm).
+fn apply_restore(new_state: &State, asked_about: &[String], path: &std::path::Path) {
+    let outcome = with_state_lock(|lock| -> Result<()> {
         // Recompute under the lock: if the set of dropped accounts changed
         // while the dialog was open, the confirmation no longer applies.
-        let dropped = crate::store::accounts_dropped_by(&new_state)?;
+        let dropped = crate::store::accounts_dropped_by(new_state)?;
         if dropped != asked_about {
             anyhow::bail!("accounts changed while the confirmation was open; try Restore again");
         }
@@ -167,12 +178,11 @@ fn handle_backup_restore_dialog_with(dialog: &dyn crate::platform::FileDialog) {
         // kept as an extra pre-restore copy.
         crate::store::stash_pre_restore(&dir)?;
         crate::store::save_state_restore(lock, new_state.clone())?;
-        Ok(true)
+        Ok(())
     });
 
     match outcome {
-        Ok(true) => notify(&format!("Restored state from {}", path.display())),
-        Ok(false) => {} // user declined the drop confirmation; no-op
+        Ok(()) => notify(&format!("Restored state from {}", path.display())),
         Err(e) => notify(&format!("Restore failed: {e}")),
     }
 }

@@ -335,7 +335,7 @@ fn handle_claim(slug: &str, target: &str) {
         key,
         &grants,
         grant_id,
-        |question| confirm_with_button(question, &button),
+        |question, on_yes| confirm_then(question, &button, on_yes),
         spawn_claim,
     );
 }
@@ -381,19 +381,21 @@ fn handle_claim_with(
     key: &str,
     grants: &[ResetGrant],
     grant_id: Option<&str>,
-    ask: impl FnOnce(&str) -> bool,
-    claim: impl FnOnce(String, Option<String>),
+    ask: impl FnOnce(String, Box<dyn FnOnce() + Send>),
+    claim: impl FnOnce(String, Option<String>) + Send + 'static,
 ) {
     if slug != CLAUDE_SLUG {
         return;
     }
-    let chosen = chosen_grant(grants, grant_id).map(|g| g.id.clone());
-    if ask(&claim_question(key, grants, grant_id)) {
-        claim(
-            key.to_string(),
-            chosen.or_else(|| grant_id.map(String::from)),
-        );
-    }
+    let key_owned = key.to_string();
+    let grant = chosen_grant(grants, grant_id)
+        .map(|g| g.id.clone())
+        .or_else(|| grant_id.map(String::from));
+    // `ask` runs `on_yes` only once the user confirms (later, on the UI thread).
+    ask(
+        claim_question(key, grants, grant_id),
+        Box::new(move || claim(key_owned, grant)),
+    );
 }
 
 /// Plain name for a limit key a reset clears.
@@ -699,9 +701,15 @@ fn handle_apikey_capture(slug: &str) {
 }
 
 fn handle_remove(slug: &str, key: &str) {
-    if !confirm(&format!("Remove account {key}? This cannot be undone.")) {
-        return;
-    }
+    let (slug, key) = (slug.to_string(), key.to_string());
+    confirm_then(
+        format!("Remove account {key}? This cannot be undone."),
+        "Remove",
+        move || remove_confirmed(&slug, &key),
+    );
+}
+
+fn remove_confirmed(slug: &str, key: &str) {
     // State v2 (codex-switch-e2e): a non-Claude provider's accounts can now
     // actually render a "Remove…" row (see `build_snapshot`), so route it to
     // the matching state.json bucket instead of the old blanket
@@ -805,17 +813,29 @@ fn set_autoswap_threshold(v: f64) {
     }
 }
 
-/// A native confirm dialog; true only if the user clicks the destructive
-/// button. Cross-platform via `rfd::MessageDialog` (already a crate
-/// dependency for the Backups Save…/Restore… file panels) rather than the
-/// macOS-only `osascript -e 'display dialog …'` this used to shell out to —
-/// `rfd::MessageDialog` has native backends on macOS (NSAlert), Windows
-/// (MessageBoxW), and Linux (our xdg-portal `rfd` feature shells out to
-/// `zenity(1)` for message dialogs specifically; if `zenity` isn't installed
-/// the dialog fails closed to `Cancel`, so a missing binary can't accidentally
-/// confirm a destructive action).
-pub(super) fn confirm(question: &str) -> bool {
-    confirm_with_button(question, "Remove")
+/// Ask `question` in a native confirm dialog, then — only if the user clicks
+/// `button` — run `on_yes` on the UI thread. Returns at once: the dialog is
+/// asked on a worker thread so the UI thread's run loop keeps turning while it
+/// is open. Asking on the UI thread froze the app: on macOS `rfd`'s blocking
+/// `MessageDialog::show()` runs `CFUserNotificationDisplayAlert` on the main
+/// thread, and with the run loop stopped none of the alert's buttons (Cancel
+/// included) did anything until the app was killed.
+pub(super) fn confirm_then(question: String, button: &str, on_yes: impl FnOnce() + Send + 'static) {
+    confirm_then_with(question, button.to_string(), ask_blocking, on_yes);
+}
+
+/// [`confirm_then`] with the dialog injected, for tests.
+fn confirm_then_with(
+    question: String,
+    button: String,
+    ask: impl FnOnce(&str, &str) -> bool + Send + 'static,
+    on_yes: impl FnOnce() + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        if ask(&question, &button) {
+            run_on_ui_thread(on_yes);
+        }
+    });
 }
 
 /// What the user answered: `Some(true)` for `button`, `Some(false)` for any
@@ -827,15 +847,31 @@ fn confirm_answer(result: rfd::MessageDialogResult, button: &str) -> Option<bool
     }
 }
 
-fn confirm_with_button(question: &str, button: &str) -> bool {
+/// Show the dialog and wait for the answer. Worker threads only (see
+/// [`confirm_then`]). Cross-platform via `rfd` — NSAlert-style user
+/// notification on macOS, MessageBoxW / TaskDialog on Windows, and
+/// `zenity(1)` on Linux (our xdg-portal `rfd` feature); if `zenity` isn't
+/// installed the dialog fails closed, so a missing binary can't accidentally
+/// confirm a destructive action.
+fn ask_blocking(question: &str, button: &str) -> bool {
+    let buttons = rfd::MessageButtons::OkCancelCustom(button.to_string(), "Cancel".to_string());
+    // macOS: the async dialog shows its alert on rfd's own thread. The sync
+    // `show()` would hop back onto the main thread and freeze it again.
+    #[cfg(target_os = "macos")]
+    let result = block_on(
+        rfd::AsyncMessageDialog::new()
+            .set_title("usagio")
+            .set_description(question)
+            .set_level(rfd::MessageLevel::Warning)
+            .set_buttons(buttons)
+            .show(),
+    );
+    #[cfg(not(target_os = "macos"))]
     let result = rfd::MessageDialog::new()
         .set_title("usagio")
         .set_description(question)
         .set_level(rfd::MessageLevel::Warning)
-        .set_buttons(rfd::MessageButtons::OkCancelCustom(
-            button.to_string(),
-            "Cancel".to_string(),
-        ))
+        .set_buttons(buttons)
         .show();
     // Both buttons are custom, so a non-button result means the dialog was
     // dismissed without one (Esc or close on Windows) or could not be shown at
@@ -852,6 +888,34 @@ fn confirm_with_button(question: &str, button: &str) -> bool {
         false
     })
 }
+
+/// Run `fut` to completion on this thread, parking between polls. Enough for
+/// the one future it drives (rfd's dialog answer, completed by rfd's own
+/// thread), so no async runtime is pulled in for it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+    struct Unpark(std::thread::Thread);
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+            return v;
+        }
+        std::thread::park();
+    }
+}
+
+/// Serializes the tests that drain the shared UI task queue.
+#[cfg(test)]
+pub(super) static UI_TASKS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 #[path = "actions_tests.rs"]
