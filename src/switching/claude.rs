@@ -196,25 +196,31 @@ fn claim_refresh_token(
 /// profile and the grant id from the cached usage the menu was built from, then
 /// POSTs the claim. Returns the server's [`ClaimOutcome`] or a user-facing
 /// error string. SPENDS a one-shot reset — only ever called from the explicit
-/// "Claim reset…" menu action.
-pub(crate) fn claim_claude_reset(email: &str) -> std::result::Result<usage::ClaimOutcome, String> {
+/// "Use … reset" menu row. `grant_id` is the grant that row named; `None`
+/// (a click id from an older menu) takes the first ready grant.
+pub(crate) fn claim_claude_reset(
+    email: &str,
+    grant_id: Option<&str>,
+) -> std::result::Result<usage::ClaimOutcome, String> {
     let provider = providers::get(CLAUDE_SLUG).ok_or("claude provider unavailable")?;
     let mut acct = State::load()
         .map_err(|e| format!("loading state: {e:#}"))?
         .find(email)
         .cloned()
         .ok_or_else(|| format!("account {email} not found"))?;
-    // Pick the grant from the cache the menu row was built from — the one the
-    // user saw as claimable. First ready grant wins (see `ResetGrant::is_ready`).
+    // Check the grant against the cache the menu row was built from: it must
+    // still be ready (see `ResetGrant::is_ready`) so a click never spends a
+    // reset that would clear nothing.
     let grant_id = acct
         .cached_usage
         .as_ref()
         .map(|c| &c.reported.reset_grants)
         .into_iter()
         .flatten()
-        .find(|g| g.is_ready())
+        .filter(|g| g.is_ready())
+        .find(|g| grant_id.is_none_or(|id| g.id == id))
         .map(|g| g.id.clone())
-        .ok_or("no claimable reset on this account")?;
+        .ok_or("that reset is no longer claimable on this account")?;
     let is_active = State::load().ok().is_some_and(|st| {
         st.active
             .as_deref()

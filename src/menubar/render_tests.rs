@@ -466,8 +466,15 @@ fn grant_with(id: &str, usable_now: bool, clears: Vec<ClearedLimit>) -> ResetGra
     }
 }
 
+fn row_texts(grants: &[ResetGrant]) -> Vec<String> {
+    reset_grant_rows(grants)
+        .into_iter()
+        .map(|(r, _)| r)
+        .collect()
+}
+
 #[test]
-fn reset_rows_say_session_or_weekly_and_merge_duplicates() {
+fn reset_section_says_how_many_what_each_clears_and_to_click_one() {
     // Session-capped account (live shape: clears five_hour at 99%).
     let session = grant_with(
         "a",
@@ -479,30 +486,88 @@ fn reset_rows_say_session_or_weekly_and_merge_duplicates() {
     );
     assert_eq!(
         reset_grant_rows(std::slice::from_ref(&session)),
-        vec![("🎁 Session reset ready".to_string(), true)]
+        vec![
+            (
+                "🎁 1 reset available · click it to use it".to_string(),
+                false
+            ),
+            ("→ Use session reset · clears 5-hour 99%".to_string(), true),
+        ]
     );
     // Weekly-capped account: server says usable, but the only thing it
     // clears is an empty bucket — claiming would waste it (dev7).
     let wasted = |id: &str| grant_with(id, true, vec![cleared("seven_day_overage_included", 0.0)]);
     assert_eq!(
         reset_grant_rows(&[wasted("a")]),
-        vec![("🎁 Reset saved · won't clear weekly".to_string(), false)]
+        vec![
+            (
+                "🎁 1 reset saved · none would help right now".to_string(),
+                false
+            ),
+            ("Reset · won't clear weekly".to_string(), false),
+        ]
     );
     // Three identical grants collapse into one counted row (matthew@pq).
     assert_eq!(
-        reset_grant_rows(&[wasted("a"), wasted("b"), wasted("c")]),
-        vec![("🎁 3 resets saved · won't clear weekly".to_string(), false)]
+        row_texts(&[wasted("a"), wasted("b"), wasted("c")]),
+        vec![
+            "🎁 3 resets saved · none would help right now",
+            "Reset (3×) · won't clear weekly",
+        ]
     );
     // A weekly reset says so.
     let weekly = grant_with("w", true, vec![cleared("seven_day", 100.0)]);
     assert_eq!(
-        reset_grant_rows(&[weekly]),
-        vec![("🎁 Weekly reset ready".to_string(), true)]
+        row_texts(&[weekly]),
+        vec![
+            "🎁 1 reset available · click it to use it",
+            "→ Use weekly reset · clears weekly 100%",
+        ]
     );
-    // Spent → no row.
+    // Spent → no rows at all.
     let mut spent = session.clone();
     spent.resets_left = 0;
     assert!(reset_grant_rows(&[spent]).is_empty());
+}
+
+#[test]
+fn reset_rows_carry_their_grant_and_list_the_session_only_one_first() {
+    // dev2: the full reset comes first from the server; the session-only
+    // one must lead the menu and each row must claim its own grant.
+    let full = grant_with(
+        "full-reset-2611",
+        true,
+        vec![
+            cleared("five_hour", 100.0),
+            cleared("seven_day", 27.0),
+            cleared("seven_day_overage_included", 7.0),
+        ],
+    );
+    let fable = grant_with(
+        "launch-2610-fable",
+        true,
+        vec![
+            cleared("five_hour", 100.0),
+            cleared("seven_day_overage_included", 7.0),
+        ],
+    );
+    assert_eq!(
+        reset_grant_row_items(&[full, fable]),
+        vec![
+            (
+                "🎁 2 resets available · click one to use it".to_string(),
+                None
+            ),
+            (
+                "→ Use session reset · clears 5-hour 100%".to_string(),
+                Some("launch-2610-fable".to_string())
+            ),
+            (
+                "→ Use session + weekly reset · clears 5-hour 100%, weekly 27%".to_string(),
+                Some("full-reset-2611".to_string())
+            ),
+        ]
+    );
 }
 
 #[test]
@@ -514,20 +579,25 @@ fn reset_rows_without_clears_trust_the_provider_flag() {
         usable_now,
         ..ResetGrant::default()
     };
-    assert_eq!(reset_grant_rows(&[mk(1, true)])[0].0, "🎁 Reset ready");
-    assert_eq!(reset_grant_rows(&[mk(2, false)])[0].0, "🎁 2 resets saved");
+    assert_eq!(
+        row_texts(&[mk(1, true)]),
+        vec!["🎁 1 reset available · click it to use it", "→ Use reset"]
+    );
+    assert_eq!(
+        row_texts(&[mk(2, false)]),
+        vec![
+            "🎁 2 resets saved · none would help right now",
+            "Reset (2×) · not usable yet",
+        ]
+    );
 }
 
 #[test]
 fn reset_expiry_shows_only_when_close() {
     let mut g = grant_with("a", true, vec![cleared("five_hour", 99.0)]);
-    assert!(!reset_grant_rows(std::slice::from_ref(&g))[0]
-        .0
-        .contains("expires"));
+    assert!(!row_texts(std::slice::from_ref(&g))[1].contains("expires"));
     g.expires_at = Some(Utc::now() + chrono::Duration::days(3));
-    assert!(reset_grant_rows(&[g])[0]
-        .0
-        .starts_with("🎁 Session reset ready · expires in "));
+    assert!(row_texts(&[g])[1].starts_with("→ Use session reset · clears 5-hour 99% · expires in "));
 }
 
 #[test]
@@ -544,7 +614,11 @@ fn reset_grant_rows_lead_reported_rows() {
         }],
         ..ReportedUsage::default()
     });
-    assert_eq!(rows[0], "🎁 Reset ready", "{rows:?}");
+    assert_eq!(
+        rows[0], "🎁 1 reset available · click it to use it",
+        "{rows:?}"
+    );
+    assert_eq!(rows[1], "→ Use reset", "{rows:?}");
 }
 
 #[test]
