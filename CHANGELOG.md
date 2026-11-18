@@ -5,6 +5,12 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.7] - 2026-11-18
+
+### Fixed
+
+- Confirmation dialogs (use a reset, remove an account, a restore that drops accounts) no longer freeze the menu-bar app on macOS. None of their buttons worked, Cancel included, until the app was killed. The dialog was shown on the app's main thread and blocked it; it is now asked off that thread and the confirmed action runs once you answer.
+
 ## [1.1.6] - 2026-11-18
 
 ### Changed
