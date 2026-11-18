@@ -309,37 +309,85 @@ fn capture_serialized(slug: &str) {
 }
 
 /// Clicking a ready reset asks for confirmation before spending it. Claude
-/// only; a click id for any other slug is ignored. Runs off the UI thread — the claim does a token
+/// only; a click id for any other slug is ignored. `target` is
+/// `<account>:<grant id>` (the grant the clicked row names), or just
+/// `<account>` from a menu built before rows carried grant ids — then the
+/// first ready grant is used. Runs off the UI thread — the claim does a token
 /// refresh, a profile fetch and a POST — and refreshes usage on success so the
 /// cleared windows show up right away. This SPENDS a one-shot reset, so it only
 /// ever runs from this explicit click, never automatically.
-fn handle_claim(slug: &str, key: &str) {
+fn handle_claim(slug: &str, target: &str) {
+    let (key, grant_id) = split_claim_target(target);
     let grants = State::load()
         .ok()
         .and_then(|st| st.find(key).cloned())
         .and_then(|a| a.cached_usage)
         .map(|c| c.reported.reset_grants)
         .unwrap_or_default();
+    let button = format!(
+        "Use {}",
+        chosen_grant(&grants, grant_id)
+            .map(reset_name)
+            .unwrap_or("reset")
+    );
     handle_claim_with(
         slug,
         key,
         &grants,
-        |question| confirm_with_button(question, "Use reset"),
-        |key| {
-            spawn_claim(key);
-        },
+        grant_id,
+        |question| confirm_with_button(question, &button),
+        spawn_claim,
     );
+}
+
+/// `<account>:<grant id>` → (account, Some(grant id)); a bare account → None.
+/// Accounts are emails (no `:`); a grant id may contain one.
+pub(super) fn split_claim_target(target: &str) -> (&str, Option<&str>) {
+    match target.split_once(':') {
+        Some((key, id)) if !id.is_empty() => (key, Some(id)),
+        _ => (target.trim_end_matches(':'), None),
+    }
+}
+
+/// The grant a click claims: the named one if it's still ready, else (old
+/// click ids without a grant) the first ready grant.
+pub(super) fn chosen_grant<'a>(
+    grants: &'a [ResetGrant],
+    grant_id: Option<&str>,
+) -> Option<&'a ResetGrant> {
+    match grant_id {
+        Some(id) => grants.iter().find(|g| g.id == id && g.is_ready()),
+        None => grants.iter().find(|g| g.is_ready()),
+    }
+}
+
+/// "session reset", "session + weekly reset", "weekly reset" or "reset".
+fn reset_name(g: &ResetGrant) -> &'static str {
+    match (g.clears_session(), g.clears_weekly()) {
+        (true, true) => "session + weekly reset",
+        (true, false) => "session reset",
+        (false, true) => "weekly reset",
+        (false, false) => "reset",
+    }
 }
 
 fn handle_claim_with(
     slug: &str,
     key: &str,
     grants: &[ResetGrant],
+    grant_id: Option<&str>,
     ask: impl FnOnce(&str) -> bool,
-    claim: impl FnOnce(String),
+    claim: impl FnOnce(String, Option<String>),
 ) {
-    if slug == CLAUDE_SLUG && ask(&claim_question(key, grants)) {
-        claim(key.to_string());
+    if slug != CLAUDE_SLUG {
+        return;
+    }
+    let chosen = chosen_grant(grants, grant_id).map(|g| g.id.clone());
+    if ask(&claim_question(key, grants, grant_id)) {
+        claim(
+            key.to_string(),
+            chosen.or_else(|| grant_id.map(String::from)),
+        );
     }
 }
 
@@ -353,23 +401,23 @@ fn limit_name(key: &str) -> String {
     }
 }
 
-/// The confirmation text: what the reset clears (with current usage), what it
-/// leaves alone, and how many resets the account has left afterwards.
-pub(super) fn claim_question(key: &str, grants: &[ResetGrant]) -> String {
-    let Some(g) = grants.iter().find(|g| g.is_ready()) else {
+/// The confirmation text: which reset, what it clears (with current usage),
+/// what it leaves alone, a pointer to the session-only reset when the user
+/// picked a session + weekly one while both are banked, and what stays banked.
+pub(super) fn claim_question(key: &str, grants: &[ResetGrant], grant_id: Option<&str>) -> String {
+    let Some(g) = chosen_grant(grants, grant_id) else {
         return format!("Use a reset on {key}?");
     };
-    let kind = match (g.clears_session(), g.clears_weekly()) {
-        (true, true) => "a session + weekly reset",
-        (true, false) => "a session reset",
-        (false, true) => "a weekly reset",
-        (false, false) => "a reset",
-    };
-    let mut lines = vec![format!("Use {kind} on {key}?"), String::new()];
-    // Skip empty side buckets (0%): clearing them changes nothing.
-    for c in g.clears.iter().filter(|c| {
-        c.key == SESSION_LIMIT_KEY || c.key == WEEKLY_LIMIT_KEY || c.pct.is_some_and(|p| p > 0.0)
-    }) {
+    let mut lines = vec![
+        format!("Use the {} on {key}?", reset_name(g)),
+        String::new(),
+    ];
+    // Only the session and weekly limits; side buckets are noise here.
+    for c in g
+        .clears
+        .iter()
+        .filter(|c| c.key == SESSION_LIMIT_KEY || c.key == WEEKLY_LIMIT_KEY)
+    {
         let now = c
             .pct
             .map(|p| format!(" (now {}%)", p.round() as i64))
@@ -377,30 +425,86 @@ pub(super) fn claim_question(key: &str, grants: &[ResetGrant]) -> String {
         lines.push(format!("Clears the {}{now}.", limit_name(&c.key)));
     }
     if !g.clears.is_empty() && !g.clears_weekly() {
-        lines.push("Your weekly limit is not reset.".to_string());
+        // The weekly % comes from any grant that lists it.
+        let weekly = grants
+            .iter()
+            .flat_map(|o| o.clears.iter())
+            .find(|c| c.key == WEEKLY_LIMIT_KEY)
+            .and_then(|c| c.pct)
+            .map(|p| format!(" (now {}%)", p.round() as i64))
+            .unwrap_or_default();
+        lines.push(format!("Your weekly limit{weekly} is not reset."));
     }
-    let left: u32 = grants
-        .iter()
-        .filter(|g| g.is_available())
-        .map(|g| g.resets_left)
-        .sum();
+    let cheaper = g.clears_weekly()
+        && g.clears_session()
+        && grants
+            .iter()
+            .any(|o| o.id != g.id && o.is_ready() && o.clears_session() && !o.clears_weekly());
+    if cheaper {
+        lines.push(String::new());
+        lines.push("Only need the session cleared? Use the session reset".to_string());
+        lines.push("instead and keep this one for the weekly limit.".to_string());
+    }
+    // What stays banked: every available grant, minus the one being spent.
+    let mut left: Vec<(&'static str, u32)> = Vec::new();
+    for o in grants.iter().filter(|o| o.is_available()) {
+        let n = if o.id == g.id {
+            o.resets_left - 1
+        } else {
+            o.resets_left
+        };
+        if n == 0 {
+            continue;
+        }
+        let name = reset_name(o);
+        match left.iter_mut().find(|(k, _)| *k == name) {
+            Some((_, c)) => *c += n,
+            None => left.push((name, n)),
+        }
+    }
     lines.push(String::new());
-    lines.push(match left.saturating_sub(1) {
-        0 => "This is the last reset on this account.".to_string(),
-        1 => "1 reset will be left on this account.".to_string(),
-        n => format!("{n} resets will be left on this account."),
-    });
+    if left.is_empty() {
+        lines.push("This is the last reset on this account.".to_string());
+    } else {
+        let parts: Vec<String> = left
+            .iter()
+            .map(|(name, n)| {
+                if *n == 1 {
+                    format!("1 {name}")
+                } else {
+                    format!("{n} {name}s")
+                }
+            })
+            .collect();
+        lines.push(format!("Still banked after this: {}.", parts.join(", ")));
+    }
     lines.join("\n")
 }
 
-fn spawn_claim(key: String) {
+/// What a successful claim cleared, for the notification.
+fn cleared_phrase(cleared: &[String]) -> String {
+    let names: Vec<String> = cleared
+        .iter()
+        .filter(|k| *k == SESSION_LIMIT_KEY || *k == WEEKLY_LIMIT_KEY)
+        .map(|k| limit_name(k))
+        .collect();
+    match names.len() {
+        0 => "limit cleared".to_string(),
+        1 => format!("{} cleared", names[0]),
+        _ => format!("{} cleared", names.join(" and ")),
+    }
+}
+
+fn spawn_claim(key: String, grant_id: Option<String>) {
     std::thread::spawn(move || {
-        let res = crate::switching::claude::claim_claude_reset(&key);
+        use crate::providers::claude::usage::ClaimOutcome;
+        let res = crate::switching::claude::claim_claude_reset(&key, grant_id.as_deref());
         crate::logging::log(&format!(
-            "event=reset_claim provider=claude account={key} outcome={}",
+            "event=reset_claim provider=claude account={key} grant={} outcome={}",
+            grant_id.as_deref().unwrap_or("-"),
             match &res {
-                Ok(crate::providers::claude::usage::ClaimOutcome::Reset) => "reset".to_string(),
-                Ok(crate::providers::claude::usage::ClaimOutcome::NoChange(s)) => s.clone(),
+                Ok(ClaimOutcome::Reset { .. }) => "reset".to_string(),
+                Ok(ClaimOutcome::NoChange(s)) => s.clone(),
                 Err(e) => format!("error:{e}"),
             }
         ));
@@ -410,11 +514,14 @@ fn spawn_claim(key: String) {
             expire_cached_usage(&key);
         }
         match res {
-            Ok(crate::providers::claude::usage::ClaimOutcome::Reset) => {
-                notify(&format!("Reset used on {key} — limit cleared"));
+            Ok(ClaimOutcome::Reset { cleared }) => {
+                notify(&format!(
+                    "Reset used on {key} — {}",
+                    cleared_phrase(&cleared)
+                ));
                 request_poll_now();
             }
-            Ok(crate::providers::claude::usage::ClaimOutcome::NoChange(status)) => {
+            Ok(ClaimOutcome::NoChange(status)) => {
                 notify(&format!("No reset applied for {key}: {status}"));
                 request_poll_now();
             }

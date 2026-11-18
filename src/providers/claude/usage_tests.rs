@@ -591,15 +591,49 @@ fn scoped_opus_limit_defers_to_the_fixed_opus_window() {
 }
 
 #[test]
-fn claim_outcome_from_status_only_reset_is_applied() {
-    assert_eq!(ClaimOutcome::from_status("reset"), ClaimOutcome::Reset);
+fn claim_outcome_reads_the_live_result_field() {
+    // Live response from a session-only claim (2026-11-17). It names the
+    // outcome `result`; reading only `status`/`outcome` reported "unknown".
+    let live = serde_json::json!({
+        "result": "reset",
+        "reason": null,
+        "reset": true,
+        "grant_id": "launch-2610-fable",
+        "resets_left": 0,
+        "cleared": ["five_hour", "seven_day_overage_included"],
+        "weekly_resets_at": "2026-11-25T05:00:00+00:00",
+        "cooldown_until": "2026-11-18T07:56:45.138745+00:00"
+    });
+    assert_eq!(
+        ClaimOutcome::from_response(&live),
+        ClaimOutcome::Reset {
+            cleared: vec!["five_hour".into(), "seven_day_overage_included".into()]
+        }
+    );
+    // Older field names still work; a bare `reset: true` counts as applied.
+    assert_eq!(
+        ClaimOutcome::from_response(&serde_json::json!({"status": "reset"})),
+        ClaimOutcome::Reset { cleared: vec![] }
+    );
+    assert_eq!(
+        ClaimOutcome::from_response(&serde_json::json!({"reset": true})),
+        ClaimOutcome::Reset { cleared: vec![] }
+    );
+}
+
+#[test]
+fn claim_outcome_only_reset_is_applied() {
     for other in ["already_used", "not_limited", "cooldown", "unknown", ""] {
         assert_eq!(
-            ClaimOutcome::from_status(other),
+            ClaimOutcome::from_response(&serde_json::json!({"result": other, "reset": false})),
             ClaimOutcome::NoChange(other.to_string()),
             "{other:?} must not be reported as an applied reset"
         );
     }
+    assert_eq!(
+        ClaimOutcome::from_response(&serde_json::json!({})),
+        ClaimOutcome::NoChange("unknown".to_string())
+    );
 }
 
 #[test]

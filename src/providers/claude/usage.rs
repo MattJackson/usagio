@@ -340,19 +340,36 @@ pub(crate) fn fetch(access_token: &str) -> std::result::Result<Usage, FetchError
 /// account isn't actually at a limit yet).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ClaimOutcome {
-    /// The reset was applied — windows cleared.
-    Reset,
+    /// The reset was applied; `cleared` lists the limit keys the server says
+    /// it cleared (e.g. `five_hour`), empty when it doesn't say.
+    Reset { cleared: Vec<String> },
     /// A non-success outcome the server named (`already_used`, `not_limited`,
     /// `cooldown`, `ineligible`, `unavailable`, or anything new).
     NoChange(String),
 }
 
 impl ClaimOutcome {
-    fn from_status(s: &str) -> Self {
-        if s == "reset" {
-            ClaimOutcome::Reset
+    /// Read a claim response. The live endpoint answers
+    /// `{"result":"reset","reset":true,"cleared":["five_hour",...],...}`;
+    /// `status` / `outcome` are accepted too. A `reset: true` flag counts as
+    /// applied even when the status word is missing.
+    pub(crate) fn from_response(v: &serde_json::Value) -> Self {
+        let status = ["result", "status", "outcome"]
+            .iter()
+            .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
+            .unwrap_or("unknown");
+        let flagged = v.get("reset").and_then(|x| x.as_bool()) == Some(true);
+        if status == "reset" || flagged {
+            let cleared = v
+                .get("cleared")
+                .and_then(|x| x.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|k| k.as_str().map(String::from))
+                .collect();
+            ClaimOutcome::Reset { cleared }
         } else {
-            ClaimOutcome::NoChange(s.to_string())
+            ClaimOutcome::NoChange(status.to_string())
         }
     }
 }
@@ -369,7 +386,7 @@ fn request_id() -> String {
 
 /// Claim a banked usage-limit reset for `org_uuid`'s `grant_id`. POSTs the
 /// `cedar_ember` program to the organization's `reset_rate_limits` endpoint and
-/// maps the response `status` to a [`ClaimOutcome`]. This SPENDS a one-shot
+/// maps the response to a [`ClaimOutcome`]. This SPENDS a one-shot
 /// reset — only ever call it from an explicit user action, never automatically.
 /// Not gated on `cfg(test)`: no test invokes it (so none hits the network), and
 /// gating it out would break the test build of its `main::claim_claude_reset`
@@ -397,12 +414,7 @@ pub(crate) fn claim_reset(
             let v: serde_json::Value = r
                 .into_json()
                 .map_err(|e| FetchError::Other(format!("parsing claim response: {e}")))?;
-            let status = v
-                .get("status")
-                .or_else(|| v.get("outcome"))
-                .and_then(|x| x.as_str())
-                .unwrap_or("unknown");
-            Ok(ClaimOutcome::from_status(status))
+            Ok(ClaimOutcome::from_response(&v))
         }
         Err(ureq::Error::Status(429, _)) => Err(FetchError::RateLimited),
         Err(ureq::Error::Status(401, _)) => Err(FetchError::Auth),
