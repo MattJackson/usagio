@@ -131,15 +131,20 @@ fn checkbox(
 fn build_account_submenu_item(sec: &ProviderSection, a: &AcctView) -> PMenuItem {
     let mut items = Vec::new();
     let rows = account_submenu_rows(sec, a);
+    // Reset rows not yet matched to an info row, in render order. Two resets
+    // of the same kind render identical text, so each match is consumed and
+    // the second row claims the second grant.
+    let mut reset_rows = if rows.claim_reset_row {
+        reset_grant_row_items(&a.reported.reset_grants)
+    } else {
+        Vec::new()
+    };
     for (row, locked) in submenu_info_items(sec, a) {
         // A ready reset row claims exactly the grant it names.
-        let ready_grant = if rows.claim_reset_row {
-            reset_grant_row_items(&a.reported.reset_grants)
-                .into_iter()
-                .find_map(|(text, id)| id.filter(|_| text == row))
-        } else {
-            None
-        };
+        let ready_grant = reset_rows
+            .iter()
+            .position(|(text, _)| *text == row)
+            .and_then(|i| reset_rows.remove(i).1);
         if let Some(grant_id) = ready_grant {
             items.push(action(
                 format!("claim:{}:{}:{grant_id}", sec.provider_id, a.key),

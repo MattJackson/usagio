@@ -317,6 +317,22 @@ fn claim_question_counts_the_last_and_remaining_resets() {
 }
 
 #[test]
+fn claim_question_names_an_extra_usage_only_reset() {
+    // matthew@getbusbar: weekly-capped, launch reset clears only extra usage.
+    let g = ready_grant(
+        "launch-2610-fable",
+        vec![cleared("seven_day_overage_included", 2.0)],
+    );
+    assert_eq!(
+        claim_question("m@example.com", &[g], None),
+        "Use the extra-usage reset on m@example.com?\n\n\
+         Clears the extra-usage allowance (now 2%).\n\
+         Your weekly limit is not reset.\n\n\
+         This is the last reset on this account."
+    );
+}
+
+#[test]
 fn claim_notification_says_what_was_cleared() {
     assert_eq!(
         cleared_phrase(&["five_hour".into(), "seven_day_overage_included".into()]),
@@ -327,6 +343,10 @@ fn claim_notification_says_what_was_cleared() {
         "5-hour session limit and weekly limit cleared"
     );
     assert_eq!(cleared_phrase(&[]), "limit cleared");
+    assert_eq!(
+        cleared_phrase(&["seven_day_overage_included".into()]),
+        "extra-usage allowance cleared"
+    );
 }
 
 #[test]
