@@ -5,6 +5,13 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.8] - 2026-11-18
+
+### Added
+
+- The usage history now records each reading's scoped limits (Claude's Fable weekly bucket) and the resets banked on the account, with what each would clear. A row always lists its resets (`"grants":[]` when there are none), so a reset disappearing between two readings shows exactly when it was used, including one used outside usagio.
+- Using a reset writes a line to the decisions log: the reset, the outcome, what the server says it cleared, and the account's last reading before the claim. With the reading the forced poll writes right after, this shows what each kind of reset really does.
+
 ## [1.1.7] - 2026-11-18
 
 ### Fixed
