@@ -674,6 +674,7 @@ pub(crate) fn replay_row(
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|d| d.with_timezone(&Utc))
     };
+    let (scoped, grants) = usage_log::reported_log(&cu.reported);
     usage_log::Snapshot {
         ts: Utc::now(),
         provider: slug.to_string(),
@@ -686,6 +687,8 @@ pub(crate) fn replay_row(
         weekly_reset: parse(&cu.weekly_reset),
         fetched_at: Some(cu.fetched_at),
         outcome: Some(outcome.to_string()),
+        scoped,
+        grants: Some(grants),
     }
 }
 

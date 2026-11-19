@@ -510,7 +510,11 @@ fn cleared_phrase(cleared: &[String]) -> String {
 fn spawn_claim(key: String, grant_id: Option<String>) {
     std::thread::spawn(move || {
         use crate::providers::claude::usage::ClaimOutcome;
+        let before = State::load()
+            .ok()
+            .and_then(|st| st.find(&key).and_then(|a| a.cached_usage.clone()));
         let res = crate::switching::claude::claim_claude_reset(&key, grant_id.as_deref());
+        log_claim_decision(&key, grant_id.as_deref(), before.as_ref(), &res);
         crate::logging::log(&format!(
             "event=reset_claim provider=claude account={key} grant={} outcome={}",
             grant_id.as_deref().unwrap_or("-"),
@@ -540,6 +544,41 @@ fn spawn_claim(key: String, grant_id: Option<String>) {
             Err(e) => notify(&format!("Claim failed for {key}: {e}")),
         }
     });
+}
+
+/// A decisions-log line for a reset claim: the grant, the outcome, what the
+/// server says it cleared, and the account's last reading before the claim
+/// (every bucket, its reset time and the banked grants). The forced poll after
+/// a claim writes the "after" reading to the history log, so the two together
+/// show what a claim of this grant family really does.
+fn log_claim_decision(
+    key: &str,
+    grant_id: Option<&str>,
+    before: Option<&crate::store::CachedUsage>,
+    res: &Result<crate::providers::claude::usage::ClaimOutcome, String>,
+) {
+    use crate::providers::claude::usage::ClaimOutcome;
+    let (outcome, cleared, error) = match res {
+        Ok(ClaimOutcome::Reset { cleared }) => ("reset".to_string(), cleared.clone(), None),
+        Ok(ClaimOutcome::NoChange(s)) => (s.clone(), Vec::new(), None),
+        Err(e) => ("error".to_string(), Vec::new(), Some(e.clone())),
+    };
+    let v = serde_json::json!({
+        "ts": chrono::Utc::now().timestamp(),
+        "provider": CLAUDE_SLUG,
+        "engine": "claim",
+        "action": "claim",
+        "reason": "manual",
+        "target": key,
+        "grant": grant_id,
+        "outcome": outcome,
+        "cleared": cleared,
+        "error": error,
+        "before": before,
+    });
+    if let Err(e) = crate::usage_log::append_decision(&v) {
+        crate::logging::log(&format!("decisions log append failed: {e:#}"));
+    }
 }
 
 /// Mark `key`'s cached usage as old so the next poll refetches it even if it

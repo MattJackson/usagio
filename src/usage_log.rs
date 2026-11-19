@@ -61,6 +61,66 @@ pub(crate) struct Snapshot {
     /// pre-0.12.2 successful readings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) outcome: Option<String>,
+    /// Extra limits the provider reported with this reading (Claude's
+    /// "Fable 7d"), so a replay sees every bucket that can block (1.1.8+).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) scoped: Vec<ScopedLog>,
+    /// Reset grants banked on the account as of this reading (1.1.8+). Always
+    /// written by 1.1.8+ (`[]` when none are banked) so a replay can tell "no
+    /// grants" from "not logged yet"; a grant vanishing between two rows marks
+    /// a claim, ours or external.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) grants: Option<Vec<GrantLog>>,
+}
+
+/// One provider-scoped limit in a history row.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ScopedLog {
+    pub(crate) id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reset: Option<DateTime<Utc>>,
+}
+
+/// One banked reset grant in a history row (the label is left out: the id
+/// names the grant family and the label never changes for it).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct GrantLog {
+    pub(crate) id: String,
+    pub(crate) left: u32,
+    pub(crate) usable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expires: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) clears: Vec<crate::providers::trait_def::ClearedLimit>,
+}
+
+/// The scoped limits and banked grants of `r`, as history rows carry them.
+pub(crate) fn reported_log(
+    r: &crate::providers::trait_def::ReportedUsage,
+) -> (Vec<ScopedLog>, Vec<GrantLog>) {
+    let scoped = r
+        .scoped_limits
+        .iter()
+        .map(|w| ScopedLog {
+            id: w.id.clone(),
+            pct: w.utilization,
+            reset: w.resets_at,
+        })
+        .collect();
+    let grants = r
+        .reset_grants
+        .iter()
+        .map(|g| GrantLog {
+            id: g.id.clone(),
+            left: g.resets_left,
+            usable: g.usable_now,
+            expires: g.expires_at,
+            clears: g.clears.clone(),
+        })
+        .collect();
+    (scoped, grants)
 }
 
 impl Snapshot {
@@ -2126,5 +2186,68 @@ mod tests {
         let pe = pace(&AccountKey::new("claude", "a@x.io")).expect("8 rising samples");
         assert_eq!(pe.sample_count, 8);
         assert!((pe.slope_pct_per_hour - 2.0).abs() < 1e-6);
+    }
+
+    // --- gift-replay fields ---
+
+    #[test]
+    fn reported_log_carries_scoped_limits_and_grants() {
+        use crate::providers::trait_def::{ClearedLimit, ReportedUsage, ResetGrant, UsageWindow};
+        let reset = Utc.with_ymd_and_hms(2026, 11, 25, 3, 0, 0).unwrap();
+        let r = ReportedUsage {
+            scoped_limits: vec![UsageWindow {
+                id: "scoped:fable".into(),
+                label: "Fable 7d".into(),
+                utilization: Some(49.0),
+                resets_at: Some(reset),
+            }],
+            reset_grants: vec![ResetGrant {
+                id: "full-reset-2611".into(),
+                label: "One full limit reset".into(),
+                resets_left: 1,
+                usable_now: true,
+                expires_at: Some(reset),
+                clears: vec![ClearedLimit {
+                    key: "seven_day".into(),
+                    pct: Some(49.0),
+                }],
+            }],
+            ..Default::default()
+        };
+        let (scoped, grants) = reported_log(&r);
+        assert_eq!(
+            scoped,
+            vec![ScopedLog {
+                id: "scoped:fable".into(),
+                pct: Some(49.0),
+                reset: Some(reset),
+            }]
+        );
+        assert_eq!(grants.len(), 1);
+        let g = &grants[0];
+        assert_eq!(g.id, "full-reset-2611");
+        assert_eq!((g.left, g.usable, g.expires), (1, true, Some(reset)));
+        assert_eq!(g.clears, r.reset_grants[0].clears);
+    }
+
+    #[test]
+    fn grants_field_tells_none_banked_from_not_logged() {
+        let now = Utc::now();
+        let none_banked = Snapshot {
+            grants: Some(Vec::new()),
+            ..snap("claude", "a@x.io", now, Some(10.0))
+        };
+        let line = serde_json::to_string(&none_banked).unwrap();
+        assert!(line.contains("\"grants\":[]"), "{line}");
+        assert!(!line.contains("scoped"), "empty scoped is omitted: {line}");
+        let back: Snapshot = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.grants, Some(Vec::new()));
+        // A row written before 1.1.8 has no field at all.
+        let old: Snapshot = serde_json::from_str(
+            r#"{"ts":"2026-11-01T00:00:00Z","provider":"claude","account":"a@x.io","weekly_pct":10.0}"#,
+        )
+        .unwrap();
+        assert_eq!(old.grants, None);
+        assert!(old.scoped.is_empty());
     }
 }
