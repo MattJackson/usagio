@@ -169,9 +169,9 @@ fn refresh_error_trailing_when_not_needing_relogin() {
 }
 
 #[test]
-fn lapsed_subscription_trailing_is_red_dash_not_countdown() {
+fn lapsed_subscription_trailing_counts_down_to_its_weekly_reset() {
     let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
-    let reset = now + chrono::Duration::days(4);
+    let reset = now + chrono::Duration::hours(39);
     with_now(now, || {
         let mut a = acct_with_resets(
             "lapsed@x.com",
@@ -182,11 +182,74 @@ fn lapsed_subscription_trailing_is_red_dash_not_countdown() {
             Some(reset),
         );
         a.no_subscription = true;
+        // Renewing before the week resets resumes it maxed: count down to it,
+        // red like any locked account.
+        let (trailing, colors) = trailing_for_account(&a, bands(), now);
+        assert_eq!(trailing, "1d 15h");
+        assert_eq!(colors, vec![(0, 6, Severity::Red)]);
+        // An unmaxed week still counts down, uncoloured.
+        a.windows[1].pct = Some(40.0);
+        assert_eq!(
+            trailing_for_account(&a, bands(), now),
+            ("1d 15h".to_string(), Vec::new())
+        );
+        // Past the reset (or unknown) the plan is the headline.
+        a.weekly_reset_at = Some(now - chrono::Duration::minutes(1));
         let (trailing, colors) = trailing_for_account(&a, bands(), now);
         assert_eq!(trailing, "Free", "no plan name known → Free");
         assert_eq!(colors, vec![(0, 4, Severity::Red)]);
+        a.weekly_reset_at = None;
         a.plan = Some("Pro".into());
         assert_eq!(trailing_for_account(&a, bands(), now).0, "Pro");
+    });
+}
+
+#[test]
+fn lapsed_subscription_submenu_matches_a_locked_account() {
+    let now = Utc::now();
+    with_now(now, || {
+        let mut a = acct_with_resets(
+            "lapsed@x.com",
+            Some(0.0),
+            Some(100.0),
+            false,
+            Some(now - chrono::Duration::hours(3)),
+            Some(now + chrono::Duration::days(2)),
+        );
+        a.no_subscription = true;
+        a.reported = ReportedUsage {
+            credits: Some(Credits {
+                enabled: true,
+                balance: usd(310),
+                ..Credits::default()
+            }),
+            scoped_limits: vec![
+                UsageWindow {
+                    resets_at: Some(now + chrono::Duration::days(2)),
+                    ..scoped("Fable", Some(85.0))
+                },
+                UsageWindow {
+                    resets_at: Some(now - chrono::Duration::hours(1)),
+                    ..scoped("Old", Some(50.0))
+                },
+            ],
+            ..ReportedUsage::default()
+        };
+        let rows = submenu_info_rows(&claude_section(), &a);
+        assert_eq!(rows[..2], ["Plan · Free", "Weekly locked · unlocks in 2d"]);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(
+            rows[2].starts_with("Fable 7d · 85% · resets in "),
+            "{rows:?}"
+        );
+        let items = submenu_info_items(&claude_section(), &a);
+        assert!(!items[0].1, "plan row is plain");
+        assert!(items[1].1, "weekly lock is red");
+        assert_eq!(
+            account_extra_info_rows(&claude_section(), &a),
+            vec!["updated 1m ago"],
+            "no burn forecast"
+        );
     });
 }
 
@@ -254,24 +317,23 @@ fn lapsed_subscription_outranks_needs_relogin() {
     assert_eq!(trailing_for_account(&a, bands(), now).0, "Free");
     assert_eq!(
         submenu_info_rows(&claude_section(), &a),
-        vec!["No subscription · Free plan"]
+        vec!["Plan · Free"]
     );
 }
 
 #[test]
-fn lapsed_subscription_submenu_explains_instead_of_window_rows() {
-    let mut a = acct("lapsed@x.com", Some(0.0), Some(100.0), false);
-    a.no_subscription = true;
-    a.plan = Some("Free".into());
-    let rows = submenu_info_rows(&claude_section(), &a);
-    assert_eq!(rows, vec!["No subscription · Free plan"], "one row only");
-    assert!(
-        !rows
-            .iter()
-            .any(|r| r.contains("renews in") || r.contains("unlocks in")),
-        "no stale window rows: {rows:?}"
-    );
-    assert!(account_extra_info_rows(&claude_section(), &a).is_empty());
+fn lapsed_subscription_submenu_drops_windows_past_or_without_a_reset() {
+    let now = Utc::now();
+    with_now(now, || {
+        let mut a = acct("lapsed@x.com", Some(0.0), Some(100.0), false);
+        a.no_subscription = true;
+        a.plan = Some("Free".into());
+        let rows = submenu_info_rows(&claude_section(), &a);
+        assert_eq!(rows, vec!["Plan · Free"], "no reset known: one row only");
+        a.weekly_reset_at = Some(now - chrono::Duration::minutes(5));
+        let rows = submenu_info_rows(&claude_section(), &a);
+        assert_eq!(rows, vec!["Plan · Free"], "reset passed: one row only");
+    });
 }
 
 fn usd(minor: i64) -> Option<Money> {
@@ -646,7 +708,7 @@ fn lapsed_account_shows_no_reported_rows() {
         ..ReportedUsage::default()
     };
     let rows = submenu_info_rows(&claude_section(), &a);
-    assert!(rows[0].contains("No subscription"), "{rows:?}");
+    assert_eq!(rows[0], "Plan · Free", "{rows:?}");
     assert!(
         !rows
             .iter()

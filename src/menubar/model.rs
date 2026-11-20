@@ -60,9 +60,9 @@ pub(super) struct AcctView {
     /// as the reason line under a `⚠ error` trailing when `needs_relogin` is not
     /// set. `None` in the common healthy case.
     pub(super) error: Option<String>,
-    /// The account's subscription lapsed: its cached usage (and reset
-    /// countdowns) are meaningless, so the row shows a red "-" and the
-    /// submenu explains instead.
+    /// The account's subscription lapsed: usage isn't fetched, so the row
+    /// counts down to the last-known weekly reset (when renewing starts a
+    /// fresh week), then shows the plan once that has passed.
     pub(super) no_subscription: bool,
     /// Plan label ("Max 20x", "Pro", "Free", …) when known.
     pub(super) plan: Option<String>,
