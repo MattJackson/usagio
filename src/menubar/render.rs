@@ -288,10 +288,21 @@ fn trailing_usage_for_account(
     bands: SeverityBands,
     now: DateTime<Utc>,
 ) -> (String, Vec<(usize, usize, Severity)>) {
-    // No plan, no usage: a countdown to a reset that frees nothing would lie.
-    // Outranks auth trouble too — a Free account is unusable whether or not
-    // its login is healthy, so the plan is the headline, not "re-login".
+    // A lapsed plan keeps its last week running: renewing before that week
+    // resets resumes it (still maxed) instead of starting a fresh one, so the
+    // row counts down to the reset like any other account. Once it's past (or
+    // unknown) the plan is the headline. Outranks auth trouble too — a Free
+    // account is unusable whether or not its login is healthy.
     if a.no_subscription {
+        if let Some(until) = lapsed_weekly_reset(a, now) {
+            let cd = countdown::format_countdown(until - now);
+            let colors = if weekly_maxed(a) {
+                vec![(0, u16len(&cd), Severity::Red)]
+            } else {
+                Vec::new()
+            };
+            return (cd, colors);
+        }
         let t = a.plan.clone().unwrap_or_else(|| "Free".to_string());
         let len = u16len(&t);
         return (t, vec![(0, len, Severity::Red)]);
@@ -405,6 +416,44 @@ fn trailing_usage_for_account(
             (trailing, colors)
         }
     }
+}
+
+/// A lapsed account's last-known weekly reset, while it's still ahead.
+fn lapsed_weekly_reset(a: &AcctView, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    a.weekly_reset_at.filter(|r| *r > now)
+}
+
+/// The cached weekly window is at its limit.
+fn weekly_maxed(a: &AcctView) -> bool {
+    a.windows
+        .iter()
+        .any(|w| w.id == "weekly" && w.pct.is_some_and(|p| p >= countdown::LOCKED_THRESHOLD_PCT))
+}
+
+/// A lapsed account's submenu body under its plan row: the weekly window and
+/// per-model limits still running from before it lapsed (when to renew for a
+/// fresh week), plus any reset grants. Nothing past its reset — usage isn't
+/// fetched while lapsed, so it would never refresh.
+fn lapsed_rows(a: &AcctView, now: DateTime<Utc>) -> Vec<(String, bool)> {
+    let mut rows: Vec<(String, bool)> = Vec::new();
+    if lapsed_weekly_reset(a, now).is_some() {
+        rows.extend(
+            a.windows
+                .iter()
+                .filter(|w| w.id == "weekly")
+                .filter_map(|w| window_status_row_at(w, false)),
+        );
+    }
+    rows.extend(reset_grant_rows(&a.reported.reset_grants));
+    rows.extend(
+        a.reported
+            .scoped_limits
+            .iter()
+            .filter(|w| w.resets_at.is_some_and(|r| r > now))
+            .filter_map(scoped_limit_row)
+            .map(|r| (r, false)),
+    );
+    rows
 }
 
 /// Credits the account can still spend, if it can run on them at all.
@@ -703,12 +752,10 @@ pub(super) fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(St
     // `trailing_for_account`): the account is unusable either way.
     if a.no_subscription {
         rows.push((
-            format!(
-                "No subscription · {} plan",
-                a.plan.as_deref().unwrap_or("Free")
-            ),
-            true,
+            format!("Plan · {}", a.plan.as_deref().unwrap_or("Free")),
+            false,
         ));
+        rows.extend(lapsed_rows(a, now_utc()));
         return rows;
     }
     // Auth trouble is the account's headline state — spell out the reason and
@@ -804,7 +851,7 @@ pub(super) fn submenu_info_items(sec: &ProviderSection, a: &AcctView) -> Vec<(St
 /// appends them after the `submenu_info_rows` block.
 pub(super) fn account_extra_info_rows(sec: &ProviderSection, a: &AcctView) -> Vec<String> {
     let mut rows = Vec::new();
-    if sec.supports_usage && a.has_data && !a.windows.is_empty() && !a.no_subscription {
+    if sec.supports_usage && a.has_data && !a.windows.is_empty() {
         let account_key =
             crate::usage_log::AccountKey::new(sec.provider_id.to_string(), a.key.clone());
         // The burn-rate row forecasts when the WEEKLY window empties ("Weekly ·
@@ -814,7 +861,9 @@ pub(super) fn account_extra_info_rows(sec: &ProviderSection, a: &AcctView) -> Ve
         let weekly_locked = a.windows.iter().any(|w| {
             w.id == "weekly" && w.pct.is_some_and(|p| p >= countdown::LOCKED_THRESHOLD_PCT)
         });
-        if !weekly_locked {
+        // A lapsed account burns nothing: no forecast, just how old its
+        // last reading is.
+        if !weekly_locked && !a.no_subscription {
             if let Some(row) = empty_in_row(&account_key, a, now_utc()) {
                 rows.push(row);
             }
