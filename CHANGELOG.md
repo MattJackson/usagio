@@ -5,6 +5,12 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.9] - 2026-11-19
+
+### Changed
+
+- An account whose subscription lapsed now shows when its last week resets, like any other account: the row counts down to the weekly reset (red while the week is used up), and its menu reads `Plan · Free` with the weekly lock, per-model limits still running, and when it was last updated. Renewing before that reset picks the old week back up instead of starting a fresh one, so this is when to renew. Once the reset has passed the row goes back to showing `Free`.
+
 ## [1.1.8] - 2026-11-18
 
 ### Added
